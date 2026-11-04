@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import hmac
+import hashlib
+import stat
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -64,8 +67,8 @@ def parse_model_response(raw, message):
     return {**value, "backend": "dsh"}
 
 
-def run_sdk(turn, home, workspace, factory=None):
-    """Fresh runtime per call, no persisted session resume; Hub supplies history."""
+def run_sdk(turn, home, workspace, factory=None, *, resume=False):
+    """Use explicit resume only after the durable continuity guard has approved it."""
     if factory is None:
         from importlib.metadata import version
         if version("deepseek-harness-sdk") != SDK_VERSION or version("deepseek-harness-runtime-bin") != SDK_VERSION:
@@ -83,13 +86,17 @@ def run_sdk(turn, home, workspace, factory=None):
         'If unclear, ask a question in reply and set proposal to null. A proposal is only a private draft awaiting explicit human confirmation. '
         'Do not add fields, Markdown fences, tool calls, or authorization flags.\n'
     ) + json.dumps(
-        {"history": turn["history"], "message": turn["message"]}, ensure_ascii=False)
+        {"history": [] if resume else turn["history"], "message": turn["message"]}, ensure_ascii=False)
     with factory(dsh_home=str(home), cwd=str(workspace), runtime_cwd=str(workspace),
                  profile="sdk-minimal", patches=(str(ROOT / "no-tools.patch.yml"),),
                  provider="deepseek-official", model=os.environ.get("AGENCT_DSH_MODEL", "deepseek-v4-flash"),
                  max_tokens=4096, initialize_timeout_seconds=20,
                  request_timeout_seconds=45, shutdown_timeout_seconds=2) as harness:
-        result = harness.run(prompt, session_id=turn["session_id"])
+        if resume:
+            # Never fall back to start/run when restoration fails.
+            result = harness.resume_session(turn["session_id"]).run(prompt)
+        else:
+            result = harness.run(prompt, session_id=turn["session_id"])
         if result.finish_reason != "completed" or not isinstance(result.final_response, str) or not result.final_response.strip():
             raise RuntimeError("incomplete_turn")
         if len(result.final_response.encode()) > MAX_BODY:
@@ -97,38 +104,158 @@ def run_sdk(turn, home, workspace, factory=None):
         return parse_model_response(result.final_response, turn["message"])
 
 
+def runtime_fingerprint():
+    value = {"sdk": SDK_VERSION, "model": os.environ.get("AGENCT_DSH_MODEL", "deepseek-v4-flash"),
+             "provider": "deepseek-official", "profile": "sdk-minimal",
+             "patch": (ROOT / "no-tools.patch.yml").read_text(), "protocol": 1}
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def history_digests(history):
+    return [hashlib.sha256(json.dumps(item, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+            for item in history]
+
+
+def private_directory(path):
+    # The adapter OS account is trusted. Other accounts and symlink aliases are not.
+    if not path.is_absolute() or path.resolve() != path:
+        raise RuntimeError("unsafe_state_directory")
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise RuntimeError("unsafe_state_directory")
+
+
+def private_file(path, flags):
+    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1:
+        os.close(fd)
+        raise RuntimeError("unsafe_state_file")
+    return fd
+
+
+def write_journal(root, value):
+    # Persist before launching the runtime. A crash can only strand a dirty session,
+    # never authorize automatic replay of an uncertain provider call.
+    path = root / ("journal-" + uuid.uuid4().hex + ".tmp")
+    fd = private_file(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    with os.fdopen(fd, "w") as stream:
+        json.dump(value, stream)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(path, root / "journal.json")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class SessionStore:
+    """Disabled persistence prototype. NOT a durable SDK checkpoint guarantee."""
+    def __init__(self, root):
+        self.root = Path(root)
+        private_directory(self.root)  # Explicit pre-created private directory required.
+
+    @contextmanager
+    def turn(self, turn):
+        import fcntl
+        validate_turn(turn)
+        private_directory(self.root)
+        fd = private_file(self.root / "adapter.lock", os.O_RDWR | os.O_CREAT)
+        try:
+            # One lock avoids same-session races and bounds persistent-runtime concurrency.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            root = self.root / turn["session_id"]
+            resume = root.exists() or root.is_symlink()
+            if resume:
+                private_directory(root)
+                jfd = private_file(root / "journal.json", os.O_RDONLY)
+                with os.fdopen(jfd) as stream:
+                    raw = stream.read(32769)
+                if len(raw) > 32768:
+                    raise RuntimeError("invalid_session_journal")
+                journal = json.loads(raw)
+                if (not isinstance(journal, dict) or set(journal) != {"version", "state", "history", "runtime"}
+                        or journal["version"] != 1 or journal["state"] != "ready"
+                        or journal["runtime"] != runtime_fingerprint()
+                        or not isinstance(journal["history"], list)):
+                    raise RuntimeError("session_requires_reconciliation")
+                incoming = history_digests(turn["history"])
+                expected = journal["history"]
+                # Hub may trim an old prefix, but must acknowledge our last completed pair.
+                if len(incoming) < 2 or len(incoming) > len(expected) or incoming != expected[-len(incoming):]:
+                    raise RuntimeError("session_history_diverged")
+                private_directory(root / "home")
+                private_directory(root / "workspace")
+            else:
+                root.mkdir(mode=0o700)
+                (root / "home").mkdir(mode=0o700)
+                (root / "workspace").mkdir(mode=0o700)
+                parent_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+            write_journal(root, {"version": 1, "state": "uncertain", "history": [], "runtime": runtime_fingerprint()})
+            yield root, resume
+        finally:
+            os.close(fd)
+
+    def completed(self, root, turn, result):
+        expected = turn["history"] + [{"role": "user", "content": turn["message"]},
+                                        {"role": "assistant", "content": result["reply"]}]
+        write_journal(root, {"version": 1, "state": "ready", "history": history_digests(expected), "runtime": runtime_fingerprint()})
+
+
 class DshRunner:
-    def __init__(self, timeout=45):
+    def __init__(self, timeout=45, state_root=None):
         self.timeout = timeout
+        # Do not expose the persistence prototype until SDK JSONL durability and
+        # turn/checkpoint equivalence are verified. A ready adapter journal alone
+        # cannot prove that a resumed SDK log includes the acknowledged answer.
+        if state_root is not None:
+            raise RuntimeError("persistent_dsh_sessions_not_verified")
+        self.store = None
 
     def __call__(self, turn):
+        validate_turn(turn)
         # The SDK inherits its environment. Pass an allowlist to the isolated worker.
         env = {key: os.environ[key] for key in ("PATH", "LANG", "DEEPSEEK_API_KEY", "AGENCT_DSH_MODEL") if key in os.environ}
         if not env.get("DEEPSEEK_API_KEY"):
             raise RuntimeError("provider_not_configured")
+        if self.store:
+            with self.store.turn(turn) as (root, resume):
+                result = self.worker(turn, root, env, resume)
+                self.store.completed(root, turn, result)
+                return result
         with tempfile.TemporaryDirectory(prefix="agenct-dsh-") as directory:
             root = Path(directory)
             (root / "home").mkdir(mode=0o700)
             (root / "workspace").mkdir(mode=0o700)
-            env["HOME"] = str(root / "home")
-            process = subprocess.Popen([sys.executable, str(ROOT / "adapter.py"), "--worker", str(root)],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                cwd=root / "workspace", env=env, start_new_session=True)
+            return self.worker(turn, root, env, False)
+
+    def worker(self, turn, root, env, resume):
+        env["HOME"] = str(root / "home")
+        command = [sys.executable, str(ROOT / "adapter.py"), "--resume-worker" if resume else "--worker", str(root)]
+        process = subprocess.Popen(command,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            cwd=root / "workspace", env=env, start_new_session=True)
+        try:
+            output, _ = process.communicate(json.dumps(turn, ensure_ascii=False).encode(), timeout=self.timeout)
+            if process.returncode or len(output) > MAX_BODY * 2:
+                raise RuntimeError("runtime_failed")
+            value = json.loads(output)
+            if not isinstance(value, dict) or value.get("backend") != "dsh":
+                raise RuntimeError("invalid_runtime_response")
+            return parse_model_response(json.dumps({k: v for k, v in value.items() if k != "backend"}), turn["message"])
+        finally:
+            # Kill the whole group, including any lingering SDK runtime child.
             try:
-                output, _ = process.communicate(json.dumps(turn, ensure_ascii=False).encode(), timeout=self.timeout)
-                if process.returncode or len(output) > MAX_BODY * 2:
-                    raise RuntimeError("runtime_failed")
-                value = json.loads(output)
-                if value.get("backend") != "dsh" or not isinstance(value.get("reply"), str):
-                    raise RuntimeError("invalid_runtime_response")
-                return value
-            finally:
-                # Kill the whole group, including any lingering SDK runtime child.
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait()
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
 
 
 def make_server(token, runner, port=8788):
@@ -183,15 +310,15 @@ def make_server(token, runner, port=8788):
 
 
 def main():
-    if len(sys.argv) == 3 and sys.argv[1] == "--worker":
+    if len(sys.argv) == 3 and sys.argv[1] in ("--worker", "--resume-worker"):
         root = Path(sys.argv[2])
         turn = validate_turn(json.loads(sys.stdin.buffer.read(MAX_BODY + 1)))
-        result = run_sdk(turn, root / "home", root / "workspace")
+        result = run_sdk(turn, root / "home", root / "workspace", resume=sys.argv[1] == "--resume-worker")
         print(json.dumps(result))
     else:
         if os.name != "posix":
             raise RuntimeError("This experimental process-group isolation requires Linux/macOS")
-        server = make_server(os.environ.get("AGENCT_ADAPTER_TOKEN", ""), DshRunner(),
+        server = make_server(os.environ.get("AGENCT_ADAPTER_TOKEN", ""), DshRunner(state_root=os.environ.get("AGENCT_DSH_STATE_DIR")),
                              int(os.environ.get("AGENCT_ADAPTER_PORT", "8788")))
         try:
             server.serve_forever()

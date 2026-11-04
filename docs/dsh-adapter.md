@@ -4,9 +4,9 @@ The Rust Hub is the identity, authorization and conversation authority. This ada
 
 ## What exists and what was verified
 
-- A real SDK integration path: `DeepSeekHarness(..., profile="sdk-minimal", patches=(...), dsh_home=...)`, followed by `run(..., session_id=...)` and context-managed shutdown.
+- A real SDK integration path: `DeepSeekHarness(..., profile="sdk-minimal", patches=(...), dsh_home=...)`, followed by `run(..., session_id=...)` and context-managed shutdown. A disabled persistence prototype exercises the pinned SDK’s explicit `resume_session(id).run(...)`; production configuration cannot enable it.
 - Official SDK and bundled runtime pinned to `0.2.1rc2`. Constructor arguments were verified against that published SDK wheel. Disabled profile row IDs were verified against the matching upstream `dsh-v0.2.1-rc.2` tag, not guessed from a different release.
-- Seven offline boundary/lifecycle tests use a fake SDK or process. **No provider credentials were used, no model request was sent, and the actual runtime plus patch has not yet passed a live integration test.** This is a foundation, not a claim that real DSH chat is already operating.
+- Twenty-four offline boundary/lifecycle tests use a fake SDK, process, or guarded local storage. **No provider credentials were used, no model request was sent, and the actual runtime plus patch has not yet passed a live integration test.** This is a foundation, not a claim that real DSH chat is already operating.
 - There is no mock model response inside this service. Missing credentials, version mismatch, timeouts, and runtime failures fail explicitly. Rust's separately selected mock runtime is for UI/Hub development only.
 
 ## Local configuration
@@ -46,13 +46,25 @@ The Hub must authorize the caller and choose the session UUID/history itself. Po
 
 ## Isolation and capability limits
 
-Every request gets a separate temporary home/workspace and runtime process. History is reconstructed from Hub data; DSH resume/persistent memory is intentionally unused. Inputs are wrapped as JSON conversation text so a slash-prefixed message is not routed as a native SDK command. The wrapper is not a prompt-injection defense; disabling capabilities is the boundary.
+By default every request gets a separate temporary home/workspace and runtime process. History is reconstructed from Hub data. The disabled persistence prototype is described below; no supported configuration resumes SDK state between turns. Inputs are wrapped as JSON conversation text so a slash-prefixed message is not routed as a native SDK command. The wrapper is not a prompt-injection defense; disabling capabilities is the boundary.
 
-`no-tools.patch.yml` disables the sdk-minimal profile's file, working-directory and persistent shell tool producers, plus session-log and package-inventory telemetry plugins. No MCP servers, external tools or cross-user sessions are configured. Per-request directories are removed after completion; the SDK is closed via its context manager. The adapter kills the worker's process group on both normal return and a hard 45-second timeout. The SDK's own request timeout is not treated as an end-to-end deadline.
+`no-tools.patch.yml` disables the sdk-minimal profile's file, working-directory and persistent shell tool producers, plus session-log and package-inventory telemetry plugins. No MCP servers, external tools or cross-user sessions are configured. In default mode, per-request directories are removed after completion; the SDK is closed via its context manager. The adapter kills the worker's process group on both normal return and a hard 45-second timeout. The SDK's own request timeout is not treated as an end-to-end deadline.
 
 Only an allowlist of environment variables reaches the worker. This does not provide OS-level confinement: the upstream runtime still runs with the adapter OS account's filesystem/network privileges. A runtime vulnerability or changed plugin behavior could escape application-level restrictions. **Before public or multi-tenant deployment, use an isolated unprivileged container/VM with resource limits, controlled egress, no host mounts/secrets, and verify the effective runtime tool inventory.** The HTTP server is a bounded-active-work development server, not an Internet-facing production gateway.
 
 This profile patch must be re-audited on dependency upgrades: upstream missing-row patches can warn rather than fail. The version guard refuses any SDK/runtime version other than the pinned one. Next acceptance gate: install the exact runtime, inspect its resolved profile/tool inventory without a provider call, then run an explicitly authorized live smoke test for two independent Hub users and failure/cancellation behavior. Do not enable tools merely to make this chat smoke test pass.
+
+## Persisted SDK sessions are disabled
+
+**Do not set `AGENCT_DSH_STATE_DIR`.** The adapter explicitly fails at startup with `persistent_dsh_sessions_not_verified` whenever this variable is present, before opening a store or invoking a runtime. Default request-local temporary homes remain supported. Persisted conversational context remains the Hub's responsibility and is supplied to each fresh runtime.
+
+The repository retains an internal prototype and offline tests for private per-session homes, explicit `resume_session`, history acknowledgment, uncertain-outcome journals, model/profile fingerprints, and cross-process locks. Tests wire that prototype directly; there is no production configuration override. The pinned Python SDK documents resume failure rather than implicit creation, and `sdk-minimal` includes separate JSONL session persistence, but those facts alone do not establish crash-safe turn durability.
+
+**Why disabled:** a ready adapter journal can acknowledge a response while the SDK JSONL is missing that turn, truncated, or rolled back. Matching Hub-history hashes prove only what the adapter accepted, not what the SDK can restore. Hashing/fsyncing an arbitrary SDK home after shutdown would detect some later file changes but would still not prove buffered events had reached the correct completed-turn checkpoint before the snapshot. The prototype is therefore not a safe restoration boundary and must not be enabled by editing around the gate.
+
+Before enabling persistence, implement and test a version-pinned SDK checkpoint contract that binds the exact completed session/turn to durable JSONL content, verifies it before resume, and refuses stale/corrupt/reordered state. Include actual-runtime crash/restart tests at each write/flush/ack boundary, multi-user isolation, and Hub/SDK reconciliation. Failures must never trigger silent fresh-session fallback or automatic replay of possibly charged requests. Until then, no live persistent DSH memory claim is made.
+
+Regression tests assert that production rejects persistence before runtime invocation for empty stores and for ready journals paired with stale or truncated fake SDK logs. The remaining prototype tests exercise local guard logic only; they do not validate SDK persistence or model behavior.
 
 ## Offline tests
 
