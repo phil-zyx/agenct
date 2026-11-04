@@ -23,11 +23,15 @@
     <button type="button" id="check-turn">核对发送状态</button>
     <button type="button" id="new-turn">开始新尝试</button>
   </section>
+  <section id="task-context" class="hide" aria-label="下一条聊天的任务上下文">
+    <p id="task-context-details" role="status" aria-live="polite"></p>
+    <button type="button" id="clear-task-context">清除任务上下文</button>
+  </section>
   <form id="form">
     <textarea id="text" aria-label="给管家发消息" placeholder="输入 /agents 配置个人 Agent（仅配置存储）。Mock 示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。"></textarea>
     <button id="send">发送</button>
   </form>
-  <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。任务状态来自当前账号的服务端快照，页面可见时每 5 秒自动检查更新，离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号及所属账号，不保存令牌或消息正文；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。</small>
+  <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，页面可见时每 5 秒自动检查更新，离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号及所属账号，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。</small>
 </section>
 <p id="status" role="status"></p>
 <script src="profiles-ui.js"></script>

@@ -80,3 +80,11 @@ are dispatched at most once per owner/request ID; replies and private proposals
 commit atomically with their receipt. Legacy API calls without a request ID are
 not deduplicated. This does not enable code execution or publication. See
 [recovery behavior and limits](docs/chat-turn-recovery.md).
+
+### Selected-task discussion
+
+Use “讨论此任务” on a Rust Hub task card to include a bounded, participant-authorized
+snapshot in your next chat question. No task is included automatically, and this
+read-only context does not accept, execute, deliver or publish work. Task revisions
+and selections are bound to durable turn receipts. See
+[scope, confirmation boundaries and validation limits](docs/task-discussion.md).

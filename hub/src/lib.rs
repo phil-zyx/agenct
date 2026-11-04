@@ -5,6 +5,7 @@ pub mod gitlab;
 pub mod oidc;
 mod profiles;
 pub mod publication;
+mod task_context;
 pub mod worker;
 pub mod worker_api;
 pub mod worker_consumer;
@@ -112,7 +113,18 @@ pub struct Error(StatusCode, &'static str);
 type Result<T> = std::result::Result<T, Error>;
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+        // Only these selection checks run before receipt reservation/dispatch.
+        // Generic conflicts and transport failures must remain uncertain to clients.
+        let code = match self.1 {
+            task_context::STALE => Some("selected_task_stale_before_dispatch"),
+            task_context::UNAVAILABLE => Some("selected_task_unavailable_before_dispatch"),
+            _ => None,
+        };
+        let mut body = serde_json::json!({"error": self.1});
+        if let Some(code) = code {
+            body["code"] = serde_json::json!(code);
+        }
+        (self.0, Json(body)).into_response()
     }
 }
 impl From<rusqlite::Error> for Error {
@@ -342,6 +354,7 @@ struct ChatInput {
     message: String,
     agent_id: Option<String>,
     request_id: Option<String>,
+    selected_task: Option<task_context::Selection>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -378,6 +391,7 @@ async fn execute_chat(
     id: &str,
     input: &ChatInput,
     runtime_profile: profiles::RuntimeProfile,
+    task_context: Option<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
     // The deterministic mock is a test double, not a model or DSH tool call.
     // No prior/private history is consulted when constructing the shared summary.
@@ -404,7 +418,7 @@ async fn execute_chat(
             )?;
             let mut response = serde_json::json!({
                 "reply":"[MOCK · deterministic test double] 请检查接收人和将共享的任务内容，再明确确认。确认前对方不会收到任务。",
-                "backend":"mock", "proposal":proposal, "runtime_profile":runtime_profile
+                "backend":"mock", "proposal":proposal, "runtime_profile":runtime_profile,"task_context":task_context
             });
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
@@ -438,7 +452,9 @@ async fn execute_chat(
         Runtime::Mock=>Ok(AdapterReply {reply: format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。",prior.len()), backend:"mock".into(), proposal:None}),
         Runtime::Dsh{url,token}=>{
             let mut payload=serde_json::json!({"session_id":session_id,"runtime_profile":runtime_profile,"history":prior.iter().map(|m|serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),"message":input.message});
-            while serde_json::to_vec(&payload).unwrap().len()>60000 {
+            if let Some(context) = &task_context {payload["task_context"] = context.clone();}
+            while payload["history"].as_array().unwrap().len()>100 || serde_json::to_vec(&payload).unwrap().len()>60000 {
+                if payload["history"].as_array().unwrap().is_empty() {return Err(invalid("chat context exceeds adapter limit"));}
                 payload["history"].as_array_mut().unwrap().remove(0);
             }
             let response=h.client.post(url).bearer_auth(token).json(&payload).send().await;
@@ -485,7 +501,7 @@ async fn execute_chat(
                 [message_id],
             )?;
             tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
-            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile});
+            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context});
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
             Ok(Json(response))

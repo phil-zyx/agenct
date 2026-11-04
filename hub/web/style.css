@@ -6,3 +6,4 @@ article{padding:16px;background:white;border:1px solid #d5e0d8;border-radius:12p
 small{color:#56675f}#status{white-space:pre-wrap;color:#8b332a}.hide{display:none}
 
 #turn-recovery{border:1px solid #ad6d32;border-radius:12px;background:#fff6e9;padding:12px;margin:12px 0}#turn-status{white-space:pre-wrap;overflow-wrap:anywhere}
+#task-context{border:1px solid #7b9e90;border-radius:12px;background:#edf6f0;padding:12px;margin:12px 0}#task-context-details{white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}

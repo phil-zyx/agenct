@@ -26,6 +26,10 @@ function fixture(auth = { enabled: false }, settings = {}) {
   let stallReads = false, stallPosts = false;
   let revision = 0;
   let postTurnStatus = 'complete', checkTurnStatus = 'complete', turnFailure = 0;
+  let tasks = settings.tasks || [];
+  const turnContexts = settings.turnContexts || new Map();
+  let responseContextOverride;
+  let postFailure = null;
   let confirmation = false;
   const confirmations = [];
   const storage = settings.storage || new Map();
@@ -69,11 +73,21 @@ function fixture(auth = { enabled: false }, settings = {}) {
         if (settings.logoutFailure) throw Error('Network outcome unknown');
         return { ok: true, status: 204 };
       }
+      // Capture the context at dispatch, including an eventually lost response.
+      if (url === '/api/messages' && options.method === 'POST') {
+        const body = JSON.parse(options.body), selected = body.selected_task;
+        const task = selected && tasks.find(task => task.id === selected.task_id);
+        turnContexts.set(body.request_id, task ? { ...task, summary_truncated: false, result_truncated: false } : null);
+      }
       // Intentionally ignore abort to also exercise responses already in flight.
       if (hold) await new Promise(resolve => waiting.push(resolve));
       if (failNextPost && options.method === 'POST') {
         failNextPost = false;
         throw Error('Simulated uncertain network outcome');
+      }
+      if (postFailure && url === '/api/messages' && options.method === 'POST') {
+        return { ok: false, status: postFailure.status,
+          json: async () => ({ error: 'Selected task request rejected', code: postFailure.code }) };
       }
       if (stallPosts && options.method === 'POST') await new Promise((resolve, reject) => {
         options.signal.addEventListener('abort', () => reject(Error('Send aborted')), { once: true });
@@ -87,15 +101,20 @@ function fixture(auth = { enabled: false }, settings = {}) {
       if (url.endsWith('/proposals') && options.method === 'GET') {
         data = [{ id: 1, owner: 'bob', summary: 'Exact <summary>\nsecond line', status: 'pending', revision }];
       }
+      if (url === '/api/tasks' && options.method === 'GET') data = tasks;
       if (url === '/api/messages' && options.method === 'POST') {
         const requestId = JSON.parse(options.body).request_id;
-        data = { reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null, turn: { request_id: requestId, status: postTurnStatus } };
+        data = { reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null,
+          task_context: responseContextOverride === undefined ? turnContexts.get(requestId) : responseContextOverride,
+          turn: { request_id: requestId, status: postTurnStatus } };
       }
       if (url.startsWith('/api/turns/')) {
         if (turnFailure) return { ok: false, status: turnFailure, json: async () => ({ error: 'Receipt unavailable' }) };
         const requestId = decodeURIComponent(url.split('/').at(-1));
         data = { request_id: requestId, status: checkTurnStatus,
-          response: checkTurnStatus === 'complete' ? { reply: 'Saved chat reply', turn: { request_id: requestId, status: 'complete' } } : null };
+          response: checkTurnStatus === 'complete' ? { reply: 'Saved chat reply',
+            task_context: responseContextOverride === undefined ? turnContexts.get(requestId) ?? null : responseContextOverride,
+            turn: { request_id: requestId, status: 'complete' } } : null };
       }
       if (url.endsWith('/profile/catalog')) data = { roles: ['coordinator', 'researcher'], models: [{ id: 'server-default' }], max_agents: 8 };
       if (url.endsWith('/profile')) data = { revision: 0, agents: [{ id: 'butler', name: '管家', role: 'coordinator', model_ref: 'server-default', enabled: true }] };
@@ -106,7 +125,14 @@ function fixture(auth = { enabled: false }, settings = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'worker-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'client.js'), 'utf8'), context);
   return {
-    $, calls, timers, storage, confirmations,
+    $, calls, timers, storage, confirmations, turnContexts,
+    tasks(value) { tasks = value; },
+    responseContext(value) { responseContextOverride = value; },
+    messageFailure(status, code) { postFailure = status ? { status, code } : null; },
+    discussion(id) {
+      const card = $('conversation').children.find(card => card.textContent.startsWith('任务 ·') && card.textContent.includes('任务编号：' + id + ' ·'));
+      return card?.children.find(button => button.textContent === '讨论此任务');
+    },
     confirm(value) { confirmation = value; },
     postTurn(status) { postTurnStatus = status; },
     receipt(status) { checkTurnStatus = status; },
@@ -136,6 +162,10 @@ async function test(name, run) {
   await run();
   console.log('PASS ' + name);
 }
+
+const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'alice', owner: 'bob',
+  status: 'working', summary: 'Shared <summary>\nsecond line', result: 'Shared delivery result', ...overrides });
+const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
   await test('exact proposal text, explicit confirmation and revision', async () => {
@@ -615,6 +645,249 @@ async function test(name, run) {
     assert.equal(f.$('turn-status').textContent, '');
     assert.equal(f.$('room').classList.contains('hide'), true);
     assert(![...f.timers.values()].some(timer => timer.delay === 90000));
+  });
+  await test('discussion selects exactly one visible task without sending or performing task actions', async () => {
+    const one = task(), two = task({ id: 'task-two', revision: 8, summary: 'Other shared summary', result: null });
+    const f = fixture({ enabled: false }, { tasks: [one, two] }); await f.login('alice');
+    f.$('text').value = 'unsent question';
+    const before = f.calls.length;
+    f.discussion(one.id).onclick();
+    assert.equal(f.calls.length, before);
+    assert.equal(f.$('task-context').classList.contains('hide'), false);
+    assert.match(f.$('task-context-details').textContent, /任务编号：task-one\n版本：3/);
+    assert.match(f.$('task-context-details').textContent, /Shared <summary>\nsecond line/);
+    assert.match(f.$('task-context-details').textContent, /Shared delivery result/);
+    assert.match(f.$('task-context-details').textContent, /不包含其他任务或完整私聊.*不授权/);
+    f.discussion(two.id).onclick();
+    assert.match(f.$('task-context-details').textContent, /任务编号：task-two\n版本：8/);
+    assert.doesNotMatch(f.$('task-context-details').textContent, /Shared delivery result|task-one/);
+    assert.equal(f.calls.length, before);
+    f.$('clear-task-context').onclick();
+    assert.equal(f.$('task-context').classList.contains('hide'), true);
+    assert.equal(f.$('task-context-details').textContent, '');
+    assert.equal(f.$('text').value, 'unsent question');
+    assert.equal(f.calls.length, before);
+  });
+  await test('selected task sends only its ID and reviewed revision for one ordinary chat', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task(), task({ id: 'task-two' })] }); await f.login('alice');
+    f.discussion('task-one').onclick(); await f.send('How is this going?');
+    const body = JSON.parse(chatPosts(f)[0].options.body);
+    assert.deepEqual(body, { message: 'How is this going?', request_id: body.request_id,
+      selected_task: { task_id: 'task-one', expected_revision: 3 } });
+    assert.match(body.request_id, /^[a-f0-9-]{36}$/);
+    assert(!JSON.stringify(body).includes('Shared'));
+    assert.equal(f.$('task-context-details').textContent, '');
+    assert.match(f.$('status').textContent, /本次任务上下文：task-one · 版本 3/);
+    await f.send('Unrelated question');
+    assert(!('selected_task' in JSON.parse(chatPosts(f)[1].options.body)));
+    assert(!f.calls.some(call => call.url.includes('/actions') || call.url.includes('/worker')));
+  });
+  await test('unselected and explicitly cleared chat never includes visible tasks', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    await f.send('plain question');
+    f.discussion('task-one').onclick(); f.$('clear-task-context').onclick(); await f.send('plain after clear');
+    assert(chatPosts(f).every(call => !('selected_task' in JSON.parse(call.options.body))));
+  });
+  await test('profile and explicit delegation commands neither send nor consume selected task context', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick(); await f.send('/agents');
+    assert.equal(chatPosts(f).length, 0);
+    assert.match(f.$('task-context-details').textContent, /task-one/);
+    await f.send('/delegate bob new summary');
+    const proposal = f.calls.find(call => call.url === '/api/proposals' && call.options.method === 'POST');
+    assert(!('selected_task' in JSON.parse(proposal.options.body)));
+    assert.match(f.$('task-context-details').textContent, /task-one/);
+    await f.send('Discuss the original task');
+    assert.deepEqual(JSON.parse(chatPosts(f)[0].options.body).selected_task, { task_id: 'task-one', expected_revision: 3 });
+  });
+  await test('task revision, content, visibility and participant changes invalidate unsent selection without changing its scope', async () => {
+    for (const changed of [[task({ revision: 4 })], [task({ result: 'Changed result' })], [],
+      [task({ requester: 'charlie', owner: 'david' })]]) {
+      const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+      const oldButton = f.discussion('task-one'); oldButton.onclick();
+      f.$('text').value = 'draft about selected task'; f.tasks(changed); await f.$('refresh').onclick();
+      assert.match(f.$('task-context-details').textContent, /选择已失效/);
+      assert.match(f.$('task-context-details').textContent, /版本：3/);
+      oldButton.onclick();
+      assert.match(f.$('task-context-details').textContent, /选择已失效/);
+      await f.send('draft about selected task');
+      assert.equal(chatPosts(f).length, 0);
+      assert.equal(f.$('text').value, 'draft about selected task');
+      assert.match(f.$('status').textContent, /未发送消息/);
+      f.$('clear-task-context').onclick(); await f.send('explicitly context-free question');
+      assert(!('selected_task' in JSON.parse(chatPosts(f)[0].options.body)));
+    }
+  });
+  await test('reselecting an updated visible task explicitly binds the new revision', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick(); f.tasks([task({ revision: 4 })]); await f.tick();
+    f.discussion('task-one').onclick();
+    assert.match(f.$('task-context-details').textContent, /版本：4/);
+    assert.doesNotMatch(f.$('task-context-details').textContent, /选择已失效/);
+    await f.send('use updated task');
+    assert.equal(JSON.parse(chatPosts(f)[0].options.body).selected_task.expected_revision, 4);
+  });
+  await test('unchanged polling preserves selection but detached task cards cannot replace it', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task(), task({ id: 'task-two' })] }); await f.login('alice');
+    const old = f.discussion('task-one'); old.onclick(); await f.tick();
+    assert.equal(f.discussion('task-one'), old);
+    assert.match(f.$('task-context-details').textContent, /task-one/);
+    f.change(); await f.tick(); f.discussion('task-two').onclick(); old.onclick();
+    assert.match(f.$('task-context-details').textContent, /task-two/);
+    await f.send('question');
+    assert.equal(JSON.parse(chatPosts(f)[0].options.body).selected_task.task_id, 'task-two');
+  });
+  await test('nonparticipants and malformed task identifiers or revisions cannot be selected', async () => {
+    for (const invalid of [task({ requester: 'charlie', owner: 'david' }), task({ id: 123 }),
+      task({ revision: '3' }), task({ revision: -1 }), task({ revision: 1.5 })]) {
+      const f = fixture({ enabled: false }, { tasks: [invalid] }); await f.login('alice');
+      assert.equal(f.discussion(invalid.id), undefined);
+      await f.send('plain question');
+      assert(!('selected_task' in JSON.parse(chatPosts(f)[0].options.body)));
+    }
+  });
+  await test('logout, relogin and auth expiry clear task selection and stale cards cannot restore it', async () => {
+    for (const transition of ['logout', 'login', 'expiry']) {
+      const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+      const old = f.discussion('task-one'); old.onclick();
+      if (transition === 'logout') await f.$('logout').onclick();
+      else if (transition === 'login') await f.login('bob');
+      else { f.failReads(401); await f.tick(); }
+      old.onclick();
+      assert.equal(f.$('task-context-details').textContent, '');
+      assert.equal(f.$('task-context').classList.contains('hide'), true);
+      f.failReads(0); await f.login('alice'); await f.send('new session question');
+      assert(!('selected_task' in JSON.parse(chatPosts(f)[0].options.body)));
+    }
+  });
+  await test('in-flight selected context is frozen through changed tasks and repeated control clicks', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task(), task({ id: 'task-two' })] }); await f.login('alice');
+    f.discussion('task-one').onclick(); const otherButton = f.discussion('task-two'); f.hold();
+    const send = f.send('question'); await f.ready();
+    assert.equal(f.$('clear-task-context').disabled, true);
+    assert.equal(otherButton.disabled, true);
+    otherButton.onclick(); f.$('clear-task-context').onclick(); await f.send('different question');
+    f.tasks([task({ revision: 4 }), task({ id: 'task-two' })]); f.unhold(); await f.$('refresh').onclick();
+    assert.match(f.$('task-context-details').textContent, /task-one\n版本：3/);
+    assert.match(f.$('task-context-details').textContent, /已锁定/);
+    f.discussion('task-two').onclick();
+    assert.equal(chatPosts(f).length, 1);
+    assert.deepEqual(JSON.parse(chatPosts(f)[0].options.body).selected_task, { task_id: 'task-one', expected_revision: 3 });
+    f.release(); await send;
+    assert.match(f.$('status').textContent, /本次任务上下文：task-one · 版本 3/);
+    assert.equal(f.$('task-context-details').textContent, '');
+    assert.equal(f.$('text').value, 'different question');
+  });
+  await test('uncertain context remains locked and read-only recovery keeps the original snapshot', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task(), task({ id: 'task-two' })] }); await f.login('alice');
+    f.discussion('task-one').onclick(); f.failNextPost(); await f.send('private question');
+    f.tasks([task({ revision: 4 }), task({ id: 'task-two' })]); await f.$('refresh').onclick();
+    f.discussion('task-two').onclick(); f.$('clear-task-context').onclick();
+    assert.match(f.$('task-context-details').textContent, /task-one\n版本：3/);
+    assert.equal(f.$('clear-task-context').disabled, true);
+    f.receipt('pending'); await f.$('check-turn').onclick();
+    assert.equal(f.$('send').disabled, true);
+    assert.match(f.$('task-context-details').textContent, /task-one\n版本：3/);
+    f.receipt('complete'); await f.$('check-turn').onclick();
+    assert.equal(chatPosts(f).length, 1);
+    assert.equal(f.$('task-context-details').textContent, '');
+    assert.match(f.$('status').textContent, /本次任务上下文：task-one · 版本 3/);
+  });
+  await test('reloaded recovery stores no selected task data and never guesses or resends context', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick(); f.failNextPost(); await f.send('private question');
+    const serialized = JSON.stringify([...f.storage]);
+    for (const privateText of ['task-one', 'Shared', 'private question', 'revision']) assert(!serialized.includes(privateText));
+    const reloaded = fixture({ enabled: false }, { tasks: [task({ revision: 9 })], storage: f.storage, turnContexts: f.turnContexts });
+    await reloaded.login('alice');
+    assert.equal(reloaded.$('task-context-details').textContent, '');
+    assert.equal(reloaded.discussion('task-one').disabled, true);
+    reloaded.discussion('task-one').onclick(); await reloaded.send('another question');
+    assert.equal(chatPosts(reloaded).length, 0);
+    await reloaded.$('check-turn').onclick();
+    assert.match(reloaded.$('status').textContent, /本次任务上下文：task-one · 版本 3/);
+    assert.equal(chatPosts(reloaded).length, 0);
+  });
+  await test('new attempt drops old selected context only after confirmation and needs a new explicit selection', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick(); f.failNextPost(); await f.send('question');
+    f.$('new-turn').onclick();
+    assert.match(f.$('task-context-details').textContent, /task-one/);
+    f.confirm(true); f.$('new-turn').onclick();
+    assert.equal(f.$('task-context-details').textContent, '');
+    assert.equal(chatPosts(f).length, 1);
+    await f.send('question');
+    assert.equal(chatPosts(f).length, 2);
+    assert(!('selected_task' in JSON.parse(chatPosts(f)[1].options.body)));
+    assert.notEqual(JSON.parse(chatPosts(f)[0].options.body).request_id, JSON.parse(chatPosts(f)[1].options.body).request_id);
+  });
+  await test('mismatched task-context receipt never clears recovery or substitutes task scope', async () => {
+    for (const wrong of [null, task({ id: 'other-task' }), task({ revision: 4 })]) {
+      const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+      f.discussion('task-one').onclick(); f.responseContext(wrong); await f.send('question');
+      assert.equal(f.$('send').disabled, true);
+      assert.match(f.$('status').textContent, /任务上下文回执与本次选择不符/);
+      assert.match(f.$('task-context-details').textContent, /task-one\n版本：3/);
+      await f.$('check-turn').onclick();
+      assert.equal(f.storage.size, 1);
+      assert.equal(chatPosts(f).length, 1);
+      f.responseContext(undefined); await f.$('check-turn').onclick();
+      assert.equal(f.storage.size, 0);
+    }
+  });
+  await test('unexpected context on unselected receipt stays unresolved and truncation is disclosed', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    f.responseContext(task()); await f.send('plain question');
+    assert.equal(f.$('send').disabled, true);
+    assert.match(f.$('status').textContent, /任务上下文回执与本次选择不符/);
+    f.responseContext(undefined); await f.$('check-turn').onclick();
+    f.discussion('task-one').onclick();
+    f.responseContext({ ...task(), summary_truncated: true, result_truncated: true });
+    await f.send('selected question');
+    assert.match(f.$('status').textContent, /共享摘要已截断。交付结果已截断/);
+  });
+  await test('known pre-dispatch stale or unavailable selection clears only its unstarted receipt and keeps invalidated scope', async () => {
+    for (const [code, httpStatus] of [['selected_task_stale_before_dispatch', 409],
+      ['selected_task_unavailable_before_dispatch', 404]]) {
+      const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+      f.discussion('task-one').onclick(); f.messageFailure(httpStatus, code);
+      await f.send('question about original task');
+      assert.equal(f.storage.size, 0);
+      assert.equal(f.$('turn-recovery').classList.contains('hide'), true);
+      assert.equal(f.$('send').disabled, false);
+      assert.equal(f.$('clear-task-context').disabled, false);
+      assert.equal(f.$('text').value, 'question about original task');
+      assert.match(f.$('task-context-details').textContent, /选择已失效/);
+      assert.match(f.$('task-context-details').textContent, /task-one\n版本：3/);
+      assert.match(f.$('status').textContent, /尚未处理.*未自动重发/);
+      assert.equal(chatPosts(f).length, 1);
+      await f.send('question about original task');
+      assert.equal(chatPosts(f).length, 1, 'Invalid scope requires explicit user action');
+      f.tasks([task({ revision: 4 })]); await f.$('refresh').onclick();
+      f.discussion('task-one').onclick(); f.messageFailure(0);
+      assert.equal(chatPosts(f).length, 1, 'Reselection does not send');
+      await f.send('question about updated task');
+      const before = JSON.parse(chatPosts(f)[0].options.body), after = JSON.parse(chatPosts(f)[1].options.body);
+      assert.notEqual(before.request_id, after.request_id);
+      assert.equal(after.selected_task.expected_revision, 4);
+    }
+  });
+  await test('generic or mismatched 409/404 codes never discard a possibly dispatched selected-context receipt', async () => {
+    for (const [httpStatus, code] of [[409], [404], [409, 'different_code'],
+      [404, 'selected_task_stale_before_dispatch'], [409, 'selected_task_unavailable_before_dispatch'],
+      [500, 'selected_task_stale_before_dispatch']]) {
+      const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+      f.discussion('task-one').onclick(); f.messageFailure(httpStatus, code); await f.send('question');
+      assert.equal(f.storage.size, 1);
+      assert.equal(f.$('send').disabled, true);
+      assert.equal(f.$('clear-task-context').disabled, true);
+      assert.match(f.$('task-context-details').textContent, /已锁定/);
+      assert.match(f.$('status').textContent, /结果未知/);
+      await f.send('another question'); assert.equal(chatPosts(f).length, 1);
+    }
+    const f = fixture(); await f.login('alice');
+    f.messageFailure(409, 'selected_task_stale_before_dispatch'); await f.send('unselected question');
+    assert.equal(f.storage.size, 1, 'Selection-specific errors cannot clear an unselected attempt');
   });
   console.log('Client regression tests passed');
 

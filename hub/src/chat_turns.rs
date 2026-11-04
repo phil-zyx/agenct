@@ -7,10 +7,23 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
         owner TEXT NOT NULL, request_id TEXT NOT NULL, message TEXT NOT NULL,
         agent_id TEXT, runtime_profile TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('pending','uncertain','complete')),
-        response TEXT, message_id INTEGER, PRIMARY KEY(owner,request_id));
+        response TEXT, message_id INTEGER, selected_task TEXT, task_context TEXT, PRIMARY KEY(owner,request_id));
         UPDATE messages SET status='uncertain' WHERE status IN ('pending','interrupted') AND id IN (SELECT message_id FROM chat_turns WHERE status='pending');
         UPDATE chat_turns SET status='uncertain' WHERE status='pending'; COMMIT;",
-    )
+    )?;
+    let columns = db
+        .prepare("PRAGMA table_info(chat_turns)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for column in ["selected_task", "task_context"] {
+        if !columns.iter().any(|name| name == column) {
+            db.execute(
+                &format!("ALTER TABLE chat_turns ADD COLUMN {column} TEXT"),
+                [],
+            )?;
+        }
+    }
+    Ok(())
 }
 fn mark_uncertain(db: &mut Connection, owner: &str, key: &str) -> Result<()> {
     let tx = db.transaction()?;
@@ -49,18 +62,22 @@ fn replay(db: &Connection, owner: &str, input: &ChatInput) -> Result<Option<serd
     };
     let binding = db
         .query_row(
-            "SELECT message,agent_id FROM chat_turns WHERE owner=?1 AND request_id=?2",
+            "SELECT message,agent_id,selected_task FROM chat_turns WHERE owner=?1 AND request_id=?2",
             params![owner, key],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,r.get::<_,Option<String>>(2)?)),
         )
         .optional()?;
-    let Some((message, agent_id)) = binding else {
+    let Some((message, agent_id, selected_task)) = binding else {
         return Ok(None);
     };
-    if message != input.message || agent_id != input.agent_id {
+    let selection = input
+        .selected_task
+        .as_ref()
+        .map(|s| serde_json::to_string(s).expect("selection JSON"));
+    if message != input.message || agent_id != input.agent_id || selected_task != selection {
         return Err(Error(
             StatusCode::CONFLICT,
-            "request_id already used for different content or agent",
+            "request_id already used for different content, agent or selected task",
         ));
     }
     let found = receipt(db, owner, key)?.ok_or_else(denied)?;
@@ -103,6 +120,13 @@ pub(super) async fn chat(
     {
         return Err(invalid("invalid request_id"));
     }
+    if input
+        .selected_task
+        .as_ref()
+        .is_some_and(|selected| !selected.valid())
+    {
+        return Err(invalid("invalid selected task"));
+    }
     // Completed/uncertain replays are independent of current profile and active turns.
     if let Some(response) = replay(&*h.db()?, &id, &input)? {
         return Ok(Json(response));
@@ -116,24 +140,34 @@ pub(super) async fn chat(
     if let Some(response) = replay(&*h.db()?, &id, &input)? {
         return Ok(Json(response));
     }
-    let runtime_profile = profiles::route(&*h.db()?, &id, input.agent_id.as_deref())?;
-    if let Some(key) = input.request_id.as_deref() {
+    let (runtime_profile, task_context) = {
+        // Capture and reserve under the task mutation mutex. Later task changes
+        // cannot alter this frozen discussion snapshot or its replay.
         let db = h.db()?;
-        let collision: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM proposals WHERE requester=?1 AND request_id=?2)",
-            params![id, key],
-            |r| r.get(0),
-        )?;
-        if collision {
-            return Err(Error(
-                StatusCode::CONFLICT,
-                "request_id already used by proposal endpoint",
-            ));
+        let runtime_profile = profiles::route(&db, &id, input.agent_id.as_deref())?;
+        let task_context = task_context::capture(&db, &id, input.selected_task.as_ref())?;
+        if let Some(key) = input.request_id.as_deref() {
+            let collision: bool = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM proposals WHERE requester=?1 AND request_id=?2)",
+                params![id, key],
+                |r| r.get(0),
+            )?;
+            if collision {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "request_id already used by proposal endpoint",
+                ));
+            }
+            let selection = input
+                .selected_task
+                .as_ref()
+                .map(|s| serde_json::to_string(s).expect("selection JSON"));
+            db.execute("INSERT INTO chat_turns(owner,request_id,message,agent_id,runtime_profile,status,selected_task,task_context) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7)",
+                params![id,key,input.message,input.agent_id,serde_json::to_string(&runtime_profile).map_err(|_| invalid("invalid runtime profile"))?,selection,task_context.as_ref().map(|c|c.to_string())])?;
         }
-        db.execute("INSERT INTO chat_turns(owner,request_id,message,agent_id,runtime_profile,status) VALUES (?1,?2,?3,?4,?5,'pending')",
-            params![id,key,input.message,input.agent_id,serde_json::to_string(&runtime_profile).map_err(|_| invalid("invalid runtime profile"))?])?;
-    }
-    let result = execute_chat(&h, &id, &input, runtime_profile).await;
+        (runtime_profile, task_context)
+    };
+    let result = execute_chat(&h, &id, &input, runtime_profile, task_context).await;
     if result.is_err() {
         // A timeout/error cannot prove the provider never acted. Never retry dispatch.
         if let Some(key) = input.request_id.as_deref() {
@@ -206,6 +240,7 @@ mod tests {
             message: "hello".into(),
             agent_id: None,
             request_id: Some("timeout".into()),
+            selected_task: None,
         };
         let result = chat(State(h.clone()), headers.clone(), Json(input())).await;
         assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);

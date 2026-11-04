@@ -23,7 +23,8 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
   const page = await context.newPage();
   if (useClock) await page.clock.install();
   const calls = [], errors = [];
-  const state = { user: 'alice', authenticated: true, post: 'complete', receipt: 'complete', receiptCode: 200 };
+  const state = { user: 'alice', authenticated: true, post: 'complete', receipt: 'complete', receiptCode: 200, tasks: [] };
+  const taskContexts = new Map();
   let messages = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.route('**/auth/**', async route => {
@@ -43,10 +44,15 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
     if (pathname === '/api/me') data = { user, runtime: 'mock' };
     if (pathname === '/api/messages') {
       if (method === 'POST') {
+        const task = state.tasks.find(task => task.id === body.selected_task?.task_id);
+        taskContexts.set(body.request_id, task ? {
+          id: task.id, revision: task.revision, requester: task.requester, owner: task.owner,
+          status: task.status, summary: task.summary, result: task.result || null
+        } : null);
         if (state.post === 'stall') return; // Leave this POST unanswered until the browser aborts.
         if (state.post === 'network-failure') { await route.abort('failed'); return; }
         if (state.post === 'complete') messages.push({ role: 'assistant', status: 'complete', content: 'Saved reply' });
-        data = { turn: { request_id: body.request_id, status: state.post }, reply: state.post === 'complete' ? 'Saved reply' : null };
+        data = { turn: { request_id: body.request_id, status: state.post }, reply: state.post === 'complete' ? 'Saved reply' : null, task_context: taskContexts.get(body.request_id) };
       } else data = messages;
     }
     if (pathname.startsWith('/api/turns/')) {
@@ -55,9 +61,12 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
       }
       const id = pathname.split('/').at(-1);
       data = { request_id: id, status: state.receipt, response: state.receipt === 'complete'
-        ? { turn: { request_id: id, status: 'complete' }, reply: 'Recovered saved reply' } : null };
+        ? { turn: { request_id: id, status: 'complete' }, reply: 'Recovered saved reply', task_context: taskContexts.get(id) || null } : null };
       if (state.receipt === 'complete') messages = [{ role: 'assistant', status: 'complete', content: 'Recovered saved reply' }];
     }
+    if (pathname === '/api/tasks' && method === 'GET') data = state.tasks;
+    if (pathname === '/api/profile') data = { revision: 0, agents: [] };
+    if (pathname === '/api/profile/catalog') data = { roles: [], models: [] };
     if (pathname === '/api/proposals' && method === 'GET') data = [{ id: 1, owner: 'bob', summary: 'Share only this exact summary', status: 'pending', revision: 0 }];
     await route.fulfill({ json: data });
   });
@@ -78,6 +87,24 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
     },
     async close() { assert.deepEqual(errors, []); await context.close(); }
   };
+}
+
+function taskFixture(id = 'task-alpha', revision = 7) {
+  return { id, revision, requester: 'alice', owner: 'bob', status: 'ready_for_acceptance',
+    summary: `Public summary ${id}`, result: `Delivered result ${id}` };
+}
+
+async function showTasks(f, tasks) {
+  f.state.tasks = tasks;
+  await f.page.locator('#refresh').click();
+  await f.page.waitForFunction(count => [...document.querySelectorAll('#conversation button')]
+    .filter(button => button.textContent === '讨论此任务').length === count, tasks.length);
+}
+
+function discussButtons(f) { return f.page.getByRole('button', { name: '讨论此任务', exact: true }); }
+
+async function settled(f) {
+  await f.page.waitForFunction(() => !document.getElementById('send').disabled);
 }
 
 (async () => {
@@ -152,7 +179,10 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
     }
     {
       const f = await fixture(browser, origin, false, true); f.state.post = 'stall';
+      await showTasks(f, [taskFixture()]); await discussButtons(f).click();
       await f.send('stalled question');
+      assert.equal(await discussButtons(f).isDisabled(), true);
+      assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
       await f.page.waitForFunction(key => !!sessionStorage.getItem(key), STORAGE_KEY);
       await f.page.clock.fastForward(90001);
       await f.page.waitForFunction(() => document.getElementById('status').textContent.includes('等待超时'));
@@ -165,6 +195,101 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
       assert.equal(await f.stored(), null);
       assert.equal(f.posts().length, 1);
       await f.close(); console.log('PASS Chromium stalled POST times out to read-only receipt recovery');
+    }
+    {
+      const f = await fixture(browser, origin);
+      const alpha = taskFixture(), beta = taskFixture('task-beta', 3);
+      await showTasks(f, [alpha, beta]);
+      const writesBefore = f.calls.filter(call => call.method !== 'GET').length;
+      await discussButtons(f).nth(0).click();
+      assert.equal(await f.page.locator('#task-context').isVisible(), true);
+      const details = await f.page.locator('#task-context-details').textContent();
+      for (const value of [alpha.id, String(alpha.revision), alpha.summary, alpha.result]) assert(details.includes(value));
+      assert.equal(f.calls.filter(call => call.method !== 'GET').length, writesBefore, 'Selecting context is not a mutation');
+      await discussButtons(f).nth(1).click();
+      assert((await f.page.locator('#task-context-details').textContent()).includes(beta.id));
+      await f.send('/agents'); await settled(f);
+      await f.send('/delegate bob only this explicit summary'); await settled(f);
+      assert.equal(f.posts().length, 0, 'Profile and delegation commands do not send ordinary chat');
+      assert.equal(await f.page.locator('#task-context').isVisible(), true);
+      await f.send('Explain the selected result'); await settled(f);
+      assert.deepEqual(f.posts()[0].body.selected_task, { task_id: beta.id, expected_revision: beta.revision });
+      assert.deepEqual(Object.keys(f.posts()[0].body).sort(), ['message', 'request_id', 'selected_task']);
+      assert((await f.page.locator('#status').textContent()).includes(`本次任务上下文：${beta.id} · 版本 ${beta.revision}`));
+      assert.equal(await f.page.locator('#task-context').isVisible(), false);
+      await f.send('Now answer without task context'); await settled(f);
+      assert.equal(Object.hasOwn(f.posts()[1].body, 'selected_task'), false);
+      assert(!f.calls.some(call => call.pathname.includes('/actions')));
+      await f.close(); console.log('PASS Chromium explicit single task selection, command preservation and next-chat-only payload');
+    }
+    for (const change of ['revision', 'disappearance']) {
+      const f = await fixture(browser, origin);
+      const alpha = taskFixture(); await showTasks(f, [alpha]);
+      await discussButtons(f).click();
+      f.state.tasks = change === 'revision' ? [{ ...alpha, revision: 8, summary: 'Updated public summary' }] : [];
+      await f.page.locator('#refresh').click();
+      if (change === 'revision') await f.page.waitForFunction(() => document.getElementById('conversation').textContent.includes('Updated public summary'));
+      else await f.page.waitForFunction(() => ![...document.querySelectorAll('#conversation button')].some(button => button.textContent === '讨论此任务'));
+      await f.page.locator('#text').fill('Do not silently drop my selected context');
+      await f.page.locator('#form').evaluate(form => form.requestSubmit());
+      assert.equal(f.posts().length, 0, 'Invalid selection must block even direct form submission');
+      assert.equal(await f.page.locator('#task-context').isVisible(), true);
+      assert((await f.page.locator('#task-context-details').textContent()).includes('失效'));
+      if (change === 'revision') {
+        await discussButtons(f).click();
+        await f.send('Discuss the new revision'); await settled(f);
+        assert.deepEqual(f.posts()[0].body.selected_task, { task_id: alpha.id, expected_revision: 8 });
+      } else {
+        await f.page.locator('#clear-task-context').click();
+        await f.send('Explicitly continue without context'); await settled(f);
+        assert.equal(Object.hasOwn(f.posts()[0].body, 'selected_task'), false);
+      }
+      await f.close(); console.log(`PASS Chromium ${change} invalidates unsent task selection without silent context loss`);
+    }
+    {
+      const f = await fixture(browser, origin);
+      await showTasks(f, [taskFixture()]); await discussButtons(f).click();
+      await f.page.locator('#logout').click(); await f.login('bob');
+      assert.equal(await f.page.locator('#task-context').isVisible(), false);
+      await f.send('New identity question'); await settled(f);
+      assert.equal(Object.hasOwn(f.posts()[0].body, 'selected_task'), false);
+      await f.close(); console.log('PASS Chromium logout and identity change clear task selection');
+    }
+    for (const outcome of ['recover', 'new-attempt', 'new-attempt-before-reload']) {
+      const f = await fixture(browser, origin);
+      const alpha = taskFixture(); await showTasks(f, [alpha]); await discussButtons(f).click();
+      await f.uncertain('Discuss this task privately');
+      const original = structuredClone(f.posts()[0].body);
+      assert.deepEqual(original.selected_task, { task_id: alpha.id, expected_revision: 7 });
+      assert.equal(await discussButtons(f).isDisabled(), true);
+      assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
+      f.state.tasks = [{ ...alpha, revision: 8, summary: 'Changed while previous turn unresolved' }];
+      await f.page.locator('#refresh').click();
+      await f.page.waitForFunction(() => document.getElementById('conversation').textContent.includes('Changed while previous turn unresolved'));
+      assert.equal(await discussButtons(f).isDisabled(), true);
+      assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
+      assert.deepEqual(f.posts()[0].body, original, 'Refresh must not retarget the in-flight task context');
+      if (outcome !== 'new-attempt-before-reload') { await f.page.reload(); await f.login(); }
+      await discussButtons(f).waitFor();
+      assert.equal(await discussButtons(f).isDisabled(), true);
+      assert.equal(await f.page.locator('#send').isDisabled(), true);
+      assert.equal(f.posts().length, 1, 'Reload must not replay selected-context chat');
+      if (outcome === 'new-attempt-before-reload') assert.equal(await f.page.locator('#task-context').isVisible(), true);
+      if (outcome === 'recover') {
+        await f.page.locator('#check-turn').click();
+        await f.page.waitForSelector('#turn-recovery.hide', { state: 'attached' });
+        await settled(f);
+      } else {
+        f.page.once('dialog', dialog => dialog.dismiss()); await f.page.locator('#new-turn').click();
+        assert.equal(await f.page.locator('#send').isDisabled(), true);
+        f.page.once('dialog', dialog => dialog.accept()); await f.page.locator('#new-turn').click();
+      }
+      assert.equal(f.posts().length, 1, 'Recovery/new attempt is not a resend');
+      assert.equal(await f.page.locator('#task-context').isVisible(), false);
+      f.state.post = 'complete'; await f.send('An explicitly new ordinary question'); await settled(f);
+      assert.notEqual(f.posts()[1].body.request_id, original.request_id);
+      assert.equal(Object.hasOwn(f.posts()[1].body, 'selected_task'), false);
+      await f.close(); console.log(`PASS Chromium selected-context uncertain reload and ${outcome} isolation`);
     }
     for (const browserMode of [false, true]) {
       const f = await fixture(browser, origin, browserMode); await f.uncertain();

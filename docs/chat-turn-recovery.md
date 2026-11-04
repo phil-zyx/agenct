@@ -2,7 +2,8 @@
 
 Chat clients can send an owner-scoped `request_id` with `POST /api/messages`.
 The Hub reserves this ID durably before dispatching a model request. It binds the
-exact message and requested agent selection, snapshots the current runtime profile,
+exact message, requested agent selection and optional selected task/revision,
+snapshots the current runtime profile and selected task context,
 and records completion in the same SQLite transaction as the assistant reply and
 any sender-private delegation proposal. Delegation still requires its separate
 explicit sharing confirmation. Receipts never authorize execution or publication.
@@ -21,7 +22,8 @@ deduplication guarantee. Existing single-process database locking remains requir
   model call. Later profile edits do not change it. Proposal data in the response
   is a historical snapshot: reread `/api/proposals` before presenting current
   confirmation controls; existing proposal revisions still fence actions.
-- Changing the message or explicit agent selection under that ID returns 409.
+- Changing the message, explicit agent selection or selected task/revision under
+  that ID returns 409.
   Omitting an agent and explicitly naming the coordinator are different bindings.
 - A replay of an unresolved receipt returns `reply: null` and a `turn` with status
   `pending` or `uncertain`. It never dispatches again. The initial adapter failure
@@ -80,3 +82,7 @@ do not establish provider-side exactly-once execution, real-browser acceptance,
 host-crash/power-loss durability, multi-process dispatch or indefinite retention.
 Stored receipts contain private messages and replies; deployment still needs an
 explicit retention and backup policy. The production executor remains disabled.
+
+Explicit selected-task discussion is documented separately in
+[task discussion](task-discussion.md). Snapshot replay is historical and does not
+authorize a task mutation or refresh the task's current revision.

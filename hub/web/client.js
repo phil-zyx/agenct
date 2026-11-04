@@ -2,6 +2,7 @@ let token = '', user = '', epoch = 0, refreshVersion = 0;
 let browserMode = null, csrfToken = '', logoutPending = false;
 let controller = new AbortController(), pendingSend = null, pendingTurn = null;
 let turnStorageAvailable = true;
+let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
 const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 let pollTimer = null, pollDelay = 5000, refreshFlight = null, snapshot = '', renderedBusy = '';
 const POLL_INTERVAL = 5000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000, CHAT_SEND_TIMEOUT = 90000;
@@ -35,6 +36,7 @@ async function api(context, path, method = 'GET', body) {
   if (!response.ok) {
     const error = Error(data.error || response.status);
     error.httpStatus = response.status;
+    error.code = data.code;
     throw error;
   }
   return data;
@@ -68,6 +70,64 @@ function article(text) {
 const profileUI = createProfileUI({ api, current, article, conversation: () => $('conversation'), status });
 
 const workerUI = createWorkerUI({ api, current, article, conversation: () => $('conversation') });
+
+const taskSignature = task => JSON.stringify([
+  task.id, task.revision, task.requester, task.owner, task.status, task.summary, task.result
+]);
+
+function renderTaskContext() {
+  const task = pendingTurn?.selectedTask || selectedTask;
+  const locked = !!pendingTurn || busy.has('send') || busy.has('turn-check');
+  $('task-context').classList[task ? 'remove' : 'add']('hide');
+  $('task-context-details').textContent = task
+    ? (pendingTurn ? '本次发送的任务上下文已锁定，核对结果前不能更换。'
+      : task.invalidated ? '所选任务已变更或不再可见，此选择已失效。请重新选择任务，或清除后再发送。'
+        : '仅用于下一条普通聊天；选择本身不会发送消息。')
+      + `\n任务编号：${task.id}\n版本：${task.revision}\n${task.requester} → ${task.owner} · ${task.status}`
+      + '\n上下文范围：仅此任务的参与人、状态、共享摘要和交付结果；服务端核实后提供，长文本可能截断。不包含其他任务或完整私聊，不授权任何任务操作或执行。'
+      + `\n共享摘要：\n${task.summary}\n交付结果：\n${task.result ?? '尚无交付结果'}`
+    : '';
+  $('clear-task-context').disabled = !selectedTask || locked;
+  discussionButtons.forEach(button => { button.disabled = locked; });
+}
+
+function updateTaskContext(context, tasks) {
+  visibleTasks = new Map(tasks.filter(task => typeof task.id === 'string'
+    && Number.isSafeInteger(task.revision) && task.revision >= 0
+    && (task.requester === context.user || task.owner === context.user)).map(task => [task.id, task]));
+  if (selectedTask && (!visibleTasks.has(selectedTask.id)
+      || taskSignature(visibleTasks.get(selectedTask.id)) !== taskSignature(selectedTask))) {
+    // Keep a visible invalidation notice instead of silently changing scope or
+    // sending an already-written question without its intended task context.
+    selectedTask.invalidated = true;
+  }
+  renderTaskContext();
+}
+
+function addDiscussion(element, context, task) {
+  if (!visibleTasks.has(task.id)) return;
+  const view = taskView;
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = '讨论此任务';
+  button.onclick = () => {
+    if (!current(context) || view !== taskView || pendingTurn || busy.has('send') || busy.has('turn-check')) return;
+    const visible = visibleTasks.get(task.id);
+    if (!visible || taskSignature(visible) !== taskSignature(task)) return;
+    selectedTask = { ...visible, invalidated: false };
+    renderTaskContext();
+    status('已选择此任务作为下一条普通聊天的上下文。请填写问题后点击发送；尚未发送消息或执行任务操作。');
+  };
+  discussionButtons.push(button);
+  element.append(button);
+}
+
+$('clear-task-context').onclick = () => {
+  if (!current(session()) || pendingTurn || busy.has('send') || busy.has('turn-check')) return;
+  selectedTask = null;
+  renderTaskContext();
+  status('已清除任务上下文，下一条聊天不会自动附带任务。');
+};
 
 // Only a recovery receipt is kept for this tab. Never persist credentials or chat text.
 function forgetTurn() {
@@ -109,16 +169,26 @@ function renderTurn() {
   $('check-turn').disabled = !waiting || busy.has('send') || busy.has('turn-check');
   $('new-turn').disabled = !waiting || busy.has('send') || busy.has('turn-check');
   $('send').disabled = waiting || busy.has('send');
+  renderTaskContext();
 }
 
 async function completeTurn(context, response) {
-  const text = pendingTurn.text;
+  const { text, selectedTask: expectedTask } = pendingTurn;
+  const task = response.task_context;
+  if (text !== null && (expectedTask
+    ? !task || task.id !== expectedTask.id || task.revision !== expectedTask.revision
+    : task != null)) throw Error('任务上下文回执与本次选择不符');
+  const receiptContext = task
+    ? `\n本次任务上下文：${task.id} · 版本 ${task.revision}。`
+      + (task.summary_truncated ? '共享摘要已截断。' : '')
+      + (task.result_truncated ? '交付结果已截断。' : '')
+    : '';
   forgetTurn();
   if (text !== null && $('text').value.trim() === text) $('text').value = '';
-  status('已核实消息处理完成。');
+  status('已核实消息处理完成。' + receiptContext);
   try { await refresh(context); }
   catch (error) {
-    if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message
+    if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message + receiptContext
       + (typeof response.reply === 'string' ? '\n已保存的回复：' + response.reply : ''));
   }
 }
@@ -143,6 +213,10 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   user = '';
   pendingSend = null;
   pendingTurn = null;
+  selectedTask = null;
+  visibleTasks = new Map();
+  discussionButtons = [];
+  taskView++;
   busy.clear();
   if (!preserveRecovery) forgetTurn();
   else renderTurn();
@@ -266,6 +340,7 @@ async function readSnapshot(context) {
   }
   if (!current(context) || version !== refreshVersion) return;
   workerUI.update(context, tasks);
+  updateTaskContext(context, tasks);
   const nextSnapshot = JSON.stringify([messages, proposals, tasks]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
@@ -276,6 +351,8 @@ async function readSnapshot(context) {
   if (snapshot === nextSnapshot && renderedBusy === nextBusy) return;
   snapshot = nextSnapshot;
   renderedBusy = nextBusy;
+  taskView++;
+  discussionButtons = [];
   const entries = messages.map(message => article(`${message.role} · ${message.status}\n${message.content}`));
   for (const proposal of proposals) {
     const element = article(`委派提案 · ${proposal.status}\n接收人：${proposal.owner}\n将共享的完整任务摘要（原文）：\n${proposal.summary}\n\n确认后，仅将所示接收人与任务摘要用于跨人委派；对方会看到发起人身份和任务记录，不会收到你的完整私聊。${proposal.task_id ? '\n任务编号：' + proposal.task_id : ''}`);
@@ -286,19 +363,21 @@ async function readSnapshot(context) {
     entries.push(element);
   }
   for (const task of tasks) {
-    const element = article(`任务 · ${task.status}\n${task.requester} → ${task.owner}\n${task.summary}${task.result ? '\n交付：' + task.result : ''}`);
+    const element = article(`任务 · ${task.status}\n任务编号：${task.id} · 版本：${task.revision}\n${task.requester} → ${task.owner}\n${task.summary}${task.result ? '\n交付：' + task.result : ''}`);
     const actions = [];
     if (task.owner === context.user && task.status === 'awaiting_owner') actions.push(['accept', '接单']);
     if (task.owner === context.user && task.status === 'working') actions.push(['deliver', '提交人工交付']);
     if (task.requester === context.user && task.status === 'ready_for_acceptance') actions.push(['approve', '验收'], ['return', '退回']);
     if (!['completed', 'canceled'].includes(task.status)) actions.push(['cancel', '取消']);
     addActions(element, context, 'tasks', task, actions);
+    addDiscussion(element, context, task);
     workerUI.attach(element, context, task);
     entries.push(element);
   }
   profileUI.append(entries);
   workerUI.append(entries);
   $('conversation').replaceChildren(...entries);
+  renderTaskContext();
 
 }
 
@@ -462,7 +541,7 @@ $('new-turn').onclick = () => {
   if (!confirm('上一次发送的结果仍未知，消息可能已经处理。开始新尝试后再次发送可能重复处理。是否放弃此恢复凭据并开始新尝试？')) return;
   if (!current(context) || pendingTurn !== turn) return;
   forgetTurn();
-  status('已开始新尝试。请核对输入内容，再点击发送；将使用新的请求编号。上次操作不会被撤销。');
+  status('已开始新尝试。请核对输入内容，如需任务上下文请重新选择，再点击发送；将使用新的请求编号。上次操作不会被撤销。');
 };
 
 $('form').onsubmit = async event => {
@@ -500,11 +579,22 @@ $('form').onsubmit = async event => {
       if ($('text').value.trim() === text) $('text').value = '';
       await refresh(context);
     } else {
-      chatTurn = { text, id: crypto.randomUUID(), status: 'pending' };
+      if (selectedTask && (selectedTask.invalidated || !visibleTasks.has(selectedTask.id)
+          || taskSignature(visibleTasks.get(selectedTask.id)) !== taskSignature(selectedTask))) {
+        selectedTask.invalidated = true;
+        status('任务上下文已失效，未发送消息。请重新选择任务，或清除任务上下文后再发送。');
+        return;
+      }
+      chatTurn = { text, id: crypto.randomUUID(), status: 'pending', selectedTask };
+      selectedTask = null;
       pendingTurn = chatTurn;
       rememberTurn(context);
       renderTurn();
-      const response = await postChat(context, { message: text, request_id: chatTurn.id });
+      const response = await postChat(context, { message: text, request_id: chatTurn.id,
+        ...(chatTurn.selectedTask ? { selected_task: {
+          task_id: chatTurn.selectedTask.id, expected_revision: chatTurn.selectedTask.revision
+        } } : {})
+      });
       if (!current(context) || pendingTurn !== chatTurn) return;
       const receipt = response.turn;
       if (!receipt || receipt.request_id !== chatTurn.id || !['complete', 'pending', 'uncertain'].includes(receipt.status)) {
@@ -520,8 +610,20 @@ $('form').onsubmit = async event => {
   } catch (error) {
     if (!current(context)) return;
     if (chatTurn && pendingTurn === chatTurn) {
-      chatTurn.status = 'uncertain';
-      status(error.message + '。发送结果未知，请核对发送状态；不会自动重发。');
+      const rejectedSelection = chatTurn.selectedTask
+        && ((error.httpStatus === 409 && error.code === 'selected_task_stale_before_dispatch')
+          || (error.httpStatus === 404 && error.code === 'selected_task_unavailable_before_dispatch'));
+      if (rejectedSelection) {
+        // These two server codes guarantee rejection before receipt reservation
+        // and provider dispatch. Generic conflicts/not-found stay uncertain.
+        selectedTask = { ...chatTurn.selectedTask, invalidated: true };
+        forgetTurn();
+        status(error.message + '。服务端尚未处理本次消息，任务上下文已失效。请重新选择任务，或清除后再发送。未自动重发。');
+        await refresh(context).catch(() => {});
+      } else {
+        chatTurn.status = 'uncertain';
+        status(error.message + '。发送结果未知，请核对发送状态；不会自动重发。');
+      }
     } else {
       status(error.message + '。发送结果可能需要核对，请刷新查看。');
       await refresh(context).catch(() => {});
