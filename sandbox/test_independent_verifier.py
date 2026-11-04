@@ -244,7 +244,8 @@ class PlanningTests(unittest.TestCase):
                 observation['HostConfig'][field] = mode
                 self.assertEqual(v.validate_daemon_fixture(self.plan, observation)['status'],
                                  'offline-fixture-only')
-        self.assertIn('--pid=private', self.plan.argv)
+        self.assertIn('--pid=', self.plan.argv)
+        self.assertNotIn('--pid=private', self.plan.argv)
         self.assertIn('--ipc=private', self.plan.argv)
 
     def test_test_stdout_cannot_be_used_as_daemon_evidence(self):

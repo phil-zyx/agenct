@@ -45,6 +45,20 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def command_with_diagnostics(args, env, timeout=60, check=True):
+    try:
+        return subprocess.run(args, env=env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              timeout=timeout, check=check)
+    except subprocess.CalledProcessError as error:
+        # Only this fixed fixture harness uses this helper. No credentials are
+        # passed, and stdout may be a binary archive: never dump it. JSON escaping
+        # prevents control characters/newlines from becoming CI log commands.
+        diagnostic = (error.stderr or b'')[:4096].decode('utf-8', errors='replace')
+        print('fixture command stderr: ' + json.dumps(diagnostic), file=sys.stderr)
+        raise
+
+
 def cleanup(docker, names, tag, image_id):
     """Attempt every resource even after timeouts; fail on any uncertain outcome."""
     failures = []
@@ -78,9 +92,7 @@ def run():
                'DOCKER_CONFIG': temporary, 'DOCKER_BUILDKIT': '1', 'LANG': 'C'}
 
         def command(args, timeout=60, check=True):
-            return subprocess.run(args, env=env, stdin=subprocess.DEVNULL,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                  timeout=timeout, check=check)
+            return command_with_diagnostics(args, env, timeout, check)
 
         def docker(*args, **kwargs):
             return command(['docker', *args], **kwargs)

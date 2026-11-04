@@ -2,7 +2,9 @@
 import importlib.util
 from pathlib import Path
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+import contextlib
+import io
 import subprocess
 
 spec = importlib.util.spec_from_file_location(
@@ -62,6 +64,20 @@ class SmokeFixtureTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 1, b'',
                 ('Error: No such object: ' + args[-1]).encode())
         smoke.cleanup(docker, ['first'], 'tag', 'image-id')
+
+    def test_failed_command_emits_bounded_escaped_stderr_not_stdout(self):
+        error = subprocess.CalledProcessError(125, ['docker', 'create'],
+            output=b'never log binary stdout', stderr=b'bad pid\n::error::oops\x1b' + b'x' * 10000)
+        output = io.StringIO()
+        with patch.object(smoke.subprocess, 'run', side_effect=error), contextlib.redirect_stderr(output):
+            with self.assertRaises(subprocess.CalledProcessError):
+                smoke.command_with_diagnostics(['docker', 'create'], {})
+        message = output.getvalue()
+        self.assertIn('bad pid', message)
+        self.assertNotIn('never log binary stdout', message)
+        self.assertNotIn('\x1b', message)
+        self.assertEqual(message.count('\n'), 1)
+        self.assertLess(len(message), 4300)
 
 
 if __name__ == '__main__':

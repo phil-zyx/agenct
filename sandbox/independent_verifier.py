@@ -330,7 +330,9 @@ def plan_check(snapshot, image_id, checker):
     if not IMAGE_ID.fullmatch(image_id) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', checker):
         raise Rejected('invalid immutable image/checker')
     executable = '/opt/agenct-checks/' + checker
-    argv = ('create', '--network=none', '--pid=private', '--ipc=private', '--read-only', '--cap-drop=ALL',
+    # Docker uses an empty PID mode for its own namespace; 'private' is not
+    # a valid PID CLI value (unlike IPC). Still verify the daemon observation.
+    argv = ('create', '--network=none', '--pid=', '--ipc=private', '--read-only', '--cap-drop=ALL',
             '--security-opt=no-new-privileges', '--user=65534:65534',
             '--pids-limit=64', '--memory=512m', '--memory-swap=512m', '--cpus=1',
             '--tmpfs=/scratch:rw,nosuid,nodev,size=134217728,mode=1777',
