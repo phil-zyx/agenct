@@ -21,9 +21,32 @@ SDK_VERSION = "0.2.1rc2"
 ROOT = Path(__file__).resolve().parent
 
 
+ROLE_GUIDANCE = {
+    "coordinator": "Help clarify the user's goal and give a useful next step.",
+    "researcher": "Analyze evidence and distinguish known facts from uncertainty. Do not claim to have browsed.",
+    "writer": "Help draft and revise text. Do not claim to have sent or published it.",
+    "reviewer": "Review the supplied material for mistakes, risks, and missing checks.",
+}
+
+
+def validate_runtime_profile(value):
+    if not isinstance(value, dict) or set(value) != {"revision", "agent_id", "role", "model_ref"}:
+        raise ValueError("invalid_runtime_profile")
+    if type(value["revision"]) is not int or not 0 <= value["revision"] <= 2**63 - 1:
+        raise ValueError("invalid_profile_revision")
+    agent_id = value["agent_id"]
+    if not isinstance(agent_id, str) or not 1 <= len(agent_id) <= 32 or not all(c.isascii() and (c.isalnum() or c in "_-") for c in agent_id):
+        raise ValueError("invalid_agent_id")
+    if not isinstance(value["role"], str) or value["role"] not in ROLE_GUIDANCE or value["model_ref"] != "server-default":
+        raise ValueError("unsupported_profile_route")
+    return value
+
+
 def validate_turn(value):
-    if not isinstance(value, dict) or set(value) != {"session_id", "history", "message"}:
+    if not isinstance(value, dict) or set(value) not in ({"session_id", "history", "message"}, {"session_id", "history", "message", "runtime_profile"}):
         raise ValueError("invalid_turn")
+    if "runtime_profile" in value:
+        validate_runtime_profile(value["runtime_profile"])
     if not isinstance(value["session_id"], str) or str(uuid.UUID(value["session_id"])) != value["session_id"]:
         raise ValueError("invalid_session")
     if not isinstance(value["message"], str) or not value["message"].strip() or len(value["message"]) > 8000:
@@ -69,6 +92,8 @@ def parse_model_response(raw, message):
 
 def run_sdk(turn, home, workspace, factory=None, *, resume=False):
     """Use explicit resume only after the durable continuity guard has approved it."""
+    validate_turn(turn)
+    role = turn.get("runtime_profile", {}).get("role", "coordinator")
     if factory is None:
         from importlib.metadata import version
         if version("deepseek-harness-sdk") != SDK_VERSION or version("deepseek-harness-runtime-bin") != SDK_VERSION:
@@ -84,7 +109,8 @@ def run_sdk(turn, home, workspace, factory=None, *, resume=False):
         'Propose only if the current user explicitly asks to delegate a task to another participant. '
         'Never use history to supply a recipient or shared summary, never guess a recipient, never claim a task was sent. '
         'If unclear, ask a question in reply and set proposal to null. A proposal is only a private draft awaiting explicit human confirmation. '
-        'Do not add fields, Markdown fences, tool calls, or authorization flags.\n'
+        'Do not add fields, Markdown fences, tool calls, or authorization flags. '
+        + ROLE_GUIDANCE[role] + '\n'
     ) + json.dumps(
         {"history": [] if resume else turn["history"], "message": turn["message"]}, ensure_ascii=False)
     with factory(dsh_home=str(home), cwd=str(workspace), runtime_cwd=str(workspace),

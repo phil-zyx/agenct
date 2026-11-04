@@ -325,6 +325,7 @@ async fn messages(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<M
 #[serde(deny_unknown_fields)]
 struct ChatInput {
     message: String,
+    agent_id: Option<String>,
     request_id: Option<String>,
 }
 #[derive(Deserialize)]
@@ -372,6 +373,7 @@ async fn chat(
         .unwrap()
         .try_lock()
         .map_err(|_| Error(StatusCode::CONFLICT, "a turn is already running"))?;
+    let runtime_profile = profiles::route(&*h.db()?, &id, input.agent_id.as_deref())?;
     // The deterministic mock is a test double, not a model or DSH tool call.
     // No prior/private history is consulted when constructing the shared summary.
     if matches!(h.runtime, Runtime::Mock) {
@@ -386,7 +388,7 @@ async fn chat(
             )?;
             return Ok(Json(serde_json::json!({
                 "reply":"[MOCK · deterministic test double] 请检查接收人和将共享的任务内容，再明确确认。确认前对方不会收到任务。",
-                "backend":"mock", "proposal":proposal
+                "backend":"mock", "proposal":proposal, "runtime_profile":runtime_profile
             })));
         }
     }
@@ -410,7 +412,7 @@ async fn chat(
     let answer=match &h.runtime {
         Runtime::Mock=>Ok(AdapterReply {reply: format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。",prior.len()), backend:"mock".into(), proposal:None}),
         Runtime::Dsh{url,token}=>{
-            let mut payload=serde_json::json!({"session_id":session_id,"history":prior.iter().map(|m|serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),"message":input.message});
+            let mut payload=serde_json::json!({"session_id":session_id,"runtime_profile":runtime_profile,"history":prior.iter().map(|m|serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),"message":input.message});
             while serde_json::to_vec(&payload).unwrap().len()>60000 {
                 payload["history"].as_array_mut().unwrap().remove(0);
             }
@@ -460,7 +462,7 @@ async fn chat(
             tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
             tx.commit()?;
             Ok(Json(
-                serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal}),
+                serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile}),
             ))
         }
         Err(()) => {

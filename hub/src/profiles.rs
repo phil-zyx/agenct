@@ -1,4 +1,4 @@
-//! Personal configuration only. It cannot grant tools, permissions, or credentials.
+//! Personal role routing. It cannot grant tools, permissions, or credentials.
 use super::*;
 use std::collections::HashSet;
 
@@ -63,7 +63,8 @@ pub(super) async fn catalog(
         "models": [{"id":"server-default", "runtime": h.runtime.label(), "description":"Operator-configured server model; no personal credentials"}],
         "roles": ["coordinator", "researcher", "writer", "reviewer"],
         "max_agents": 8,
-        "execution": "configuration_only",
+        "execution": "single_role_turn",
+        "selection": "Default enabled coordinator; optional chat agent_id selects an enabled personal role",
         "permissions": "Profiles do not grant tools, delegation, or data access"
     })))
 }
@@ -78,12 +79,34 @@ pub(super) async fn update_profile(
     Json(input): Json<Update>,
 ) -> Result<Json<Profile>> {
     let owner = h.identity(&headers)?;
-    if input.agents.is_empty() || input.agents.len() > 8 {
+    validate(&input.agents)?;
+    let db = h.db()?;
+    let current = read(&db, &owner)?;
+    if input.expected_revision != current.revision {
+        return Err(Error(StatusCode::CONFLICT, "stale profile revision"));
+    }
+    let revision = current
+        .revision
+        .checked_add(1)
+        .filter(|v| *v <= i64::MAX as u64)
+        .ok_or(Error(StatusCode::CONFLICT, "profile revision exhausted"))?;
+    let encoded = serde_json::to_string(&input.agents)
+        .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "profile encoding failed"))?;
+    // The shared connection mutex covers both the revision check and write.
+    db.execute("INSERT INTO personal_profiles(owner, revision, agents_json) VALUES (?1,?2,?3) ON CONFLICT(owner) DO UPDATE SET revision=excluded.revision, agents_json=excluded.agents_json", params![owner, revision, encoded])?;
+    Ok(Json(Profile {
+        revision,
+        agents: input.agents,
+    }))
+}
+
+fn validate(agents: &[PersonalAgent]) -> Result<()> {
+    if agents.is_empty() || agents.len() > 8 {
         return Err(invalid("profile must contain 1..8 agents"));
     }
     let mut ids = HashSet::new();
     let mut coordinators = 0;
-    for agent in &input.agents {
+    for agent in agents {
         if agent.id.is_empty()
             || agent.id.len() > 32
             || !agent
@@ -117,22 +140,59 @@ pub(super) async fn update_profile(
     if coordinators != 1 {
         return Err(invalid("exactly one enabled coordinator is required"));
     }
-    let db = h.db()?;
-    let current = read(&db, &owner)?;
-    if input.expected_revision != current.revision {
-        return Err(Error(StatusCode::CONFLICT, "stale profile revision"));
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(super) struct RuntimeProfile {
+    pub revision: u64,
+    pub agent_id: String,
+    pub role: String,
+    pub model_ref: String,
+}
+
+pub(super) fn route(
+    db: &Connection,
+    owner: &str,
+    selected: Option<&str>,
+) -> Result<RuntimeProfile> {
+    let profile = read(db, owner)?;
+    // Validate stored state as well as writes: never fall back on corruption.
+    validate(&profile.agents)?;
+    let agent = profile
+        .agents
+        .iter()
+        .find(|a| {
+            a.enabled
+                && match selected {
+                    Some(id) => a.id == id,
+                    None => a.role == "coordinator",
+                }
+        })
+        .ok_or(invalid("unknown or disabled personal agent"))?;
+    Ok(RuntimeProfile {
+        revision: profile.revision,
+        agent_id: agent.id.clone(),
+        role: agent.role.clone(),
+        model_ref: agent.model_ref.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn runtime_revalidates_corrupt_stored_profiles() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize(&db).unwrap();
+        let mut agents = defaults();
+        agents[0].model_ref = "http://untrusted".into();
+        db.execute(
+            "INSERT INTO personal_profiles VALUES ('alice',1,?1)",
+            [serde_json::to_string(&agents).unwrap()],
+        )
+        .unwrap();
+        assert!(route(&db, "alice", None).is_err());
+        assert_eq!(route(&db, "bob", None).unwrap().model_ref, "server-default");
     }
-    let revision = current
-        .revision
-        .checked_add(1)
-        .filter(|v| *v <= i64::MAX as u64)
-        .ok_or(Error(StatusCode::CONFLICT, "profile revision exhausted"))?;
-    let encoded = serde_json::to_string(&input.agents)
-        .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "profile encoding failed"))?;
-    // The shared connection mutex covers both the revision check and write.
-    db.execute("INSERT INTO personal_profiles(owner, revision, agents_json) VALUES (?1,?2,?3) ON CONFLICT(owner) DO UPDATE SET revision=excluded.revision, agents_json=excluded.agents_json", params![owner, revision, encoded])?;
-    Ok(Json(Profile {
-        revision,
-        agents: input.agents,
-    }))
 }

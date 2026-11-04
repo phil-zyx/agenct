@@ -1,7 +1,7 @@
-/* Configuration-only controls in the existing conversation, never a model/tool grant. */
+/* Personal role controls in the existing conversation, never a model/tool grant. */
 function createProfileUI({ api, current, article, conversation, status }) {
   let generation = 0, card = null;
-  const notice = '仅保存个人配置：角色和启用状态尚不调度模型、不启动 Agent，也不授予工具权限。当前聊天仍使用服务端模型。请勿填写密钥。';
+  const notice = '聊天默认使用启用的管家角色，其他启用角色可通过 API 单次选择。每次只调用一个服务端模型，不启动 Agent 团队，也不授予工具权限；MOCK 不调用模型。请勿填写密钥。';
   function reset() { generation++; card = null; }
   function append(entries) { if (card) entries.push(card); }
   async function open(context) {

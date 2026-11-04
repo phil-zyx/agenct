@@ -7,7 +7,7 @@ Edit names, fixed roles, server model references, and enabled flags, then inspec
 the complete replacement before explicitly confirming save. Cancel makes no write.
 Refresh preserves the editing card; logout invalidates it. A stale revision or
 uncertain save requires rereading server state, never an automatic retry.
-This is configuration storage, **not an autonomous agent army or a model switcher**.
+This supports **one fixed role per turn, not an autonomous agent army or a model switcher**.
 The existing single chat still executes through the operator-selected runtime.
 
 - `GET /api/profile/catalog`: server-owned model references, supported roles and limits.
@@ -39,8 +39,31 @@ tasks, cannot expand tool access, and do not affect delegation authorization.
 
 ## Deliberate limits
 
-Role assignments and enabled flags are stored for future orchestration; they do not
-currently spawn agents or change chat behavior. There is no personal API-key entry,
+Chat snapshots the authenticated user’s profile at turn start and selects its enabled
+coordinator. An optional `agent_id` in `POST /api/messages` selects another enabled
+role from that same profile. Unknown/disabled IDs or invalid stored profiles fail
+before invoking the adapter. Updates take effect on the next turn; they do not
+change an in-flight snapshot. The reply reports `runtime_profile` with agent ID,
+profile revision, role, and model reference. The entire single-user chat history
+remains shared between that user’s roles; these are not isolated subagent sessions.
+
+The DSH adapter accepts only the four fixed role values and `server-default`, then
+adds server-owned writing/research/review guidance. Display names and free-form
+role descriptions never become runtime instructions. Every role keeps the same
+no-tools patch, provider, operator-selected model, proposal validation, and human
+confirmation boundary. Role guidance is a prompt preference, not an authority
+boundary or a guarantee of output quality. There is no fan-out or background team.
+The mock runtime remains deterministic and does not exercise a model.
+
+Example single-role turn: `{"message":"Review this draft…","agent_id":"research"}`.
+The inline configuration UI does not yet select per-turn roles. Deploy the Hub and
+adapter together: an older adapter rejects the new profile payload rather than
+silently dropping routing. Legacy direct adapter requests without a profile retain
+the coordinator default for compatibility.
+
+Fake-adapter and fake-SDK tests cover owner isolation, disabled/unknown selections,
+fixed-role prompting, metadata bounds, and unchanged runtime authority. These are
+not live model or autonomous team acceptance tests. There is no personal API-key entry,
 provider URL entry, dynamic model catalog, or per-user provider routing. These need
 operator-managed model bindings, secure credential provisioning, runtime dispatch,
 quotas, tool policy enforcement, and end-to-end live-provider tests before claiming

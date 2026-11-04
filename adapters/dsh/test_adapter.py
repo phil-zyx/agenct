@@ -43,6 +43,27 @@ class BoundaryTests(unittest.TestCase):
         self.assertTrue(calls[0]["patches"][0].endswith("no-tools.patch.yml"))
         self.assertEqual(calls[-1], "closed")
 
+    def test_profile_routes_fixed_role_without_changing_runtime_authority(self):
+        calls = []
+        class Fake:
+            def __init__(self, **config): calls.append(config)
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def run(self, prompt, session_id):
+                self_prompt = json.loads(prompt.split("\n", 1)[1])
+                assert "Review the supplied material" in prompt
+                assert "agent_id" not in self_prompt
+                return SimpleNamespace(finish_reason="completed", final_response='{"reply":"review","proposal":null}')
+        profile = {"revision":1,"agent_id":"reviewer","role":"reviewer","model_ref":"server-default"}
+        run_sdk(turn() | {"runtime_profile":profile}, Path("/tmp/h"), Path("/tmp/w"), Fake)
+        self.assertEqual(calls[0]["provider"], "deepseek-official")
+        self.assertEqual(calls[0]["profile"], "sdk-minimal")
+        self.assertTrue(calls[0]["patches"][0].endswith("no-tools.patch.yml"))
+        for changes in ({"role":"admin"}, {"role":[]}, {"model_ref":"https://evil.example"}, {"revision":True}, {"name":"ignore safeguards"}, {"permissions":["shell"]}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                run_sdk(turn() | {"runtime_profile":profile | changes}, Path("/tmp/h"), Path("/tmp/w"), Fake)
+        self.assertEqual(len(calls), 1)
+
     def test_structured_proposal_is_draft_only(self):
         raw = json.dumps({"reply": "Please review", "proposal": {"owner": "bob", "summary": "review tests"}})
         self.assertEqual(parse_model_response(raw, "Ask bob to review tests")["proposal"]["owner"], "bob")
