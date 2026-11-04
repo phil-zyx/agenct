@@ -5,6 +5,7 @@ pub mod oidc;
 mod profiles;
 pub mod publication;
 pub mod worker;
+pub mod worker_api;
 pub mod worker_consumer;
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
@@ -95,6 +96,7 @@ impl Config {
 }
 #[derive(Clone)]
 pub struct Hub {
+    worker_scopes: Arc<HashMap<String, worker_api::Scope>>,
     browser_auth: Option<browser_auth::BrowserAuth>,
     oidc: Option<oidc::Validator>,
     _lock: Option<Arc<std::fs::File>>,
@@ -173,6 +175,7 @@ CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, requester TEXT NOT NU
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 UPDATE messages SET status='interrupted' WHERE status='pending';")?;
         profiles::initialize(&db)?;
+        worker::migrate(&db).map_err(|_| "worker schema migration failed")?;
         let has_revision: bool = db
             .prepare("PRAGMA table_info(tasks)")?
             .query_map([], |r| r.get::<_, String>(1))?
@@ -192,6 +195,7 @@ UPDATE messages SET status='interrupted' WHERE status='pending';")?;
             )?;
         }
         Ok(Self {
+            worker_scopes: Arc::new(HashMap::new()),
             browser_auth: None,
             oidc: None,
             _lock: lock,
@@ -285,6 +289,14 @@ pub fn app(hub: Hub) -> Router {
         .route("/api/tasks", get(tasks).post(delegate))
         .route("/api/tasks/{id}", get(task_detail))
         .route("/api/tasks/{id}/actions", post(action))
+        .route(
+            "/api/tasks/{id}/worker",
+            get(worker_api::status).post(worker_api::enqueue),
+        )
+        .route(
+            "/api/tasks/{id}/worker/{job}/cancel",
+            post(worker_api::cancel),
+        )
         .fallback_service(tower_http::services::ServeDir::new("hub/web"))
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(axum::middleware::from_fn_with_state(
@@ -608,6 +620,8 @@ async fn action(
         "INSERT INTO events(task_id,actor,action) VALUES (?1,?2,?3)",
         params![id, user, a.action],
     )?;
+    // Task revision changes revoke queued work and lease capabilities atomically.
+    worker::revoke_task(&tx, &id)?;
     tx.commit()?;
     Ok(Json(
         serde_json::json!({"id":id,"status":next,"revision":t.revision+1}),

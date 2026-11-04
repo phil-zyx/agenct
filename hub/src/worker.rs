@@ -120,10 +120,33 @@ pub fn migrate(db: &Connection) -> Result<()> {
       UNIQUE(owner,request_id));
       CREATE UNIQUE INDEX IF NOT EXISTS worker_one_active_task ON worker_jobs(task_id)
       WHERE status IN ('queued','running','review_ready');")?;
+    let columns = db
+        .prepare("PRAGMA table_info(worker_jobs)")?
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|c| c == "execution_authorized") {
+        // Existing unclassified receipts fail closed after migration.
+        db.execute(
+            "ALTER TABLE worker_jobs ADD COLUMN execution_authorized INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
     Ok(())
 }
 fn authorized(db: &Connection, job: &Job) -> Result<bool> {
     Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND owner=?2 AND revision=?3 AND status='working')",params![job.request.task_id,job.owner,job.request.task_revision],|r|r.get(0))?)
+}
+/// Same transaction as task state changes, so no stale live lease survives commit.
+pub(crate) fn revoke_task(db: &Connection, task: &str) -> rusqlite::Result<()> {
+    db.execute("UPDATE worker_jobs SET status='cancelled',lease_hash=NULL,lease_until=NULL WHERE task_id=?1 AND status IN ('queued','running','review_ready')", [task])?;
+    Ok(())
+}
+pub fn list_for_task(db: &Connection, actor: &str, task: &str) -> Result<Vec<Job>> {
+    let mut q = db.prepare(&format!(
+        "{SELECT} WHERE owner=?1 AND task_id=?2 ORDER BY created_at,id"
+    ))?;
+    let rows = q.query_map(params![actor, task], job_row)?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 /// Explicit owner request, after task acceptance; not called automatically on model output.
 /// request_id is owner-scoped and immutable. A replay returns the original job, never requeues it.
@@ -133,6 +156,26 @@ pub fn enqueue(
     request: JobRequest,
     policy: &Policy,
     now: i64,
+) -> Result<Job> {
+    enqueue_inner(db, actor, request, policy, now, true)
+}
+/// Queue-only receipts cannot be claimed by any consumer, even if one is later wired.
+pub(crate) fn enqueue_queue_only(
+    db: &mut Connection,
+    actor: &str,
+    request: JobRequest,
+    policy: &Policy,
+    now: i64,
+) -> Result<Job> {
+    enqueue_inner(db, actor, request, policy, now, false)
+}
+fn enqueue_inner(
+    db: &mut Connection,
+    actor: &str,
+    request: JobRequest,
+    policy: &Policy,
+    now: i64,
+    execution_authorized: bool,
 ) -> Result<Job> {
     policy.executor()?;
     if !valid_key(&request.request_id)
@@ -155,7 +198,12 @@ pub fn enqueue(
         )
         .optional()?
     {
-        return if old.request == request {
+        let old_authorized: bool = tx.query_row(
+            "SELECT execution_authorized FROM worker_jobs WHERE id=?1",
+            [&old.id],
+            |r| r.get(0),
+        )?;
+        return if old.request == request && old_authorized == execution_authorized {
             Ok(old)
         } else {
             Err(Error::Conflict)
@@ -174,7 +222,7 @@ pub fn enqueue(
     // A new accepted task revision supersedes any old candidate/lease before uniqueness checks.
     tx.execute("UPDATE worker_jobs SET status='cancelled',lease_hash=NULL,lease_until=NULL WHERE task_id=?1 AND status IN ('queued','running','review_ready') AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=worker_jobs.task_id AND t.owner=worker_jobs.owner AND t.revision=worker_jobs.task_revision AND t.status='working')", [&job.request.task_id])?;
     if tx.query_row("SELECT EXISTS(SELECT 1 FROM worker_jobs WHERE task_id=?1 AND status IN ('queued','running','review_ready'))",[&job.request.task_id],|r|r.get::<_,bool>(0))? {return Err(Error::Conflict);}
-    tx.execute("INSERT INTO worker_jobs(id,owner,task_id,task_revision,repository,base_commit,request_id,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',?8)",params![job.id,job.owner,job.request.task_id,job.request.task_revision,job.request.repository,job.request.base_commit,job.request.request_id,now])?;
+    tx.execute("INSERT INTO worker_jobs(id,owner,task_id,task_revision,repository,base_commit,request_id,status,created_at,execution_authorized) VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',?8,?9)",params![job.id,job.owner,job.request.task_id,job.request.task_revision,job.request.repository,job.request.base_commit,job.request.request_id,now,execution_authorized])?;
     tx.commit()?;
     Ok(job)
 }
@@ -197,7 +245,7 @@ pub fn claim(
     tx.execute("UPDATE worker_jobs SET status='cancelled',lease_hash=NULL,lease_until=NULL WHERE status IN ('queued','running','review_ready') AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=worker_jobs.task_id AND t.owner=worker_jobs.owner AND t.revision=worker_jobs.task_revision AND t.status='working')",[])?;
     tx.execute("UPDATE worker_jobs SET status='failed',failure='attempt limit',lease_hash=NULL,lease_until=NULL WHERE status='running' AND lease_until<=?1 AND attempt>=3",[now])?;
     let jobs = {
-        let mut q=tx.prepare(&format!("{SELECT} WHERE status='queued' OR (status='running' AND lease_until<=?1 AND attempt<3) ORDER BY created_at,id"))?;
+        let mut q=tx.prepare(&format!("{SELECT} WHERE execution_authorized=1 AND (status='queued' OR (status='running' AND lease_until<=?1 AND attempt<3)) ORDER BY created_at,id"))?;
         let rows = q.query_map([now], job_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()?
     };
@@ -226,7 +274,7 @@ fn live_job(db: &Connection, lease: &Lease, policy: &Policy, now: i64) -> Result
     if now < 0 || policy.executor()? != lease.executor {
         return Err(Error::Denied);
     }
-    let job=db.query_row(&format!("{SELECT} WHERE id=?1 AND status='running' AND executor=?2 AND lease_hash=?3 AND lease_until>?4"),params![lease.job.id,lease.executor,hash(&lease.token),now],job_row).optional()?.ok_or(Error::LeaseLost)?;
+    let job=db.query_row(&format!("{SELECT} WHERE id=?1 AND execution_authorized=1 AND status='running' AND executor=?2 AND lease_hash=?3 AND lease_until>?4"),params![lease.job.id,lease.executor,hash(&lease.token),now],job_row).optional()?.ok_or(Error::LeaseLost)?;
     if !policy.repositories.contains(&job.request.repository) || !authorized(db, &job)? {
         return Err(Error::Denied);
     }
@@ -333,6 +381,31 @@ mod tests {
                 required_checks: BTreeSet::from(["unit".into(), "lint".into()]),
             },
         )
+    }
+    #[test]
+    fn queue_only_receipt_cannot_be_claimed_or_upgraded_by_replay() {
+        let (mut db, policy) = setup();
+        let job = enqueue_queue_only(&mut db, "bob", request(), &policy, 0).unwrap();
+        assert!(claim(&mut db, "sandbox", &policy, 1, 10).unwrap().is_none());
+        assert!(matches!(
+            enqueue(&mut db, "bob", request(), &policy, 2),
+            Err(Error::Conflict)
+        ));
+        assert_eq!(inspect(&db, "bob", &job.id).unwrap().0.attempt, 0);
+    }
+    #[test]
+    fn legacy_jobs_migrate_without_execution_authority() {
+        let (mut db, policy) = setup();
+        let job = enqueue(&mut db, "bob", request(), &policy, 0).unwrap();
+        db.execute(
+            "ALTER TABLE worker_jobs DROP COLUMN execution_authorized",
+            [],
+        )
+        .unwrap();
+        migrate(&db).unwrap();
+        migrate(&db).unwrap();
+        assert!(claim(&mut db, "sandbox", &policy, 1, 10).unwrap().is_none());
+        assert_eq!(inspect(&db, "bob", &job.id).unwrap().0.attempt, 0);
     }
     fn request() -> JobRequest {
         JobRequest {

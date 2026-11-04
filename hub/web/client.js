@@ -46,6 +46,8 @@ function article(text) {
 
 const profileUI = createProfileUI({ api, current, article, conversation: () => $('conversation'), status });
 
+const workerUI = createWorkerUI({ api, current, article, conversation: () => $('conversation') });
+
 function resetIdentity() {
   clearTimeout(pollTimer);
   pollTimer = null;
@@ -56,6 +58,7 @@ function resetIdentity() {
   $('last-refresh').textContent = '';
   $('sync-notice').textContent = '';
   profileUI.reset();
+  workerUI.reset();
   controller.abort();
   controller = new AbortController();
   epoch++;
@@ -184,6 +187,7 @@ async function readSnapshot(context) {
     reads.abort();
   }
   if (!current(context) || version !== refreshVersion) return;
+  workerUI.update(context, tasks);
   const nextSnapshot = JSON.stringify([messages, proposals, tasks]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
@@ -211,9 +215,11 @@ async function readSnapshot(context) {
     if (task.requester === context.user && task.status === 'ready_for_acceptance') actions.push(['approve', '验收'], ['return', '退回']);
     if (!['completed', 'canceled'].includes(task.status)) actions.push(['cancel', '取消']);
     addActions(element, context, 'tasks', task, actions);
+    workerUI.attach(element, context, task);
     entries.push(element);
   }
   profileUI.append(entries);
+  workerUI.append(entries);
   $('conversation').replaceChildren(...entries);
 
 }

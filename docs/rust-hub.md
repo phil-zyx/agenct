@@ -1,6 +1,6 @@
 # Rust Hub technical proof of concept
 
-This is a **loopback-only development server**, not an Internet-ready account system. It does not replace or change the hosted browser demo. It supplies real server-side storage and authorization; mock model output is explicitly labelled. SQLite is used to make the single-process experiment runnable without a PostgreSQL service. PostgreSQL, OIDC, production deployment hardening and trustworthy code execution remain future work. Persistent worker leases exist as an unwired library; the built-in executor remains disabled. See [architecture.md](architecture.md).
+This is a **loopback-only development server**, not an Internet-ready account system. It does not replace or change the hosted browser demo. It supplies real server-side storage and authorization; mock model output is explicitly labelled. SQLite is used to make the single-process experiment runnable without a PostgreSQL service. PostgreSQL, OIDC, production deployment hardening and trustworthy code execution remain future work. Owner-confirmed queue admission is available through opt-in per-task HTTP scopes; no consumer is running and the built-in executor remains disabled. Queue-only receipts cannot be claimed for execution. See [architecture.md](architecture.md).
 
 ## Run
 

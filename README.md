@@ -66,7 +66,7 @@ The Rust chat UI now supports sender-private delegation proposals, explicit shar
 - 单窗口服务端聊天、持久任务、私有提案确认和人工交付可在本机运行；开发令牌不是生产账号。UI 自动轮询，不是实时推送。
 - [个人配置 API](docs/personal-profiles.md)可保存角色与模型引用；目前仅支持 `server-default`，不改变运行时、不启动 Agent，也不提供个人密钥输入或配置 UI。
 - [DSH 适配器](docs/dsh-adapter.md)实现 SDK 路径与严格结构化提案校验；真实模型调用和有效工具限制仍未验收。无静默 mock 回退。
-- [Worker 与发布合同](docs/worker-contract.md)、[GitLab 传输](docs/gitlab-transport.md)是未接入聊天的库。内置执行器因证据可信性问题保持禁用；没有自动编码、分支上传、真实 MR 或 CI 验收结果。
+- [Worker 队列](docs/worker-contract.md)已提供按任务授权的 HTTP 入队、查询和取消接口，须由接单人明确确认；仅记录排队，不授权执行。接单人的聊天任务卡可查看、确认入队和取消，尚无运行中的消费者。[发布合同与 GitLab 传输](docs/gitlab-transport.md)仍是库。内置执行器因证据可信性问题保持禁用；没有自动编码、分支上传、真实 MR 或 CI 验收结果。
 - [私有试运行工具](docs/private-staging.md)可准备本地服务和 SSH 访问；未部署远端实例，没有已验证的云端后端 URL。不要公开开发令牌或将服务暴露到公网。
 - 确认委派是聊天 UI 的流程保证；兼容 `POST /api/tasks` 接口可直接创建任务且不幂等。普通模型聊天超时也不能自动重试。
 

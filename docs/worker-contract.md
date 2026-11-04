@@ -3,11 +3,73 @@
 Status: tested Rust library foundation, **not a deployed code-execution service**.
 `hub/src/worker.rs` implements a persistent SQLite queue and candidate verification
 boundary. It performs no shell execution, network access, Git operation, GitLab or
-GitHub write, publication, merge, or task completion. There are currently no HTTP
-routes or running queue consumer wired to the Hub. `worker_consumer.rs` provides an
+GitHub write, publication, merge, or task completion. The Hub now exposes opt-in,
+owner-confirmed queue admission/status/cancellation routes. There is still no
+running queue consumer wired to the Hub. `worker_consumer.rs` provides an
 opt-in consumer scaffolding; built-in Docker execution and evidence generation
 are now disabled because repository tests could tamper with their verifier. See [executor integration](executor-integration.md). The existing human delivery
 flow remains unchanged.
+
+## Hub queue-only admission (experimental)
+
+This is an admission receipt, **not working code execution**. No provider is
+called, no code is run, no PR/MR is created, and no task is delivered automatically.
+The built-in executor remains hard-disabled. No HTTP claim/finish/publish API exists.
+The chat UI still uses manual task delivery. Each owner task has a “查看待办队列
+（不执行）” button that opens a card in the same conversation, not a new dashboard.
+It reads scope and receipts before displaying a separate “确认仅入队，不执行”
+button. The exact task revision, repository and immutable base are shown before
+consent. No scope means no enqueue button. Queue cancellation and rereading are
+also inline. Closing a card, identity change or a refreshed task revision
+invalidates its controls. Uncertain submissions are not retried automatically;
+a deliberate retry after rereading keeps the original request ID until a matching
+receipt is found. A terminal receipt is shown as ended, never as newly queued;
+a separate explicit new-request confirmation generates a new ID after reconciliation.
+
+Set `AGENCT_WORKER_SCOPES_FILE` to an operator-managed JSON array (maximum 128 KiB,
+256 entries). Without it, no task can enqueue work. Each entry fixes exactly:
+
+```json
+[{"task_id":"EXISTING-TASK-ID","owner":"bob","task_revision":1,"repository":"agenct","base_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]
+```
+
+Use a real immutable commit for intended future work, not the illustrative hash.
+Scopes are operator configuration, never model output or an endpoint accepting
+browser-written policy. One entry per task; revision must match the accepted task.
+Changing task state increments its revision and atomically cancels all queued,
+running or review-ready jobs. A new revision needs new operator scope and new
+explicit owner consent. Removing a scope prevents new admission, not deletion of
+historical receipts; no consumer is running to act on those receipts.
+
+- `GET /api/tasks/{id}/worker`: owner-only current scope and job receipts. Requester
+  and unrelated users cannot read this queue. Always reports `execution_enabled:
+  false` and `publication_enabled: false`.
+- `POST /api/tasks/{id}/worker`: owner explicitly submits `expected_revision`,
+  exact `repository`, exact `base_commit`, a stable `request_id`, and
+  `confirm_queue_only: true`. It requires accepted/working task state and matching
+  operator scope; accepting a task alone never enqueues it. Unknown fields fail.
+- `POST /api/tasks/{id}/worker/{job}/cancel`: authenticated owner cancellation,
+  bound to this task. Cancellation is idempotent and immediately revokes leases.
+
+Example queue-only request body:
+
+```json
+{"expected_revision":1,"repository":"agenct","base_commit":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","request_id":"owner-generated-stable-uuid","confirm_queue_only":true}
+```
+
+Retain the same request ID after an uncertain response. An identical replay
+returns the original receipt, including its cancelled status, and never requeues.
+Changing fields under that ID conflicts; a second active job also conflicts.
+A new intentional request after cancellation requires a new ID. Historical
+receipts survive restart; attempts stay zero. Queue-only receipts persist an
+execution-denied flag: `claim` cannot select them even if a consumer is later
+connected. A replay through the execution-authorized library API cannot upgrade
+the original receipt. Legacy unclassified rows migrate to execution-denied.
+The reserved `queue-only-disabled` policy identity is only a library admission
+marker, **not an executable identity or an isolation attestation**. Do not attach
+an executor to it or infer execution permission from these receipts. Enabling
+real execution requires a separate reviewed implementation, immutable evidence
+verification, and explicit execution authorization, not changing this string.
 
 ## Integration
 

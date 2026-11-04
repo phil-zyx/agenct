@@ -30,6 +30,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hub = hub.with_browser_auth(serde_json::from_slice(&bytes)?)?;
         eprintln!("Authentication: opt-in OIDC browser sessions; bearer tokens disabled");
     }
+    if let Some(path) = std::env::var_os("AGENCT_WORKER_SCOPES_FILE") {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(131073)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 131072 {
+            return Err("worker scopes exceed 128 KiB".into());
+        }
+        hub = hub.with_worker_scopes(serde_json::from_slice(&bytes)?)?;
+        eprintln!("Worker queue admission configured; execution and publication remain disabled");
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("Agenct Hub listening at http://{bind}; runtime={mode}; loopback development only");
     axum::serve(listener, app(hub))

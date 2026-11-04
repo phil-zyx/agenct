@@ -79,6 +79,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
     }
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'profiles-ui.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'worker-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'client.js'), 'utf8'), context);
   return {
     $, calls, timers,
