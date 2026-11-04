@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use fs2::FileExt;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -160,6 +160,7 @@ impl Hub {
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, requester TEXT NOT NULL, owner TEXT NOT NULL, summary TEXT NOT NULL, status TEXT NOT NULL, result TEXT, revision INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, requester TEXT NOT NULL, owner TEXT NOT NULL, summary TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', revision INTEGER NOT NULL DEFAULT 0, task_id TEXT UNIQUE, request_id TEXT NOT NULL, source TEXT NOT NULL, UNIQUE(requester,request_id));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 UPDATE messages SET status='interrupted' WHERE status='pending';")?;
         let has_revision: bool = db
@@ -222,6 +223,8 @@ pub fn app(hub: Hub) -> Router {
         )
         .route("/api/me", get(me))
         .route("/api/messages", get(messages).post(chat))
+        .route("/api/proposals", get(proposals).post(propose))
+        .route("/api/proposals/{id}/actions", post(proposal_action))
         .route("/api/tasks", get(tasks).post(delegate))
         .route("/api/tasks/{id}", get(task_detail))
         .route("/api/tasks/{id}/actions", post(action))
@@ -261,6 +264,7 @@ async fn messages(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<M
 #[serde(deny_unknown_fields)]
 struct ChatInput {
     message: String,
+    request_id: Option<String>,
 }
 #[derive(Deserialize)]
 struct AdapterReply {
@@ -282,6 +286,24 @@ async fn chat(
         .unwrap()
         .try_lock()
         .map_err(|_| Error(StatusCode::CONFLICT, "a turn is already running"))?;
+    // The deterministic mock is a test double, not a model or DSH tool call.
+    // No prior/private history is consulted when constructing the shared summary.
+    if matches!(h.runtime, Runtime::Mock) {
+        if let Some((owner, summary)) = mock_delegation(&input.message) {
+            let proposal = save_proposal(
+                &h,
+                &id,
+                &owner,
+                &summary,
+                input.request_id.as_deref(),
+                &input.message,
+            )?;
+            return Ok(Json(serde_json::json!({
+                "reply":"[MOCK · deterministic test double] 请检查接收人和将共享的任务内容，再明确确认。确认前对方不会收到任务。",
+                "backend":"mock", "proposal":proposal
+            })));
+        }
+    }
     let prior: Vec<_> = history(&h, &id)?
         .into_iter()
         .filter(|m| m.status == "complete")
@@ -474,4 +496,185 @@ async fn action(
     Ok(Json(
         serde_json::json!({"id":id,"status":next,"revision":t.revision+1}),
     ))
+}
+
+// Intentionally bounded recognition for the offline acceptance fixture. DSH replies
+// remain plain text and have no task-creation authority.
+fn mock_delegation(message: &str) -> Option<(String, String)> {
+    let text = message.trim();
+    let rest = text
+        .strip_prefix("请让 ")
+        .or_else(|| text.strip_prefix("ask "))?;
+    let (owner, rest) = rest.split_once(' ')?;
+    let summary = rest
+        .strip_prefix("帮我 ")
+        .or_else(|| rest.strip_prefix("to "))?;
+    Some((owner.to_owned(), summary.to_owned()))
+}
+#[derive(Serialize)]
+struct Proposal {
+    id: String,
+    requester: String,
+    owner: String,
+    summary: String,
+    status: String,
+    revision: i64,
+    task_id: Option<String>,
+}
+fn row_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proposal> {
+    Ok(Proposal {
+        id: r.get(0)?,
+        requester: r.get(1)?,
+        owner: r.get(2)?,
+        summary: r.get(3)?,
+        status: r.get(4)?,
+        revision: r.get(5)?,
+        task_id: r.get(6)?,
+    })
+}
+const PROPOSAL_COLUMNS: &str = "id,requester,owner,summary,status,revision,task_id";
+fn save_proposal(
+    h: &Hub,
+    requester: &str,
+    owner: &str,
+    summary: &str,
+    request_id: Option<&str>,
+    source: &str,
+) -> Result<Proposal> {
+    if owner == requester || !h.gates.contains_key(owner) {
+        return Err(invalid("select another configured participant"));
+    }
+    if summary.trim().is_empty() || summary.len() > 4000 {
+        return Err(invalid("summary must contain 1..4000 bytes"));
+    }
+    let generated = Uuid::new_v4().to_string();
+    let key = request_id.unwrap_or(&generated);
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(invalid("invalid request_id"));
+    }
+    let mut db = h.db()?;
+    let tx = db.transaction()?;
+    let existing = tx.query_row(&format!("SELECT {PROPOSAL_COLUMNS},source FROM proposals WHERE requester=?1 AND request_id=?2"),params![requester,key],|r|Ok((row_proposal(r)?,r.get::<_,String>(7)?))).optional()?;
+    if let Some((proposal, previous)) = existing {
+        if previous != source || proposal.owner != owner || proposal.summary != summary {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "request_id already used for different content",
+            ));
+        }
+        return Ok(proposal);
+    }
+    let id = Uuid::new_v4().to_string();
+    tx.execute("INSERT INTO proposals(id,requester,owner,summary,request_id,source) VALUES (?1,?2,?3,?4,?5,?6)",params![id,requester,owner,summary,key,source])?;
+    let p = tx.query_row(
+        &format!("SELECT {PROPOSAL_COLUMNS} FROM proposals WHERE id=?1"),
+        [id],
+        row_proposal,
+    )?;
+    tx.commit()?;
+    Ok(p)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalInput {
+    owner: String,
+    summary: String,
+    request_id: Option<String>,
+}
+async fn propose(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Json(p): Json<ProposalInput>,
+) -> Result<Json<Proposal>> {
+    let user = h.identity(&headers)?;
+    Ok(Json(save_proposal(
+        &h,
+        &user,
+        &p.owner,
+        &p.summary,
+        p.request_id.as_deref(),
+        "explicit",
+    )?))
+}
+async fn proposals(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<Proposal>>> {
+    let user = h.identity(&headers)?;
+    let db = h.db()?;
+    let mut q = db.prepare(&format!(
+        "SELECT {PROPOSAL_COLUMNS} FROM proposals WHERE requester=?1 ORDER BY rowid DESC"
+    ))?;
+    let rows = q.query_map([user], row_proposal)?;
+    Ok(Json(rows.collect::<std::result::Result<Vec<_>, _>>()?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalAction {
+    action: String,
+    expected_revision: i64,
+}
+async fn proposal_action(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<ProposalAction>,
+) -> Result<Json<Proposal>> {
+    let user = h.identity(&headers)?;
+    if a.action != "confirm" && a.action != "reject" {
+        return Err(invalid("unsupported proposal action"));
+    }
+    let mut db = h.db()?;
+    let tx = db.transaction()?;
+    let p = tx
+        .query_row(
+            &format!("SELECT {PROPOSAL_COLUMNS} FROM proposals WHERE id=?1 AND requester=?2"),
+            params![id, user],
+            row_proposal,
+        )
+        .optional()?
+        .ok_or_else(denied)?;
+    // Retry of the identical action at the reviewed revision returns the same result.
+    // This cannot authorize different content: proposal fields are immutable.
+    let target = if a.action == "confirm" {
+        "confirmed"
+    } else {
+        "rejected"
+    };
+    if p.status == target && a.expected_revision == 0 && p.revision == 1 {
+        return Ok(Json(p));
+    }
+    if p.status != "pending" || p.revision != a.expected_revision {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "proposal changed; refresh and review",
+        ));
+    }
+    if a.action == "confirm" && (!h.gates.contains_key(&p.owner) || p.owner == user) {
+        return Err(invalid("recipient is no longer available"));
+    }
+    let task_id = if a.action == "confirm" {
+        let task = Uuid::new_v4().to_string();
+        tx.execute("INSERT INTO tasks(id,requester,owner,summary,status) VALUES (?1,?2,?3,?4,'awaiting_owner')",params![task,user,p.owner,p.summary])?;
+        tx.execute(
+            "INSERT INTO events(task_id,actor,action) VALUES (?1,?2,'created')",
+            params![task, user],
+        )?;
+        Some(task)
+    } else {
+        None
+    };
+    tx.execute(
+        "UPDATE proposals SET status=?1,revision=revision+1,task_id=?2 WHERE id=?3",
+        params![target, task_id, id],
+    )?;
+    let result = tx.query_row(
+        &format!("SELECT {PROPOSAL_COLUMNS} FROM proposals WHERE id=?1"),
+        [id],
+        row_proposal,
+    )?;
+    tx.commit()?;
+    Ok(Json(result))
 }

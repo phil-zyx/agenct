@@ -52,3 +52,8 @@ npm run check
 新增 `hub/`：Rust/Axum 本地开发服务，开发令牌身份认证、SQLite 持久消息与任务、跨身份隔离及人工接单/交付/验收。它与 `dist/` 静态演示分开运行。真实 DSH 适配层见 `adapters/dsh/`；默认不启用模型或危险工具，mock 与真实模式明确区分且不会自动回退。
 
 开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。PostgreSQL、生产登录、自动 Agent 委派、代码执行、Git 写入和独立 CI 核验尚未实现。不要将开发服务器暴露到公网。
+
+
+### Controlled delegation demo
+
+The Rust chat UI now supports sender-private delegation proposals, explicit sharing confirmation, recipient acceptance/manual reply and requester acceptance. In `mock` mode, try `请让 bob 帮我 检查公开文档` or `ask bob to review the public docs`. This is a **deterministic test double**, not live DSH language understanding. `/delegate bob ...` also prepares a proposal rather than immediately sharing. See [the acceptance walkthrough and limitations](docs/rust-hub.md#controlled-delegation-acceptance-offline-test-double). The browser-only `dist/` simulation remains separate.

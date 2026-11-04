@@ -319,12 +319,23 @@ async fn adapter_contract_uses_scoped_role_content_history() {
         ("bob", "bob private"),
         ("alice", "hello"),
         ("alice", "followup"),
+        ("alice", "ask bob to send a task"),
     ] {
         let (status, value) =
             request(&a, who, "POST", "/api/messages", json!({"message":message})).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["backend"], "dsh");
     }
+    assert_eq!(
+        request(&a, "alice", "GET", "/api/proposals", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+    assert_eq!(
+        request(&a, "bob", "GET", "/api/tasks", Value::Null).await.1,
+        json!([])
+    );
     server.abort();
 }
 
@@ -432,4 +443,370 @@ async fn existing_task_schema_is_migrated() {
     drop(a);
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_file(path.with_extension("lock")).unwrap();
+}
+
+#[tokio::test]
+async fn natural_language_proposal_requires_confirmation_and_is_private() {
+    let app = setup();
+    request(
+        &app,
+        "alice",
+        "POST",
+        "/api/messages",
+        json!({"message":"private secret 9321"}),
+    )
+    .await;
+    let input = json!({"message":"请让 bob 帮我 检查公开文档","request_id":"natural-1"});
+    let (code, reply) = request(&app, "alice", "POST", "/api/messages", input.clone()).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(reply["backend"], "mock");
+    let p = &reply["proposal"];
+    assert_eq!(p["summary"], "检查公开文档");
+    assert_eq!(p["status"], "pending");
+    assert_eq!(
+        request(&app, "alice", "POST", "/api/messages", input)
+            .await
+            .1["proposal"]["id"],
+        p["id"]
+    );
+    for who in ["alice", "bob", "eve"] {
+        assert_eq!(
+            request(&app, who, "GET", "/api/tasks", Value::Null).await.1,
+            json!([])
+        );
+    }
+    assert_eq!(
+        request(&app, "bob", "GET", "/api/proposals", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+    let path = format!("/api/proposals/{}/actions", p["id"].as_str().unwrap());
+    for who in ["bob", "eve"] {
+        assert_eq!(
+            request(
+                &app,
+                who,
+                "POST",
+                &path,
+                json!({"action":"confirm","expected_revision":0})
+            )
+            .await
+            .0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    assert_eq!(
+        request(
+            &app,
+            "alice",
+            "POST",
+            &path,
+            json!({"action":"confirm","expected_revision":5})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let confirm = json!({"action":"confirm","expected_revision":0});
+    let (a, b) = tokio::join!(
+        request(&app, "alice", "POST", &path, confirm.clone()),
+        request(&app, "alice", "POST", &path, confirm)
+    );
+    assert_eq!(a.0, StatusCode::OK);
+    assert_eq!(a, b);
+    let task = a.1["task_id"].as_str().unwrap();
+    let inbox = request(&app, "bob", "GET", "/api/tasks", Value::Null)
+        .await
+        .1;
+    assert_eq!(inbox.as_array().unwrap().len(), 1);
+    assert!(!inbox.to_string().contains("9321"));
+    assert_eq!(
+        request(&app, "bob", "GET", "/api/messages", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+    let action = format!("/api/tasks/{task}/actions");
+    assert_eq!(
+        request(
+            &app,
+            "bob",
+            "POST",
+            &action,
+            json!({"action":"accept","expected_revision":0})
+        )
+        .await
+        .1["status"],
+        "working"
+    );
+    assert_eq!(
+        request(
+            &app,
+            "bob",
+            "POST",
+            &action,
+            json!({"action":"deliver","expected_revision":1,"result":"文档检查完成"})
+        )
+        .await
+        .1["status"],
+        "ready_for_acceptance"
+    );
+    let detail = request(
+        &app,
+        "alice",
+        "GET",
+        &format!("/api/tasks/{task}"),
+        Value::Null,
+    )
+    .await
+    .1;
+    assert_eq!(detail["task"]["result"], "文档检查完成");
+    assert_eq!(detail["events"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        request(
+            &app,
+            "eve",
+            "GET",
+            &format!("/api/tasks/{task}"),
+            Value::Null
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        request(
+            &app,
+            "alice",
+            "POST",
+            &action,
+            json!({"action":"approve","expected_revision":2})
+        )
+        .await
+        .1["status"],
+        "completed"
+    );
+}
+#[tokio::test]
+async fn proposals_reject_forgery_reuse_and_rejected_confirmation() {
+    let app = setup();
+    for input in [
+        json!({"owner":"mallory","summary":"x"}),
+        json!({"owner":"alice","summary":"x"}),
+        json!({"owner":"bob","summary":" "}),
+        json!({"owner":"bob","summary":"x","request_id":"a b"}),
+    ] {
+        assert_eq!(
+            request(&app, "alice", "POST", "/api/proposals", input)
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    for field in ["requester", "status", "task_id", "revision"] {
+        let mut input = json!({"owner":"bob","summary":"x"});
+        input[field] = json!("forged");
+        assert_eq!(
+            request(&app, "alice", "POST", "/api/proposals", input)
+                .await
+                .0,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
+    let p = request(
+        &app,
+        "alice",
+        "POST",
+        "/api/proposals",
+        json!({"owner":"bob","summary":"review","request_id":"stable"}),
+    )
+    .await
+    .1;
+    assert_eq!(
+        request(
+            &app,
+            "alice",
+            "POST",
+            "/api/proposals",
+            json!({"owner":"bob","summary":"different","request_id":"stable"})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    // Keys are scoped to authenticated sender, not globally shared.
+    assert_eq!(
+        request(
+            &app,
+            "eve",
+            "POST",
+            "/api/proposals",
+            json!({"owner":"bob","summary":"different","request_id":"stable"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let path = format!("/api/proposals/{}/actions", p["id"].as_str().unwrap());
+    assert_eq!(
+        request(
+            &app,
+            "alice",
+            "POST",
+            &path,
+            json!({"action":"confirm","expected_revision":0,"summary":"mutated"})
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            request(
+                &app,
+                "alice",
+                "POST",
+                &path,
+                json!({"action":"reject","expected_revision":0})
+            )
+            .await
+            .1["status"],
+            "rejected"
+        );
+    }
+    assert_eq!(
+        request(
+            &app,
+            "alice",
+            "POST",
+            &path,
+            json!({"action":"confirm","expected_revision":0})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        request(&app, "bob", "GET", "/api/tasks", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+}
+#[tokio::test]
+async fn proposal_retries_survive_restart_without_duplicate_tasks() {
+    let dir = std::env::temp_dir().join(format!("agenct-proposal-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("hub.db");
+    let p = path.to_str().unwrap();
+    let a = app(Hub::open(config(p)).unwrap());
+    let input = json!({"owner":"bob","summary":"restart test","request_id":"persisted"});
+    let proposal = request(&a, "alice", "POST", "/api/proposals", input.clone())
+        .await
+        .1;
+    let action = format!(
+        "/api/proposals/{}/actions",
+        proposal["id"].as_str().unwrap()
+    );
+    let confirmed = request(
+        &a,
+        "alice",
+        "POST",
+        &action,
+        json!({"action":"confirm","expected_revision":0}),
+    )
+    .await
+    .1;
+    drop(a);
+    let a = app(Hub::open(config(p)).unwrap());
+    assert_eq!(
+        request(&a, "alice", "POST", "/api/proposals", input)
+            .await
+            .1,
+        confirmed
+    );
+    assert_eq!(
+        request(
+            &a,
+            "alice",
+            "POST",
+            &action,
+            json!({"action":"confirm","expected_revision":0})
+        )
+        .await
+        .1,
+        confirmed
+    );
+    assert_eq!(
+        request(&a, "bob", "GET", "/api/tasks", Value::Null)
+            .await
+            .1
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(a);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn removed_recipient_blocks_confirmation_but_not_rejection() {
+    let dir = std::env::temp_dir().join(format!("agenct-removed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("hub.db");
+    let p = path.to_str().unwrap();
+    let a = app(Hub::open(config(p)).unwrap());
+    let proposal = request(
+        &a,
+        "alice",
+        "POST",
+        "/api/proposals",
+        json!({"owner":"bob","summary":"review"}),
+    )
+    .await
+    .1;
+    let action = format!(
+        "/api/proposals/{}/actions",
+        proposal["id"].as_str().unwrap()
+    );
+    drop(a);
+    let mut changed = config(p);
+    changed.users.retain(|u| u.id != "bob");
+    let a = app(Hub::open(changed).unwrap());
+    assert_eq!(
+        request(
+            &a,
+            "alice",
+            "POST",
+            &action,
+            json!({"action":"confirm","expected_revision":0})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(&a, "alice", "GET", "/api/tasks", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+    for _ in 0..2 {
+        let (status, rejected) = request(
+            &a,
+            "alice",
+            "POST",
+            &action,
+            json!({"action":"reject","expected_revision":0}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(rejected["status"], "rejected");
+        assert_eq!(rejected["revision"], 1);
+        assert!(rejected["task_id"].is_null());
+    }
+    drop(a);
+    std::fs::remove_dir_all(dir).unwrap();
 }

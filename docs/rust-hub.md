@@ -18,7 +18,7 @@ Use Alice's token in one browser and Bob's token in another private browser wind
 
 `AGENCT_RUNTIME` must explicitly be `mock` or `dsh`. There is no automatic fallback. Mock replies never claim a real model was called. For the actual DSH adapter, see [dsh-adapter.md](dsh-adapter.md). Real mode requires separately authorized model credentials and an allowlisted provider; no real model was called during the credential-free tests.
 
-The only current UI commands are ordinary chat and `/delegate bob <summary>` (or `/delegate alice <summary>`). Delegation is a user command, **not autonomous model tool use**. All configured participants are allowed to send one-hop tasks to each other. This limited policy is intended only for a consenting two-person trial. Adding a configured user gives them a token identity and the ability to receive/send such tasks; do not treat it as a production multi-tenant policy.
+The UI supports ordinary chat and `/delegate bob <summary>` (or `/delegate alice <summary>`). `/delegate` now creates a **private proposal**, not a task. In mock mode, the bounded natural-language fixtures `请让 bob 帮我 <summary>` and `ask bob to <summary>` also create a private proposal. These are deterministic test-double patterns, **not general language understanding or live DSH model tool use**. Review the exact recipient and summary, then click confirm to share and create the task. Rejecting shares nothing. The proposal does not copy prior conversation into the shared summary. All configured participants are allowed to send one-hop tasks to each other. This limited policy is intended only for a consenting two-person trial. Adding a configured user gives them a token identity and the ability to receive/send such tasks; do not treat it as a production multi-tenant policy.
 
 Recipients accept and submit **human-authored** results. Requesters accept/return results. This is a real task lifecycle but not independent artifact/CI verification. Tasks do not read private chat history. Model replies cannot create tasks, approve results, write a repository or execute commands through the Hub.
 
@@ -34,7 +34,7 @@ All `/api/*` routes require `Authorization: Bearer <token>`; no query-string cre
 - `GET /api/tasks/{id}`: permitted task and its event log; nonparticipants receive 404.
 - `POST /api/tasks/{id}/actions` with `{ "action": "accept", "expected_revision": 0 }`, `deliver` plus a `result`, `approve`, `return`, or `cancel`.
 
-The caller cannot supply the requester, model session ID, task state or authorization. Unknown request fields are rejected. SQL values are parameterized. All state-changing task actions and events share a transaction. Repeated acceptance and terminal-state actions are rejected. There is not yet request-id idempotency for task creation; repeated create commands create separate tasks.
+The caller cannot supply the requester, model session ID, task state or authorization. Unknown request fields are rejected. SQL values are parameterized. All state-changing task actions and events share a transaction. Repeated acceptance and terminal-state actions are rejected. Proposal creation supports a sender-scoped `request_id` (1–128 ASCII letters/digits/hyphens/underscores). Same key and same content return the persisted proposal; changed content gives 409. Confirm/reject are atomic and replay-safe at the originally reviewed revision, including after restart. Confirm creates exactly one task/event. Rejection cannot later be confirmed. Direct low-level `POST /api/tasks` remains an explicit authenticated task-creation compatibility endpoint, without idempotency; models never call it and the UI no longer uses it. Ordinary model chat is not idempotent; do not automatically retry a chat timeout.
 
 ## Storage and failures
 
@@ -65,3 +65,24 @@ DSH 上下文仅传 role/content，不传消息状态或他人内容；请求超
 - 未配置提供商密钥、未进行真实模型调用；DSH 实际插件禁用行为仍需按适配器文档验收。
 
 Every task action must include the revision last reviewed by the caller. Each successful transition increments revision in the same transaction. Stale actions return 409 with no task/event mutation, including approval after return/redelivery. The UI binds buttons to the displayed revision. Existing development databases gain revision=0 on upgrade.
+
+
+## Controlled delegation acceptance (offline test double)
+
+Use two separate browser windows, one with Alice's development token and one with Bob's. In mock mode:
+
+1. Alice sends `请让 bob 帮我 检查公开文档`. A private proposal appears, with no task in Bob's window even after refresh.
+2. Alice reviews the exact recipient and shared summary and clicks **确认共享并委派**. A task is persisted atomically. Only the displayed summary, participant identities and task lifecycle are shared, not Alice's private chat.
+3. Bob refreshes, accepts and submits a **human-written** result. This does not execute code or an agent worker.
+4. Alice refreshes, sees Bob's result and approves or returns it. All actions validate identity, state and reviewed revision on the server.
+5. Replaying confirmation does not duplicate the task. Rejected proposals remain rejected. Eve cannot view or confirm Alice's proposal or task.
+
+API additions:
+- `GET /api/proposals`: only proposals created by the authenticated sender; recipients see nothing until confirmation.
+- `POST /api/proposals`: `{ "owner": "bob", "summary": "review", "request_id": "optional-client-key" }`.
+- `POST /api/proposals/{id}/actions`: `{ "action": "confirm", "expected_revision": 0 }` or `reject`. Content is immutable and cannot be supplied to confirmation.
+- `POST /api/messages` accepts optional `request_id` for recognized mock proposal fixtures only. Those fixtures persist the proposal, rather than a normal model conversation turn.
+
+DSH mode continues to return plain chat replies only; neither model text nor adapter-supplied extra JSON fields authorize delegation. The explicit `/delegate` proposal UI works in either mode. Live DSH model-backed structured proposal extraction is **not implemented or validated**. No real-time notifications, general natural-language task actions, autonomous execution, queue workers, production authorization, or multi-tenant security claims are added by this stage.
+
+Run `cargo test --manifest-path hub/Cargo.toml`, `cargo clippy --manifest-path hub/Cargo.toml --all-targets -- -D warnings`, and `node hub/web/client.test.cjs`. The UI tests use a mocked DOM, not a real browser.
