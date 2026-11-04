@@ -99,16 +99,19 @@ reviewed microVM boundary. No runtime isolation guarantee is claimed here.
 
 ## Exact blockers before real execution
 
-1. Development validation has been offline; real-Docker results must be checked
-   separately in CI. Benign smoke coverage is not hostile-input validation of
-   resource limits, output floods or general repository execution.
+1. The journal-enabled benign supervisor passed real-Docker CI at
+   `e5ac7af891eab6279c1b571f35a42bd66e64880b`
+   ([run](https://github.com/phil-zyx/agenct/actions/runs/41895662417)).
+   This is not hostile-input validation of resource limits, output floods or
+   general repository execution.
 2. A staged host supervisor and CLI adapter now exercise fixed benign fixtures.
    No production daemon transport or durable authenticated lease integration
    exists. See [staged supervisor](staged-supervisor.md) for its exact scope.
 3. Packed repositories need a bounded trusted object export/provisioning stage.
    The prototype does not shell out or fall back to reading untrusted Git config.
 4. No audited pinned image/checker profiles or isolated-kernel security review is
-   supplied. Crash cleanup and image provenance checks need implementation.
+   supplied. Production crash cleanup and image provenance checks remain gates;
+   benign container journal tests do not verify real daemon crash recovery.
 5. No Rust integration accepts the prototype's fixture results. The built-in
    consumer cannot reach `review_ready`, and no configured image bypasses that.
 
@@ -141,7 +144,8 @@ the production blockers listed above remain mandatory.
 ## Benign real-Docker CI smoke (separate from the executor)
 
 `.github/workflows/docker-boundary.yml` runs
-`python3 sandbox/docker_smoke/run.py` on a disposable GitHub-hosted Ubuntu runner.
+`python3 sandbox/docker_smoke/run.py --journal-directory "$RUNNER_TEMP/agenct-stage-journal"`
+on a disposable GitHub-hosted Ubuntu runner.
 The harness compiles a fixed, reviewed C fixture with the runner's static C
 compiler and builds a `FROM scratch` image. It pulls no base image, installs no
 packages, contacts no model or GitLab service, and accepts no repository command.

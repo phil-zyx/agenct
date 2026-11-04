@@ -61,11 +61,12 @@ Run the fixed real-Docker stage only on an authorized disposable host:
 
 `python3 sandbox/docker_smoke/run.py`
 
-The earlier boundary smoke passed in GitHub-hosted CI before this stage was added.
-This new supervisor path has only been tested offline in the development workspace;
-its real-Docker CI result must be checked separately. A passed benign run would
-establish only the exercised fixed-fixture behaviors, not safe execution of
-adversarial repositories or production readiness.
+The journal-enabled supervisor passed the real-Docker smoke on a disposable
+GitHub-hosted runner at commit `e5ac7af891eab6279c1b571f35a42bd66e64880b`:
+[verified CI run](https://github.com/phil-zyx/agenct/actions/runs/41895662417).
+This verifies only the exercised fixed-fixture lifecycle, boundary inspection,
+timeout, revocation and confirmed cleanup on that runner. It does not establish
+safe execution of adversarial repositories or production readiness.
 
 ## Gates still required for general jobs
 
@@ -118,8 +119,10 @@ recovery service. Image build/tag cleanup remains the outer smoke's in-memory
 accounting. A process crash may leave its scratch fixture image behind. Host loss,
 unreliable filesystems, malicious host owners and destruction of the journal are
 outside this stage. A new disposable CI runner cannot recover another runner's
-resources. The journal-enabled real Docker path still requires its own CI result;
-offline reopen/failure tests do not establish real daemon crash behavior.
+resources. The journal-enabled fixed-fixture path passed the CI run cited above;
+crash-window and SIGKILL recovery tests still use a fake engine. Neither those
+tests nor the benign CI run establishes real daemon crash recovery or power-loss
+durability.
 
 Authorization and deadline are rechecked after journal registration immediately
 before create. If that check fails, the supervisor removes only its known-unissued
