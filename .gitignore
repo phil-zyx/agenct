@@ -1,0 +1,9 @@
+node_modules/
+.env
+.env.*
+!.env.example
+.openai/
+*.log
+*.tar.gz
+coverage/
+.DS_Store

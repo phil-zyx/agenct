@@ -1,0 +1,14 @@
+{
+  "name": "agenct",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Chat-first, browser-local demonstration of cross-person agent delegation",
+  "license": "MIT",
+  "scripts": {
+    "test": "node test.cjs && node test-chat.cjs",
+    "check": "node --check dist/chat.js && node --check dist/chat-engine.js && node --check dist/engine.js && node --check dist/dashboard-app.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
