@@ -1,4 +1,5 @@
 //! Agenct local development control plane. Not a production authentication service.
+pub mod browser_auth;
 pub mod gitlab;
 pub mod oidc;
 mod profiles;
@@ -94,6 +95,7 @@ impl Config {
 }
 #[derive(Clone)]
 pub struct Hub {
+    browser_auth: Option<browser_auth::BrowserAuth>,
     oidc: Option<oidc::Validator>,
     _lock: Option<Arc<std::fs::File>>,
     db: Arc<Mutex<Connection>>,
@@ -190,6 +192,7 @@ UPDATE messages SET status='interrupted' WHERE status='pending';")?;
             )?;
         }
         Ok(Self {
+            browser_auth: None,
             oidc: None,
             _lock: lock,
             db: Arc::new(Mutex::new(db)),
@@ -206,13 +209,32 @@ UPDATE messages SET status='interrupted' WHERE status='pending';")?;
     /// Switches authentication exclusively to pinned external access tokens.
     /// Existing users remain the authorization roster; dev tokens no longer work.
     pub fn with_oidc(mut self, config: oidc::Config) -> std::result::Result<Self, &'static str> {
+        if self.browser_auth.is_some() {
+            return Err("choose browser sessions or API bearer validation, not both");
+        }
         self.oidc = Some(oidc::Validator::new(
             config,
             &self.users.values().cloned().collect(),
         )?);
         Ok(self)
     }
+    pub fn with_browser_auth(
+        mut self,
+        config: browser_auth::Config,
+    ) -> std::result::Result<Self, &'static str> {
+        if self.oidc.is_some() {
+            return Err("choose browser sessions or API bearer validation, not both");
+        }
+        self.browser_auth = Some(browser_auth::BrowserAuth::new(
+            config,
+            &self.users.values().cloned().collect(),
+        )?);
+        Ok(self)
+    }
     fn identity(&self, headers: &HeaderMap) -> Result<String> {
+        if let Some(auth) = &self.browser_auth {
+            return auth.identity(headers);
+        }
         if headers.get_all("authorization").iter().count() != 1 {
             return Err(Error(StatusCode::UNAUTHORIZED, "one bearer token required"));
         }
@@ -243,6 +265,10 @@ UPDATE messages SET status='interrupted' WHERE status='pending';")?;
 }
 pub fn app(hub: Hub) -> Router {
     Router::new()
+        .route("/auth/session", get(browser_auth::session))
+        .route("/auth/login", get(browser_auth::login))
+        .route("/auth/callback", get(browser_auth::callback))
+        .route("/auth/logout", post(browser_auth::logout))
         .route(
             "/health",
             get(|| async { Json(serde_json::json!({"status":"ok","stage":"development"})) }),
@@ -259,9 +285,13 @@ pub fn app(hub: Hub) -> Router {
         .route("/api/tasks", get(tasks).post(delegate))
         .route("/api/tasks/{id}", get(task_detail))
         .route("/api/tasks/{id}/actions", post(action))
-        .layer(DefaultBodyLimit::max(16 * 1024))
-        .with_state(hub)
         .fallback_service(tower_http::services::ServeDir::new("hub/web"))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(axum::middleware::from_fn_with_state(
+            hub.clone(),
+            browser_auth::guard,
+        ))
+        .with_state(hub)
 }
 async fn me(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<serde_json::Value>> {
     let id = h.identity(&headers)?;

@@ -1,19 +1,31 @@
 let token = '', user = '', epoch = 0, refreshVersion = 0;
+let browserMode = null, csrfToken = '', logoutPending = false;
 let controller = new AbortController(), pendingSend = null;
 let pollTimer = null, pollDelay = 5000, refreshFlight = null, snapshot = '', renderedBusy = '';
 const POLL_INTERVAL = 5000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000;
 const busy = new Set();
 const $ = id => document.getElementById(id);
 const status = text => { $('status').textContent = text; };
-const session = () => ({ epoch, token, user, signal: controller.signal });
-const current = context => context.epoch === epoch && context.token === token && !!token;
+const session = () => ({ epoch, token, user, browserMode, csrfToken, signal: controller.signal });
+const current = context => context.epoch === epoch && context.browserMode === browserMode
+  && (browserMode === true
+    ? !!csrfToken && context.csrfToken === csrfToken && context.user === user
+    : browserMode === false && !!token && context.token === token);
 
 async function api(context, path, method = 'GET', body) {
   if (!current(context)) throw Error('身份已变更，请重新操作');
+  const headers = { 'Content-Type': 'application/json' };
+  if (context.browserMode) {
+    // Bind reads too: another tab may have replaced the shared session cookie.
+    headers['X-CSRF-Token'] = context.csrfToken;
+  } else {
+    headers.Authorization = 'Bearer ' + context.token;
+  }
   const response = await fetch('/api/' + path, {
     method,
     signal: context.signal,
-    headers: { Authorization: 'Bearer ' + context.token, 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    headers,
     body: body ? JSON.stringify(body) : undefined
   });
   const data = await response.json();
@@ -49,6 +61,7 @@ function resetIdentity() {
   epoch++;
   refreshVersion++;
   token = '';
+  csrfToken = '';
   user = '';
   pendingSend = null;
   busy.clear();
@@ -116,7 +129,7 @@ async function poll(context) {
     if (!current(context)) return;
     if (error.httpStatus === 401) {
       resetIdentity();
-      status('登录已失效，请重新输入访问令牌。');
+      status(browserMode ? '登录已失效，请重新登录。' : '登录已失效，请重新输入访问令牌。');
       return;
     }
     pollDelay = Math.min(pollDelay * 2, MAX_POLL_DELAY);
@@ -129,7 +142,7 @@ async function poll(context) {
 document.addEventListener('visibilitychange', () => {
   clearTimeout(pollTimer);
   pollTimer = null;
-  if (!document.hidden && token && user) void poll(session());
+  if (!document.hidden && current(session()) && user) void poll(session());
 });
 
 function refresh(context = session(), force = true) {
@@ -205,7 +218,68 @@ async function readSnapshot(context) {
 
 }
 
+async function enterRoom(context) {
+  const me = await api(context, 'me');
+  if (!current(context)) return;
+  if (context.browserMode && me.user !== context.user) throw Error('登录身份已变更，请重新加载页面');
+  user = me.user;
+  context.user = user;
+  $('identity').textContent = `${user} 的管家 · 运行时 ${me.runtime} · 已验证身份`;
+  $('login').classList.add('hide');
+  $('room').classList.remove('hide');
+  await refresh(context);
+  if (current(context)) schedulePoll(context);
+}
+
+async function checkSession() {
+  resetIdentity();
+  const checkEpoch = epoch;
+  browserMode = null;
+  $('dev-login').classList.add('hide');
+  $('oidc-login').classList.add('hide');
+  $('auth-retry').classList.add('hide');
+  status('正在检查登录状态…');
+  const timeout = setTimeout(() => { if (epoch === checkEpoch) controller.abort(); }, READ_TIMEOUT);
+  try {
+    const response = await fetch('/auth/session', {
+      method: 'GET', credentials: 'same-origin', cache: 'no-store', signal: controller.signal
+    });
+    if (!response.ok) throw Error('无法检查登录状态，请重试');
+    const data = await response.json();
+    if (epoch !== checkEpoch) return;
+    if (typeof data.enabled !== 'boolean') throw Error('登录配置响应无效');
+    browserMode = data.enabled;
+    clearTimeout(timeout);
+    status('');
+    if (!browserMode) {
+      $('dev-login').classList.remove('hide');
+      return;
+    }
+    $('oidc-login').classList.remove('hide');
+    if (data.authenticated) {
+      if (typeof data.user !== 'string' || !data.user || typeof data.csrf_token !== 'string' || !data.csrf_token) {
+        throw Error('登录会话响应无效');
+      }
+      user = data.user;
+      csrfToken = data.csrf_token;
+      await enterRoom(session());
+    }
+  } catch (error) {
+    if (epoch !== checkEpoch) return;
+    resetIdentity();
+    status(error.message + '。请重试登录状态检查。');
+    $('auth-retry').classList.remove('hide');
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+$('auth-retry').onclick = () => { if (!logoutPending) return checkSession(); };
+$('oidc-login').onclick = () => {
+  if (browserMode === true && !logoutPending) window.location.assign('/auth/login');
+};
 $('enter').onclick = async () => {
+  if (browserMode !== false) return;
   const enteredToken = $('token').value;
   $('token').value = '';
   resetIdentity();
@@ -213,25 +287,44 @@ $('enter').onclick = async () => {
   const context = session();
   status('');
   try {
-    const me = await api(context, 'me');
-    if (!current(context)) return;
-    user = me.user;
-    context.user = user;
-    $('identity').textContent = `${user} 的管家 · 运行时 ${me.runtime} · 已验证身份`;
-    $('login').classList.add('hide');
-    $('room').classList.remove('hide');
-    await refresh(context);
-    schedulePoll(context);
+    await enterRoom(context);
   } catch (error) {
     if (context.epoch !== epoch) return;
     resetIdentity();
     status(error.message);
   }
 };
-$('logout').onclick = () => {
+$('logout').onclick = async () => {
+  if (logoutPending) return;
+  const context = session();
   resetIdentity();
-  $('last-refresh').textContent = '';
-  status('已清除本页身份和显示内容。已发出的服务端操作不会因退出而撤销。');
+  if (!context.browserMode) {
+    status('已清除本页身份和显示内容。已发出的服务端操作不会因退出而撤销。');
+    return;
+  }
+  const logoutEpoch = epoch;
+  logoutPending = true;
+  $('oidc-login').disabled = true;
+  status('正在退出服务器会话…');
+  const logoutController = new AbortController();
+  const timeout = setTimeout(() => logoutController.abort(), READ_TIMEOUT);
+  try {
+    const response = await fetch('/auth/logout', {
+      method: 'POST', credentials: 'same-origin', signal: logoutController.signal,
+      headers: { 'X-CSRF-Token': context.csrfToken }
+    });
+    if (!response.ok) throw Error('服务器未确认退出');
+    if (epoch === logoutEpoch) status('已退出服务器会话并清除本页内容。已发出的操作不会因退出而撤销。');
+  } catch (error) {
+    if (epoch === logoutEpoch) {
+      status('本页内容已清除，但无法确认服务器会话已退出。请检查登录状态后重试退出。');
+      $('auth-retry').classList.remove('hide');
+    }
+  } finally {
+    clearTimeout(timeout);
+    logoutPending = false;
+    $('oidc-login').disabled = false;
+  }
 };
 $('refresh').onclick = async () => {
   const context = session();
@@ -276,3 +369,5 @@ $('form').onsubmit = async event => {
     }
   }
 };
+
+void checkSession();

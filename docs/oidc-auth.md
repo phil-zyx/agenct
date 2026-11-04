@@ -5,6 +5,9 @@ The Hub can validate an external identity provider's **RFC 9068 JWT access
 production-ready login system** or an OIDC authorization-code client. It does
 not accept ID tokens. Existing loopback-only binding is unchanged.
 
+For the separate opt-in authorization-code browser flow, see
+[browser-oidc.md](browser-oidc.md). Choose one authentication mode at startup.
+
 ## Policy
 
 Set `AGENCT_OIDC_CONFIG_FILE` to an operator-controlled JSON file. If absent,
@@ -60,7 +63,7 @@ configuration failure, and disabled dev-token fallback. Tests contact no IdP.
 
 ## Remaining deployment requirements
 
-There is no browser login redirect, PKCE/state/nonce flow, refresh-token storage,
+This API bearer-validation mode has no browser login redirect, PKCE/state/nonce flow, refresh-token storage,
 logout/revocation/introspection, automatic key rotation, IdP tenant setup, or
 real-provider integration test. No credentials were created or configured.
 Current UI manual bearer entry is a local acceptance aid, not a production

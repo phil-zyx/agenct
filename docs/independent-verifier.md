@@ -121,3 +121,19 @@ budgets, deterministic source contexts, read-only source archive comparison,
 base-image ONBUILD/volume rejection, wrong image/writable source observations,
 stdout-forged evidence rejection and unconditional runtime disablement. These are
 unit/protocol tests, not a substitute for Docker smoke tests or security review.
+
+
+## Integration gate verified while runtime is unavailable
+
+The Rust consumer now checks a default-deny, sealed executor preflight before it
+claims a queued job or calls an input provider. The only ready implementation is
+an in-crate test fixture. The disabled Docker implementation leaves a queued job
+untouched and cannot consume model/provider resources. This is a verified safety
+integration, not a real execution integration.
+
+A current environment check found neither a Docker CLI nor a local Docker socket.
+No daemon client, audited image or external trusted supervisor is available here.
+Implementing another fixture-only adapter cannot establish that real immutable
+mounts, namespace isolation, daemon observations, revocation and cleanup work.
+Consequently no runtime adapter was enabled and no “verified execution” result is
+reported. The production blockers listed above remain mandatory.

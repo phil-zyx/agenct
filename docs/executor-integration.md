@@ -15,6 +15,9 @@ runner does not isolate the verifier from the code being tested.
 
 The built-in path now fails closed:
 
+- `consume_one` checks sealed executor preflight **before claiming a lease or
+  calling an input provider**. Disabled execution leaves the job queued with zero
+  attempts and makes no source/model request.
 - `DockerExecutor::run` launches no process and returns `ExecutorUnavailable`,
   even with a valid pinned image and allowed check configuration.
 - `sandbox/runner.py` always exits unsuccessfully without cloning, applying a

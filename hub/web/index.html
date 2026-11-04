@@ -3,19 +3,14 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Agenct · Rust Hub</title>
-<style>
-body{font:16px system-ui;max-width:760px;margin:40px auto;padding:20px;background:#f7f9f6;color:#183b31}
-textarea,input,button{font:inherit;padding:12px;border:1px solid #bbcfc5;border-radius:8px}
-textarea{width:95%;min-height:80px}button{cursor:pointer;background:#173e32;color:white;margin:5px}
-button:disabled{opacity:.5;cursor:wait}
-article{padding:16px;background:white;border:1px solid #d5e0d8;border-radius:12px;margin:12px 0;white-space:pre-wrap;overflow-wrap:anywhere}
-small{color:#56675f}#status{white-space:pre-wrap;color:#8b332a}.hide{display:none}
-</style>
+<link rel="stylesheet" href="style.css">
 <h1>Agenct</h1>
 <p>一个窗口，与你的管家协作。</p>
-<small>开发验证版 · 仅本机 · 无真实代码执行或 GitHub 发布。令牌只保留在页面内存。</small>
+<small>验证版 · 无真实代码执行或 GitHub 发布。开发令牌仅保留在页面内存；浏览器登录由服务器管理会话。</small>
 <section id="login">
-  <p><input type="password" id="token" placeholder="输入开发访问令牌" aria-label="开发访问令牌" autocomplete="off"><button id="enter">进入</button></p>
+  <p id="dev-login" class="hide"><input type="password" id="token" placeholder="输入开发访问令牌" aria-label="开发访问令牌" autocomplete="off"><button id="enter">进入</button></p>
+  <button id="oidc-login" class="hide">通过身份提供方登录</button>
+  <button id="auth-retry" class="hide">重试登录状态检查</button>
 </section>
 <section id="room" class="hide">
   <p id="identity"></p>

@@ -36,6 +36,11 @@ mod sealed {
     pub trait TrustedEvidence {}
 }
 pub trait Executor: sealed::TrustedEvidence {
+    /// Fail closed before reserving work or invoking a provider. Only an independently
+    /// reviewed runtime may override this; configuration alone is not evidence of readiness.
+    fn preflight(&self) -> Result<()> {
+        Err(Error::ExecutorUnavailable)
+    }
     /// Must terminate work when still_authorized returns false, and return only observed evidence.
     fn run(
         &mut self,
@@ -65,6 +70,8 @@ pub fn consume_one(
     provider: &mut dyn InputProvider,
     executor: &mut dyn Executor,
 ) -> Result<Outcome> {
+    // No lease mutation or source/model request is allowed while verification is disabled.
+    executor.preflight()?;
     let runner = policy
         .executor_id
         .as_deref()
@@ -276,6 +283,10 @@ mod tests {
     }
     impl sealed::TrustedEvidence for FakeExecutor {}
     impl Executor for FakeExecutor {
+        // Test-only fixture, never a configured production implementation.
+        fn preflight(&self) -> Result<()> {
+            Ok(())
+        }
         fn run(&mut self, input: &RunInput, valid: &mut dyn FnMut() -> bool) -> Result<Candidate> {
             self.called = true;
             assert!(valid());
@@ -427,11 +438,16 @@ mod tests {
             checks: BTreeMap::from([("unit".into(), vec!["true".into()])]),
         };
         assert!(matches!(
-            consume_one(&mut db, &policy, &mut source, &mut executor).unwrap(),
-            Outcome::Failed { .. }
+            consume_one(&mut db, &policy, &mut source, &mut executor),
+            Err(Error::ExecutorUnavailable)
         ));
         let (job, candidate) = worker::inspect(&db, "bob", &id).unwrap();
-        assert_eq!(job.status, "failed");
+        assert_eq!(job.status, "queued");
+        assert_eq!(job.attempt, 0);
         assert!(candidate.is_none());
+        assert!(
+            source.by_job.contains_key(&id),
+            "disabled executor must not call provider"
+        );
     }
 }
