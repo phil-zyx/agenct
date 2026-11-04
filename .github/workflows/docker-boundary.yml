@@ -1,0 +1,22 @@
+name: Benign Docker boundary smoke
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  benign-docker:
+    # Disposable GitHub-hosted runner only; never use a persistent/self-hosted host.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify disabled runtime and offline protocol
+        run: python3 -m unittest discover -s sandbox -p 'test*.py' -v
+      - name: Test fixed benign fixtures against real Docker
+        # No secrets, service credentials, repository test command, pulled base
+        # image, host bind mounts, or Docker socket inside the scratch container.
+        run: python3 sandbox/docker_smoke/run.py

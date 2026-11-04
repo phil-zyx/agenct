@@ -137,3 +137,35 @@ Implementing another fixture-only adapter cannot establish that real immutable
 mounts, namespace isolation, daemon observations, revocation and cleanup work.
 Consequently no runtime adapter was enabled and no “verified execution” result is
 reported. The production blockers listed above remain mandatory.
+
+## Benign real-Docker CI smoke (separate from the executor)
+
+`.github/workflows/docker-boundary.yml` runs
+`python3 sandbox/docker_smoke/run.py` on a disposable GitHub-hosted Ubuntu runner.
+The harness compiles a fixed, reviewed C fixture with the runner's static C
+compiler and builds a `FROM scratch` image. It pulls no base image, installs no
+packages, contacts no model or GitLab service, and accepts no repository command.
+Checkout credentials are not persisted, and no Actions secret is passed to the
+harness. Docker receives a minimal environment and empty client configuration;
+there are no host binds or Docker sockets inside a container.
+
+The harness uses independently hashed, fixed in-memory Git objects to obtain a
+snapshot, verifies `docker cp`'s archive from a never-started container, then
+runs the existing read-only plan against the immutable daemon image ID. A fixed
+probe checks nonroot identity, read-only source contents, absence of `.git`, and
+writable scratch/tmp directories. Actual daemon inspection is checked against
+the existing policy validator. A second fixed sleep fixture checks bounded wait,
+explicit termination and unsuccessful terminal state. A `finally` path removes
+only the harness's uniquely named resources and fails if they remain.
+
+This is intentionally **not** a supervisor, an audited general-purpose base
+image, or evidence that arbitrary untrusted code is safe. It does not exercise
+model-generated code, required behavior checks, crash/orphan reconciliation,
+permission revocation, resource-exhaustion attacks or Rust worker completion.
+The existing validator retains its `offline-fixture-only` result label; this
+harness does not turn that object into a runtime attestation. All production
+execution gates remain disabled. A green run only establishes that these
+specific benign checks passed on that runner, and should be cited with its
+actual CI run, never inferred from local unit tests. The development workspace
+still has no Docker daemon, so the initial local checks cover compilation,
+fixture construction and the offline suites only.
