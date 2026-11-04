@@ -59,7 +59,7 @@ npm run check
 
 ### Controlled delegation demo
 
-The Rust chat UI now supports sender-private delegation proposals, explicit sharing confirmation, recipient acceptance/manual reply and requester acceptance. In `mock` mode, try `请让 bob 帮我 检查公开文档` or `ask bob to review the public docs`. This is a **deterministic test double**, not live DSH language understanding. `/delegate bob ...` also prepares a proposal rather than immediately sharing. See [the acceptance walkthrough and limitations](docs/rust-hub.md#controlled-delegation-acceptance-offline-test-double). The browser-only `dist/` simulation remains separate.
+The Rust chat UI now supports sender-private delegation proposals, explicit sharing confirmation, recipient acceptance/manual reply and requester acceptance. In `mock` mode, try `请让 bob 帮我检查公开文档` (optional whitespace after `帮我`) or `ask bob to review the public docs`. This is a **deterministic test double**, not live DSH language understanding. `/delegate bob ...` also prepares a proposal rather than immediately sharing. See [the acceptance walkthrough and limitations](docs/rust-hub.md#controlled-delegation-acceptance-offline-test-double). The browser-only `dist/` simulation remains separate.
 
 ## 当前能力与明确缺口
 

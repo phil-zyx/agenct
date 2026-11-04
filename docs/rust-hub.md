@@ -18,7 +18,7 @@ Use Alice's token in one browser and Bob's token in another private browser wind
 
 `AGENCT_RUNTIME` must explicitly be `mock` or `dsh`. There is no automatic fallback. Mock replies never claim a real model was called. For the actual DSH adapter, see [dsh-adapter.md](dsh-adapter.md). Real mode requires separately authorized model credentials and an allowlisted provider; no real model was called during the credential-free tests.
 
-The UI supports ordinary chat and `/delegate bob <summary>` (or `/delegate alice <summary>`). `/delegate` now creates a **private proposal**, not a task. In mock mode, the bounded natural-language fixtures `请让 bob 帮我 <summary>` and `ask bob to <summary>` also create a private proposal. These are deterministic test-double patterns, **not general language understanding or live DSH model tool use**. Review the exact recipient and summary, then click confirm to share and create the task. Rejecting shares nothing. The proposal does not copy prior conversation into the shared summary. All configured participants are allowed to send one-hop tasks to each other. This limited policy is intended only for a consenting two-person trial. Adding a configured user gives them a token identity and the ability to receive/send such tasks; do not treat it as a production multi-tenant policy.
+The UI supports ordinary chat and `/delegate bob <summary>` (or `/delegate alice <summary>`). `/delegate` now creates a **private proposal**, not a task. In mock mode, the bounded natural-language fixtures `请让 bob 帮我<summary>` (optional whitespace after `帮我`) and `ask bob to <summary>` also create a private proposal. These are deterministic test-double patterns, **not general language understanding or live DSH model tool use**. Review the exact recipient and summary, then click confirm to share and create the task. Rejecting shares nothing. The proposal does not copy prior conversation into the shared summary. All configured participants are allowed to send one-hop tasks to each other. This limited policy is intended only for a consenting two-person trial. Adding a configured user gives them a token identity and the ability to receive/send such tasks; do not treat it as a production multi-tenant policy.
 
 Recipients accept and submit **human-authored** results. Requesters accept/return results. This is a real task lifecycle but not independent artifact/CI verification. Tasks do not read private chat history. Model replies cannot create tasks, approve results, write a repository or execute commands through the Hub.
 
@@ -71,7 +71,7 @@ Every task action must include the revision last reviewed by the caller. Each su
 
 Use two separate browser windows, one with Alice's development token and one with Bob's. In mock mode:
 
-1. Alice sends `请让 bob 帮我 检查公开文档`. A private proposal appears, with no task in Bob's window even after refresh.
+1. Alice sends `请让 bob 帮我检查公开文档` (a space after `帮我` is also accepted). A private proposal appears, with no task in Bob's window even after refresh.
 2. Alice reviews the exact recipient and shared summary and clicks **确认共享并委派**. A task is persisted atomically. Only the displayed summary, participant identities and task lifecycle are shared, not Alice's private chat.
 3. Bob waits for the visible-tab poll (or refreshes), accepts and submits a **human-written** result. This does not execute code or an agent worker.
 4. Alice waits for the visible-tab poll (or refreshes), sees Bob's result and approves or returns it. All actions validate identity, state and reviewed revision on the server.

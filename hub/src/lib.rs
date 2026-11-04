@@ -637,7 +637,8 @@ fn mock_delegation(message: &str) -> Option<(String, String)> {
         .or_else(|| text.strip_prefix("ask "))?;
     let (owner, rest) = rest.split_once(' ')?;
     let summary = rest
-        .strip_prefix("帮我 ")
+        .strip_prefix("帮我")
+        .map(str::trim_start)
         .or_else(|| rest.strip_prefix("to "))?;
     Some((owner.to_owned(), summary.to_owned()))
 }

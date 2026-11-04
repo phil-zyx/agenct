@@ -992,3 +992,70 @@ async fn dsh_requires_explicit_nullable_proposal_field() {
         server.abort();
     }
 }
+
+#[tokio::test]
+async fn mock_chinese_summary_accepts_optional_whitespace_without_task_authority() {
+    let app = setup();
+    for (index, separator) in ["", " ", "  ", "\t", "\u{3000}"].iter().enumerate() {
+        let (status, response) = request(
+            &app,
+            "alice",
+            "POST",
+            "/api/messages",
+            json!({
+                "message":format!("请让 bob 帮我{separator}整理公开文档"),
+                "request_id":format!("spacing-{index}")
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["backend"], "mock");
+        assert_eq!(response["proposal"]["owner"], "bob");
+        assert_eq!(response["proposal"]["summary"], "整理公开文档");
+        assert_eq!(response["proposal"]["status"], "pending");
+    }
+    for message in [
+        "请让 bob 帮我",
+        "请让 bob 帮我   ",
+        "请让 bob 帮我\u{3000}",
+        "请让 mallory 帮我整理文档",
+        "请让 alice 帮我整理文档",
+    ] {
+        assert_eq!(
+            request(
+                &app,
+                "alice",
+                "POST",
+                "/api/messages",
+                json!({"message":message})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // English still requires the explicit 'to ' boundary, not a prefix such as 'today'.
+    let (_, response) = request(
+        &app,
+        "alice",
+        "POST",
+        "/api/messages",
+        json!({"message":"ask bob today"}),
+    )
+    .await;
+    assert!(response["proposal"].is_null());
+    for user in ["alice", "bob"] {
+        assert_eq!(
+            request(&app, user, "GET", "/api/tasks", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+    }
+    assert_eq!(
+        request(&app, "bob", "GET", "/api/proposals", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+}
