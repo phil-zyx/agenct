@@ -4,3 +4,5 @@ textarea{width:95%;min-height:80px}button{cursor:pointer;background:#173e32;colo
 button:disabled{opacity:.5;cursor:wait}
 article{padding:16px;background:white;border:1px solid #d5e0d8;border-radius:12px;margin:12px 0;white-space:pre-wrap;overflow-wrap:anywhere}
 small{color:#56675f}#status{white-space:pre-wrap;color:#8b332a}.hide{display:none}
+
+#turn-recovery{border:1px solid #ad6d32;border-radius:12px;background:#fff6e9;padding:12px;margin:12px 0}#turn-status{white-space:pre-wrap;overflow-wrap:anywhere}

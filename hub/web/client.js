@@ -1,8 +1,10 @@
 let token = '', user = '', epoch = 0, refreshVersion = 0;
 let browserMode = null, csrfToken = '', logoutPending = false;
-let controller = new AbortController(), pendingSend = null;
+let controller = new AbortController(), pendingSend = null, pendingTurn = null;
+let turnStorageAvailable = true;
+const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 let pollTimer = null, pollDelay = 5000, refreshFlight = null, snapshot = '', renderedBusy = '';
-const POLL_INTERVAL = 5000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000;
+const POLL_INTERVAL = 5000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000, CHAT_SEND_TIMEOUT = 90000;
 const busy = new Set();
 const $ = id => document.getElementById(id);
 const status = text => { $('status').textContent = text; };
@@ -38,6 +40,25 @@ async function api(context, path, method = 'GET', body) {
   return data;
 }
 
+async function postChat(context, body) {
+  const request = new AbortController();
+  let timedOut = false;
+  const abort = () => request.abort();
+  context.signal.addEventListener('abort', abort, { once: true });
+  // Longer than the Hub adapter timeout; aborting only ends this browser wait.
+  const timeout = setTimeout(() => { timedOut = true; abort(); }, CHAT_SEND_TIMEOUT);
+  try {
+    return await api({ ...context, signal: request.signal }, 'messages', 'POST', body);
+  } catch (error) {
+    if (timedOut) throw Error('发送等待超时');
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    context.signal.removeEventListener('abort', abort);
+    request.abort();
+  }
+}
+
 function article(text) {
   const element = document.createElement('article');
   element.textContent = text;
@@ -48,7 +69,61 @@ const profileUI = createProfileUI({ api, current, article, conversation: () => $
 
 const workerUI = createWorkerUI({ api, current, article, conversation: () => $('conversation') });
 
-function resetIdentity() {
+// Only a recovery receipt is kept for this tab. Never persist credentials or chat text.
+function forgetTurn() {
+  pendingTurn = null;
+  try { sessionStorage.removeItem(TURN_STORAGE_KEY); } catch { turnStorageAvailable = false; }
+  renderTurn();
+}
+
+function rememberTurn(context) {
+  try {
+    sessionStorage.setItem(TURN_STORAGE_KEY, JSON.stringify({
+      id: pendingTurn.id, user: context.user, browserMode: context.browserMode
+    }));
+    turnStorageAvailable = true;
+  } catch { turnStorageAvailable = false; }
+}
+
+function restoreTurn(context) {
+  let saved;
+  try { saved = JSON.parse(sessionStorage.getItem(TURN_STORAGE_KEY)); }
+  catch { turnStorageAvailable = false; }
+  if (saved && saved.user === context.user && saved.browserMode === context.browserMode
+      && typeof saved.id === 'string' && /^[a-f0-9-]{36}$/.test(saved.id)) {
+    pendingTurn = { id: saved.id, status: 'uncertain', text: null };
+    renderTurn();
+  } else {
+    forgetTurn();
+  }
+}
+
+function renderTurn() {
+  const waiting = !!pendingTurn;
+  $('turn-recovery').classList[waiting ? 'remove' : 'add']('hide');
+  $('turn-status').textContent = waiting
+    ? (pendingTurn.status === 'pending' ? '消息仍在处理中，尚未确认完成。' : '上次发送的结果尚未确认，可能已经处理。')
+      + '\n请求编号：' + pendingTurn.id + '\n不会自动重发。请先核对发送状态。'
+      + (turnStorageAvailable ? '' : '\n当前浏览器无法保存恢复凭据，请先记下请求编号，刷新后将无法自动恢复。')
+    : '';
+  $('check-turn').disabled = !waiting || busy.has('send') || busy.has('turn-check');
+  $('new-turn').disabled = !waiting || busy.has('send') || busy.has('turn-check');
+  $('send').disabled = waiting || busy.has('send');
+}
+
+async function completeTurn(context, response) {
+  const text = pendingTurn.text;
+  forgetTurn();
+  if (text !== null && $('text').value.trim() === text) $('text').value = '';
+  status('已核实消息处理完成。');
+  try { await refresh(context); }
+  catch (error) {
+    if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message
+      + (typeof response.reply === 'string' ? '\n已保存的回复：' + response.reply : ''));
+  }
+}
+
+function resetIdentity({ preserveRecovery = false } = {}) {
   clearTimeout(pollTimer);
   pollTimer = null;
   refreshFlight = null;
@@ -67,7 +142,10 @@ function resetIdentity() {
   csrfToken = '';
   user = '';
   pendingSend = null;
+  pendingTurn = null;
   busy.clear();
+  if (!preserveRecovery) forgetTurn();
+  else renderTurn();
   $('conversation').replaceChildren();
   $('identity').textContent = '';
   $('text').value = '';
@@ -131,7 +209,7 @@ async function poll(context) {
   } catch (error) {
     if (!current(context)) return;
     if (error.httpStatus === 401) {
-      resetIdentity();
+      resetIdentity({ preserveRecovery: true });
       status(browserMode ? '登录已失效，请重新登录。' : '登录已失效，请重新输入访问令牌。');
       return;
     }
@@ -230,6 +308,7 @@ async function enterRoom(context) {
   if (context.browserMode && me.user !== context.user) throw Error('登录身份已变更，请重新加载页面');
   user = me.user;
   context.user = user;
+  restoreTurn(context);
   $('identity').textContent = `${user} 的管家 · 运行时 ${me.runtime} · 已验证身份`;
   $('login').classList.add('hide');
   $('room').classList.remove('hide');
@@ -238,7 +317,7 @@ async function enterRoom(context) {
 }
 
 async function checkSession() {
-  resetIdentity();
+  resetIdentity({ preserveRecovery: true });
   const checkEpoch = epoch;
   browserMode = null;
   $('dev-login').classList.add('hide');
@@ -270,9 +349,10 @@ async function checkSession() {
       csrfToken = data.csrf_token;
       await enterRoom(session());
     }
+    // An expired/unknown login does not establish a different receipt owner.
   } catch (error) {
     if (epoch !== checkEpoch) return;
-    resetIdentity();
+    resetIdentity({ preserveRecovery: true });
     status(error.message + '。请重试登录状态检查。');
     $('auth-retry').classList.remove('hide');
   } finally {
@@ -288,7 +368,7 @@ $('enter').onclick = async () => {
   if (browserMode !== false) return;
   const enteredToken = $('token').value;
   $('token').value = '';
-  resetIdentity();
+  resetIdentity({ preserveRecovery: true });
   token = enteredToken;
   const context = session();
   status('');
@@ -296,7 +376,7 @@ $('enter').onclick = async () => {
     await enterRoom(context);
   } catch (error) {
     if (context.epoch !== epoch) return;
-    resetIdentity();
+    resetIdentity({ preserveRecovery: true });
     status(error.message);
   }
 };
@@ -337,17 +417,67 @@ $('refresh').onclick = async () => {
   try { await refresh(context); }
   catch (error) { if (current(context)) status(error.message); }
 };
+$('check-turn').onclick = async () => {
+  const context = session(), turn = pendingTurn;
+  if (!current(context) || !turn || busy.has('send') || busy.has('turn-check')) return;
+  busy.add('turn-check');
+  renderTurn();
+  status('正在核对发送状态…');
+  const reads = new AbortController();
+  const abort = () => reads.abort();
+  context.signal.addEventListener('abort', abort, { once: true });
+  const timeout = setTimeout(abort, READ_TIMEOUT);
+  try {
+    const receipt = await api({ ...context, signal: reads.signal }, 'turns/' + encodeURIComponent(turn.id));
+    if (!current(context) || pendingTurn !== turn) return;
+    if (receipt.request_id !== turn.id || !['complete', 'pending', 'uncertain'].includes(receipt.status)
+        || (receipt.status === 'complete' && (!receipt.response || typeof receipt.response !== 'object'))) {
+      throw Error('发送状态响应无效');
+    }
+    if (receipt.status === 'complete') {
+      await completeTurn(context, receipt.response);
+    } else {
+      turn.status = receipt.status;
+      status(receipt.status === 'pending' ? '服务端仍在处理。稍后可再次核对，未重发消息。' : '服务端无法确认上次处理结果。未重发消息。');
+    }
+  } catch (error) {
+    if (!current(context) || pendingTurn !== turn) return;
+    status(error.httpStatus === 404
+      ? '当前账号未找到这条发送记录，仍无法确认上次结果。未重发消息。'
+      : error.message + '。暂时无法核对上次结果，未重发消息。');
+  } finally {
+    clearTimeout(timeout);
+    context.signal.removeEventListener('abort', abort);
+    reads.abort();
+    if (current(context)) {
+      busy.delete('turn-check');
+      renderTurn();
+    }
+  }
+};
+
+$('new-turn').onclick = () => {
+  const context = session(), turn = pendingTurn;
+  if (!current(context) || !turn || busy.has('send') || busy.has('turn-check')) return;
+  if (!confirm('上一次发送的结果仍未知，消息可能已经处理。开始新尝试后再次发送可能重复处理。是否放弃此恢复凭据并开始新尝试？')) return;
+  if (!current(context) || pendingTurn !== turn) return;
+  forgetTurn();
+  status('已开始新尝试。请核对输入内容，再点击发送；将使用新的请求编号。上次操作不会被撤销。');
+};
+
 $('form').onsubmit = async event => {
   event.preventDefault();
   const context = session();
   const text = $('text').value.trim();
   if (!text || !current(context) || busy.has('send')) return;
+  if (pendingTurn) {
+    status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
+    return;
+  }
   busy.add('send');
-  $('send').disabled = true;
+  renderTurn();
   status('');
-  // Reuse the request ID after an uncertain send of the unchanged draft.
-  if (!pendingSend || pendingSend.text !== text) pendingSend = { text, id: crypto.randomUUID() };
-  const requestId = pendingSend.id;
+  let chatTurn = null;
   try {
     if (await profileUI.handle(context, text)) {
       if (current(context)) {
@@ -356,22 +486,50 @@ $('form').onsubmit = async event => {
       }
       return;
     }
-    const delegation = text.match(/^\/delegate\s+([a-zA-Z0-9_-]+)\s+([\s\S]+)$/);
-    await api(context, delegation ? 'proposals' : 'messages', 'POST', delegation
-      ? { owner: delegation[1], summary: delegation[2], request_id: requestId }
-      : { message: text, request_id: requestId });
+    // A profile read may finish after logout or a different login.
     if (!current(context)) return;
-    pendingSend = null;
-    if ($('text').value.trim() === text) $('text').value = '';
-    await refresh(context);
+    const delegation = text.match(/^\/delegate\s+([a-zA-Z0-9_-]+)\s+([\s\S]+)$/);
+    if (delegation) {
+      // Proposal creation retains its existing, explicit idempotent retry behavior.
+      if (!pendingSend || pendingSend.text !== text) pendingSend = { text, id: crypto.randomUUID() };
+      await api(context, 'proposals', 'POST', {
+        owner: delegation[1], summary: delegation[2], request_id: pendingSend.id
+      });
+      if (!current(context)) return;
+      pendingSend = null;
+      if ($('text').value.trim() === text) $('text').value = '';
+      await refresh(context);
+    } else {
+      chatTurn = { text, id: crypto.randomUUID(), status: 'pending' };
+      pendingTurn = chatTurn;
+      rememberTurn(context);
+      renderTurn();
+      const response = await postChat(context, { message: text, request_id: chatTurn.id });
+      if (!current(context) || pendingTurn !== chatTurn) return;
+      const receipt = response.turn;
+      if (!receipt || receipt.request_id !== chatTurn.id || !['complete', 'pending', 'uncertain'].includes(receipt.status)) {
+        throw Error('发送状态响应无效');
+      }
+      if (receipt.status === 'complete') {
+        await completeTurn(context, response);
+      } else {
+        chatTurn.status = receipt.status;
+        status('尚未确认消息处理完成。请核对发送状态；不会自动重发。');
+      }
+    }
   } catch (error) {
     if (!current(context)) return;
-    status(error.message + '。发送结果可能需要核对，请刷新查看。');
-    await refresh(context).catch(() => {});
+    if (chatTurn && pendingTurn === chatTurn) {
+      chatTurn.status = 'uncertain';
+      status(error.message + '。发送结果未知，请核对发送状态；不会自动重发。');
+    } else {
+      status(error.message + '。发送结果可能需要核对，请刷新查看。');
+      await refresh(context).catch(() => {});
+    }
   } finally {
     if (current(context)) {
       busy.delete('send');
-      $('send').disabled = false;
+      renderTurn();
     }
   }
 };

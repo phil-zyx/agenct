@@ -71,3 +71,12 @@ The Rust chat UI now supports sender-private delegation proposals, explicit shar
 - 确认委派是聊天 UI 的流程保证；兼容 `POST /api/tasks` 接口可直接创建任务且不幂等。普通模型聊天超时也不能自动重试。
 
 完整边界见 [架构](docs/architecture.md)，后续验收门槛见 [路线图](docs/roadmap.md)。离线/API/模拟 DOM 测试通过不等于真实浏览器、提供商或沙箱验收。
+
+### Durable chat recovery
+
+The Rust chat client now retains owner-scoped turn receipts across a tab refresh
+and checks an uncertain request's status instead of resending it. Keyed API calls
+are dispatched at most once per owner/request ID; replies and private proposals
+commit atomically with their receipt. Legacy API calls without a request ID are
+not deduplicated. This does not enable code execution or publication. See
+[recovery behavior and limits](docs/chat-turn-recovery.md).

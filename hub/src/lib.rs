@@ -1,5 +1,6 @@
 //! Agenct local development control plane. Not a production authentication service.
 pub mod browser_auth;
+mod chat_turns;
 pub mod gitlab;
 pub mod oidc;
 mod profiles;
@@ -175,6 +176,7 @@ CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, requester TEXT NOT NU
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 UPDATE messages SET status='interrupted' WHERE status='pending';")?;
         profiles::initialize(&db)?;
+        chat_turns::initialize(&db)?;
         worker::migrate(&db).map_err(|_| "worker schema migration failed")?;
         let has_revision: bool = db
             .prepare("PRAGMA table_info(tasks)")?
@@ -283,7 +285,8 @@ pub fn app(hub: Hub) -> Router {
             get(profiles::get_profile).put(profiles::update_profile),
         )
         .route("/api/profile/catalog", get(profiles::catalog))
-        .route("/api/messages", get(messages).post(chat))
+        .route("/api/messages", get(messages).post(chat_turns::chat))
+        .route("/api/turns/{id}", get(chat_turns::status))
         .route("/api/proposals", get(proposals).post(propose))
         .route("/api/proposals/{id}/actions", post(proposal_action))
         .route("/api/tasks", get(tasks).post(delegate))
@@ -370,56 +373,66 @@ impl AdapterReply {
             })
     }
 }
-async fn chat(
-    State(h): State<Hub>,
-    headers: HeaderMap,
-    Json(input): Json<ChatInput>,
+async fn execute_chat(
+    h: &Hub,
+    id: &str,
+    input: &ChatInput,
+    runtime_profile: profiles::RuntimeProfile,
 ) -> Result<Json<serde_json::Value>> {
-    let id = h.identity(&headers)?;
-    if input.message.trim().is_empty() || input.message.len() > 8000 {
-        return Err(invalid("message must contain 1..8000 bytes"));
-    }
-    let _guard = h
-        .gates
-        .get(&id)
-        .unwrap()
-        .try_lock()
-        .map_err(|_| Error(StatusCode::CONFLICT, "a turn is already running"))?;
-    let runtime_profile = profiles::route(&*h.db()?, &id, input.agent_id.as_deref())?;
     // The deterministic mock is a test double, not a model or DSH tool call.
     // No prior/private history is consulted when constructing the shared summary.
     if matches!(h.runtime, Runtime::Mock) {
         if let Some((owner, summary)) = mock_delegation(&input.message) {
-            let proposal = save_proposal(
-                &h,
-                &id,
+            if owner == id
+                || !h.gates.contains_key(&owner)
+                || summary.trim().is_empty()
+                || summary.len() > 4000
+            {
+                return Err(invalid(
+                    "select another configured participant and bounded summary",
+                ));
+            }
+            let mut db = h.db()?;
+            let tx = db.transaction()?;
+            let proposal = save_proposal_tx(
+                &tx,
+                id,
                 &owner,
                 &summary,
                 input.request_id.as_deref(),
                 &input.message,
             )?;
-            return Ok(Json(serde_json::json!({
+            let mut response = serde_json::json!({
                 "reply":"[MOCK · deterministic test double] 请检查接收人和将共享的任务内容，再明确确认。确认前对方不会收到任务。",
                 "backend":"mock", "proposal":proposal, "runtime_profile":runtime_profile
-            })));
+            });
+            chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
+            tx.commit()?;
+            return Ok(Json(response));
         }
     }
-    let prior: Vec<_> = history(&h, &id)?
+    let prior: Vec<_> = history(h, id)?
         .into_iter()
         .filter(|m| m.status == "complete")
         .collect();
     let (message_id, session_id) = {
-        let db = h.db()?;
-        db.execute(
+        let mut db = h.db()?;
+        let tx = db.transaction()?;
+        tx.execute(
             "INSERT INTO messages(owner,role,content,status) VALUES (?1,'user',?2,'pending')",
             params![id, input.message],
         )?;
-        let sid: String = db.query_row(
+        let message_id = tx.last_insert_rowid();
+        if let Some(key) = input.request_id.as_deref() {
+            tx.execute("UPDATE chat_turns SET message_id=?3 WHERE owner=?1 AND request_id=?2 AND status='pending'", params![id,key,message_id])?;
+        }
+        let sid: String = tx.query_row(
             "SELECT session_id FROM sessions WHERE owner=?1",
-            [&id],
+            [id],
             |r| r.get(0),
         )?;
-        (db.last_insert_rowid(), sid)
+        tx.commit()?;
+        (message_id, sid)
     };
     let answer=match &h.runtime {
         Runtime::Mock=>Ok(AdapterReply {reply: format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。",prior.len()), backend:"mock".into(), proposal:None}),
@@ -430,7 +443,7 @@ async fn chat(
             }
             let response=h.client.post(url).bearer_auth(token).json(&payload).send().await;
             match response {
-                Ok(r) if r.status().is_success()=>match r.json::<AdapterReply>().await {Ok(r) if r.valid(&h,&id,&input.message)=>Ok(r),_=>Err(())},
+                Ok(r) if r.status().is_success()=>match r.json::<AdapterReply>().await {Ok(r) if r.valid(h,id,&input.message)=>Ok(r),_=>Err(())},
                 _=>Err(()),
             }
         }
@@ -447,7 +460,7 @@ async fn chat(
                 .map(|p| {
                     save_proposal_tx(
                         &tx,
-                        &id,
+                        id,
                         &p.owner,
                         &p.summary,
                         input.request_id.as_deref(),
@@ -472,10 +485,10 @@ async fn chat(
                 [message_id],
             )?;
             tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
+            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile});
+            chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
-            Ok(Json(
-                serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile}),
-            ))
+            Ok(Json(response))
         }
         Err(()) => {
             tx.execute(
@@ -679,6 +692,19 @@ fn save_proposal(
         return Err(invalid("summary must contain 1..4000 bytes"));
     }
     let mut db = h.db()?;
+    if let Some(key) = request_id {
+        let collision: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chat_turns WHERE owner=?1 AND request_id=?2)",
+            params![requester, key],
+            |r| r.get(0),
+        )?;
+        if collision {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "request_id already used by chat endpoint",
+            ));
+        }
+    }
     let tx = db.transaction()?;
     let proposal = save_proposal_tx(&tx, requester, owner, summary, request_id, source)?;
     tx.commit()?;
