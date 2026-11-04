@@ -99,11 +99,12 @@ reviewed microVM boundary. No runtime isolation guarantee is claimed here.
 
 ## Exact blockers before real execution
 
-1. No Docker daemon/CLI exists in this development environment. No image build,
-   stopped-container export, real read-only check, cancellation, timeout, resource
-   limit, output flood or cleanup test has been performed.
-2. No trusted daemon client or supervisor has been implemented. The plan and
-   observation fixtures do not create, start or inspect a real container.
+1. Development validation has been offline; real-Docker results must be checked
+   separately in CI. Benign smoke coverage is not hostile-input validation of
+   resource limits, output floods or general repository execution.
+2. A staged host supervisor and CLI adapter now exercise fixed benign fixtures.
+   No production daemon transport or durable authenticated lease integration
+   exists. See [staged supervisor](staged-supervisor.md) for its exact scope.
 3. Packed repositories need a bounded trusted object export/provisioning stage.
    The prototype does not shell out or fall back to reading untrusted Git config.
 4. No audited pinned image/checker profiles or isolated-kernel security review is
@@ -131,12 +132,11 @@ an in-crate test fixture. The disabled Docker implementation leaves a queued job
 untouched and cannot consume model/provider resources. This is a verified safety
 integration, not a real execution integration.
 
-A current environment check found neither a Docker CLI nor a local Docker socket.
-No daemon client, audited image or external trusted supervisor is available here.
-Implementing another fixture-only adapter cannot establish that real immutable
-mounts, namespace isolation, daemon observations, revocation and cleanup work.
-Consequently no runtime adapter was enabled and no “verified execution” result is
-reported. The production blockers listed above remain mandatory.
+The development environment previously reported neither a Docker CLI nor a local
+Docker socket. The staged fixture supervisor now exists, but its offline tests
+cannot establish real namespace isolation or daemon behavior. The benign Docker
+CI job exercises only its fixed fixtures. No production executor was enabled;
+the production blockers listed above remain mandatory.
 
 ## Benign real-Docker CI smoke (separate from the executor)
 
@@ -154,16 +154,18 @@ snapshot, verifies `docker cp`'s archive from a never-started container, then
 runs the existing read-only plan against the immutable daemon image ID. A fixed
 probe checks nonroot identity, read-only source contents, absence of `.git`, and
 writable scratch/tmp directories. Actual daemon inspection is checked against
-the existing policy validator. A second fixed sleep fixture checks bounded wait,
-explicit termination and unsuccessful terminal state. A `finally` path removes
-only the harness's uniquely named resources and fails if they remain.
+the existing policy validator, including exact tmpfs settings, disabled restart
+policy and zero restart history. Fixed sleep fixtures check timeout and revocation
+after start. The staged supervisor withholds success on either failure and
+requires cleanup; the outer harness also attempts all named resource cleanup.
 
-This is intentionally **not** a supervisor, an audited general-purpose base
-image, or evidence that arbitrary untrusted code is safe. It does not exercise
+This is a **benign-fixture supervisor only**, not an audited general-purpose
+image or evidence that arbitrary untrusted code is safe. It does not exercise
 model-generated code, required behavior checks, crash/orphan reconciliation,
-permission revocation, resource-exhaustion attacks or Rust worker completion.
-The existing validator retains its `offline-fixture-only` result label; this
-harness does not turn that object into a runtime attestation. All production
+resource-exhaustion attacks or Rust worker completion. Revocation coverage uses
+a local callback, not a durable authenticated production lease. The validator
+retains its `offline-fixture-only` label; the supervisor returns a separate
+`StagingObservation` with `production_eligible=False`. All production
 execution gates remain disabled. A green run only establishes that these
 specific benign checks passed on that runner, and should be cited with its
 actual CI run, never inferred from local unit tests. The development workspace

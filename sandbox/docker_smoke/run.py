@@ -5,6 +5,8 @@ No credentials, external services, image pulls, arbitrary commands, or repositor
 source enter the container. The runtime's unconditional disablement is unchanged.
 Requires a disposable Linux host with Docker, Python 3 and static C toolchain.
 """
+import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -15,29 +17,12 @@ import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import independent_verifier as verifier
-
-
-class FixtureObjects:
-    length = 40
-
-    def __init__(self):
-        self.objects = {}
-
-    def add(self, kind, body):
-        oid = verifier.digest_object(kind, body, self.length)
-        self.objects[oid] = (kind, body)
-        return oid
-
-    def read(self, oid):
-        return self.objects[oid]
+import staged_supervisor as supervisor
+from cleanup_journal import CleanupJournal
 
 
 def fixture_snapshot():
-    store = FixtureObjects()
-    blob = store.add('blob', b'agenct benign fixture\n')
-    tree = store.add('tree', b'100644 fixture.txt\x00' + bytes.fromhex(blob))
-    commit = store.add('commit', ('tree ' + tree + '\n\nfixed fixture\n').encode())
-    return verifier.extract_snapshot(store, commit)
+    return supervisor.fixture_snapshot()
 
 
 def require(condition, message):
@@ -82,10 +67,13 @@ def cleanup(docker, names, tag, image_id):
     require(not failures, 'cleanup incomplete: ' + ', '.join(failures))
 
 
-def run():
+def run(journal_directory=None):
     names = []
     tag = 'agenct-benign-smoke:' + uuid.uuid4().hex
-    with tempfile.TemporaryDirectory(prefix='agenct-docker-smoke-') as temporary:
+    with ExitStack() as stack:
+        temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix='agenct-docker-smoke-'))
+        journal = (stack.enter_context(CleanupJournal(journal_directory))
+                   if journal_directory is not None else None)
         directory = Path(temporary)
         # Do not inherit proxy, credential, remote-daemon or Docker config values.
         env = {'PATH': os.environ['PATH'], 'HOME': temporary,
@@ -100,20 +88,52 @@ def run():
         def inspect(name):
             return json.loads(docker('inspect', name).stdout)[0]
 
-        def create(plan, suffix):
-            name = tag.replace(':', '-') + '-' + suffix
-            names.append(name)  # Register before a possibly uncertain create result.
-            docker('create', '--name=' + name, *plan.argv[1:])
-            observation = inspect(name)
-            require(observation['State']['Status'] == 'created', 'must not have started')
-            # Reuse the existing policy validator for configuration before start;
-            # only terminal-state fields are synthetic at this point, not evidence.
-            configuration = dict(observation)
-            configuration['State'] = {'Status': 'exited', 'Running': False,
-                                      'ExitCode': 0, 'OOMKilled': False, 'Error': ''}
-            verifier.validate_daemon_fixture(plan, configuration)
-            return name
+        class BenignEngine:
+            """Trusted CLI adapter restricted to this fixed fixture harness."""
+            def __init__(self):
+                self.started = False
 
+            def call(self, *args, timeout):
+                try:
+                    return docker(*args, timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    raise supervisor.StageTimeout('bounded daemon operation timed out') from error
+
+            def create(self, name, plan, labels, timeout):
+                if journal is None:
+                    names.append(name)
+                self.call('create', '--name=' + name,
+                       *('--label=' + key + '=' + value for key, value in labels.items()),
+                       *plan.argv[1:], timeout=timeout)
+
+            def inspect(self, name, timeout):
+                return json.loads(self.call('inspect', name, timeout=timeout).stdout)[0]
+
+            def lookup(self, identity, timeout):
+                result = docker('inspect', identity, timeout=timeout, check=False)
+                if result.returncode == 0:
+                    return json.loads(result.stdout)[0]
+                # Unknown daemon failures are never interpreted as absence.
+                missing = ('Error: No such object: ' + identity).encode()
+                if result.returncode == 1 and result.stderr.strip() == missing:
+                    return None
+                raise RuntimeError('daemon absence not confirmed')
+
+            def archive(self, container_id, timeout):
+                return self.call('cp', container_id + ':/candidate', '-', timeout=timeout).stdout
+
+            def start(self, container_id, timeout):
+                self.call('start', container_id, timeout=timeout)
+                self.started = True
+
+            def remove(self, name, timeout):
+                def bounded(*args, **kwargs):
+                    return docker(*args, timeout=timeout, **kwargs)
+                cleanup(bounded, [name], None, None)
+                return True
+
+        if journal is not None:
+            journal.reconcile(BenignEngine())
         snapshot = fixture_snapshot()
         image_id = None
         try:
@@ -133,26 +153,32 @@ def run():
             image_id = image['Id']
             require(image['Config'].get('OnBuild') in (None, []), 'unexpected ONBUILD')
             require(image['Config'].get('Volumes') in (None, {}), 'unexpected volume')
-            plan = verifier.plan_check(snapshot, image_id, 'probe')
-            name = create(plan, 'check')
-            archive = docker('cp', name + ':/candidate', '-').stdout
-            verifier.verify_source_archive(snapshot, archive)
-            docker('start', name)
-            docker('wait', name, timeout=30)
-            verifier.validate_daemon_fixture(plan, inspect(name))
-            print('PASS: real stopped-container archive, immutable source, uid, tmpfs and daemon policy')
+            observed = supervisor.observe_benign(BenignEngine(), image_id, journal=journal)
+            require(observed.production_eligible is False and observed.cleanup_confirmed,
+                    'staging observation must not enable production')
+            require(observed.snapshot_digest == snapshot.digest,
+                    'host-side snapshot binding changed')
+            print('PASS: staged supervisor inspected immutable source and exact container/image before and after check')
 
-            hang = create(verifier.plan_check(snapshot, image_id, 'hang'), 'timeout')
-            docker('start', hang)
+            timed = BenignEngine()
             try:
-                docker('wait', hang, timeout=2)
+                supervisor.observe_benign(timed, image_id, 'hang', timeout=4, journal=journal)
                 raise RuntimeError('fixed sleep fixture ended before timeout')
-            except subprocess.TimeoutExpired:
-                docker('kill', hang)
-            terminated = inspect(hang)['State']
-            require(terminated['Running'] is False and terminated['ExitCode'] != 0,
-                    'timeout fixture not terminated')
-            print('PASS: bounded wait and explicit container termination')
+            except supervisor.StageTimeout:
+                pass
+            require(timed.started, 'deadline fixture must have started before timeout')
+            print('PASS: supervised deadline terminated fixed fixture and confirmed cleanup')
+
+            revoked = BenignEngine()
+            try:
+                supervisor.observe_benign(revoked, image_id, 'hang', journal=journal,
+                                          still_authorized=lambda: not revoked.started)
+                raise RuntimeError('revoked fixture produced an observation')
+            except supervisor.StageRevoked:
+                pass
+            require(revoked.started, 'revocation fixture must have started first')
+            print('PASS: revocation after start produced no evidence and confirmed cleanup')
+
         finally:
             # A failed cleanup fails the job. No broad daemon prune operations.
             cleanup(docker, names, tag, image_id)
@@ -161,4 +187,6 @@ def run():
 
 
 if __name__ == '__main__':
-    run()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--journal-directory', help='private durable host directory for fixture cleanup')
+    run(parser.parse_args().journal_directory)

@@ -19,4 +19,4 @@ jobs:
       - name: Test fixed benign fixtures against real Docker
         # No secrets, service credentials, repository test command, pulled base
         # image, host bind mounts, or Docker socket inside the scratch container.
-        run: python3 sandbox/docker_smoke/run.py
+        run: python3 sandbox/docker_smoke/run.py --journal-directory "$RUNNER_TEMP/agenct-stage-journal"

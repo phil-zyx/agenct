@@ -22,6 +22,10 @@ MAX_DEPTH = 32
 OID = re.compile(r'(?:[0-9a-f]{40}|[0-9a-f]{64})\Z')
 PIN = re.compile(r'[a-zA-Z0-9._:/-]+@sha256:[0-9a-f]{64}\Z')
 IMAGE_ID = re.compile(r'sha256:[0-9a-f]{64}\Z')
+TMPFS_POLICY = (
+    ('/scratch', 'rw,nosuid,nodev,size=134217728,mode=1777'),
+    ('/tmp', 'rw,nosuid,nodev,noexec,size=33554432,mode=1777'),
+)
 
 
 class Rejected(ValueError):
@@ -332,26 +336,19 @@ def plan_check(snapshot, image_id, checker):
     executable = '/opt/agenct-checks/' + checker
     # Docker uses an empty PID mode for its own namespace; 'private' is not
     # a valid PID CLI value (unlike IPC). Still verify the daemon observation.
-    argv = ('create', '--network=none', '--pid=', '--ipc=private', '--read-only', '--cap-drop=ALL',
+    argv = ('create', '--restart=no', '--network=none', '--pid=', '--ipc=private', '--read-only', '--cap-drop=ALL',
             '--security-opt=no-new-privileges', '--user=65534:65534',
             '--pids-limit=64', '--memory=512m', '--memory-swap=512m', '--cpus=1',
-            '--tmpfs=/scratch:rw,nosuid,nodev,size=134217728,mode=1777',
-            '--tmpfs=/tmp:rw,nosuid,nodev,noexec,size=33554432,mode=1777',
+            *('--tmpfs=' + path + ':' + options for path, options in TMPFS_POLICY),
             '--workdir=/candidate', '--entrypoint=' + executable,
             image_id, '--source=/candidate', '--output=/scratch')
     return CheckPlan(snapshot.digest, snapshot.commit, image_id, executable, argv)
 
 
-def validate_daemon_fixture(plan, observation):
-    """Offline schema validation only, NOT production test evidence.
-
-    Future observations must come from the trusted Docker daemon, never stdout,
-    stderr, files written by tests, model responses or caller-supplied HTTP JSON.
-    The sealed Rust executor deliberately does not accept this prototype output.
-    """
+def validate_container_policy(plan, observation):
+    """Validate daemon-owned policy fields without inventing a terminal check result."""
     config = observation.get('Config', {})
     host = observation.get('HostConfig', {})
-    state = observation.get('State', {})
     if observation.get('Image') != plan.image_id or config.get('Image') != plan.image_id:
         raise Rejected('image binding')
     if config.get('Entrypoint') != [plan.checker] or config.get('Cmd') != ['--source=/candidate', '--output=/scratch'] or config.get('User') != '65534:65534' or config.get('WorkingDir') != '/candidate':
@@ -360,15 +357,32 @@ def validate_daemon_fixture(plan, observation):
     # Empty is Docker's default private mode; host/container joins are forbidden.
     if host.get('PidMode') not in ('', 'private') or host.get('IpcMode') not in ('', 'private'):
         raise Rejected('PID/IPC namespace must be private')
+    restart = host.get('RestartPolicy')
+    if (restart != {'Name': 'no', 'MaximumRetryCount': 0}
+            or type(restart.get('MaximumRetryCount')) is not int
+            or type(observation.get('RestartCount')) is not int
+            or observation['RestartCount'] != 0):
+        raise Rejected('container restart policy/history')
     if config.get('Volumes') not in (None, {}):
         raise Rejected('inherited image volume')
     if host.get('SecurityOpt') != ['no-new-privileges'] or host.get('PidsLimit') != 64 or host.get('Memory') != 512 * 1024 * 1024 or host.get('MemorySwap') != 512 * 1024 * 1024 or host.get('NanoCpus') != 1_000_000_000 or host.get('VolumesFrom') not in (None, []) or host.get('DeviceRequests') not in (None, []):
         raise Rejected('resource/security policy')
     if host.get('ReadonlyRootfs') is not True or host.get('Privileged') is not False or host.get('NetworkMode') != 'none' or host.get('CapDrop') != ['ALL'] or host.get('CapAdd') not in (None, []) or host.get('Binds') not in (None, []) or host.get('Devices') not in (None, []):
         raise Rejected('container policy')
+    # Docker preserves CLI tmpfs option strings in HostConfig.Tmpfs. Mounts
+    # alone cannot attest these options (and may omit tmpfs before start).
+    # Exact matching fails closed on omitted, extra or weakened options.
+    if host.get('Tmpfs') != dict(TMPFS_POLICY):
+        raise Rejected('tmpfs resource/security policy')
     mounts = observation.get('Mounts', [])
     if any(m.get('Type') != 'tmpfs' or m.get('Destination') not in ('/scratch', '/tmp') for m in mounts):
         raise Rejected('unexpected writable mount')
+
+
+def validate_daemon_fixture(plan, observation):
+    """Offline terminal schema only. No fixture result is accepted by the Rust executor."""
+    validate_container_policy(plan, observation)
+    state = observation.get('State', {})
     if state.get('Status') != 'exited' or state.get('Running') is not False or type(state.get('ExitCode')) is not int or state.get('ExitCode') != 0 or state.get('OOMKilled') is not False or state.get('Error'):
         raise Rejected('check did not exit successfully')
     return {'status': 'offline-fixture-only', 'snapshot_digest': plan.snapshot_digest,

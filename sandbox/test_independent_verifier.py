@@ -199,12 +199,16 @@ class PlanningTests(unittest.TestCase):
                 'Config': {'Image': self.image, 'Entrypoint': [self.plan.checker],
                            'Cmd': ['--source=/candidate', '--output=/scratch'],
                            'User': '65534:65534', 'WorkingDir': '/candidate'},
-                'HostConfig': {'ReadonlyRootfs': True, 'Privileged': False,
+                'RestartCount': 0,
+                'HostConfig': {'RestartPolicy': {'Name': 'no', 'MaximumRetryCount': 0},
+                               'ReadonlyRootfs': True, 'Privileged': False,
                                'NetworkMode': 'none', 'PidMode': '', 'IpcMode': 'private', 'CapDrop': ['ALL'],
                                'CapAdd': None, 'Binds': None, 'Devices': None,
                                'SecurityOpt': ['no-new-privileges'], 'PidsLimit': 64,
                                'Memory': 512 * 1024 * 1024, 'MemorySwap': 512 * 1024 * 1024,
-                               'NanoCpus': 1_000_000_000, 'VolumesFrom': None, 'DeviceRequests': None},
+                               'NanoCpus': 1_000_000_000, 'VolumesFrom': None, 'DeviceRequests': None,
+                               'Tmpfs': {'/scratch': 'rw,nosuid,nodev,size=134217728,mode=1777',
+                                         '/tmp': 'rw,nosuid,nodev,noexec,size=33554432,mode=1777'}},
                 'Mounts': [{'Type': 'tmpfs', 'Destination': '/scratch'}],
                 'State': {'Status': 'exited', 'Running': False, 'ExitCode': 0,
                           'OOMKilled': False, 'Error': ''}}
@@ -247,6 +251,53 @@ class PlanningTests(unittest.TestCase):
         self.assertIn('--pid=', self.plan.argv)
         self.assertNotIn('--pid=private', self.plan.argv)
         self.assertIn('--ipc=private', self.plan.argv)
+
+    def test_tmpfs_policy_missing_extra_or_weakened_rejected(self):
+        valid = self.observation()['HostConfig']['Tmpfs']
+        cases = [None, {}, {'/tmp': valid['/tmp']},
+                 {**valid, '/candidate': 'rw,size=33554432'},
+                 {**valid, '/tmp': valid['/tmp'] + ',exec'},
+                 {**valid, '/scratch': valid['/scratch'] + ',suid'}]
+        for path, options in valid.items():
+            for option in options.split(','):
+                cases.append({**valid, path: ','.join(
+                    value for value in options.split(',') if value != option)})
+            cases.append({**valid, path: options.replace('size=', 'size=999')})
+        for policy in cases:
+            observed = self.observation()
+            observed['HostConfig']['Tmpfs'] = policy
+            with self.subTest(policy=policy), self.assertRaises(v.Rejected):
+                v.validate_container_policy(self.plan, observed)
+        observed = self.observation()
+        del observed['HostConfig']['Tmpfs']
+        with self.assertRaises(v.Rejected):
+            v.validate_container_policy(self.plan, observed)
+        for path, options in valid.items():
+            self.assertIn('--tmpfs=' + path + ':' + options, self.plan.argv)
+
+    def test_restart_policy_and_history_fail_closed(self):
+        for policy in (None, {}, {'Name': 'always', 'MaximumRetryCount': 0},
+                       {'Name': 'on-failure', 'MaximumRetryCount': 5},
+                       {'Name': 'no', 'MaximumRetryCount': 1},
+                       {'Name': 'no', 'MaximumRetryCount': False}):
+            observed = self.observation()
+            observed['HostConfig']['RestartPolicy'] = policy
+            with self.subTest(policy=policy), self.assertRaises(v.Rejected):
+                v.validate_container_policy(self.plan, observed)
+        observed = self.observation()
+        del observed['HostConfig']['RestartPolicy']
+        with self.assertRaises(v.Rejected):
+            v.validate_container_policy(self.plan, observed)
+        for count in (None, False, 1, -1, '0'):
+            observed = self.observation()
+            observed['RestartCount'] = count
+            with self.subTest(count=count), self.assertRaises(v.Rejected):
+                v.validate_daemon_fixture(self.plan, observed)
+        observed = self.observation()
+        del observed['RestartCount']
+        with self.assertRaises(v.Rejected):
+            v.validate_container_policy(self.plan, observed)
+        self.assertIn('--restart=no', self.plan.argv)
 
     def test_test_stdout_cannot_be_used_as_daemon_evidence(self):
         fake = {'passed': True, 'commit': self.snapshot.commit, 'image': self.image}
