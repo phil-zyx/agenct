@@ -28,7 +28,7 @@ All `/api/*` routes require `Authorization: Bearer <token>`; no query-string cre
 
 - `GET /api/me`: current server-resolved identity and runtime.
 - `GET /api/messages`: most recent 40 personal messages, including failure status.
-- `POST /api/messages` with `{ "message": "hello" }`: one turn at a time per identity; 60-second adapter deadline.
+- `POST /api/messages` with `{ "message": "hello" }`: one turn at a time per identity; 75-second Hub HTTP deadline; the adapter enforces a shorter 45-second process-group deadline, leaving 30 seconds for cleanup and the error response.
 - `GET /api/tasks`: only tasks involving the current identity.
 - `POST /api/tasks` with `{ "owner": "bob", "summary": "shared task" }`.
 - `GET /api/tasks/{id}`: permitted task and its event log; nonparticipants receive 404.
