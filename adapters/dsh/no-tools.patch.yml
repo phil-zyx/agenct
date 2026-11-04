@@ -1,0 +1,19 @@
+# Matches official dsh-v0.2.1-rc.2 sdk-minimal row IDs. Re-audit on upgrade.
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+  disabled: true
+- id: tool-working-directory
+  name: '@deepseek-ai/dsh-tool-working-directory'
+  disabled: true
+- id: persistent-bash
+  name: '@deepseek-ai/dsh-tool-bash-persistent'
+  disabled: true
+- id: persistent-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+  disabled: true
+- id: session-log-deepseek
+  name: '@deepseek-ai/dsh-session-log-deepseek'
+  disabled: true
+- id: plugin-package-inventory-deepseek
+  name: '@deepseek-ai/dsh-plugin-package-inventory-deepseek'
+  disabled: true

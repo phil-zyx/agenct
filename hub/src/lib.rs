@@ -1,0 +1,477 @@
+//! Agenct local development control plane. Not a production authentication service.
+use axum::{
+    extract::{DefaultBodyLimit, Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use fs2::FileExt;
+use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use uuid::Uuid;
+
+#[derive(Clone)]
+pub enum Runtime {
+    Mock,
+    Dsh { url: String, token: String },
+}
+impl Runtime {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::Dsh { .. } => "dsh",
+        }
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UserConfig {
+    pub id: String,
+    pub token_sha256: String,
+}
+pub struct Config {
+    pub bind: SocketAddr,
+    pub database: PathBuf,
+    pub users: Vec<UserConfig>,
+    pub runtime: Runtime,
+}
+impl Config {
+    pub fn from_env() -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let bind: SocketAddr = std::env::var("AGENCT_BIND")
+            .unwrap_or("127.0.0.1:8080".into())
+            .parse()?;
+        if !bind.ip().is_loopback() {
+            return Err("This development service must bind to loopback".into());
+        }
+        let users = serde_json::from_str(&std::env::var("AGENCT_USERS_JSON")?)?;
+        let runtime = match std::env::var("AGENCT_RUNTIME")?.as_str() {
+            "mock" => Runtime::Mock,
+            "dsh" => {
+                let url = std::env::var("AGENCT_ADAPTER_URL")?;
+                let parsed = reqwest::Url::parse(&url)?;
+                let ip: IpAddr = parsed.host_str().ok_or("adapter host required")?.parse()?;
+                if parsed.scheme() != "http"
+                    || !ip.is_loopback()
+                    || parsed.path() != "/v1/turn"
+                    || parsed.query().is_some()
+                    || !parsed.username().is_empty()
+                    || parsed.password().is_some()
+                {
+                    return Err("Adapter URL must be a loopback HTTP /v1/turn endpoint".into());
+                }
+                let token = std::env::var("AGENCT_ADAPTER_TOKEN")?;
+                if token.len() < 32 {
+                    return Err("Adapter token must contain at least 32 characters".into());
+                }
+                Runtime::Dsh { url, token }
+            }
+            _ => return Err("Set AGENCT_RUNTIME explicitly to mock or dsh".into()),
+        };
+        Ok(Self {
+            bind,
+            database: std::env::var("AGENCT_DATABASE")
+                .unwrap_or("agenct.sqlite3".into())
+                .into(),
+            users,
+            runtime,
+        })
+    }
+}
+#[derive(Clone)]
+pub struct Hub {
+    _lock: Option<Arc<std::fs::File>>,
+    db: Arc<Mutex<Connection>>,
+    users: Arc<HashMap<String, String>>,
+    gates: Arc<HashMap<String, tokio::sync::Mutex<()>>>,
+    runtime: Runtime,
+    client: reqwest::Client,
+}
+#[derive(Debug)]
+pub struct Error(StatusCode, &'static str);
+type Result<T> = std::result::Result<T, Error>;
+impl IntoResponse for Error {
+    fn into_response(self) -> Response {
+        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+    }
+}
+impl From<rusqlite::Error> for Error {
+    fn from(_: rusqlite::Error) -> Self {
+        Self(StatusCode::INTERNAL_SERVER_ERROR, "storage error")
+    }
+}
+fn invalid(message: &'static str) -> Error {
+    Error(StatusCode::BAD_REQUEST, message)
+}
+fn denied() -> Error {
+    Error(StatusCode::NOT_FOUND, "not found")
+}
+impl Hub {
+    pub fn open(config: Config) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let mut users = HashMap::new();
+        let mut gates = HashMap::new();
+        for user in config.users {
+            if user.id.is_empty()
+                || user.id.len() > 64
+                || !user
+                    .id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                || user.token_sha256.len() != 64
+                || !user.token_sha256.chars().all(|c| c.is_ascii_hexdigit())
+                || users.contains_key(&user.token_sha256)
+                || gates.contains_key(&user.id)
+            {
+                return Err("invalid or duplicated identity configuration".into());
+            }
+            gates.insert(user.id.clone(), tokio::sync::Mutex::new(()));
+            users.insert(user.token_sha256, user.id);
+        }
+        if users.is_empty() {
+            return Err("at least one configured user is required".into());
+        }
+        let lock = if config.database.to_str() != Some(":memory:") {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let guard = opts.open(config.database.with_extension("lock"))?;
+            guard
+                .try_lock_exclusive()
+                .map_err(|_| "database already in use by another Hub")?;
+            let _ = opts.open(&config.database)?;
+            Some(Arc::new(guard))
+        } else {
+            None
+        };
+        let db = Connection::open(config.database)?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY, owner TEXT NOT NULL, role TEXT NOT NULL, content TEXT NOT NULL, status TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, requester TEXT NOT NULL, owner TEXT NOT NULL, summary TEXT NOT NULL, status TEXT NOT NULL, result TEXT, revision INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+UPDATE messages SET status='interrupted' WHERE status='pending';")?;
+        let has_revision: bool = db
+            .prepare("PRAGMA table_info(tasks)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .iter()
+            .any(|name| name == "revision");
+        if !has_revision {
+            db.execute(
+                "ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        for id in users.values() {
+            db.execute(
+                "INSERT OR IGNORE INTO sessions(owner,session_id) VALUES (?1,?2)",
+                params![id, Uuid::new_v4().to_string()],
+            )?;
+        }
+        Ok(Self {
+            _lock: lock,
+            db: Arc::new(Mutex::new(db)),
+            users: Arc::new(users),
+            gates: Arc::new(gates),
+            runtime: config.runtime,
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(75))
+                .build()?,
+        })
+    }
+    fn identity(&self, headers: &HeaderMap) -> Result<String> {
+        let token = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .ok_or(Error(StatusCode::UNAUTHORIZED, "bearer token required"))?;
+        if token.len() < 32 || token.len() > 512 {
+            return Err(Error(StatusCode::UNAUTHORIZED, "invalid token"));
+        }
+        let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
+        self.users
+            .get(&hash)
+            .cloned()
+            .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid token"))
+    }
+    fn db(&self) -> Result<std::sync::MutexGuard<'_, Connection>> {
+        self.db
+            .lock()
+            .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "storage unavailable"))
+    }
+}
+pub fn app(hub: Hub) -> Router {
+    Router::new()
+        .route(
+            "/health",
+            get(|| async { Json(serde_json::json!({"status":"ok","stage":"development"})) }),
+        )
+        .route("/api/me", get(me))
+        .route("/api/messages", get(messages).post(chat))
+        .route("/api/tasks", get(tasks).post(delegate))
+        .route("/api/tasks/{id}", get(task_detail))
+        .route("/api/tasks/{id}/actions", post(action))
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .with_state(hub)
+        .fallback_service(tower_http::services::ServeDir::new("hub/web"))
+}
+async fn me(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<serde_json::Value>> {
+    let id = h.identity(&headers)?;
+    Ok(Json(
+        serde_json::json!({"user":id,"runtime":h.runtime.label(),"production":false}),
+    ))
+}
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Message {
+    pub role: String,
+    pub content: String,
+    pub status: String,
+}
+fn history(h: &Hub, owner: &str) -> Result<Vec<Message>> {
+    let db = h.db()?;
+    let mut stmt=db.prepare("SELECT role,content,status FROM (SELECT id,role,content,status FROM messages WHERE owner=?1 ORDER BY id DESC LIMIT 40) ORDER BY id")?;
+    let rows = stmt.query_map([owner], |r| {
+        Ok(Message {
+            role: r.get(0)?,
+            content: r.get(1)?,
+            status: r.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+async fn messages(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<Message>>> {
+    let id = h.identity(&headers)?;
+    Ok(Json(history(&h, &id)?))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatInput {
+    message: String,
+}
+#[derive(Deserialize)]
+struct AdapterReply {
+    reply: String,
+    backend: String,
+}
+async fn chat(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Json(input): Json<ChatInput>,
+) -> Result<Json<serde_json::Value>> {
+    let id = h.identity(&headers)?;
+    if input.message.trim().is_empty() || input.message.len() > 8000 {
+        return Err(invalid("message must contain 1..8000 bytes"));
+    }
+    let _guard = h
+        .gates
+        .get(&id)
+        .unwrap()
+        .try_lock()
+        .map_err(|_| Error(StatusCode::CONFLICT, "a turn is already running"))?;
+    let prior: Vec<_> = history(&h, &id)?
+        .into_iter()
+        .filter(|m| m.status == "complete")
+        .collect();
+    let (message_id, session_id) = {
+        let db = h.db()?;
+        db.execute(
+            "INSERT INTO messages(owner,role,content,status) VALUES (?1,'user',?2,'pending')",
+            params![id, input.message],
+        )?;
+        let sid: String = db.query_row(
+            "SELECT session_id FROM sessions WHERE owner=?1",
+            [&id],
+            |r| r.get(0),
+        )?;
+        (db.last_insert_rowid(), sid)
+    };
+    let answer=match &h.runtime {
+        Runtime::Mock=>Ok(format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。",prior.len())),
+        Runtime::Dsh{url,token}=>{
+            let mut payload=serde_json::json!({"session_id":session_id,"history":prior.iter().map(|m|serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),"message":input.message});
+            while serde_json::to_vec(&payload).unwrap().len()>60000 {
+                payload["history"].as_array_mut().unwrap().remove(0);
+            }
+            let response=h.client.post(url).bearer_auth(token).json(&payload).send().await;
+            match response {
+                Ok(r) if r.status().is_success()=>match r.json::<AdapterReply>().await {Ok(r) if r.backend=="dsh" && !r.reply.is_empty() && r.reply.len()<=32000=>Ok(r.reply),_=>Err(())},
+                _=>Err(()),
+            }
+        }
+    };
+    let mut db = h.db()?;
+    let tx = db.transaction()?;
+    match answer {
+        Ok(reply) => {
+            tx.execute(
+                "UPDATE messages SET status='complete' WHERE id=?1",
+                [message_id],
+            )?;
+            tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
+            tx.commit()?;
+            Ok(Json(
+                serde_json::json!({"reply":reply,"backend":h.runtime.label()}),
+            ))
+        }
+        Err(()) => {
+            tx.execute(
+                "UPDATE messages SET status='failed' WHERE id=?1",
+                [message_id],
+            )?;
+            tx.commit()?;
+            Err(Error(
+                StatusCode::BAD_GATEWAY,
+                "adapter failed; no mock fallback; task actions were not executed",
+            ))
+        }
+    }
+}
+#[derive(Serialize)]
+struct Task {
+    id: String,
+    requester: String,
+    owner: String,
+    summary: String,
+    status: String,
+    result: Option<String>,
+    revision: i64,
+}
+fn row_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
+    Ok(Task {
+        id: r.get(0)?,
+        requester: r.get(1)?,
+        owner: r.get(2)?,
+        summary: r.get(3)?,
+        status: r.get(4)?,
+        result: r.get(5)?,
+        revision: r.get(6)?,
+    })
+}
+async fn tasks(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<Task>>> {
+    let id = h.identity(&headers)?;
+    let db = h.db()?;
+    let mut q=db.prepare("SELECT id,requester,owner,summary,status,result,revision FROM tasks WHERE requester=?1 OR owner=?1 ORDER BY rowid DESC")?;
+    let rows = q.query_map([id], row_task)?;
+    Ok(Json(rows.collect::<std::result::Result<Vec<_>, _>>()?))
+}
+async fn task_detail(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Path(task): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let user = h.identity(&headers)?;
+    let db = h.db()?;
+    let t=db.query_row("SELECT id,requester,owner,summary,status,result,revision FROM tasks WHERE id=?1 AND (requester=?2 OR owner=?2)",params![task,user],row_task).map_err(|_|denied())?;
+    let mut q = db.prepare("SELECT actor,action,at FROM events WHERE task_id=?1 ORDER BY id")?;
+    let events=q.query_map([task],|r|Ok(serde_json::json!({"actor":r.get::<_,String>(0)?,"action":r.get::<_,String>(1)?,"at":r.get::<_,String>(2)?})))?.collect::<std::result::Result<Vec<_>,_>>()?;
+    Ok(Json(serde_json::json!({"task":t,"events":events})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Delegate {
+    owner: String,
+    summary: String,
+}
+async fn delegate(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Json(d): Json<Delegate>,
+) -> Result<Json<serde_json::Value>> {
+    let requester = h.identity(&headers)?;
+    if d.owner == requester || !h.gates.contains_key(&d.owner) {
+        return Err(invalid("select another configured participant"));
+    }
+    if d.summary.trim().is_empty() || d.summary.len() > 4000 {
+        return Err(invalid("summary must contain 1..4000 bytes"));
+    }
+    let id = Uuid::new_v4().to_string();
+    let mut db = h.db()?;
+    let tx = db.transaction()?;
+    tx.execute("INSERT INTO tasks(id,requester,owner,summary,status) VALUES (?1,?2,?3,?4,'awaiting_owner')",params![id,requester,d.owner,d.summary])?;
+    tx.execute(
+        "INSERT INTO events(task_id,actor,action) VALUES (?1,?2,'created')",
+        params![id, requester],
+    )?;
+    tx.commit()?;
+    Ok(Json(
+        serde_json::json!({"id":id,"status":"awaiting_owner","revision":0}),
+    ))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Action {
+    action: String,
+    expected_revision: i64,
+    result: Option<String>,
+}
+async fn action(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(a): Json<Action>,
+) -> Result<Json<serde_json::Value>> {
+    let user = h.identity(&headers)?;
+    let mut db = h.db()?;
+    let tx = db.transaction()?;
+    let t=tx.query_row("SELECT id,requester,owner,summary,status,result,revision FROM tasks WHERE id=?1 AND (requester=?2 OR owner=?2)",params![id,user],row_task).map_err(|_|denied())?;
+    if a.expected_revision != t.revision {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "task changed; refresh and review before acting",
+        ));
+    }
+    let next = match (a.action.as_str(), t.status.as_str()) {
+        ("accept", "awaiting_owner") if user == t.owner => "working",
+        ("deliver", "working") if user == t.owner => {
+            if a.result
+                .as_ref()
+                .is_none_or(|v| v.trim().is_empty() || v.len() > 8000)
+            {
+                return Err(invalid("delivery requires a 1..8000 byte result"));
+            }
+            "ready_for_acceptance"
+        }
+        ("approve", "ready_for_acceptance") if user == t.requester => "completed",
+        ("return", "ready_for_acceptance") if user == t.requester => "awaiting_owner",
+        ("cancel", s) if s != "completed" && s != "canceled" => "canceled",
+        _ => {
+            return Err(Error(
+                StatusCode::CONFLICT,
+                "action not allowed for identity or current state",
+            ))
+        }
+    };
+    let result = if a.action == "deliver" {
+        a.result
+    } else if a.action == "return" {
+        None
+    } else {
+        t.result
+    };
+    tx.execute(
+        "UPDATE tasks SET status=?1,result=?2,revision=revision+1 WHERE id=?3",
+        params![next, result, id],
+    )?;
+    tx.execute(
+        "INSERT INTO events(task_id,actor,action) VALUES (?1,?2,?3)",
+        params![id, user, a.action],
+    )?;
+    tx.commit()?;
+    Ok(Json(
+        serde_json::json!({"id":id,"status":next,"revision":t.revision+1}),
+    ))
+}

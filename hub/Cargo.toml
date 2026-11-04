@@ -1,0 +1,22 @@
+[package]
+name = "agenct-hub"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tower-http = { version = "0.6", features = ["fs"] }
+
+fs2 = "0.4"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
