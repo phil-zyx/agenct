@@ -1,6 +1,6 @@
 # Rust Hub technical proof of concept
 
-This is a **loopback-only development server**, not an Internet-ready account system. It does not replace or change the hosted browser demo. It supplies real server-side storage and authorization; mock model output is explicitly labelled. SQLite is used to make the single-process experiment runnable without a PostgreSQL service. PostgreSQL, OIDC, deployment hardening, worker leases and actual code execution remain future work.
+This is a **loopback-only development server**, not an Internet-ready account system. It does not replace or change the hosted browser demo. It supplies real server-side storage and authorization; mock model output is explicitly labelled. SQLite is used to make the single-process experiment runnable without a PostgreSQL service. PostgreSQL, OIDC, production deployment hardening and trustworthy code execution remain future work. Persistent worker leases exist as an unwired library; the built-in executor remains disabled. See [architecture.md](architecture.md).
 
 ## Run
 
@@ -59,7 +59,7 @@ DSH 上下文仅传 role/content，不传消息状态或他人内容；请求超
 
 ## 本次验证范围
 
-- 10 个 Rust API/适配器协议测试通过；8 个 Python 适配器离线测试通过；原静态演示 18 个测试通过。
+- 验证覆盖 Rust API/适配器协议、Python 离线适配器、静态演示及模拟 DOM 客户端；以当前测试命令的输出为准，不将历史测试数量视为验收证明。
 - Rust fmt/clippy 和浏览器脚本语法检查通过。
 - 此环境的 Chromium 因 socket 权限限制无法启动，因此新页面的真实浏览器验收尚未完成。不能把 API 测试当作 UI 验收。
 - 未配置提供商密钥、未进行真实模型调用；DSH 实际插件禁用行为仍需按适配器文档验收。
@@ -73,8 +73,8 @@ Use two separate browser windows, one with Alice's development token and one wit
 
 1. Alice sends `请让 bob 帮我 检查公开文档`. A private proposal appears, with no task in Bob's window even after refresh.
 2. Alice reviews the exact recipient and shared summary and clicks **确认共享并委派**. A task is persisted atomically. Only the displayed summary, participant identities and task lifecycle are shared, not Alice's private chat.
-3. Bob refreshes, accepts and submits a **human-written** result. This does not execute code or an agent worker.
-4. Alice refreshes, sees Bob's result and approves or returns it. All actions validate identity, state and reviewed revision on the server.
+3. Bob waits for the visible-tab poll (or refreshes), accepts and submits a **human-written** result. This does not execute code or an agent worker.
+4. Alice waits for the visible-tab poll (or refreshes), sees Bob's result and approves or returns it. All actions validate identity, state and reviewed revision on the server.
 5. Replaying confirmation does not duplicate the task. Rejected proposals remain rejected. Eve cannot view or confirm Alice's proposal or task.
 
 API additions:
@@ -83,6 +83,6 @@ API additions:
 - `POST /api/proposals/{id}/actions`: `{ "action": "confirm", "expected_revision": 0 }` or `reject`. Content is immutable and cannot be supplied to confirmation.
 - `POST /api/messages` accepts optional `request_id` for recognized mock proposal fixtures only. Those fixtures persist the proposal, rather than a normal model conversation turn.
 
-DSH mode continues to return plain chat replies only; neither model text nor adapter-supplied extra JSON fields authorize delegation. The explicit `/delegate` proposal UI works in either mode. Live DSH model-backed structured proposal extraction is **not implemented or validated**. No real-time notifications, general natural-language task actions, autonomous execution, queue workers, production authorization, or multi-tenant security claims are added by this stage.
+DSH mode accepts a strictly validated structured reply with an explicit `proposal` field (null or a bounded proposal). The Hub requires a configured recipient named in the current message and an exact excerpt of that message as the shared summary. This can prepare a sender-private proposal, never authorize sharing or create a task directly. The explicit `/delegate` proposal UI works in either mode. The SDK path is implemented but **live DSH model-backed extraction remains unvalidated**. The client polls while visible with bounded backoff and read timeouts; this is not push or browser notification delivery. General natural-language task actions, autonomous execution, a running queue consumer, production authorization and multi-tenant security remain absent.
 
 Run `cargo test --manifest-path hub/Cargo.toml`, `cargo clippy --manifest-path hub/Cargo.toml --all-targets -- -D warnings`, and `node hub/web/client.test.cjs`. The UI tests use a mocked DOM, not a real browser.

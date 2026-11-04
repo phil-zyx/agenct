@@ -1,4 +1,10 @@
 //! Agenct local development control plane. Not a production authentication service.
+pub mod gitlab;
+pub mod oidc;
+mod profiles;
+pub mod publication;
+pub mod worker;
+pub mod worker_consumer;
 use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
@@ -88,6 +94,7 @@ impl Config {
 }
 #[derive(Clone)]
 pub struct Hub {
+    oidc: Option<oidc::Validator>,
     _lock: Option<Arc<std::fs::File>>,
     db: Arc<Mutex<Connection>>,
     users: Arc<HashMap<String, String>>,
@@ -163,6 +170,7 @@ CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, requester TEXT NOT NULL, 
 CREATE TABLE IF NOT EXISTS proposals (id TEXT PRIMARY KEY, requester TEXT NOT NULL, owner TEXT NOT NULL, summary TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', revision INTEGER NOT NULL DEFAULT 0, task_id TEXT UNIQUE, request_id TEXT NOT NULL, source TEXT NOT NULL, UNIQUE(requester,request_id));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, task_id TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
 UPDATE messages SET status='interrupted' WHERE status='pending';")?;
+        profiles::initialize(&db)?;
         let has_revision: bool = db
             .prepare("PRAGMA table_info(tasks)")?
             .query_map([], |r| r.get::<_, String>(1))?
@@ -182,6 +190,7 @@ UPDATE messages SET status='interrupted' WHERE status='pending';")?;
             )?;
         }
         Ok(Self {
+            oidc: None,
             _lock: lock,
             db: Arc::new(Mutex::new(db)),
             users: Arc::new(users),
@@ -194,12 +203,29 @@ UPDATE messages SET status='interrupted' WHERE status='pending';")?;
                 .build()?,
         })
     }
+    /// Switches authentication exclusively to pinned external access tokens.
+    /// Existing users remain the authorization roster; dev tokens no longer work.
+    pub fn with_oidc(mut self, config: oidc::Config) -> std::result::Result<Self, &'static str> {
+        self.oidc = Some(oidc::Validator::new(
+            config,
+            &self.users.values().cloned().collect(),
+        )?);
+        Ok(self)
+    }
     fn identity(&self, headers: &HeaderMap) -> Result<String> {
+        if headers.get_all("authorization").iter().count() != 1 {
+            return Err(Error(StatusCode::UNAUTHORIZED, "one bearer token required"));
+        }
         let token = headers
             .get("authorization")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or(Error(StatusCode::UNAUTHORIZED, "bearer token required"))?;
+        if let Some(validator) = &self.oidc {
+            return validator
+                .identity(token)
+                .map_err(|_| Error(StatusCode::UNAUTHORIZED, "invalid access token"));
+        }
         if token.len() < 32 || token.len() > 512 {
             return Err(Error(StatusCode::UNAUTHORIZED, "invalid token"));
         }
@@ -222,6 +248,11 @@ pub fn app(hub: Hub) -> Router {
             get(|| async { Json(serde_json::json!({"status":"ok","stage":"development"})) }),
         )
         .route("/api/me", get(me))
+        .route(
+            "/api/profile",
+            get(profiles::get_profile).put(profiles::update_profile),
+        )
+        .route("/api/profile/catalog", get(profiles::catalog))
         .route("/api/messages", get(messages).post(chat))
         .route("/api/proposals", get(proposals).post(propose))
         .route("/api/proposals/{id}/actions", post(proposal_action))
@@ -267,9 +298,34 @@ struct ChatInput {
     request_id: Option<String>,
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdapterProposal {
+    owner: String,
+    summary: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdapterReply {
     reply: String,
     backend: String,
+    // Explicit null means no proposal; an omitted field is a protocol error.
+    #[serde(deserialize_with = "Option::deserialize")]
+    proposal: Option<AdapterProposal>,
+}
+impl AdapterReply {
+    fn valid(&self, h: &Hub, requester: &str, message: &str) -> bool {
+        self.backend == "dsh"
+            && !self.reply.trim().is_empty()
+            && self.reply.len() <= 32000
+            && self.proposal.as_ref().is_none_or(|p| {
+                p.owner != requester
+                    && h.gates.contains_key(&p.owner)
+                    && message.contains(&p.owner)
+                    && !p.summary.trim().is_empty()
+                    && p.summary.len() <= 4000
+                    && message.contains(&p.summary)
+            })
+    }
 }
 async fn chat(
     State(h): State<Hub>,
@@ -322,7 +378,7 @@ async fn chat(
         (db.last_insert_rowid(), sid)
     };
     let answer=match &h.runtime {
-        Runtime::Mock=>Ok(format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。",prior.len())),
+        Runtime::Mock=>Ok(AdapterReply {reply: format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。",prior.len()), backend:"mock".into(), proposal:None}),
         Runtime::Dsh{url,token}=>{
             let mut payload=serde_json::json!({"session_id":session_id,"history":prior.iter().map(|m|serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),"message":input.message});
             while serde_json::to_vec(&payload).unwrap().len()>60000 {
@@ -330,7 +386,7 @@ async fn chat(
             }
             let response=h.client.post(url).bearer_auth(token).json(&payload).send().await;
             match response {
-                Ok(r) if r.status().is_success()=>match r.json::<AdapterReply>().await {Ok(r) if r.backend=="dsh" && !r.reply.is_empty() && r.reply.len()<=32000=>Ok(r.reply),_=>Err(())},
+                Ok(r) if r.status().is_success()=>match r.json::<AdapterReply>().await {Ok(r) if r.valid(&h,&id,&input.message)=>Ok(r),_=>Err(())},
                 _=>Err(()),
             }
         }
@@ -338,7 +394,35 @@ async fn chat(
     let mut db = h.db()?;
     let tx = db.transaction()?;
     match answer {
-        Ok(reply) => {
+        Ok(answer) => {
+            // Model output is untrusted. Only an immutable, sender-private proposal
+            // is persisted here; the existing authenticated confirm action creates tasks.
+            let proposal = match answer
+                .proposal
+                .as_ref()
+                .map(|p| {
+                    save_proposal_tx(
+                        &tx,
+                        &id,
+                        &p.owner,
+                        &p.summary,
+                        input.request_id.as_deref(),
+                        &input.message,
+                    )
+                })
+                .transpose()
+            {
+                Ok(p) => p,
+                Err(error) => {
+                    tx.execute(
+                        "UPDATE messages SET status='failed' WHERE id=?1",
+                        [message_id],
+                    )?;
+                    tx.commit()?;
+                    return Err(error);
+                }
+            };
+            let reply = answer.reply;
             tx.execute(
                 "UPDATE messages SET status='complete' WHERE id=?1",
                 [message_id],
@@ -346,7 +430,7 @@ async fn chat(
             tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
             tx.commit()?;
             Ok(Json(
-                serde_json::json!({"reply":reply,"backend":h.runtime.label()}),
+                serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal}),
             ))
         }
         Err(()) => {
@@ -547,6 +631,20 @@ fn save_proposal(
     if summary.trim().is_empty() || summary.len() > 4000 {
         return Err(invalid("summary must contain 1..4000 bytes"));
     }
+    let mut db = h.db()?;
+    let tx = db.transaction()?;
+    let proposal = save_proposal_tx(&tx, requester, owner, summary, request_id, source)?;
+    tx.commit()?;
+    Ok(proposal)
+}
+fn save_proposal_tx(
+    tx: &rusqlite::Transaction<'_>,
+    requester: &str,
+    owner: &str,
+    summary: &str,
+    request_id: Option<&str>,
+    source: &str,
+) -> Result<Proposal> {
     let generated = Uuid::new_v4().to_string();
     let key = request_id.unwrap_or(&generated);
     if key.is_empty()
@@ -557,8 +655,6 @@ fn save_proposal(
     {
         return Err(invalid("invalid request_id"));
     }
-    let mut db = h.db()?;
-    let tx = db.transaction()?;
     let existing = tx.query_row(&format!("SELECT {PROPOSAL_COLUMNS},source FROM proposals WHERE requester=?1 AND request_id=?2"),params![requester,key],|r|Ok((row_proposal(r)?,r.get::<_,String>(7)?))).optional()?;
     if let Some((proposal, previous)) = existing {
         if previous != source || proposal.owner != owner || proposal.summary != summary {
@@ -576,7 +672,6 @@ fn save_proposal(
         [id],
         row_proposal,
     )?;
-    tx.commit()?;
     Ok(p)
 }
 #[derive(Deserialize)]

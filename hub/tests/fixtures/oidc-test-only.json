@@ -1,0 +1,20 @@
+{
+  "issuer": "https://issuer.example.test",
+  "audience": "agenct-api",
+  "subjects": {
+    "subject-alice": "alice"
+  },
+  "jwks": {
+    "keys": [
+      {
+        "kid": "test-key",
+        "kty": "RSA",
+        "alg": "RS256",
+        "use": "sig",
+        "n": "REPLACED_AT_TEST_RUNTIME_WITH_EPHEMERAL_PUBLIC_MODULUS",
+        "e": "AQAB"
+      }
+    ]
+  },
+  "required_scope": "agenct:access"
+}

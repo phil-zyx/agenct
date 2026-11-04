@@ -21,14 +21,29 @@ function fixture() {
   const calls = [];
   const waiting = [];
   let hold = false;
+  let failReads = 0;
+  let stallReads = false;
+  let revision = 0;
+  const timers = new Map();
+  const listeners = new Map();
+  let timerId = 0;
+  const document = {
+    hidden: false,
+    getElementById: id => $(id),
+    createElement: () => new Element(),
+    addEventListener: (name, callback) => listeners.set(name, callback)
+  };
   let failNextPost = false;
   const $ = id => {
     if (!elements.has(id)) elements.set(id, new Element());
     return elements.get(id);
   };
   const context = vm.createContext({
-    document: { getElementById: $, createElement: () => new Element() },
+    document,
+    setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
+    clearTimeout: id => timers.delete(id),
     AbortController,
+    TextEncoder,
     crypto: webcrypto,
     Date,
     prompt: () => '',
@@ -40,17 +55,34 @@ function fixture() {
         failNextPost = false;
         throw Error('Simulated uncertain network outcome');
       }
+      if (stallReads && options.method === 'GET') await new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(Error('Read timed out')), { once: true });
+      });
+      if (failReads && options.method === 'GET') throw Object.assign(Error('Read unavailable'), { httpStatus: failReads });
       const identity = options.headers.Authorization.endsWith('bob') ? 'bob' : 'alice';
       let data = url.endsWith('/me') ? { user: identity, runtime: 'mock' } : [];
       if (url.endsWith('/proposals') && options.method === 'GET') {
-        data = [{ id: 1, owner: 'bob', summary: 'Exact <summary>\nsecond line', status: 'pending', revision: 0 }];
+        data = [{ id: 1, owner: 'bob', summary: 'Exact <summary>\nsecond line', status: 'pending', revision }];
       }
+      if (url.endsWith('/profile/catalog')) data = { roles: ['coordinator', 'researcher'], models: [{ id: 'server-default' }], max_agents: 8 };
+      if (url.endsWith('/profile')) data = { revision: 0, agents: [{ id: 'butler', name: '管家', role: 'coordinator', model_ref: 'server-default', enabled: true }] };
       return { ok: true, json: async () => data };
     }
   });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'profiles-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'client.js'), 'utf8'), context);
   return {
-    $, calls,
+    $, calls, timers,
+    change() { revision++; },
+    stallReads() { stallReads = true; },
+    failReads(status) { failReads = status; },
+    visible(value) { document.hidden = !value; listeners.get('visibilitychange')(); },
+    async tick() {
+      const timer = [...timers.entries()].find(([, value]) => value.delay !== 15000);
+      assert(timer, 'Expected a scheduled poll');
+      timers.delete(timer[0]);
+      await timer[1].callback();
+    },
     hold() { hold = true; },
     release() { hold = false; waiting.splice(0).forEach(resolve => resolve()); },
     unhold() { hold = false; },
@@ -136,6 +168,8 @@ async function test(name, run) {
     f.release();
     await oldLogin;
     assert.match(f.$('identity').textContent, /^bob/);
+    assert.match(f.$('identity').textContent, /已验证身份/);
+    assert.doesNotMatch(f.$('identity').textContent, /开发令牌认证/);
     const before = f.calls.length;
     await oldCard.children[1].onclick();
     assert.equal(f.calls.length, before, 'Stale card must not send under new identity');
@@ -156,7 +190,107 @@ async function test(name, run) {
     assert.match(f.$('identity').textContent, /^bob/);
     assert.equal(f.$('send').disabled, false);
   });
-  console.log('7 client regression tests passed');
+  await test('visible polling updates snapshots without mutation and preserves drafts', async () => {
+    const f = fixture();
+    await f.login('alice');
+    const original = f.$('conversation').children[0];
+    f.$('text').value = 'unsent private draft';
+    await f.tick();
+    assert.equal(f.$('conversation').children[0], original, 'Unchanged snapshot preserves DOM');
+    f.change();
+    await f.tick();
+    assert.notEqual(f.$('conversation').children[0], original);
+    assert.match(f.$('last-refresh').textContent, /有新的/);
+    assert.equal(f.$('text').value, 'unsent private draft');
+    assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 0);
+    assert([...f.timers.values()].some(timer => timer.delay === 5000));
+  });
+
+  await test('hidden tabs pause polling; logout clears timers and stale polling', async () => {
+    const f = fixture();
+    await f.login('alice');
+    f.visible(false);
+    assert.equal(f.timers.size, 0);
+    f.hold();
+    f.visible(true);
+    const count = f.calls.length;
+    f.visible(true);
+    assert.equal(f.calls.length, count, 'Concurrent polls coalesce');
+    f.$('logout').onclick();
+    f.release();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.$('conversation').children.length, 0);
+    assert.equal(f.$('last-refresh').textContent, '');
+  });
+
+  await test('read failures back off without changing content and recover automatically', async () => {
+    const f = fixture();
+    await f.login('alice');
+    const original = f.$('conversation').children[0];
+    f.failReads(503);
+    for (const delay of [10000, 20000, 40000, 60000, 60000]) {
+      await f.tick();
+      assert([...f.timers.values()].some(timer => timer.delay === delay));
+    }
+    assert.equal(f.$('conversation').children[0], original);
+    assert.match(f.$('last-refresh').textContent, /无法同步/);
+    f.failReads(0);
+    await f.tick();
+    assert([...f.timers.values()].some(timer => timer.delay === 5000));
+    assert.match(f.$('last-refresh').textContent, /已同步/);
+  });
+
+  await test('expired auth clears private UI and stops polling', async () => {
+    const f = fixture();
+    await f.login('alice');
+    f.failReads(401);
+    await f.tick();
+    assert.equal(f.timers.size, 0);
+    assert.equal(f.$('conversation').children.length, 0);
+    assert.match(f.$('status').textContent, /登录已失效/);
+  });
+
+  await test('manual refresh during polling obtains a subsequent snapshot', async () => {
+    const f = fixture();
+    await f.login('alice');
+    f.hold();
+    const poll = f.tick();
+    const count = f.calls.length;
+    const manual = f.$('refresh').onclick();
+    assert.equal(f.calls.length, count, 'Only one read batch in flight');
+    f.release();
+    await Promise.all([poll, manual]);
+    assert.equal(f.calls.length, count + 3, 'Manual request receives a fresh batch after in-flight read');
+  });
+  await test('stalled read times out and schedules recovery instead of overlapping requests', async () => {
+    const f = fixture();
+    await f.login('alice');
+    f.stallReads();
+    const poll = f.tick();
+    const timer = [...f.timers.entries()].find(([, value]) => value.delay === 15000);
+    assert(timer);
+    f.timers.delete(timer[0]);
+    timer[1].callback();
+    await poll;
+    assert.match(f.$('last-refresh').textContent, /无法同步/);
+    assert([...f.timers.values()].some(value => value.delay === 10000));
+  });
+  await test('profile command stays in single chat and survives refresh without sending to model', async () => {
+    const f = fixture(); await f.login('alice'); await f.send('/agents');
+    assert.equal(f.calls.filter(call => call.options.method === 'POST' || call.options.method === 'PUT').length, 0);
+    const panel = f.$('conversation').children.at(-1);
+    assert.match(panel.textContent, /个人 Agent 配置/);
+    await f.$('refresh').onclick();
+    assert.equal(f.$('conversation').children.at(-1), panel);
+    const controls = panel.children[0];
+    f.change(); await f.tick();
+    assert.equal(f.$('conversation').children.at(-1), panel, 'Changed polling snapshot keeps the same profile card');
+    assert.equal(panel.children[0], controls, 'Polling preserves in-progress profile fields');
+    f.$('logout').onclick(); await f.login('bob');
+    assert(!f.$('conversation').children.includes(panel));
+  });
+  console.log('14 client regression tests passed');
 })().catch(error => {
   console.error(error);
   process.exitCode = 1;

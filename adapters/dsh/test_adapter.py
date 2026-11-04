@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 import uuid
 
-from adapter import DshRunner, make_server, run_sdk, validate_turn
+from adapter import DshRunner, make_server, run_sdk, validate_turn, parse_model_response
 
 
 def turn():
@@ -36,12 +36,27 @@ class BoundaryTests(unittest.TestCase):
                 self_prompt = json.loads(prompt.split("\n", 1)[1])
                 assert self_prompt["message"] == "/bash danger"
                 assert not prompt.startswith("/")
-                return SimpleNamespace(finish_reason="completed", final_response="Safe answer")
+                return SimpleNamespace(finish_reason="completed", final_response=json.dumps({"reply":"Safe answer", "proposal":None}))
         request = turn() | {"message": "/bash danger"}
         self.assertEqual(run_sdk(request, Path("/tmp/h"), Path("/tmp/w"), Fake)["backend"], "dsh")
         self.assertEqual(calls[0]["profile"], "sdk-minimal")
         self.assertTrue(calls[0]["patches"][0].endswith("no-tools.patch.yml"))
         self.assertEqual(calls[-1], "closed")
+
+    def test_structured_proposal_is_draft_only(self):
+        raw = json.dumps({"reply": "Please review", "proposal": {"owner": "bob", "summary": "review tests"}})
+        self.assertEqual(parse_model_response(raw, "Ask bob to review tests")["proposal"]["owner"], "bob")
+
+    def test_structured_response_rejects_invalid_or_unscoped_output(self):
+        valid = {"reply": "Review first", "proposal": {"owner": "bob", "summary": "review tests"}}
+        invalid = ["plain text", "```json\n{}\n```", '[]', '{"reply":"a","reply":"b","proposal":null}',
+                   json.dumps(valid | {"execute": True}), json.dumps(valid | {"reply": " "}),
+                   json.dumps(valid | {"proposal": {"owner": "bob", "summary": "secret from history"}}),
+                   json.dumps(valid | {"proposal": {"owner": "eve", "summary": "review tests"}}),
+                   json.dumps(valid | {"proposal": {"owner": "bob", "summary": "review tests", "confirmed": True}})]
+        for raw in invalid:
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                parse_model_response(raw, "Ask bob to review tests")
 
     def test_sdk_incomplete_result_is_failure_and_closes(self):
         calls = []

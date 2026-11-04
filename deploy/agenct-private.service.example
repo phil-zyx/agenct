@@ -1,0 +1,27 @@
+# Template only: adapt absolute paths and use a dedicated unprivileged account.
+# Do not install automatically. Installation changes host service configuration.
+[Unit]
+Description=Agenct private staging (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+User=agenct
+Group=agenct
+WorkingDirectory=/opt/agenct
+ExecStart=/usr/bin/python3 /opt/agenct/scripts/private-staging.py run --state-dir /var/lib/agenct-private
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agenct-private
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+# No EnvironmentFile containing browser tokens. The launcher reads only token hashes.
+# DSH needs a separately operated loopback adapter and approved provider credentials.
+
+[Install]
+WantedBy=multi-user.target

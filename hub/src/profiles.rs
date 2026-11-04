@@ -1,0 +1,138 @@
+//! Personal configuration only. It cannot grant tools, permissions, or credentials.
+use super::*;
+use std::collections::HashSet;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonalAgent {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub model_ref: String,
+    pub enabled: bool,
+}
+#[derive(Serialize, Deserialize)]
+pub struct Profile {
+    pub revision: u64,
+    pub agents: Vec<PersonalAgent>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Update {
+    pub expected_revision: u64,
+    pub agents: Vec<PersonalAgent>,
+}
+fn defaults() -> Vec<PersonalAgent> {
+    vec![PersonalAgent {
+        id: "butler".into(),
+        name: "个人管家".into(),
+        role: "coordinator".into(),
+        model_ref: "server-default".into(),
+        enabled: true,
+    }]
+}
+pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
+    db.execute_batch("CREATE TABLE IF NOT EXISTS personal_profiles (owner TEXT PRIMARY KEY, revision INTEGER NOT NULL, agents_json TEXT NOT NULL);")
+}
+fn read(db: &Connection, owner: &str) -> Result<Profile> {
+    let record: Option<(u64, String)> = db
+        .query_row(
+            "SELECT revision, agents_json FROM personal_profiles WHERE owner=?1",
+            [owner],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match record {
+        Some((revision, agents)) => Ok(Profile {
+            revision,
+            agents: serde_json::from_str(&agents)
+                .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "invalid stored profile"))?,
+        }),
+        None => Ok(Profile {
+            revision: 0,
+            agents: defaults(),
+        }),
+    }
+}
+pub(super) async fn catalog(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>> {
+    h.identity(&headers)?;
+    Ok(Json(serde_json::json!({
+        "models": [{"id":"server-default", "runtime": h.runtime.label(), "description":"Operator-configured server model; no personal credentials"}],
+        "roles": ["coordinator", "researcher", "writer", "reviewer"],
+        "max_agents": 8,
+        "execution": "configuration_only",
+        "permissions": "Profiles do not grant tools, delegation, or data access"
+    })))
+}
+pub(super) async fn get_profile(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Profile>> {
+    let owner = h.identity(&headers)?;
+    let db = h.db()?;
+    Ok(Json(read(&db, &owner)?))
+}
+pub(super) async fn update_profile(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Json(input): Json<Update>,
+) -> Result<Json<Profile>> {
+    let owner = h.identity(&headers)?;
+    if input.agents.is_empty() || input.agents.len() > 8 {
+        return Err(invalid("profile must contain 1..8 agents"));
+    }
+    let mut ids = HashSet::new();
+    let mut coordinators = 0;
+    for agent in &input.agents {
+        if agent.id.is_empty()
+            || agent.id.len() > 32
+            || !agent
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || !ids.insert(&agent.id)
+        {
+            return Err(invalid(
+                "agent IDs must be unique, 1..32 ASCII letters, digits, hyphens or underscores",
+            ));
+        }
+        if agent.name.trim().is_empty()
+            || agent.name.len() > 96
+            || agent.name.chars().any(char::is_control)
+        {
+            return Err(invalid(
+                "agent names must contain 1..96 bytes without control characters",
+            ));
+        }
+        if !["coordinator", "researcher", "writer", "reviewer"].contains(&agent.role.as_str()) {
+            return Err(invalid("unknown agent role"));
+        }
+        if agent.model_ref != "server-default" {
+            return Err(invalid("unknown server model reference"));
+        }
+        if agent.role == "coordinator" && agent.enabled {
+            coordinators += 1;
+        }
+    }
+    if coordinators != 1 {
+        return Err(invalid("exactly one enabled coordinator is required"));
+    }
+    let db = h.db()?;
+    let current = read(&db, &owner)?;
+    if input.expected_revision != current.revision {
+        return Err(Error(StatusCode::CONFLICT, "stale profile revision"));
+    }
+    let revision = current
+        .revision
+        .checked_add(1)
+        .filter(|v| *v <= i64::MAX as u64)
+        .ok_or(Error(StatusCode::CONFLICT, "profile revision exhausted"))?;
+    let encoded = serde_json::to_string(&input.agents)
+        .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "profile encoding failed"))?;
+    // The shared connection mutex covers both the revision check and write.
+    db.execute("INSERT INTO personal_profiles(owner, revision, agents_json) VALUES (?1,?2,?3) ON CONFLICT(owner) DO UPDATE SET revision=excluded.revision, agents_json=excluded.agents_json", params![owner, revision, encoded])?;
+    Ok(Json(Profile {
+        revision,
+        agents: input.agents,
+    }))
+}

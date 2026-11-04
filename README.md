@@ -4,7 +4,7 @@ Repository: https://github.com/phil-zyx/agenct
 
 一个以个人管家聊天窗口为入口的跨人 Agent 协作原型。每个人只关注自己的会话，任务、状态与交付在后台协调。
 
-**在线演示仍是浏览器内脚本模拟，不是真实 AI 服务。** Alice 与 Bob 是虚构演示角色。没有真实账号认证、服务端、多人同步、模型调用、GitLab 连接或安全隔离。两个角色的数据都在同一浏览器 localStorage 中。不要输入个人信息、凭据或敏感代码。
+**在线演示仍是浏览器内脚本模拟，不是真实 AI 服务。** Alice 与 Bob 是虚构演示角色。该静态页面没有真实账号认证、服务端、多人同步、模型调用、GitLab 连接或安全隔离；仓库中的 Rust Hub 需另行启动。两个角色的数据都在同一浏览器 localStorage 中。不要输入个人信息、凭据或敏感代码。
 
 ## 快速开始
 
@@ -19,7 +19,7 @@ npm run check
 
 以 Alice 身份输入“请 Bob 修复报告单位显示问题”，切换 Bob 接单并推进，再切回 Alice 验收。角色切换仅用于演示，不代表访问控制。刷新保留本浏览器数据，重置会清空演示数据。
 
-## 已实现
+## 静态演示已实现
 
 - 单窗口聊天、预设意图匹配、跨角色任务摘要路由。
 - 接单、模拟执行与发布、证据核验、验收和退回。
@@ -30,6 +30,9 @@ npm run check
 
 - `dist/`：可直接运行的静态源文件，无构建步骤。
 - `test.cjs`、`test-chat.cjs`：状态机与聊天路由测试。
+- `hub/`：Rust 服务、单窗口客户端、未接通的 Worker/发布库。
+- `adapters/dsh/`：DSH SDK 适配器与离线协议测试。
+- `scripts/`、`deploy/`：私有试运行工具和服务模板。
 - `docs/architecture.md`：当前实现与未来边界。
 - `docs/roadmap.md`：尚未实现的里程碑。
 
@@ -51,9 +54,20 @@ npm run check
 
 新增 `hub/`：Rust/Axum 本地开发服务，开发令牌身份认证、SQLite 持久消息与任务、跨身份隔离及人工接单/交付/验收。它与 `dist/` 静态演示分开运行。真实 DSH 适配层见 `adapters/dsh/`；默认不启用模型或危险工具，mock 与真实模式明确区分且不会自动回退。
 
-开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。PostgreSQL、生产登录、自动 Agent 委派、代码执行、Git 写入和独立 CI 核验尚未实现。不要将开发服务器暴露到公网。
+开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。生产登录、PostgreSQL、可运行的 Agent 军团、可信代码执行和完整远端交付链路尚未完成。不要将开发服务器暴露到公网。
 
 
 ### Controlled delegation demo
 
 The Rust chat UI now supports sender-private delegation proposals, explicit sharing confirmation, recipient acceptance/manual reply and requester acceptance. In `mock` mode, try `请让 bob 帮我 检查公开文档` or `ask bob to review the public docs`. This is a **deterministic test double**, not live DSH language understanding. `/delegate bob ...` also prepares a proposal rather than immediately sharing. See [the acceptance walkthrough and limitations](docs/rust-hub.md#controlled-delegation-acceptance-offline-test-double). The browser-only `dist/` simulation remains separate.
+
+## 当前能力与明确缺口
+
+- 单窗口服务端聊天、持久任务、私有提案确认和人工交付可在本机运行；开发令牌不是生产账号。UI 自动轮询，不是实时推送。
+- [个人配置 API](docs/personal-profiles.md)可保存角色与模型引用；目前仅支持 `server-default`，不改变运行时、不启动 Agent，也不提供个人密钥输入或配置 UI。
+- [DSH 适配器](docs/dsh-adapter.md)实现 SDK 路径与严格结构化提案校验；真实模型调用和有效工具限制仍未验收。无静默 mock 回退。
+- [Worker 与发布合同](docs/worker-contract.md)、[GitLab 传输](docs/gitlab-transport.md)是未接入聊天的库。内置执行器因证据可信性问题保持禁用；没有自动编码、分支上传、真实 MR 或 CI 验收结果。
+- [私有试运行工具](docs/private-staging.md)可准备本地服务和 SSH 访问；未部署远端实例，没有已验证的云端后端 URL。不要公开开发令牌或将服务暴露到公网。
+- 确认委派是聊天 UI 的流程保证；兼容 `POST /api/tasks` 接口可直接创建任务且不幂等。普通模型聊天超时也不能自动重试。
+
+完整边界见 [架构](docs/architecture.md)，后续验收门槛见 [路线图](docs/roadmap.md)。离线/API/模拟 DOM 测试通过不等于真实浏览器、提供商或沙箱验收。

@@ -5,7 +5,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let bind = config.bind;
     let mode = config.runtime.label();
-    let hub = Hub::open(config)?;
+    let mut hub = Hub::open(config)?;
+    if let Some(path) = std::env::var_os("AGENCT_OIDC_CONFIG_FILE") {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(131073)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 131072 {
+            return Err("OIDC configuration exceeds 128 KiB".into());
+        }
+        hub = hub.with_oidc(serde_json::from_slice(&bytes)?)?;
+        eprintln!("Authentication: pinned OIDC access tokens; development tokens disabled");
+    }
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("Agenct Hub listening at http://{bind}; runtime={mode}; loopback development only");
     axum::serve(listener, app(hub))

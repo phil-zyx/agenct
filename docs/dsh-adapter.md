@@ -36,7 +36,11 @@ Actual DSH mode sends the supplied conversation history and message to DeepSeek 
 {"session_id":"07a65954-7ee2-4ca3-a63a-09c9828b303b","history":[{"role":"user","content":"Earlier message"},{"role":"assistant","content":"Earlier answer"}],"message":"Current message"}
 ```
 
-Success: `{"reply":"...","backend":"dsh"}`. Errors: 400 invalid turn, 401 unauthorized, 404 unknown route, 502 runtime failure, 503 capacity exhausted, 504 total runtime timeout. No automatic retry, partial-success response, or mock fallback occurs. A failed/timed-out call may already have incurred provider charges; cancellation cannot undo a remote request.
+Success requires all three fields: `{"reply":"...","proposal":null,"backend":"dsh"}`. A delegation draft instead contains `"proposal":{"owner":"bob","summary":"review tests"}`. The SDK model must emit exactly `reply` and `proposal`; the adapter validates them before adding `backend`. Missing, duplicate, unexpected or malformed fields, Markdown fences, and unstructured model text fail closed. `proposal` must be explicitly null when no delegation is proposed.
+
+Both adapter and Hub require the proposal recipient to appear in the current message, and the nonempty summary to be an exact contiguous excerpt from that message, at most 4,000 UTF-8 bytes. The Hub additionally checks the recipient is another configured participant. Private history cannot supply shared summary text. The Hub persists only a sender-private pending proposal; the recipient sees nothing until the requester explicitly confirms the immutable recipient and summary. Rejection sends nothing. Model output cannot authorize or execute a task. Ambiguous requests should produce a clarifying reply with `proposal:null`; malformed output is not silently repaired or retried.
+
+Errors: 400 invalid turn, 401 unauthorized, 404 unknown route, 502 runtime failure, 503 capacity exhausted, 504 total runtime timeout. No automatic retry, partial-success response, or mock fallback occurs. A failed/timed-out call may already have incurred provider charges; cancellation cannot undo a remote request.
 
 The Hub must authorize the caller and choose the session UUID/history itself. Possession of the internal token gives access to all adapter operations; the adapter cannot independently establish user ownership. Never expose port 8788, forward browser bearer tokens, or share the internal token with end users.
 

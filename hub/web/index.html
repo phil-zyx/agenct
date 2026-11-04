@@ -21,13 +21,15 @@ small{color:#56675f}#status{white-space:pre-wrap;color:#8b332a}.hide{display:non
   <p id="identity"></p>
   <button id="logout">退出</button><button id="refresh">刷新本账号会话与任务</button>
   <p><small id="last-refresh"></small></p>
+  <p id="sync-notice" role="status" aria-live="polite"></p>
   <div id="conversation" aria-label="私聊、待确认提案与任务"></div>
   <form id="form">
-    <textarea id="text" aria-label="给管家发消息" placeholder="给管家发消息。Mock 示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。"></textarea>
+    <textarea id="text" aria-label="给管家发消息" placeholder="输入 /agents 配置个人 Agent（仅配置存储）。Mock 示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。"></textarea>
     <button id="send">发送</button>
   </form>
-  <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。任务状态来自当前账号的服务端快照，需手动刷新。交付按钮提交人工结果，不是自动执行证据。</small>
+  <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。任务状态来自当前账号的服务端快照，页面可见时每 5 秒自动检查更新，离线后自动重试。交付按钮提交人工结果，不是自动执行证据。</small>
 </section>
 <p id="status" role="status"></p>
+<script src="profiles-ui.js"></script>
 <script src="client.js"></script>
 </html>

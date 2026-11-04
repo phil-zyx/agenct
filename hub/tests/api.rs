@@ -297,7 +297,7 @@ async fn adapter_contract_uses_scoped_role_content_history() {
             assert!(m.get("role").is_some() && m.get("content").is_some());
             assert_ne!(m["content"], "bob private");
         }
-        axum::Json(json!({"reply":"adapter contract response","backend":"dsh"}))
+        axum::Json(json!({"reply":"adapter contract response","backend":"dsh","proposal":null}))
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -809,4 +809,186 @@ async fn removed_recipient_blocks_confirmation_but_not_rejection() {
     }
     drop(a);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+async fn dsh_app(response: Value) -> (Router, tokio::task::JoinHandle<()>) {
+    let adapter = Router::new().route(
+        "/v1/turn",
+        axum::routing::post(move || {
+            let value = response.clone();
+            async move { axum::Json(value) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config(":memory:");
+    cfg.runtime = Runtime::Dsh {
+        url: format!("http://{}/v1/turn", listener.local_addr().unwrap()),
+        token: "test-internal-token".into(),
+    };
+    let server = tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+    (app(Hub::open(cfg).unwrap()), server)
+}
+
+#[tokio::test]
+async fn dsh_proposal_stays_private_until_explicit_confirmation() {
+    let (app, server) = dsh_app(json!({"backend":"dsh","reply":"Review draft", "proposal":{"owner":"bob","summary":"review tests"}})).await;
+    let (status, turn) = request(
+        &app,
+        "alice",
+        "POST",
+        "/api/messages",
+        json!({"message":"Ask bob to review tests","request_id":"dsh-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(turn["backend"], "dsh");
+    assert_eq!(turn["proposal"]["status"], "pending");
+    for who in ["bob", "eve"] {
+        assert_eq!(
+            request(&app, who, "GET", "/api/tasks", Value::Null).await.1,
+            json!([])
+        );
+        assert_eq!(
+            request(&app, who, "GET", "/api/proposals", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+        assert_eq!(
+            request(&app, who, "GET", "/api/messages", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+    }
+    let path = format!(
+        "/api/proposals/{}/actions",
+        turn["proposal"]["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        request(
+            &app,
+            "bob",
+            "POST",
+            &path,
+            json!({"action":"confirm","expected_revision":0})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            request(
+                &app,
+                "alice",
+                "POST",
+                &path,
+                json!({"action":"confirm","expected_revision":0})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let tasks = request(&app, "bob", "GET", "/api/tasks", Value::Null)
+        .await
+        .1;
+    assert_eq!(tasks.as_array().unwrap().len(), 1);
+    assert_eq!(tasks[0]["summary"], "review tests");
+    server.abort();
+}
+
+#[tokio::test]
+async fn dsh_invalid_proposals_fail_closed_without_tasks_or_fallback() {
+    let base = json!({"backend":"dsh","reply":"Draft","proposal":null});
+    let bad = vec![
+        json!({"owner":"bob","summary":"private history"}),
+        json!({"owner":"mallory","summary":"review tests"}),
+        json!({"owner":"alice","summary":"review tests"}),
+        json!({"owner":"eve","summary":"review tests"}),
+        json!({"owner":"bob","summary":"review tests","confirm":true}),
+        json!({"owner":"bob","summary":" "}),
+        json!({"owner":"bob","summary":"review tests","action":"send"}),
+    ];
+    for proposal in bad {
+        let mut response = base.clone();
+        response["proposal"] = proposal;
+        let (app, server) = dsh_app(response).await;
+        assert_eq!(
+            request(
+                &app,
+                "alice",
+                "POST",
+                "/api/messages",
+                json!({"message":"Ask bob to review tests"})
+            )
+            .await
+            .0,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            request(&app, "alice", "GET", "/api/proposals", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+        assert_eq!(
+            request(&app, "bob", "GET", "/api/tasks", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+        let history = request(&app, "alice", "GET", "/api/messages", Value::Null)
+            .await
+            .1;
+        assert_eq!(history[0]["status"], "failed");
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn dsh_requires_explicit_nullable_proposal_field() {
+    for (response, expected) in [
+        (
+            json!({"backend":"dsh","reply":"Hello","proposal":null}),
+            StatusCode::OK,
+        ),
+        (
+            json!({"backend":"dsh","reply":"Hello"}),
+            StatusCode::BAD_GATEWAY,
+        ),
+        (
+            json!({"backend":"dsh","reply":"Hello","proposal":null,"execute":true}),
+            StatusCode::BAD_GATEWAY,
+        ),
+    ] {
+        let (app, server) = dsh_app(response).await;
+        assert_eq!(
+            request(
+                &app,
+                "alice",
+                "POST",
+                "/api/messages",
+                json!({"message":"Hello"})
+            )
+            .await
+            .0,
+            expected
+        );
+        assert_eq!(
+            request(&app, "alice", "GET", "/api/proposals", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+        assert_eq!(
+            request(&app, "alice", "GET", "/api/tasks", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+        server.abort();
+    }
 }

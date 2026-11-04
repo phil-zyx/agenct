@@ -1,0 +1,13 @@
+name: Private staging configuration
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  launcher:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo +stable build --locked --release --manifest-path hub/Cargo.toml
+      - run: python3 scripts/smoke-private-staging.py
