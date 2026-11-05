@@ -23,7 +23,10 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
             )?;
         }
     }
-    if !columns.iter().any(|name| name == "expected_profile_revision") {
+    if !columns
+        .iter()
+        .any(|name| name == "expected_profile_revision")
+    {
         db.execute(
             "ALTER TABLE chat_turns ADD COLUMN expected_profile_revision INTEGER",
             [],

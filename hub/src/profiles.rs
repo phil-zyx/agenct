@@ -161,7 +161,8 @@ pub(super) fn route(
     expected_revision: Option<i64>,
 ) -> Result<RuntimeProfile> {
     let profile = read(db, owner)?;
-    if expected_revision.is_some_and(|revision| revision < 0 || revision as u64 != profile.revision) {
+    if expected_revision.is_some_and(|revision| revision < 0 || revision as u64 != profile.revision)
+    {
         return Err(Error(StatusCode::CONFLICT, STALE));
     }
     // Validate stored state as well as writes: never fall back on corruption.
