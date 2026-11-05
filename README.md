@@ -88,3 +88,7 @@ snapshot in your next chat question. No task is included automatically, and this
 read-only context does not accept, execute, deliver or publish work. Task revisions
 and selections are bound to durable turn receipts. See
 [scope, confirmation boundaries and validation limits](docs/task-discussion.md).
+
+### 单次角色选择
+
+在同一聊天输入框上方点击“选择本次角色”，可让下一条普通聊天使用自己已启用的研究、写作或审阅角色；不选则仍使用管家。选择不会发送消息，配置变更后会要求重新选择，不会悄悄改用别的角色。每次仍是一个模型调用，不是自动工作的 Agent 团队。详见 [角色选择与恢复](docs/role-selection.md)。

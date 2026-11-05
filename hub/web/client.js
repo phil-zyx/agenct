@@ -2,6 +2,7 @@ let token = '', user = '', epoch = 0, refreshVersion = 0;
 let browserMode = null, csrfToken = '', logoutPending = false;
 let controller = new AbortController(), pendingSend = null, pendingTurn = null;
 let turnStorageAvailable = true;
+let selectedAgent = null, roleGeneration = 0, roleRead = null, roleButtons = [];
 let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
 const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 let pollTimer = null, pollDelay = 5000, refreshFlight = null, snapshot = '', renderedBusy = '';
@@ -67,7 +68,102 @@ function article(text) {
   return element;
 }
 
-const profileUI = createProfileUI({ api, current, article, conversation: () => $('conversation'), status });
+const profileUI = createProfileUI({ api, current, article, conversation: () => $('conversation'), status,
+  onSaved: revision => {
+    if (selectedAgent && selectedAgent.revision !== revision) selectedAgent.invalidated = true;
+    closeRolePicker();
+    renderRoleSelection();
+  }
+});
+
+const validAgentBinding = agent => agent && typeof agent.id === 'string'
+  && /^[A-Za-z0-9_-]{1,32}$/.test(agent.id)
+  && Number.isSafeInteger(agent.revision) && agent.revision >= 0;
+const roleLocked = () => !!pendingTurn || busy.has('send') || busy.has('turn-check');
+function closeRolePicker() {
+  roleGeneration++;
+  if (roleRead) roleRead.abort();
+  roleRead = null;
+  roleButtons = [];
+  $('role-options').replaceChildren();
+  $('role-picker').classList.add('hide');
+}
+function renderRoleSelection() {
+  const agent = pendingTurn?.selectedAgent || selectedAgent;
+  $('choose-role').disabled = roleLocked();
+  $('clear-role').disabled = roleLocked() || !selectedAgent;
+  roleButtons.forEach(button => { button.disabled = roleLocked(); });
+  $('role-details').textContent = agent
+    ? `本次角色：${agent.name || agent.id} · ${agent.role || '以原始回执为准'} · 配置版本 ${agent.revision}`
+      + (pendingTurn ? '\n发送角色已锁定；核对结果前不能切换。'
+        : agent.invalidated ? '\n所选配置已变更，选择已失效。请重新选择或明确恢复默认管家。'
+          : '\n仅用于下一条普通聊天。')
+    : pendingTurn ? '发送角色待原始回执核对，不能重新选择或自动重发。'
+      : '下一条普通聊天默认使用你的管家。';
+}
+$('choose-role').onclick = async () => {
+  const context = session();
+  if (!current(context) || roleLocked()) return;
+  closeRolePicker();
+  const generation = roleGeneration;
+  const reads = new AbortController();
+  roleRead = reads;
+  const abort = () => reads.abort();
+  context.signal.addEventListener('abort', abort, { once: true });
+  const timeout = setTimeout(abort, READ_TIMEOUT);
+  const valid = () => current(context) && generation === roleGeneration && !roleLocked();
+  $('role-picker').classList.remove('hide');
+  $('role-options').replaceChildren(article('正在读取你的启用角色…'));
+  try {
+    const profile = await api({ ...context, signal: reads.signal }, 'profile');
+    if (!valid()) return;
+    if (reads.signal.aborted) throw Error('读取角色超时');
+    if (!Number.isSafeInteger(profile.revision) || profile.revision < 0
+        || !Array.isArray(profile.agents) || !profile.agents.length || profile.agents.length > 8
+        || new Set(profile.agents.map(agent => agent.id)).size !== profile.agents.length
+        || profile.agents.some(agent => !validAgentBinding({ ...agent, revision: profile.revision })
+          || typeof agent.name !== 'string' || !agent.name || agent.name.length > 96
+          || typeof agent.enabled !== 'boolean'
+          || !['coordinator', 'researcher', 'writer', 'reviewer'].includes(agent.role)
+          || agent.model_ref !== 'server-default')
+        || profile.agents.filter(agent => agent.enabled && agent.role === 'coordinator').length !== 1) {
+      throw Error('个人角色配置响应无效');
+    }
+    if (selectedAgent && selectedAgent.revision !== profile.revision) selectedAgent.invalidated = true;
+    $('role-options').replaceChildren();
+    for (const agent of profile.agents.filter(agent => agent.enabled)) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = `${agent.name} · ${agent.role} · ${agent.id}`;
+      button.onclick = () => {
+        if (!valid()) return;
+        selectedAgent = { id: agent.id, name: agent.name, role: agent.role,
+          model_ref: agent.model_ref, revision: profile.revision, invalidated: false };
+        closeRolePicker();
+        renderRoleSelection();
+        status('已选择下一条普通聊天的角色。尚未发送消息；不增加工具或任务操作权限。');
+      };
+      roleButtons.push(button);
+      $('role-options').append(button);
+    }
+    renderRoleSelection();
+  } catch (error) {
+    if (valid()) $('role-options').replaceChildren(article('无法读取角色：' + error.message + '。未改变当前选择，可关闭后重试。'));
+  } finally {
+    clearTimeout(timeout);
+    context.signal.removeEventListener('abort', abort);
+    if (roleRead === reads) roleRead = null;
+    reads.abort();
+  }
+};
+$('close-role-picker').onclick = () => { closeRolePicker(); renderRoleSelection(); };
+$('clear-role').onclick = () => {
+  if (!current(session()) || roleLocked()) return;
+  selectedAgent = null;
+  closeRolePicker();
+  renderRoleSelection();
+  status('已明确恢复默认管家；下一条普通聊天不指定其他角色。');
+};
 
 const workerUI = createWorkerUI({ api, current, article, conversation: () => $('conversation') });
 
@@ -139,7 +235,8 @@ function forgetTurn() {
 function rememberTurn(context) {
   try {
     sessionStorage.setItem(TURN_STORAGE_KEY, JSON.stringify({
-      id: pendingTurn.id, user: context.user, browserMode: context.browserMode
+      id: pendingTurn.id, user: context.user, browserMode: context.browserMode,
+      ...(pendingTurn.selectedAgent ? { agent: { id: pendingTurn.selectedAgent.id, revision: pendingTurn.selectedAgent.revision } } : {})
     }));
     turnStorageAvailable = true;
   } catch { turnStorageAvailable = false; }
@@ -151,7 +248,9 @@ function restoreTurn(context) {
   catch { turnStorageAvailable = false; }
   if (saved && saved.user === context.user && saved.browserMode === context.browserMode
       && typeof saved.id === 'string' && /^[a-f0-9-]{36}$/.test(saved.id)) {
-    pendingTurn = { id: saved.id, status: 'uncertain', text: null };
+    pendingTurn = { id: saved.id, status: 'uncertain', text: null,
+      selectedAgent: validAgentBinding(saved.agent) ? { id: saved.agent.id, revision: saved.agent.revision } : null };
+    if (saved.agent && !validAgentBinding(saved.agent)) pendingTurn.invalidAgentBinding = true;
     renderTurn();
   } else {
     forgetTurn();
@@ -162,18 +261,31 @@ function renderTurn() {
   const waiting = !!pendingTurn;
   $('turn-recovery').classList[waiting ? 'remove' : 'add']('hide');
   $('turn-status').textContent = waiting
-    ? (pendingTurn.status === 'pending' ? '消息仍在处理中，尚未确认完成。' : '上次发送的结果尚未确认，可能已经处理。')
-      + '\n请求编号：' + pendingTurn.id + '\n不会自动重发。请先核对发送状态。'
+    ? (pendingTurn.status === 'sending' ? '正在发送，尚未收到服务端回执。'
+      : pendingTurn.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。'
+        : '上次发送的结果尚未确认，可能已经处理。')
+      + '\n请求编号：' + pendingTurn.id
+      + (busy.has('send') ? '\n正在等待响应，请勿重复发送。'
+        : '\n不会自动重发。请先核对发送状态。')
       + (turnStorageAvailable ? '' : '\n当前浏览器无法保存恢复凭据，请先记下请求编号，刷新后将无法自动恢复。')
     : '';
   $('check-turn').disabled = !waiting || busy.has('send') || busy.has('turn-check');
   $('new-turn').disabled = !waiting || busy.has('send') || busy.has('turn-check');
   $('send').disabled = waiting || busy.has('send');
   renderTaskContext();
+  renderRoleSelection();
 }
 
 async function completeTurn(context, response) {
-  const { text, selectedTask: expectedTask } = pendingTurn;
+  const { text, selectedTask: expectedTask, selectedAgent: expectedAgent } = pendingTurn;
+  const profile = response.runtime_profile;
+  if (pendingTurn.invalidAgentBinding || (expectedAgent && (!profile
+      || profile.agent_id !== expectedAgent.id || profile.revision !== expectedAgent.revision
+      || (expectedAgent.role && profile.role !== expectedAgent.role)
+      || (expectedAgent.model_ref && profile.model_ref !== expectedAgent.model_ref)))) {
+    throw Error('角色回执与本次选择不符，保留恢复凭据');
+  }
+  const receiptRole = profile ? `\n本次角色：${profile.agent_id} · ${profile.role} · 配置版本 ${profile.revision}` : '';
   const task = response.task_context;
   if (text !== null && (expectedTask
     ? !task || task.id !== expectedTask.id || task.revision !== expectedTask.revision
@@ -185,10 +297,10 @@ async function completeTurn(context, response) {
     : '';
   forgetTurn();
   if (text !== null && $('text').value.trim() === text) $('text').value = '';
-  status('已核实消息处理完成。' + receiptContext);
+  status('已核实消息处理完成。' + receiptContext + receiptRole);
   try { await refresh(context); }
   catch (error) {
-    if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message + receiptContext
+    if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message + receiptContext + receiptRole
       + (typeof response.reply === 'string' ? '\n已保存的回复：' + response.reply : ''));
   }
 }
@@ -214,6 +326,8 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   pendingSend = null;
   pendingTurn = null;
   selectedTask = null;
+  selectedAgent = null;
+  closeRolePicker();
   visibleTasks = new Map();
   discussionButtons = [];
   taskView++;
@@ -517,7 +631,7 @@ $('check-turn').onclick = async () => {
       await completeTurn(context, receipt.response);
     } else {
       turn.status = receipt.status;
-      status(receipt.status === 'pending' ? '服务端仍在处理。稍后可再次核对，未重发消息。' : '服务端无法确认上次处理结果。未重发消息。');
+      status(receipt.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。稍后可再次核对，未重发消息。' : '服务端无法确认上次处理结果。未重发消息。');
     }
   } catch (error) {
     if (!current(context) || pendingTurn !== turn) return;
@@ -541,7 +655,7 @@ $('new-turn').onclick = () => {
   if (!confirm('上一次发送的结果仍未知，消息可能已经处理。开始新尝试后再次发送可能重复处理。是否放弃此恢复凭据并开始新尝试？')) return;
   if (!current(context) || pendingTurn !== turn) return;
   forgetTurn();
-  status('已开始新尝试。请核对输入内容，如需任务上下文请重新选择，再点击发送；将使用新的请求编号。上次操作不会被撤销。');
+  status('已开始新尝试。请核对输入内容，如需角色或任务上下文请重新选择，再点击发送；将使用新的请求编号。上次操作不会被撤销。');
 };
 
 $('form').onsubmit = async event => {
@@ -553,6 +667,7 @@ $('form').onsubmit = async event => {
     status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
     return;
   }
+  closeRolePicker();
   busy.add('send');
   renderTurn();
   status('');
@@ -579,18 +694,25 @@ $('form').onsubmit = async event => {
       if ($('text').value.trim() === text) $('text').value = '';
       await refresh(context);
     } else {
+      if (selectedAgent?.invalidated) {
+        status('所选角色已失效，未发送消息。请重新选择角色或明确恢复默认管家。');
+        return;
+      }
       if (selectedTask && (selectedTask.invalidated || !visibleTasks.has(selectedTask.id)
           || taskSignature(visibleTasks.get(selectedTask.id)) !== taskSignature(selectedTask))) {
         selectedTask.invalidated = true;
         status('任务上下文已失效，未发送消息。请重新选择任务，或清除任务上下文后再发送。');
         return;
       }
-      chatTurn = { text, id: crypto.randomUUID(), status: 'pending', selectedTask };
+      chatTurn = { text, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent };
+      selectedAgent = null;
       selectedTask = null;
       pendingTurn = chatTurn;
       rememberTurn(context);
       renderTurn();
       const response = await postChat(context, { message: text, request_id: chatTurn.id,
+        ...(chatTurn.selectedAgent ? { agent_id: chatTurn.selectedAgent.id,
+          expected_profile_revision: chatTurn.selectedAgent.revision } : {}),
         ...(chatTurn.selectedTask ? { selected_task: {
           task_id: chatTurn.selectedTask.id, expected_revision: chatTurn.selectedTask.revision
         } } : {})
@@ -613,12 +735,20 @@ $('form').onsubmit = async event => {
       const rejectedSelection = chatTurn.selectedTask
         && ((error.httpStatus === 409 && error.code === 'selected_task_stale_before_dispatch')
           || (error.httpStatus === 404 && error.code === 'selected_task_unavailable_before_dispatch'));
-      if (rejectedSelection) {
+      const rejectedAgent = chatTurn.selectedAgent
+        && ((error.httpStatus === 409 && error.code === 'selected_agent_stale_before_dispatch')
+          || (error.httpStatus === 400 && error.code === 'selected_agent_unavailable_before_dispatch'));
+      if (rejectedAgent || rejectedSelection) {
+        selectedAgent = chatTurn.selectedAgent ? { ...chatTurn.selectedAgent,
+          invalidated: rejectedAgent || chatTurn.selectedAgent.invalidated } : null;
         // These two server codes guarantee rejection before receipt reservation
         // and provider dispatch. Generic conflicts/not-found stay uncertain.
-        selectedTask = { ...chatTurn.selectedTask, invalidated: true };
+        selectedTask = chatTurn.selectedTask ? { ...chatTurn.selectedTask,
+          invalidated: rejectedSelection || chatTurn.selectedTask.invalidated } : null;
         forgetTurn();
-        status(error.message + '。服务端尚未处理本次消息，任务上下文已失效。请重新选择任务，或清除后再发送。未自动重发。');
+        status(error.message + (rejectedAgent
+          ? '。服务端尚未处理本次消息，所选角色已失效。请重新选择角色或明确恢复默认管家。未自动重发。'
+          : '。服务端尚未处理本次消息，任务上下文已失效。请重新选择任务，或清除后再发送。未自动重发。'));
         await refresh(context).catch(() => {});
       } else {
         chatTurn.status = 'uncertain';

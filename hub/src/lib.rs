@@ -116,6 +116,8 @@ impl IntoResponse for Error {
         // Only these selection checks run before receipt reservation/dispatch.
         // Generic conflicts and transport failures must remain uncertain to clients.
         let code = match self.1 {
+            profiles::STALE => Some("selected_agent_stale_before_dispatch"),
+            profiles::UNAVAILABLE => Some("selected_agent_unavailable_before_dispatch"),
             task_context::STALE => Some("selected_task_stale_before_dispatch"),
             task_context::UNAVAILABLE => Some("selected_task_unavailable_before_dispatch"),
             _ => None,
@@ -353,6 +355,7 @@ async fn messages(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<M
 struct ChatInput {
     message: String,
     agent_id: Option<String>,
+    expected_profile_revision: Option<i64>,
     request_id: Option<String>,
     selected_task: Option<task_context::Selection>,
 }

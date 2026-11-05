@@ -28,7 +28,10 @@ function fixture(auth = { enabled: false }, settings = {}) {
   let postTurnStatus = 'complete', checkTurnStatus = 'complete', turnFailure = 0;
   let tasks = settings.tasks || [];
   const turnContexts = settings.turnContexts || new Map();
-  let responseContextOverride;
+  let responseContextOverride, responseProfileOverride;
+  const defaultProfile = { revision: 0, agents: [{ id: 'butler', name: '管家', role: 'coordinator', model_ref: 'server-default', enabled: true }] };
+  let profile = settings.profile || defaultProfile;
+  const turnProfiles = settings.turnProfiles || new Map();
   let postFailure = null;
   let confirmation = false;
   const confirmations = [];
@@ -76,6 +79,9 @@ function fixture(auth = { enabled: false }, settings = {}) {
       // Capture the context at dispatch, including an eventually lost response.
       if (url === '/api/messages' && options.method === 'POST') {
         const body = JSON.parse(options.body), selected = body.selected_task;
+        const agent = profile.agents?.find(agent => body.agent_id ? agent.id === body.agent_id : agent.role === 'coordinator');
+        turnProfiles.set(body.request_id, agent ? { revision: profile.revision, agent_id: agent.id,
+          role: agent.role, model_ref: agent.model_ref } : null);
         const task = selected && tasks.find(task => task.id === selected.task_id);
         turnContexts.set(body.request_id, task ? { ...task, summary_truncated: false, result_truncated: false } : null);
       }
@@ -105,6 +111,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       if (url === '/api/messages' && options.method === 'POST') {
         const requestId = JSON.parse(options.body).request_id;
         data = { reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null,
+          runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
           task_context: responseContextOverride === undefined ? turnContexts.get(requestId) : responseContextOverride,
           turn: { request_id: requestId, status: postTurnStatus } };
       }
@@ -113,11 +120,12 @@ function fixture(auth = { enabled: false }, settings = {}) {
         const requestId = decodeURIComponent(url.split('/').at(-1));
         data = { request_id: requestId, status: checkTurnStatus,
           response: checkTurnStatus === 'complete' ? { reply: 'Saved chat reply',
+            runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
             task_context: responseContextOverride === undefined ? turnContexts.get(requestId) ?? null : responseContextOverride,
             turn: { request_id: requestId, status: 'complete' } } : null };
       }
       if (url.endsWith('/profile/catalog')) data = { roles: ['coordinator', 'researcher'], models: [{ id: 'server-default' }], max_agents: 8 };
-      if (url.endsWith('/profile')) data = { revision: 0, agents: [{ id: 'butler', name: '管家', role: 'coordinator', model_ref: 'server-default', enabled: true }] };
+      if (url.endsWith('/profile')) data = profile;
       return { ok: true, json: async () => data };
     }
   });
@@ -125,7 +133,11 @@ function fixture(auth = { enabled: false }, settings = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'worker-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'client.js'), 'utf8'), context);
   return {
-    $, calls, timers, storage, confirmations, turnContexts,
+    $, calls, timers, storage, confirmations, turnContexts, turnProfiles,
+    profile(value) { profile = value; },
+    responseProfile(value) { responseProfileOverride = value; },
+    role(id) { return $('role-options').children.find(button => button.textContent.endsWith(' · ' + id)); },
+    async chooseRole(id = 'research') { await $('choose-role').onclick(); this.role(id).onclick(); },
     tasks(value) { tasks = value; },
     responseContext(value) { responseContextOverride = value; },
     messageFailure(status, code) { postFailure = status ? { status, code } : null; },
@@ -436,6 +448,39 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const saved = JSON.parse([...f.storage.values()][0]);
     assert.deepEqual(saved, { id, user: 'alice', browserMode: false });
     assert(!JSON.stringify([...f.storage]).includes('private question'));
+  });
+  await test('sending does not claim server receipt, then shows only acknowledged state', async () => {
+    for (const outcome of ['pending', 'uncertain', 'complete', 'failure']) {
+      const f = fixture(); await f.login('alice');
+      f.postTurn(outcome === 'failure' ? 'complete' : outcome);
+      if (outcome === 'failure') f.failNextPost();
+      f.hold();
+      const sending = f.send('question');
+      await f.ready();
+      assert.match(f.$('turn-status').textContent, /正在发送，尚未收到服务端回执/);
+      assert.doesNotMatch(f.$('turn-status').textContent, /已记录|处理中|请先核对/);
+      assert.equal(f.$('send').disabled, true);
+      assert.equal(f.$('check-turn').disabled, true);
+      assert.equal(f.$('new-turn').disabled, true);
+      await f.send('duplicate');
+      assert.equal(chatPosts(f).length, 1);
+      f.release(); await sending;
+      if (outcome === 'complete') {
+        assert.equal(f.$('turn-status').textContent, '');
+      } else {
+        assert.match(f.$('turn-status').textContent, outcome === 'pending'
+          ? /服务端已记录此请求，尚未确认处理完成/ : /结果尚未确认/);
+        assert.doesNotMatch(f.$('turn-status').textContent, /正在发送|正在等待响应/);
+        assert.equal(f.$('check-turn').disabled, false);
+      }
+    }
+  });
+  await test('first-use guidance keeps direct chat primary and details optional', async () => {
+    const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+    assert.match(html, /直接说你想解决的问题，无需先配置角色/);
+    assert.match(html, /aria-describedby="chat-help" placeholder="说说你想解决的问题…"/);
+    assert.match(html, /<details><summary>能力边界、委派示例与恢复说明<\/summary>/);
+    assert.match(html, /Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行/);
   });
   await test('pending and uncertain receipts only use GET until complete', async () => {
     for (const initialStatus of ['pending', 'uncertain']) {
@@ -888,6 +933,183 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(); await f.login('alice');
     f.messageFailure(409, 'selected_task_stale_before_dispatch'); await f.send('unselected question');
     assert.equal(f.storage.size, 1, 'Selection-specific errors cannot clear an unselected attempt');
+  });
+  const roles = (revision = 3) => ({ revision, agents: [
+    { id: 'butler', name: '管家', role: 'coordinator', model_ref: 'server-default', enabled: true },
+    { id: 'research', name: '<研究员>', role: 'researcher', model_ref: 'server-default', enabled: true },
+    { id: 'writer', name: '写作者', role: 'writer', model_ref: 'server-default', enabled: false }
+  ] });
+  await test('role selection reads own profile and sends only one ID with exact revision', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice');
+    const start = f.calls.length; await f.$('choose-role').onclick();
+    assert(f.role('research')); assert(!f.role('writer'));
+    assert(f.calls.slice(start).every(call => call.options.method === 'GET'));
+    f.role('research').onclick(); assert(f.$('role-details').textContent.includes('<研究员>'));
+    assert.equal(chatPosts(f).length, 0);
+    await f.send('review this');
+    const body = JSON.parse(chatPosts(f)[0].options.body);
+    assert.equal(body.agent_id, 'research'); assert.equal(body.expected_profile_revision, 3);
+    assert.deepEqual(Object.keys(body).sort(), ['agent_id', 'expected_profile_revision', 'message', 'request_id']);
+    assert.equal(f.storage.size, 0); assert(f.$('status').textContent.includes('researcher'));
+    await f.send('next default'); assert(!('agent_id' in JSON.parse(chatPosts(f)[1].options.body)));
+  });
+  await test('role picker close, repeated reads and stale callbacks never choose a role', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice');
+    await f.$('choose-role').onclick(); const old = f.role('research');
+    f.$('close-role-picker').onclick(); old.onclick();
+    assert(f.$('role-details').textContent.includes('默认'));
+    await f.$('choose-role').onclick(); const older = f.role('research');
+    await f.$('choose-role').onclick(); older.onclick();
+    assert(f.$('role-details').textContent.includes('默认'));
+    f.hold(); const reading = f.$('choose-role').onclick();
+    f.$('close-role-picker').onclick(); f.release(); await reading;
+    assert(f.$('role-picker').classList.contains('hide')); assert.equal(f.$('role-options').children.length, 0);
+  });
+  await test('invalid or disabled role records are never silently offered', async () => {
+    for (const mutate of [p => p.revision = -1, p => p.revision = 2 ** 53,
+      p => p.agents.push(p.agents[0]), p => p.agents[1].role = 'shell',
+      p => p.agents[1].model_ref = 'foreign', p => p.agents[1].id = '../bad',
+      p => p.agents[0].enabled = false]) {
+      const p = roles(); mutate(p); const f = fixture(undefined, { profile: p }); await f.login('alice');
+      await f.$('choose-role').onclick(); assert(!f.role('research'));
+      assert(f.$('role-options').children[0].textContent.includes('响应无效'));
+    }
+  });
+  await test('unsent role survives task polling and commands but clear explicitly restores default', async () => {
+    const f = fixture(undefined, { profile: roles(), tasks: [task()] }); await f.login('alice');
+    await f.chooseRole(); f.discussion('task-one').onclick(); await f.$('refresh').onclick();
+    await f.send('/agents'); await f.send('/delegate bob summary');
+    assert(f.$('role-details').textContent.includes('researcher')); assert.equal(chatPosts(f).length, 0);
+    await f.send('discuss'); const body = JSON.parse(chatPosts(f)[0].options.body);
+    assert.equal(body.agent_id, 'research'); assert.equal(body.selected_task.task_id, 'task-one');
+    await f.chooseRole(); f.$('clear-role').onclick(); await f.send('default');
+    assert(!('agent_id' in JSON.parse(chatPosts(f)[1].options.body)));
+  });
+  await test('rereading changed profile invalidates selection without silent fallback', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    f.profile(roles(4)); await f.$('choose-role').onclick(); f.$('close-role-picker').onclick();
+    await f.send('keep intended role'); assert.equal(chatPosts(f).length, 0);
+    assert(f.$('role-details').textContent.includes('失效'));
+    await f.chooseRole(); await f.send('new revision');
+    assert.equal(JSON.parse(chatPosts(f)[0].options.body).expected_profile_revision, 4);
+  });
+  await test('identity changes and late profile reads cannot restore another owners selection', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice');
+    await f.$('choose-role').onclick(); const button = f.role('research');
+    f.hold(); const reading = f.$('choose-role').onclick();
+    await f.$('logout').onclick(); f.release(); await reading;
+    f.profile({ revision: 0, agents: [roles().agents[0]] }); await f.login('bob'); button.onclick();
+    assert(f.$('role-details').textContent.includes('默认'));
+    await f.$('choose-role').onclick(); assert(!f.role('research'));
+    await f.send('bob'); assert(!('agent_id' in JSON.parse(chatPosts(f)[0].options.body)));
+  });
+  await test('inflight and uncertain role stays frozen across clicks and profile edits', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    f.hold(); const sending = f.send('private original'); await f.ready();
+    assert(f.$('choose-role').disabled); f.$('clear-role').onclick();
+    f.profile(roles(4)); f.postTurn('uncertain'); f.release(); await sending;
+    assert(f.$('role-details').textContent.includes('版本 3')); assert(f.$('choose-role').disabled);
+    const n = chatPosts(f).length; await f.$('check-turn').onclick();
+    assert.equal(chatPosts(f).length, n); assert.equal(f.storage.size, 0);
+    assert(f.$('status').textContent.includes('版本 3'));
+  });
+  await test('selected role receipt binding survives reload without names or message text', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    f.failNextPost(); await f.send('secret draft');
+    const saved = [...f.storage.values()][0];
+    assert(saved.includes('research')); assert(!saved.includes('secret draft')); assert(!saved.includes('<研究员>'));
+    const second = fixture(undefined, { profile: roles(8), storage: f.storage, turnProfiles: f.turnProfiles });
+    await second.login('alice'); assert(second.$('choose-role').disabled);
+    await second.$('check-turn').onclick(); assert.equal(second.storage.size, 0);
+    assert(second.$('status').textContent.includes('版本 3')); assert.equal(chatPosts(second).length, 0);
+  });
+  await test('mismatched selected role receipt preserves uncertainty and no automatic retry', async () => {
+    for (const changed of [null, { agent_id: 'writer', revision: 3 }, { agent_id: 'research', revision: 4 },
+      { agent_id: 'research', revision: 3, role: 'writer', model_ref: 'server-default' }]) {
+      const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+      f.responseProfile(changed); await f.send('original');
+      assert.equal(f.storage.size, 1); assert(f.$('status').textContent.includes('角色回执'));
+      await f.$('check-turn').onclick(); assert.equal(f.storage.size, 1); assert.equal(chatPosts(f).length, 1);
+    }
+  });
+  await test('only exact known agent pre-dispatch errors release recovery and preserve task choice', async () => {
+    for (const [status, code] of [[409, 'selected_agent_stale_before_dispatch'], [400, 'selected_agent_unavailable_before_dispatch']]) {
+      const f = fixture(undefined, { profile: roles(), tasks: [task()] }); await f.login('alice');
+      await f.chooseRole(); f.discussion('task-one').onclick(); f.messageFailure(status, code); await f.send('question');
+      assert.equal(f.storage.size, 0); assert(f.$('role-details').textContent.includes('失效'));
+      assert(f.$('task-context-details').textContent.includes('task-one'));
+      f.messageFailure(null); await f.send('question'); assert.equal(chatPosts(f).length, 1);
+      f.profile(roles(4)); await f.chooseRole(); await f.send('question');
+      assert.equal(chatPosts(f).length, 2); assert.equal(JSON.parse(chatPosts(f)[1].options.body).selected_task.task_id, 'task-one');
+    }
+    for (const [status, code] of [[409, undefined], [404, 'selected_agent_unavailable_before_dispatch'], [400, 'selected_agent_stale_before_dispatch']]) {
+      const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+      f.messageFailure(status, code); await f.send('question'); assert.equal(f.storage.size, 1);
+    }
+  });
+  await test('role read failure or timeout preserves selection and cancelled late results stay closed', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    f.failReads(503); await f.$('choose-role').onclick();
+    assert(f.$('role-details').textContent.includes('researcher'));
+    assert(f.$('role-options').children[0].textContent.includes('无法读取'));
+    f.failReads(0); f.hold(); const read = f.$('choose-role').onclick();
+    const timeout = [...f.timers.values()].find(timer => timer.delay === 15000); timeout.callback();
+    f.release(); await read;
+    assert(f.$('role-options').children[0].textContent.includes('超时'));
+    f.$('close-role-picker').onclick();
+    await f.send('still selected'); assert.equal(JSON.parse(chatPosts(f)[0].options.body).agent_id, 'research');
+  });
+  await test('same-owner reauthentication restores frozen role but different owner cannot inherit it', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    f.failNextPost(); await f.send('private draft'); f.failReads(401); await f.tick();
+    assert(f.$('room').classList.contains('hide')); assert(!f.$('role-details').textContent.includes('research'));
+    f.failReads(0); f.profile(roles(9)); await f.login('alice');
+    assert(f.$('choose-role').disabled); assert(f.$('role-details').textContent.includes('版本 3'));
+    await f.$('check-turn').onclick(); assert.equal(f.storage.size, 0);
+    await f.chooseRole(); f.failNextPost(); await f.send('another draft');
+    await f.login('bob'); assert.equal(f.storage.size, 0);
+    assert(!f.$('role-details').textContent.includes('research'));
+  });
+  await test('confirmed new attempt discards frozen role and requires explicit reselection', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    f.failNextPost(); await f.send('question'); const original = JSON.parse(chatPosts(f)[0].options.body);
+    f.confirm(false); f.$('new-turn').onclick(); assert(f.$('choose-role').disabled);
+    f.confirm(true); f.$('new-turn').onclick(); assert(f.$('role-details').textContent.includes('默认'));
+    await f.send('new question'); const next = JSON.parse(chatPosts(f)[1].options.body);
+    assert.notEqual(original.request_id, next.request_id); assert(!('agent_id' in next));
+  });
+  await test('confirmed profile editor save invalidates an unsent role via its real callback', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    await f.send('/agents');
+    const descendants = element => [element, ...element.children.flatMap(descendants)];
+    const button = text => descendants(f.$('conversation')).find(element => element.textContent === text);
+    await button('检查更改').onclick();
+    f.profile(roles(4)); await button('确认保存个人配置').onclick();
+    assert(f.calls.some(call => call.url === '/api/profile' && call.options.method === 'PUT'));
+    assert(f.$('role-details').textContent.includes('失效'));
+    await f.send('must not fallback'); assert.equal(chatPosts(f).length, 0);
+  });
+  await test('stale task rejection preserves selected role for explicit task reselection', async () => {
+    const f = fixture(undefined, { profile: roles(), tasks: [task()] }); await f.login('alice');
+    await f.chooseRole(); f.discussion('task-one').onclick();
+    f.messageFailure(409, 'selected_task_stale_before_dispatch'); await f.send('question');
+    assert.equal(f.storage.size, 0); assert(f.$('role-details').textContent.includes('researcher'));
+    assert(!f.$('role-details').textContent.includes('失效'));
+    f.tasks([task({ revision: 4 })]); f.messageFailure(null); await f.$('refresh').onclick();
+    f.discussion('task-one').onclick(); await f.send('question');
+    const body = JSON.parse(chatPosts(f)[1].options.body);
+    assert.equal(body.agent_id, 'research'); assert.equal(body.expected_profile_revision, 3);
+    assert.equal(body.selected_task.expected_revision, 4);
+  });
+  await test('malformed restored role binding cannot be cleared by a completion receipt', async () => {
+    const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
+    f.failNextPost(); await f.send('question');
+    const [key, raw] = [...f.storage.entries()][0]; const saved = JSON.parse(raw);
+    saved.agent.revision = '3'; f.storage.set(key, JSON.stringify(saved));
+    const next = fixture(undefined, { storage: f.storage, turnProfiles: f.turnProfiles }); await next.login('alice');
+    await next.$('check-turn').onclick(); assert.equal(next.storage.size, 1);
+    assert(next.$('status').textContent.includes('角色回执'));
+    assert.equal(chatPosts(next).length, 0);
   });
   console.log('Client regression tests passed');
 

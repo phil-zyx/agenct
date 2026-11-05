@@ -5,7 +5,7 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS chat_turns (
         owner TEXT NOT NULL, request_id TEXT NOT NULL, message TEXT NOT NULL,
-        agent_id TEXT, runtime_profile TEXT NOT NULL,
+        agent_id TEXT, expected_profile_revision INTEGER, runtime_profile TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('pending','uncertain','complete')),
         response TEXT, message_id INTEGER, selected_task TEXT, task_context TEXT, PRIMARY KEY(owner,request_id));
         UPDATE messages SET status='uncertain' WHERE status IN ('pending','interrupted') AND id IN (SELECT message_id FROM chat_turns WHERE status='pending');
@@ -22,6 +22,15 @@ pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
                 [],
             )?;
         }
+    }
+    if !columns
+        .iter()
+        .any(|name| name == "expected_profile_revision")
+    {
+        db.execute(
+            "ALTER TABLE chat_turns ADD COLUMN expected_profile_revision INTEGER",
+            [],
+        )?;
     }
     Ok(())
 }
@@ -62,22 +71,26 @@ fn replay(db: &Connection, owner: &str, input: &ChatInput) -> Result<Option<serd
     };
     let binding = db
         .query_row(
-            "SELECT message,agent_id,selected_task FROM chat_turns WHERE owner=?1 AND request_id=?2",
+            "SELECT message,agent_id,selected_task,expected_profile_revision FROM chat_turns WHERE owner=?1 AND request_id=?2",
             params![owner, key],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,r.get::<_,Option<String>>(2)?)),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<i64>>(3)?)),
         )
         .optional()?;
-    let Some((message, agent_id, selected_task)) = binding else {
+    let Some((message, agent_id, selected_task, expected_profile_revision)) = binding else {
         return Ok(None);
     };
     let selection = input
         .selected_task
         .as_ref()
         .map(|s| serde_json::to_string(s).expect("selection JSON"));
-    if message != input.message || agent_id != input.agent_id || selected_task != selection {
+    if message != input.message
+        || agent_id != input.agent_id
+        || selected_task != selection
+        || expected_profile_revision != input.expected_profile_revision
+    {
         return Err(Error(
             StatusCode::CONFLICT,
-            "request_id already used for different content, agent or selected task",
+            "request_id already used for different content, agent, profile revision or selected task",
         ));
     }
     let found = receipt(db, owner, key)?.ok_or_else(denied)?;
@@ -127,6 +140,18 @@ pub(super) async fn chat(
     {
         return Err(invalid("invalid selected task"));
     }
+    if input.agent_id.as_ref().is_some_and(|id| {
+        id.is_empty()
+            || id.len() > 32
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+    }) || input
+        .expected_profile_revision
+        .is_some_and(|revision| revision < 0 || input.agent_id.is_none())
+    {
+        return Err(invalid("invalid explicit agent selection"));
+    }
     // Completed/uncertain replays are independent of current profile and active turns.
     if let Some(response) = replay(&*h.db()?, &id, &input)? {
         return Ok(Json(response));
@@ -141,10 +166,15 @@ pub(super) async fn chat(
         return Ok(Json(response));
     }
     let (runtime_profile, task_context) = {
-        // Capture and reserve under the task mutation mutex. Later task changes
-        // cannot alter this frozen discussion snapshot or its replay.
+        // Capture and reserve under the shared profile/task mutation mutex.
+        // Later edits cannot alter the frozen routing or discussion snapshot.
         let db = h.db()?;
-        let runtime_profile = profiles::route(&db, &id, input.agent_id.as_deref())?;
+        let runtime_profile = profiles::route(
+            &db,
+            &id,
+            input.agent_id.as_deref(),
+            input.expected_profile_revision,
+        )?;
         let task_context = task_context::capture(&db, &id, input.selected_task.as_ref())?;
         if let Some(key) = input.request_id.as_deref() {
             let collision: bool = db.query_row(
@@ -162,8 +192,8 @@ pub(super) async fn chat(
                 .selected_task
                 .as_ref()
                 .map(|s| serde_json::to_string(s).expect("selection JSON"));
-            db.execute("INSERT INTO chat_turns(owner,request_id,message,agent_id,runtime_profile,status,selected_task,task_context) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7)",
-                params![id,key,input.message,input.agent_id,serde_json::to_string(&runtime_profile).map_err(|_| invalid("invalid runtime profile"))?,selection,task_context.as_ref().map(|c|c.to_string())])?;
+            db.execute("INSERT INTO chat_turns(owner,request_id,message,agent_id,runtime_profile,status,selected_task,task_context,expected_profile_revision) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?8)",
+                params![id,key,input.message,input.agent_id,serde_json::to_string(&runtime_profile).map_err(|_| invalid("invalid runtime profile"))?,selection,task_context.as_ref().map(|c|c.to_string()),input.expected_profile_revision])?;
         }
         (runtime_profile, task_context)
     };
@@ -239,6 +269,7 @@ mod tests {
         let input = || ChatInput {
             message: "hello".into(),
             agent_id: None,
+            expected_profile_revision: None,
             request_id: Some("timeout".into()),
             selected_task: None,
         };
