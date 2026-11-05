@@ -1,7 +1,7 @@
 /* Personal role controls in the existing conversation, never a model/tool grant. */
-function createProfileUI({ api, current, article, conversation, status }) {
+function createProfileUI({ api, current, article, conversation, status, onSaved = () => {} }) {
   let generation = 0, card = null;
-  const notice = '聊天默认使用启用的管家角色，其他启用角色可通过 API 单次选择。每次只调用一个服务端模型，不启动 Agent 团队，也不授予工具权限；MOCK 不调用模型。请勿填写密钥。';
+  const notice = '聊天默认使用启用的管家角色，其他启用角色可在输入框上方单次选择。每次只调用一个服务端模型，不启动 Agent 团队，也不授予工具权限；MOCK 不调用模型。请勿填写密钥。';
   function reset() { generation++; card = null; }
   function append(entries) { if (card) entries.push(card); }
   async function open(context) {
@@ -90,6 +90,7 @@ function createProfileUI({ api, current, article, conversation, status }) {
         try {
           const saved = await api(context, 'profile', 'PUT', { expected_revision: profile.revision, agents: snapshot });
           if (!valid()) return;
+          onSaved(saved.revision);
           controls.replaceChildren(article('已保存个人配置 · 修订 ' + saved.revision + '\n' + notice));
           saving = false;
           controls.append(button('重新读取配置', () => open(context)));

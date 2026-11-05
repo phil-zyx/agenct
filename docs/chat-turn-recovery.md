@@ -46,8 +46,14 @@ an HTTP handler does not establish cancellation of work already sent upstream.
 
 ## Browser behavior
 
+Before any server response, the UI says “sending, no server receipt yet,” not
+“processing.” Only a validated pending receipt says the server recorded the request;
+it does not prove the provider is currently running. Transport failure remains
+uncertain. While waiting for the initial response, recovery controls stay disabled.
+
 The chat client remembers unresolved receipt IDs in owner-scoped tab session
-storage, without saving credentials or message text there. It exposes a read-only
+storage, without saving credentials or message text there. Explicit role selection also stores
+only the role ID and expected profile revision, not display names or instructions. It exposes a read-only
 status check after transport failure or refresh instead of silently resending.
 Chat POSTs have a 90-second browser deadline. Expiry stops waiting, retains the
 unresolved receipt and enables status checks; it does not cancel or retry provider
