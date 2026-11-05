@@ -2,6 +2,9 @@
 use super::*;
 use std::collections::HashSet;
 
+pub(super) const STALE: &str = "selected agent profile changed; refresh and select it again";
+pub(super) const UNAVAILABLE: &str = "unknown or disabled personal agent";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersonalAgent {
@@ -155,8 +158,12 @@ pub(super) fn route(
     db: &Connection,
     owner: &str,
     selected: Option<&str>,
+    expected_revision: Option<i64>,
 ) -> Result<RuntimeProfile> {
     let profile = read(db, owner)?;
+    if expected_revision.is_some_and(|revision| revision < 0 || revision as u64 != profile.revision) {
+        return Err(Error(StatusCode::CONFLICT, STALE));
+    }
     // Validate stored state as well as writes: never fall back on corruption.
     validate(&profile.agents)?;
     let agent = profile
@@ -169,7 +176,7 @@ pub(super) fn route(
                     None => a.role == "coordinator",
                 }
         })
-        .ok_or(invalid("unknown or disabled personal agent"))?;
+        .ok_or(invalid(UNAVAILABLE))?;
     Ok(RuntimeProfile {
         revision: profile.revision,
         agent_id: agent.id.clone(),
@@ -192,7 +199,10 @@ mod tests {
             [serde_json::to_string(&agents).unwrap()],
         )
         .unwrap();
-        assert!(route(&db, "alice", None).is_err());
-        assert_eq!(route(&db, "bob", None).unwrap().model_ref, "server-default");
+        assert!(route(&db, "alice", None, None).is_err());
+        assert_eq!(
+            route(&db, "bob", None, None).unwrap().model_ref,
+            "server-default"
+        );
     }
 }

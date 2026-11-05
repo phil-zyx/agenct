@@ -56,7 +56,11 @@ boundary or a guarantee of output quality. There is no fan-out or background tea
 The mock runtime remains deterministic and does not exercise a model.
 
 Example single-role turn: `{"message":"Review this draft…","agent_id":"research"}`.
-The inline configuration UI does not yet select per-turn roles. Deploy the Hub and
+The chat composer now offers an optional “选择本次角色” control. It reads this
+account's profile and lets the user select one enabled role for the next ordinary
+chat, sending only its ID and expected profile revision. “恢复默认管家” explicitly
+clears the selection. A selection never sends a message by itself. See
+[per-turn role selection](role-selection.md) for revision and recovery behavior. Deploy the Hub and
 adapter together: an older adapter rejects the new profile payload rather than
 silently dropping routing. Legacy direct adapter requests without a profile retain
 the coordinator default for compatibility.

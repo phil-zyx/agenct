@@ -447,3 +447,103 @@ async fn completion_failure_rolls_back_private_proposal_as_well_as_reply() {
     );
     assert_eq!(adapter.count(), 1);
 }
+
+fn selected_agent(key: &str, agent: &str, revision: i64) -> Value {
+    json!({"request_id":key,"message":"review this","agent_id":agent,"expected_profile_revision":revision})
+}
+fn role_profile(revision: i64, enabled: bool) -> Value {
+    json!({"expected_revision":revision,"agents":[
+        {"id":"butler","name":"Coordinator","role":"coordinator","model_ref":"server-default","enabled":true},
+        {"id":"research","name":"Research","role":"researcher","model_ref":"server-default","enabled":enabled}
+    ]})
+}
+#[tokio::test]
+async fn explicit_selection_rejects_stale_disabled_unknown_and_other_owner_before_reservation() {
+    let a = app(Hub::open(config(":memory:")).unwrap());
+    assert_eq!(request(&a, "alice", "PUT", "/api/profile", role_profile(0, false)).await.0, StatusCode::OK);
+    for (who, agent, revision, code, status) in [
+        ("alice", "butler", 0, "selected_agent_stale_before_dispatch", StatusCode::CONFLICT),
+        ("alice", "research", 1, "selected_agent_unavailable_before_dispatch", StatusCode::BAD_REQUEST),
+        ("alice", "missing", 1, "selected_agent_unavailable_before_dispatch", StatusCode::BAD_REQUEST),
+        ("bob", "research", 0, "selected_agent_unavailable_before_dispatch", StatusCode::BAD_REQUEST),
+    ] {
+        let response = request(&a, who, "POST", "/api/messages", selected_agent("rejected", agent, revision)).await;
+        assert_eq!(response.0, status);
+        assert_eq!(response.1["code"], code);
+        assert_eq!(request(&a, who, "GET", "/api/turns/rejected", Value::Null).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(request(&a, who, "GET", "/api/messages", Value::Null).await.1, json!([]));
+    }
+    // Rejected selections did not consume the ID. Owner revision is independent.
+    assert_eq!(request(&a, "bob", "POST", "/api/messages", selected_agent("rejected", "butler", 0)).await.0, StatusCode::OK);
+    assert_eq!(request(&a, "alice", "POST", "/api/messages", selected_agent("rejected", "butler", 1)).await.0, StatusCode::OK);
+    // Existing clients may still omit the revision.
+    assert_eq!(request(&a, "alice", "POST", "/api/messages", json!({"message":"legacy","agent_id":"butler"})).await.0, StatusCode::OK);
+}
+#[tokio::test]
+async fn malformed_explicit_selection_never_reserves_a_receipt() {
+    let a = app(Hub::open(config(":memory:")).unwrap());
+    for patch in [
+        json!({"expected_profile_revision":0}),
+        json!({"agent_id":"butler","expected_profile_revision":-1}),
+        json!({"agent_id":"","expected_profile_revision":0}),
+        json!({"agent_id":"bad/id","expected_profile_revision":0}),
+        json!({"agent_id":"x".repeat(33),"expected_profile_revision":0}),
+        json!({"agent_id":"butler","expected_profile_revision":"0"}),
+        json!({"agent_id":"butler","expected_profile_revision":0.5}),
+        json!({"agent_id":"butler","expected_profile_revision":18446744073709551615u64}),
+    ] {
+        let mut body = turn("malformed");
+        body.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+        assert!(request(&a, "alice", "POST", "/api/messages", body).await.0.is_client_error());
+        assert_eq!(lookup(&a, "malformed").await.0, StatusCode::NOT_FOUND);
+    }
+    assert_eq!(request(&a, "alice", "GET", "/api/messages", Value::Null).await.1, json!([]));
+}
+#[tokio::test]
+async fn explicit_revision_is_frozen_during_edit_and_bound_to_receipt_after_restart() {
+    let adapter = Adapter::new(success(), true).await;
+    let db = Database::new();
+    let a = adapter.app(&db.path());
+    assert_eq!(request(&a, "alice", "PUT", "/api/profile", role_profile(0, true)).await.0, StatusCode::OK);
+    let body = selected_agent("selected", "research", 1);
+    let running = a.clone();
+    let original = body.clone();
+    let task = tokio::spawn(async move { request(&running, "alice", "POST", "/api/messages", original).await });
+    adapter.wait().await;
+    assert_eq!(request(&a, "alice", "PUT", "/api/profile", role_profile(1, false)).await.0, StatusCode::OK);
+    assert_eq!(request(&a, "alice", "POST", "/api/messages", body.clone()).await.1["turn"]["status"], "pending");
+    let changed = request(&a, "alice", "POST", "/api/messages", selected_agent("selected", "research", 2)).await;
+    assert_eq!(changed.0, StatusCode::CONFLICT);
+    assert!(changed.1.get("code").is_none());
+    adapter.release.add_permits(1);
+    let completed = task.await.unwrap();
+    assert_eq!(completed.0, StatusCode::OK);
+    assert_eq!(completed.1["runtime_profile"]["revision"], 1);
+    assert_eq!(completed.1["runtime_profile"]["agent_id"], "research");
+    assert_eq!(request(&a, "alice", "POST", "/api/messages", body.clone()).await, completed);
+    drop(a);
+    let a = adapter.app(&db.path());
+    assert_eq!(request(&a, "alice", "POST", "/api/messages", body).await, completed);
+    let mut legacy = selected_agent("selected", "research", 1);
+    legacy.as_object_mut().unwrap().remove("expected_profile_revision");
+    let conflict = request(&a, "alice", "POST", "/api/messages", legacy).await;
+    assert_eq!(conflict.0, StatusCode::CONFLICT);
+    assert!(conflict.1.get("code").is_none());
+    assert_eq!(adapter.count(), 1);
+}
+#[tokio::test]
+async fn old_receipt_schema_migrates_revision_without_rebinding_legacy_turns() {
+    let db = Database::new();
+    let sql = rusqlite::Connection::open(db.path()).unwrap();
+    sql.execute_batch("CREATE TABLE chat_turns(owner TEXT NOT NULL,request_id TEXT NOT NULL,message TEXT NOT NULL,agent_id TEXT,runtime_profile TEXT NOT NULL,status TEXT NOT NULL,response TEXT,message_id INTEGER,PRIMARY KEY(owner,request_id));").unwrap();
+    let original = json!({"reply":"frozen legacy","turn":{"request_id":"legacy","status":"complete"}});
+    sql.execute("INSERT INTO chat_turns(owner,request_id,message,agent_id,runtime_profile,status,response) VALUES ('alice','legacy','review this','butler','{}','complete',?1)", [original.to_string()]).unwrap();
+    drop(sql);
+    for _ in 0..2 {
+        let a = app(Hub::open(config(&db.path())).unwrap());
+        assert_eq!(request(&a, "alice", "POST", "/api/messages", json!({"request_id":"legacy","message":"review this","agent_id":"butler"})).await.1, original);
+        let conflict = request(&a, "alice", "POST", "/api/messages", selected_agent("legacy", "butler", 0)).await;
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+        assert!(conflict.1.get("code").is_none());
+    }
+}
