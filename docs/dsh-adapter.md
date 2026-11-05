@@ -74,6 +74,22 @@ python3 -m unittest discover -s adapters/dsh -v
 
 Tests cover authentication, malformed and cross-boundary input rejection, slash-command wrapping, SDK profile configuration, result failure handling, context cleanup, process-group timeout cleanup, environment minimization, distinct request homes, and removal of temporary state. They do not prove actual SDK plugin disabling or operating-system sandbox isolation.
 
+## Credential-free Hub/adapter integration smoke
+
+With the release Hub already built, on a host where loopback socket tests are permitted:
+
+```sh
+python3 scripts/smoke-hub-adapter.py
+```
+
+The private-staging CI workflow runs this after its release build. It starts the real Rust binary through the staging launcher and a separate Python process using the production `adapter.make_server`. Only the smoke script supplies a deterministic, clearly labeled test runner. Successful fixture replies use the production `parse_model_response`; one deliberate malformed-wire fixture bypasses that parser to test the Hub's own rejection. The production adapter and its configuration have no fake-runner mode.
+
+The smoke uses generated temporary Alice/Bob and internal bearer credentials, owner-only files, an empty private home, and explicit subprocess environments that do not inherit provider keys, proxies, Python hooks, OIDC configuration, or DSH persistence flags. It installs and imports no SDK and makes no provider call. Its HTTP client only addresses loopback, rejects redirects, and never retries writes.
+
+Coverage includes the real internal authentication boundary, distinct and stable owner session UUIDs, exact completed-only private histories, selected personal role/revision routing, rejection before dispatch for stale selection, and frozen completed receipts after profile edits. A proposal remains requester-private until the requester confirms its exact revision; recipient/stale confirmation attempts create nothing. Injected runner failure and malformed output become uncertain receipts with no extra dispatch on status checks or repeated requests, including after gracefully restarting both processes. Fresh turns after restart must exclude uncertain input and other-owner history.
+
+This is protocol and **Hub SQLite persistence** coverage, not live DSH acceptance, real network-timeout/cancellation coverage, a crash-durability test, model quality, SDK tool disabling, an OS sandbox, or persisted SDK sessions. The live-runtime and persistence gates above remain unchanged. The separate offline harness tests (`python3 -m unittest discover -s scripts -p 'test_*.py' -v`) open no sockets and cannot establish that this cross-process smoke passes.
+
 ## Primary sources
 
 - [Official SDK source at the pinned tag](https://github.com/deepseek-ai/deepseek-harness/tree/dsh-v0.2.1-rc.2/python/sdk)
