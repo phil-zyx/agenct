@@ -37,11 +37,15 @@
       <button type="button" id="close-role-picker">关闭角色选择</button>
     </section>
   </section>
+  <p id="chat-help">直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。</p>
   <form id="form">
-    <textarea id="text" aria-label="给管家发消息" placeholder="输入 /agents 配置个人 Agent（配置个人角色）。Mock 示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。"></textarea>
+    <textarea id="text" aria-label="给管家发消息" aria-describedby="chat-help" placeholder="说说你想解决的问题…"></textarea>
     <button id="send">发送</button>
   </form>
+  <details><summary>能力边界、委派示例与恢复说明</summary>
+  <p>输入 /agents 可配置个人角色。Mock 委派示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。</p>
   <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，页面可见时每 5 秒自动检查更新，离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号、所属账号及显式选择的角色 ID 和配置版本，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。</small>
+  </details>
 </section>
 <p id="status" role="status"></p>
 <script src="profiles-ui.js"></script>

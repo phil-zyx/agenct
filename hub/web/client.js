@@ -261,8 +261,12 @@ function renderTurn() {
   const waiting = !!pendingTurn;
   $('turn-recovery').classList[waiting ? 'remove' : 'add']('hide');
   $('turn-status').textContent = waiting
-    ? (pendingTurn.status === 'pending' ? '消息仍在处理中，尚未确认完成。' : '上次发送的结果尚未确认，可能已经处理。')
-      + '\n请求编号：' + pendingTurn.id + '\n不会自动重发。请先核对发送状态。'
+    ? (pendingTurn.status === 'sending' ? '正在发送，尚未收到服务端回执。'
+      : pendingTurn.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。'
+        : '上次发送的结果尚未确认，可能已经处理。')
+      + '\n请求编号：' + pendingTurn.id
+      + (busy.has('send') ? '\n正在等待响应，请勿重复发送。'
+        : '\n不会自动重发。请先核对发送状态。')
       + (turnStorageAvailable ? '' : '\n当前浏览器无法保存恢复凭据，请先记下请求编号，刷新后将无法自动恢复。')
     : '';
   $('check-turn').disabled = !waiting || busy.has('send') || busy.has('turn-check');
@@ -627,7 +631,7 @@ $('check-turn').onclick = async () => {
       await completeTurn(context, receipt.response);
     } else {
       turn.status = receipt.status;
-      status(receipt.status === 'pending' ? '服务端仍在处理。稍后可再次核对，未重发消息。' : '服务端无法确认上次处理结果。未重发消息。');
+      status(receipt.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。稍后可再次核对，未重发消息。' : '服务端无法确认上次处理结果。未重发消息。');
     }
   } catch (error) {
     if (!current(context) || pendingTurn !== turn) return;
@@ -700,7 +704,7 @@ $('form').onsubmit = async event => {
         status('任务上下文已失效，未发送消息。请重新选择任务，或清除任务上下文后再发送。');
         return;
       }
-      chatTurn = { text, id: crypto.randomUUID(), status: 'pending', selectedTask, selectedAgent };
+      chatTurn = { text, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent };
       selectedAgent = null;
       selectedTask = null;
       pendingTurn = chatTurn;

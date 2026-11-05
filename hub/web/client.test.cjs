@@ -449,6 +449,39 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.deepEqual(saved, { id, user: 'alice', browserMode: false });
     assert(!JSON.stringify([...f.storage]).includes('private question'));
   });
+  await test('sending does not claim server receipt, then shows only acknowledged state', async () => {
+    for (const outcome of ['pending', 'uncertain', 'complete', 'failure']) {
+      const f = fixture(); await f.login('alice');
+      f.postTurn(outcome === 'failure' ? 'complete' : outcome);
+      if (outcome === 'failure') f.failNextPost();
+      f.hold();
+      const sending = f.send('question');
+      await f.ready();
+      assert.match(f.$('turn-status').textContent, /正在发送，尚未收到服务端回执/);
+      assert.doesNotMatch(f.$('turn-status').textContent, /已记录|处理中|请先核对/);
+      assert.equal(f.$('send').disabled, true);
+      assert.equal(f.$('check-turn').disabled, true);
+      assert.equal(f.$('new-turn').disabled, true);
+      await f.send('duplicate');
+      assert.equal(chatPosts(f).length, 1);
+      f.release(); await sending;
+      if (outcome === 'complete') {
+        assert.equal(f.$('turn-status').textContent, '');
+      } else {
+        assert.match(f.$('turn-status').textContent, outcome === 'pending'
+          ? /服务端已记录此请求，尚未确认处理完成/ : /结果尚未确认/);
+        assert.doesNotMatch(f.$('turn-status').textContent, /正在发送|正在等待响应/);
+        assert.equal(f.$('check-turn').disabled, false);
+      }
+    }
+  });
+  await test('first-use guidance keeps direct chat primary and details optional', async () => {
+    const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+    assert.match(html, /直接说你想解决的问题，无需先配置角色/);
+    assert.match(html, /aria-describedby="chat-help" placeholder="说说你想解决的问题…"/);
+    assert.match(html, /<details><summary>能力边界、委派示例与恢复说明<\/summary>/);
+    assert.match(html, /Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行/);
+  });
   await test('pending and uncertain receipts only use GET until complete', async () => {
     for (const initialStatus of ['pending', 'uncertain']) {
       const f = fixture(); await f.login('alice'); f.postTurn(initialStatus);
