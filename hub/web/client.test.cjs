@@ -13,6 +13,7 @@ class Element {
     const classes = new Set();
     this.classList = { add: value => classes.add(value), remove: value => classes.delete(value), contains: value => classes.has(value) };
   }
+  setAttribute() {}
   append(element) { this.children.push(element); }
   replaceChildren(...elements) { this.children = elements; }
 }
@@ -58,7 +59,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
     TextEncoder,
     crypto: webcrypto,
     Date,
-    prompt: () => '',
+    prompt: (label, value) => settings.prompt ? settings.prompt(label, value) : '',
     confirm: text => { confirmations.push(text); return confirmation; },
     sessionStorage: {
       getItem: key => { if (settings.storageFailure) throw Error('Storage unavailable'); return storage.get(key) || null; },
@@ -127,6 +128,16 @@ function fixture(auth = { enabled: false }, settings = {}) {
             task_context: responseContextOverride === undefined ? turnContexts.get(requestId) ?? null : responseContextOverride,
             turn: { request_id: requestId, status: 'complete' } } : null };
       }
+      if (url.startsWith('/api/tasks/') && options.method === 'GET' && !url.includes('/drafts') && !url.includes('/worker')) {
+        const task = tasks.find(t => url === '/api/tasks/' + t.id);
+        if (task) data = { task, timeline: {events: [], deliveries: [], audit: {schema_version:1,legacy_history_incomplete:true,legacy_notice:'Earlier history unknown'}} };
+      }
+      if (url.includes('/drafts')) {
+        const task = tasks[0];
+        data = options.method === 'POST'
+          ? {kind:'draft_delivery',task_id:task.id,request_id:JSON.parse(options.body).request_id,status:'complete',current_stale:false,response:{draft:{content:'Generated draft',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}}
+          : {kind:'draft_delivery',task_id:task.id,items:[],next_cursor:null};
+      }
       if (url.endsWith('/profile/catalog')) data = { roles: ['coordinator', 'researcher'], models: [{ id: 'server-default' }], max_agents: 8 };
       if (url.endsWith('/profile')) data = profile;
       return { ok: true, json: async () => data };
@@ -134,6 +145,9 @@ function fixture(auth = { enabled: false }, settings = {}) {
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'profiles-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'worker-ui.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'draft-ui.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-model.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'client.js'), 'utf8'), context);
   return {
     $, calls, timers, storage, confirmations, turnContexts, turnProfiles,
@@ -183,6 +197,47 @@ const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'ali
 const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
+  const cancelButton = f => f.$('conversation').children
+    .find(card => card.textContent.startsWith('任务 ·'))?.children
+    .find(button => button.textContent === '取消任务');
+  const taskPosts = f => f.calls.filter(call => call.url === '/api/tasks/task-one/actions' && call.options.method === 'POST');
+  await test('cancellation controls match the approved actor and state matrix', async () => {
+    for (const who of ['alice', 'bob']) for (const state of ['awaiting_owner', 'working', 'ready_for_acceptance', 'completed', 'canceled', 'unknown']) {
+      const f = fixture({ enabled: false }, { tasks: [task({ status: state })] });
+      await f.login(who);
+      const allowed = ['awaiting_owner', 'working'].includes(state) || (who === 'alice' && state === 'ready_for_acceptance');
+      assert.equal(Boolean(cancelButton(f)), allowed, `${who}/${state}`);
+      assert.equal(taskPosts(f).length, 0);
+    }
+    const f = fixture({ enabled: false }, { tasks: [task({ requester: 'other', owner: 'someone' })] });
+    await f.login('alice'); assert.equal(cancelButton(f), undefined);
+  });
+  await test('cancel prompt discloses sharing and limits, and dismissal or invalid reason sends nothing', async () => {
+    for (const value of [null, '', ' \n\t ', 'x'.repeat(501), '🦀'.repeat(501)]) {
+      const labels = [];
+      const f = fixture({ enabled: false }, { tasks: [task()], prompt: label => { labels.push(label); return value; } });
+      await f.login('alice'); await cancelButton(f).onclick();
+      assert.equal(labels.length, 1); assert.match(labels[0], /双方可见/);
+      assert.match(labels[0], /交付记录会保留/); assert.match(labels[0], /模型请求可能继续/);
+      assert.equal(taskPosts(f).length, 0);
+      assert.equal(chatPosts(f).length, 0);
+    }
+  });
+  await test('only explicitly entered trimmed cancellation reason is shared once', async () => {
+    let prompts = 0;
+    const f = fixture({ enabled: false }, { tasks: [task()], prompt: () => { prompts++; return '  Shared reason <script>literal</script>  '; } });
+    await f.login('alice'); f.hold(); const button = cancelButton(f), pending = button.onclick();
+    await button.onclick(); assert.equal(prompts, 1); assert.equal(taskPosts(f).length, 1);
+    const body = JSON.parse(taskPosts(f)[0].options.body);
+    assert.deepEqual(body, { action: 'cancel', reason: 'Shared reason <script>literal</script>', expected_revision: 3 });
+    f.release(); await pending; assert.equal(taskPosts(f).length, 1); assert.equal(chatPosts(f).length, 0);
+  });
+  await test('uncertain cancellation is not automatically retried', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()], prompt: () => 'Shared reason' });
+    await f.login('alice'); f.failNextPost(); await cancelButton(f).onclick();
+    assert.equal(taskPosts(f).length, 1); await f.tick(); assert.equal(taskPosts(f).length, 1);
+  });
+
   await test('exact proposal text, explicit confirmation and revision', async () => {
     const f = fixture();
     await f.login('alice');
@@ -1113,6 +1168,39 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     await next.$('check-turn').onclick(); assert.equal(next.storage.size, 1);
     assert(next.$('status').textContent.includes('角色回执'));
     assert.equal(chatPosts(next).length, 0);
+  });
+  await test('private generated edits reach delivery only through explicit manual confirmation', async () => {
+    let reviewed = null;
+    const task = {id:'drafttask',owner:'bob',requester:'alice',revision:1,status:'working',summary:'Shared task'};
+    const f = fixture(undefined, {tasks:[task],prompt:(label,value)=>{reviewed=value;return value;}});
+    await f.login('bob');
+    const walk=e=>[e,...e.children.flatMap(walk)];
+    const button=text=>walk(f.$('conversation')).filter(e=>e.textContent===text).at(-1);
+    await button('我的私密交付草稿').onclick();
+    await button('让我的 Agent 起草（不交付）').onclick();
+    assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length,0);
+    const input=walk(f.$('conversation')).find(e=>e.value==='Generated draft'); input.value='Human reviewed edit';
+    await button('使用此草稿填入人工交付').onclick();
+    assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length,0);
+    await button('提交人工交付').onclick();
+    const action=f.calls.find(c=>c.url?.endsWith('/actions'));
+    assert.equal(reviewed,'Human reviewed edit');
+    assert.equal(JSON.parse(action.options.body).result,'Human reviewed edit');
+    assert.equal(JSON.parse(action.options.body).expected_revision,1);
+  });
+  await test('shared timeline and private draft hooks coexist in task cards', async () => {
+    const task={id:'timeline-task',owner:'bob',requester:'alice',revision:1,status:'working',summary:'Shared'};
+    const owner=fixture(undefined,{tasks:[task]});await owner.login('bob');
+    const walk=e=>[e,...e.children.flatMap(walk)];
+    let nodes=walk(owner.$('conversation'));
+    assert(nodes.some(e=>e.textContent==='我的私密交付草稿'));
+    await nodes.find(e=>e.textContent==='查看共享时间线').onclick();
+    nodes=walk(owner.$('conversation'));assert(nodes.some(e=>e.textContent.includes('无法恢复')));
+    assert.equal(owner.calls.filter(c=>c.options?.method==='POST').length,0);
+    const requester=fixture(undefined,{tasks:[task]});await requester.login('alice');
+    nodes=walk(requester.$('conversation'));
+    assert(nodes.some(e=>e.textContent==='查看共享时间线'));
+    assert(!nodes.some(e=>e.textContent==='我的私密交付草稿'));
   });
   console.log('Client regression tests passed');
 

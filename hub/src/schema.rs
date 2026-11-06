@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 4;
+pub(super) const VERSION: i64 = 9;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -29,6 +29,23 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
 CREATE UNIQUE INDEX IF NOT EXISTS worker_one_active_task ON worker_jobs(task_id)
     WHERE status IN ('queued','running','review_ready');";
 
+const DELIVERY_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS deliveries (
+    id TEXT PRIMARY KEY, task_id TEXT NOT NULL, seq INTEGER NOT NULL,
+    author TEXT NOT NULL, content TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('draft','submitted')),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    task_revision INTEGER NOT NULL, source_draft_id TEXT,
+    UNIQUE(task_id,status,seq));
+CREATE TRIGGER IF NOT EXISTS deliveries_no_replace BEFORE INSERT ON deliveries
+WHEN EXISTS (SELECT 1 FROM deliveries WHERE id=NEW.id OR
+    (task_id=NEW.task_id AND status=NEW.status AND seq=NEW.seq))
+BEGIN SELECT RAISE(ABORT,'deliveries are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS deliveries_no_update BEFORE UPDATE ON deliveries
+BEGIN SELECT RAISE(ABORT,'deliveries are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS deliveries_no_delete BEFORE DELETE ON deliveries
+BEGIN SELECT RAISE(ABORT,'deliveries are append-only'); END;";
+
 const TABLES: &[&str] = &[
     "sessions",
     "messages",
@@ -38,6 +55,8 @@ const TABLES: &[&str] = &[
     "personal_profiles",
     "chat_turns",
     "worker_jobs",
+    "deliveries",
+    "draft_turns",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -93,6 +112,34 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
             "execution_authorized",
             "INTEGER NOT NULL DEFAULT 0",
         )?,
+        5 => {
+            db.execute_batch(DELIVERY_SCHEMA)?;
+            // Preserve only the current surviving legacy result. Historical
+            // overwritten results cannot be reconstructed. Reopening is idempotent.
+            db.execute_batch(
+                "INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision)
+                SELECT 'legacy:' || id,id,1,owner,result,'submitted',revision FROM tasks
+                WHERE result IS NOT NULL AND NOT EXISTS
+                    (SELECT 1 FROM deliveries WHERE task_id=tasks.id AND status='submitted')",
+            )?;
+        }
+        6 => {
+            add_column(db, "events", "from_status", "TEXT")?;
+            add_column(db, "events", "to_status", "TEXT")?;
+            add_column(db, "events", "task_revision", "INTEGER")?;
+            db.execute_batch(
+                "CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
+                BEGIN SELECT RAISE(ABORT,'events are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS events_no_delete BEFORE DELETE ON events
+                BEGIN SELECT RAISE(ABORT,'events are append-only'); END;
+                CREATE TRIGGER IF NOT EXISTS events_no_replace BEFORE INSERT ON events
+                WHEN EXISTS (SELECT 1 FROM events WHERE id=NEW.id)
+                BEGIN SELECT RAISE(ABORT,'events are append-only'); END;",
+            )?;
+        }
+        7 => db.execute_batch(crate::drafts::SCHEMA)?,
+        8 => crate::audit_migration::upgrade(db)?,
+        9 => add_column(db, "events", "reason", "TEXT")?,
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -129,7 +176,8 @@ pub(super) fn recover(db: &mut Connection) -> rusqlite::Result<()> {
          UPDATE messages SET status='uncertain'
          WHERE status IN ('pending','interrupted') AND id IN
              (SELECT message_id FROM chat_turns WHERE status='pending');
-         UPDATE chat_turns SET status='uncertain' WHERE status='pending';",
+         UPDATE chat_turns SET status='uncertain' WHERE status='pending';
+         UPDATE draft_turns SET status='uncertain' WHERE status='pending';",
     )?;
     tx.commit()
 }
@@ -162,6 +210,11 @@ fn columns(db: &Connection, table: &str) -> rusqlite::Result<BTreeMap<String, Co
 
 fn introduced(table: &str, column: &str) -> i64 {
     match (table, column) {
+        ("deliveries", _) => 5,
+        ("draft_turns", _) => 7,
+        ("events", "from_status" | "to_status" | "task_revision") => 6,
+        ("events", "revision" | "delivery_seq") => 8,
+        ("events", "reason") => 9,
         ("tasks", "revision") => 2,
         ("chat_turns", "selected_task" | "task_context" | "expected_profile_revision") => 3,
         ("worker_jobs", "execution_authorized") => 4,
@@ -227,7 +280,10 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
             )
             .optional()?;
         let Some((kind, sql)) = object else {
-            if version == 0 {
+            if version == 0
+                || (table == "deliveries" && version < 5)
+                || (table == "draft_turns" && version < 7)
+            {
                 continue;
             }
             return Err(format!("missing Hub table {table} at schema version {version}").into());
@@ -261,6 +317,17 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         if extra_partial_keys != 0 {
             return Err(format!("unsupported Hub partial unique key on {table}").into());
         }
+        if table == "draft_turns" {
+            let wanted_sql: String = expected.query_row(
+                "SELECT sql FROM sqlite_schema WHERE name='draft_turns'",
+                [],
+                |r| r.get(0),
+            )?;
+            if normalized(&sql) != normalized(&wanted_sql) {
+                return Err("incompatible draft receipt schema".into());
+            }
+            continue;
+        }
         // Some supported old receipt schemas lack a status CHECK. Preserve
         // them as-is; do not rebuild populated tables just to add constraints.
         let normalized = normalized(&sql);
@@ -268,6 +335,7 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
             "chat_turns" if normalized.contains("check(") => {
                 Some("check(statusin('pending','uncertain','complete'))")
             }
+            "deliveries" => Some("check(statusin('draft','submitted'))"),
             "worker_jobs" => {
                 Some("check(statusin('queued','running','review_ready','failed','cancelled'))")
             }
@@ -288,7 +356,26 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
             [table],
             |row| row.get(0),
         )?;
-        if foreign_keys != 0 {
+        let upgraded_events = table == "events"
+            && (version >= 8
+                || actual.contains_key("revision")
+                || actual.contains_key("delivery_seq"));
+        if upgraded_events {
+            let matching: i64 = db.query_row(
+                "SELECT count(*) FROM pragma_foreign_key_list('events')
+                 WHERE \"table\"='tasks' AND \"from\"='task_id' AND \"to\"='id'
+                 AND on_update='NO ACTION' AND on_delete='RESTRICT' AND match='NONE' AND seq=0",
+                [],
+                |row| row.get(0),
+            )?;
+            if !actual.contains_key("revision")
+                || !actual.contains_key("delivery_seq")
+                || foreign_keys != 1
+                || matching != 1
+            {
+                return Err("incompatible event task foreign key".into());
+            }
+        } else if foreign_keys != 0 {
             return Err(format!("unsupported Hub foreign key on {table}").into());
         }
     }
@@ -310,6 +397,39 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         }
         None if version != 0 => return Err("missing Hub index worker_one_active_task".into()),
         _ => {}
+    }
+    for (name, since) in [
+        ("deliveries_no_replace", 5),
+        ("deliveries_no_update", 5),
+        ("deliveries_no_delete", 5),
+        ("events_no_update", 6),
+        ("events_no_delete", 6),
+        ("events_no_replace", 6),
+        ("draft_turns_no_replace", 7),
+        ("draft_turns_no_replace_update", 7),
+        ("draft_turns_no_delete", 7),
+        ("draft_turns_binding_immutable", 7),
+        ("draft_turns_terminal", 7),
+    ] {
+        let actual: Option<String> = db
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let wanted: String = expected.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?1",
+            [name],
+            |row| row.get(0),
+        )?;
+        match actual {
+            Some(sql) if normalized(&sql) != normalized(&wanted) => {
+                return Err(format!("incompatible Hub trigger {name}").into())
+            }
+            None if version >= since => return Err(format!("missing Hub trigger {name}").into()),
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -358,7 +478,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(*seen.borrow(), vec![1, 2, 3, 4]);
+        assert_eq!(*seen.borrow(), (1..=VERSION).collect::<Vec<_>>());
         assert_eq!(version(&db).unwrap(), VERSION);
         let before = schema(&db);
         migrate_with_hook(&mut db, |_| panic!("must not rerun a migration")).unwrap();
@@ -462,6 +582,61 @@ mod tests {
             );
             migrate(&mut db).unwrap();
         }
+    }
+
+    #[test]
+    fn surviving_results_backfill_once_and_ledger_remains_immutable() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for next in 1..=4 {
+            step(&db, next).unwrap();
+        }
+        db.pragma_update(None, "user_version", 4).unwrap();
+        db.execute_batch("INSERT INTO tasks VALUES ('old','alice','bob','old task','ready_for_acceptance','surviving result',8)").unwrap();
+        let before = schema(&db);
+        assert!(migrate_with_hook(&mut db, |_| Err("injected backfill failure".into())).is_err());
+        assert_eq!(schema(&db), before);
+        assert_eq!(version(&db).unwrap(), 4);
+        assert_eq!(text(&db, "SELECT result FROM tasks"), "surviving result");
+        migrate(&mut db).unwrap();
+        migrate(&mut db).unwrap();
+        assert_eq!(scalar(&db, "SELECT count(*) FROM deliveries"), 1);
+        assert_eq!(scalar(&db, "SELECT seq FROM deliveries"), 1);
+        assert_eq!(scalar(&db, "SELECT task_revision FROM deliveries"), 8);
+        assert_eq!(text(&db, "SELECT author FROM deliveries"), "bob");
+        assert_eq!(
+            text(&db, "SELECT content FROM deliveries"),
+            "surviving result"
+        );
+        assert!(db
+            .execute_batch("UPDATE deliveries SET content='mutated'")
+            .is_err());
+        assert!(db.execute_batch("DELETE FROM deliveries").is_err());
+        db.execute_batch("DROP TRIGGER deliveries_no_update")
+            .unwrap();
+        assert!(migrate(&mut db).is_err());
+    }
+
+    #[test]
+    fn replace_cannot_overwrite_either_delivery_identity() {
+        let mut db = Connection::open_in_memory().unwrap();
+        migrate(&mut db).unwrap();
+        // REPLACE's implicit DELETE does not fire DELETE triggers by default.
+        db.execute_batch(
+            "PRAGMA recursive_triggers=OFF;
+            INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision)
+            VALUES ('original','task',1,'bob','immutable','submitted',2)",
+        )
+        .unwrap();
+        for (id, seq) in [("original", 2), ("new", 1)] {
+            assert!(db.execute("INSERT OR REPLACE INTO deliveries(id,task_id,seq,author,content,status,task_revision)
+                VALUES (?1,'task',?2,'bob','overwritten','submitted',3)", rusqlite::params![id,seq]).is_err());
+            assert_eq!(scalar(&db, "SELECT count(*) FROM deliveries"), 1);
+            assert_eq!(text(&db, "SELECT content FROM deliveries"), "immutable");
+            assert_eq!(scalar(&db, "SELECT task_revision FROM deliveries"), 2);
+        }
+        db.execute_batch("DROP TRIGGER deliveries_no_replace")
+            .unwrap();
+        assert!(migrate(&mut db).is_err());
     }
 
     #[test]
@@ -627,5 +802,96 @@ mod tests {
         assert!(columns(&db, "worker_jobs")
             .unwrap()
             .contains_key("execution_authorized"));
+    }
+    #[test]
+    fn audit_upgrade_preserves_unknown_history_and_guards_recorded_rows() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for version in 1..=5 {
+            step(&db, version).unwrap();
+        }
+        db.pragma_update(None, "user_version", 5).unwrap();
+        db.execute_batch(
+            "INSERT INTO tasks(id,requester,owner,summary,status,revision)
+            VALUES ('task','alice','bob','old','working',1);
+            INSERT INTO events(task_id,actor,action) VALUES ('task','alice','created');",
+        )
+        .unwrap();
+        migrate(&mut db).unwrap();
+        assert_eq!(version(&db).unwrap(), VERSION);
+        assert_eq!(scalar(&db,"SELECT count(*) FROM events WHERE from_status IS NULL AND to_status IS NULL AND task_revision IS NULL"),1);
+        assert!(db
+            .execute_batch("UPDATE events SET action='cancel'")
+            .is_err());
+        assert!(db.execute_batch("DELETE FROM events").is_err());
+        assert!(db.execute_batch("INSERT OR REPLACE INTO events(id,task_id,actor,action) VALUES (1,'task','bob','cancel')").is_err());
+        migrate(&mut db).unwrap();
+        assert_eq!(scalar(&db, "SELECT count(*) FROM events"), 1);
+        db.execute_batch("DROP TRIGGER events_no_replace").unwrap();
+        assert!(migrate(&mut db)
+            .unwrap_err()
+            .to_string()
+            .contains("events_no_replace"));
+    }
+    #[test]
+    fn orphan_v7_event_refuses_full_upgrade_without_changing_schema_or_rows() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for next in 1..=7 {
+            step(&db, next).unwrap();
+        }
+        db.pragma_update(None, "user_version", 7).unwrap();
+        db.execute_batch(
+            "INSERT INTO events(task_id,actor,action) VALUES ('missing','alice','created')",
+        )
+        .unwrap();
+        let before = schema(&db);
+        assert!(migrate(&mut db).unwrap_err().to_string().contains("orphan"));
+        assert_eq!(schema(&db), before);
+        assert_eq!(version(&db).unwrap(), 7);
+        assert_eq!(text(&db, "SELECT task_id FROM events"), "missing");
+    }
+    #[test]
+    fn incoming_event_foreign_key_blocks_full_migration_without_cascade_loss() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for next in 1..=7 {
+            step(&db, next).unwrap();
+        }
+        db.pragma_update(None, "user_version", 7).unwrap();
+        db.pragma_update(None, "foreign_keys", true).unwrap();
+        db.execute_batch("INSERT INTO tasks(id,requester,owner,summary,status) VALUES ('task','alice','bob','old','working');
+            INSERT INTO events(id,task_id,actor,action) VALUES (7,'task','alice','created');
+            CREATE TABLE external_notes(id INTEGER PRIMARY KEY,event_id INTEGER REFERENCES events(id) ON DELETE CASCADE,note TEXT);
+            INSERT INTO external_notes VALUES (1,7,'keep this note');").unwrap();
+        let before = schema(&db);
+        assert!(migrate(&mut db)
+            .unwrap_err()
+            .to_string()
+            .contains("incoming foreign keys"));
+        assert_eq!(schema(&db), before);
+        assert_eq!(version(&db).unwrap(), 7);
+        assert_eq!(scalar(&db, "SELECT count(*) FROM events"), 1);
+        assert_eq!(scalar(&db, "SELECT event_id FROM external_notes"), 7);
+        assert_eq!(
+            text(&db, "SELECT note FROM external_notes"),
+            "keep this note"
+        );
+    }
+    #[test]
+    fn cancellation_reason_upgrade_preserves_unknown_legacy_reasons() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for next in 1..=8 {
+            step(&db, next).unwrap();
+        }
+        db.pragma_update(None, "user_version", 8).unwrap();
+        db.execute_batch("INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('task','alice','bob','old','canceled',1);
+            INSERT INTO events(id,task_id,actor,action,from_status,to_status,task_revision,revision)
+            VALUES (7,'task','alice','cancel','working','canceled',1,1);").unwrap();
+        migrate(&mut db).unwrap();
+        assert_eq!(version(&db).unwrap(), VERSION);
+        assert_eq!(scalar(&db,"SELECT count(*) FROM events WHERE id=7 AND reason IS NULL AND action='cancel' AND revision=1"),1);
+        migrate(&mut db).unwrap();
+        assert_eq!(
+            scalar(&db, "SELECT count(*) FROM events WHERE reason IS NULL"),
+            1
+        );
     }
 }

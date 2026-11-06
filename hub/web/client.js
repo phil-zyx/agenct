@@ -68,6 +68,10 @@ function article(text) {
   return element;
 }
 
+const timelineUI = createTaskTimelineUI({ api, current, article, conversation: () => $('conversation') });
+
+const draftUI = createDraftUI({ api, current, article, conversation: () => $('conversation') });
+
 const profileUI = createProfileUI({ api, current, article, conversation: () => $('conversation'), status,
   onSaved: revision => {
     if (selectedAgent && selectedAgent.revision !== revision) selectedAgent.invalidated = true;
@@ -316,6 +320,8 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('sync-notice').textContent = '';
   profileUI.reset();
   workerUI.reset();
+  draftUI.reset({ preserveRecovery });
+  timelineUI.reset();
   controller.abort();
   controller = new AbortController();
   epoch++;
@@ -350,17 +356,23 @@ function addActions(element, context, kind, item, actions) {
     button.disabled = busy.has(key);
     button.onclick = async () => {
       if (!current(context) || busy.has(key)) return;
-      let result;
+      let result, reason;
       if (action === 'deliver') {
-        result = prompt('填写人工交付结果（不会执行任何代码）');
+        result = prompt('填写并确认人工交付结果（不会执行任何代码；确认后对方可见）', draftUI.reviewedText(item));
         if (!result || !current(context)) return;
+      }
+      if (action === 'cancel') {
+        const entered = prompt('取消任务：请填写 1–500 字的简短原因，确认后双方可见。已有交付记录会保留；已发出的模型请求可能继续运行并产生费用。');
+        if (entered === null || !current(context)) return;
+        reason = entered.trim();
+        if (!reason || Array.from(reason).length > 500) { status('取消原因须为 1–500 字。尚未发送取消请求。'); return; }
       }
       busy.add(key);
       buttons.forEach(control => { control.disabled = true; });
       status('');
       try {
         await api(context, kind + '/' + encodeURIComponent(item.id) + '/actions', 'POST', {
-          action, result, expected_revision: item.revision
+          action, result, ...(reason === undefined ? {} : { reason }), expected_revision: item.revision
         });
         if (!current(context)) return;
         status(kind === 'proposals'
@@ -454,6 +466,8 @@ async function readSnapshot(context) {
   }
   if (!current(context) || version !== refreshVersion) return;
   workerUI.update(context, tasks);
+  draftUI.update(context, tasks);
+  timelineUI.update(context, tasks);
   updateTaskContext(context, tasks);
   const nextSnapshot = JSON.stringify([messages, proposals, tasks]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
@@ -482,14 +496,20 @@ async function readSnapshot(context) {
     if (task.owner === context.user && task.status === 'awaiting_owner') actions.push(['accept', '接单']);
     if (task.owner === context.user && task.status === 'working') actions.push(['deliver', '提交人工交付']);
     if (task.requester === context.user && task.status === 'ready_for_acceptance') actions.push(['approve', '验收'], ['return', '退回']);
-    if (!['completed', 'canceled'].includes(task.status)) actions.push(['cancel', '取消']);
+    const canCancel = (task.requester === context.user && ['awaiting_owner', 'working', 'ready_for_acceptance'].includes(task.status))
+      || (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status));
+    if (canCancel) actions.push(['cancel', '取消任务']);
     addActions(element, context, 'tasks', task, actions);
     addDiscussion(element, context, task);
     workerUI.attach(element, context, task);
+    draftUI.attach(element, context, task);
+    timelineUI.attach(element, context, task);
     entries.push(element);
   }
   profileUI.append(entries);
   workerUI.append(entries);
+  draftUI.append(entries);
+  timelineUI.append(entries);
   $('conversation').replaceChildren(...entries);
   renderTaskContext();
 

@@ -307,7 +307,7 @@ async fn cancellation_is_terminal() {
         "alice",
         "POST",
         &p,
-        json!({"action":"cancel","expected_revision":0}),
+        json!({"action":"cancel","expected_revision":0,"reason":"This task is no longer needed"}),
     )
     .await;
     assert_eq!(
@@ -1135,4 +1135,194 @@ async fn mock_chinese_summary_accepts_optional_whitespace_without_task_authority
             .1,
         json!([])
     );
+}
+
+#[tokio::test]
+async fn invalid_mock_runtime_proposals_never_persist_history_tasks_or_proposals() {
+    let app = setup();
+    for (index, message) in ["ask alice to review", "ask mallory to review"]
+        .iter()
+        .enumerate()
+    {
+        let body = json!({"message":message,"request_id":format!("invalid-mock-{index}")});
+        assert_eq!(
+            request(&app, "alice", "POST", "/api/messages", body.clone())
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        // The reserved failed request is not dispatched again, including by retries.
+        assert_eq!(
+            request(&app, "alice", "POST", "/api/messages", body)
+                .await
+                .1["turn"]["status"],
+            "uncertain"
+        );
+    }
+    for who in ["alice", "bob", "eve"] {
+        for endpoint in ["/api/messages", "/api/tasks", "/api/proposals"] {
+            assert_eq!(
+                request(&app, who, "GET", endpoint, Value::Null).await.1,
+                json!([])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn deliveries_preserve_three_versions_after_two_returns() {
+    let a = setup();
+    let task = confirmed_task(&a, "alice", "bob", "immutable evidence").await;
+    let path = format!("/api/tasks/{}", task["id"].as_str().unwrap());
+    let actions = format!("{path}/actions");
+    let mut revision = task["revision"].as_i64().unwrap();
+    for version in 1..=3 {
+        assert_eq!(
+            request(
+                &a,
+                "bob",
+                "POST",
+                &actions,
+                json!({"action":"accept","expected_revision":revision})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        revision += 1;
+        let deliver = json!({"action":"deliver","expected_revision":revision,"result":format!("version {version}")});
+        assert_eq!(
+            request(&a, "alice", "POST", &actions, deliver.clone())
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            request(&a, "bob", "POST", &actions, deliver.clone())
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&a, "bob", "POST", &actions, deliver).await.0,
+            StatusCode::CONFLICT
+        );
+        revision += 1;
+        if version < 3 {
+            assert_eq!(
+                request(
+                    &a,
+                    "alice",
+                    "POST",
+                    &actions,
+                    json!({"action":"return","expected_revision":revision})
+                )
+                .await
+                .0,
+                StatusCode::OK
+            );
+            revision += 1;
+            let (_, detail) = request(&a, "alice", "GET", &path, Value::Null).await;
+            assert!(detail["task"]["result"].is_null());
+            assert_eq!(detail["deliveries"].as_array().unwrap().len(), version);
+        }
+    }
+    for who in ["alice", "bob"] {
+        let (_, detail) = request(&a, who, "GET", &path, Value::Null).await;
+        let rows = detail["deliveries"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row["seq"], i + 1);
+            assert_eq!(row["content"], format!("version {}", i + 1));
+            assert_eq!(row["author"], "bob");
+            assert_eq!(row.as_object().unwrap().len(), 5);
+        }
+    }
+    assert_eq!(
+        request(&a, "eve", "GET", &path, Value::Null).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn private_drafts_do_not_leak_or_consume_submitted_sequence() {
+    let directory =
+        std::env::temp_dir().join(format!("agenct-deliveries-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("hub.db");
+    let a = app(Hub::open(config(path.to_str().unwrap())).unwrap());
+    let task = confirmed_task(&a, "alice", "bob", "private drafting").await;
+    let id = task["id"].as_str().unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute("INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision) VALUES ('secret-draft',?1,99,'bob','secret content','draft',0)",[id]).unwrap();
+    let endpoint = format!("/api/tasks/{id}");
+    let actions = format!("{endpoint}/actions");
+    let revision = task["revision"].as_i64().unwrap();
+    request(
+        &a,
+        "bob",
+        "POST",
+        &actions,
+        json!({"action":"accept","expected_revision":revision}),
+    )
+    .await;
+    db.execute_batch("CREATE TRIGGER fail_delivery_event BEFORE INSERT ON events WHEN NEW.action='deliver' BEGIN SELECT RAISE(ABORT,'injected event failure'); END").unwrap();
+    assert_eq!(
+        request(
+            &a,
+            "bob",
+            "POST",
+            &actions,
+            json!({"action":"deliver","expected_revision":revision+1,"result":"rolled back"})
+        )
+        .await
+        .0,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM deliveries WHERE status='submitted'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    let (_, before) = request(&a, "alice", "GET", &endpoint, Value::Null).await;
+    assert_eq!(before["task"]["revision"], revision + 1);
+    assert_eq!(before["task"]["status"], "working");
+    db.execute_batch("DROP TRIGGER fail_delivery_event")
+        .unwrap();
+    assert_eq!(
+        request(
+            &a,
+            "bob",
+            "POST",
+            &actions,
+            json!({"action":"deliver","expected_revision":revision+1,"result":"public result"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, detail) = request(&a, "alice", "GET", &endpoint, Value::Null).await;
+    assert_eq!(detail["deliveries"].as_array().unwrap().len(), 1);
+    assert_eq!(detail["deliveries"][0]["seq"], 1);
+    assert!(!detail.to_string().contains("secret"));
+    assert_eq!(
+        db.query_row(
+            "SELECT content FROM deliveries WHERE id='secret-draft'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "secret content"
+    );
+    assert!(db
+        .execute("UPDATE deliveries SET content='changed'", [])
+        .is_err());
+    assert!(db.execute("DELETE FROM deliveries", []).is_err());
+    drop(db);
+    drop(a);
+    std::fs::remove_dir_all(directory).unwrap();
 }

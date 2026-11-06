@@ -7,8 +7,8 @@ pub(super) const UNAVAILABLE: &str = "selected task is not available for discuss
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Selection {
-    task_id: String,
-    expected_revision: i64,
+    pub(super) task_id: String,
+    pub(super) expected_revision: i64,
 }
 impl Selection {
     pub(super) fn valid(&self) -> bool {
