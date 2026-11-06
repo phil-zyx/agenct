@@ -115,6 +115,8 @@ function fixture(auth = { enabled: false }, settings = {}) {
         return { ok: false, status: 405, json: async () => ({ error: 'Method Not Allowed' }) };
       }
       if (url === '/api/tasks' && options.method === 'GET') data = tasks;
+      if (url === '/api/activity') data = settings.activity || [];
+      if (url === '/api/messages' && options.method === 'GET' && settings.messages) data = settings.messages;
       if (url === '/api/messages' && options.method === 'POST') {
         const requestId = JSON.parse(options.body).request_id;
         data = { reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null,
@@ -298,6 +300,50 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.deepEqual(Object.keys(JSON.parse(call.options.body)).sort(), ['action', 'expected_revision']);
   });
 
+  await test('work index groups by day, describes the latest step and navigates', async () => {
+    const now = new Date();
+    const utc = d => d.toISOString().slice(0, 19).replace('T', ' ');
+    const yesterday = new Date(now.getTime() - 86400000);
+    const activity = [
+      { kind: 'task', id: 'task-one', title: 'Shared task', status: 'working', role: 'requester', counterpart: 'bob',
+        latest: { action: 'accept', actor: 'bob', at: utc(now), reason: null } },
+      { kind: 'proposal', id: '1', title: 'Exact', status: 'pending', role: 'requester', counterpart: 'bob',
+        latest: { action: 'proposal_pending', actor: 'alice', at: utc(yesterday), reason: null } },
+      { kind: 'task', id: 'old', title: 'Old', status: 'canceled', role: 'owner', counterpart: 'carol',
+        latest: { action: 'cancel', actor: 'carol', at: null, reason: '不需要了' } }
+    ];
+    const f = fixture({ enabled: false }, { tasks: [task()], activity });
+    await f.login('alice');
+    const list = f.$('activity').children;
+    assert.deepEqual(list.filter(n => n.className === 'day').map(n => n.textContent), ['今天', '昨天', '更早']);
+    const rows = list.filter(n => n.className.startsWith('activity-item'));
+    assert.match(rows[0].textContent, /Shared task.*bob 已接单/s);
+    assert.match(rows[1].textContent, /等你确认 · 委派给 bob/);
+    assert.match(rows[2].textContent, /carol 取消了任务：不需要了/);
+    assert(f.$('tasks').classList.contains('hide'), 'index is the default view');
+    rows[0].onclick();
+    assert(!f.$('tasks').classList.contains('hide'), 'clicking a task item opens the task view');
+    assert(f.$('activity').classList.contains('hide'));
+    assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 0, 'navigation never mutates');
+  });
+
+  await test('chat shows time separators only for dated messages with gaps', async () => {
+    const utc = d => d.toISOString().slice(0, 19).replace('T', ' ');
+    const t0 = new Date(Date.now() - 3600000);
+    const messages = [
+      { role: 'user', content: 'legacy', status: 'complete' },
+      { role: 'user', content: 'a', status: 'complete', created_at: utc(t0) },
+      { role: 'assistant', content: 'b', status: 'complete', created_at: utc(new Date(t0.getTime() + 60000)) },
+      { role: 'user', content: 'c', status: 'complete', created_at: utc(new Date(t0.getTime() + 30 * 60000)) },
+      { role: 'user', content: 'bad', status: 'complete', created_at: 'not-a-time' }
+    ];
+    const f = fixture({ enabled: false }, { messages });
+    await f.login('alice');
+    const seps = f.$('conversation').children.filter(n => n.className === 'time-sep');
+    assert.equal(seps.length, 2, 'first dated message and the 29-minute gap only');
+    assert.match(seps[0].textContent, /^\d{2}:\d{2}$/);
+  });
+
   await test('reject proposal without creating a task', async () => {
     const f = fixture();
     await f.login('alice');
@@ -448,7 +494,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(f.calls.length, count, 'Only one read batch in flight');
     f.release();
     await Promise.all([poll, manual]);
-    assert.equal(f.calls.length, count + 3, 'Manual request receives a fresh batch after in-flight read');
+    assert.equal(f.calls.length, count + 4, 'Manual request receives a fresh batch (messages, proposals, tasks, activity) after in-flight read');
   });
   await test('stalled read times out and schedules recovery instead of overlapping requests', async () => {
     const f = fixture();

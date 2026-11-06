@@ -18,6 +18,8 @@ pub(super) struct Proposal {
     status: String,
     revision: i64,
     task_id: Option<String>,
+    /// UTC "YYYY-MM-DD HH:MM:SS"; None for proposals written before schema v11.
+    created_at: Option<String>,
 }
 fn row_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proposal> {
     Ok(Proposal {
@@ -28,9 +30,10 @@ fn row_proposal(r: &rusqlite::Row<'_>) -> rusqlite::Result<Proposal> {
         status: r.get(4)?,
         revision: r.get(5)?,
         task_id: r.get(6)?,
+        created_at: r.get(7)?,
     })
 }
-const PROPOSAL_COLUMNS: &str = "id,requester,owner,summary,status,revision,task_id";
+const PROPOSAL_COLUMNS: &str = "id,requester,owner,summary,status,revision,task_id,created_at";
 fn save_proposal(
     h: &Hub,
     requester: &str,
@@ -82,7 +85,7 @@ pub(super) fn save_proposal_tx(
     {
         return Err(invalid("invalid request_id"));
     }
-    let existing = tx.query_row(&format!("SELECT {PROPOSAL_COLUMNS},source FROM proposals WHERE requester=?1 AND request_id=?2"),params![requester,key],|r|Ok((row_proposal(r)?,r.get::<_,String>(7)?))).optional()?;
+    let existing = tx.query_row(&format!("SELECT {PROPOSAL_COLUMNS},source FROM proposals WHERE requester=?1 AND request_id=?2"),params![requester,key],|r|Ok((row_proposal(r)?,r.get::<_,String>(8)?))).optional()?;
     if let Some((proposal, previous)) = existing {
         if previous != source || proposal.owner != owner || proposal.summary != summary {
             return Err(Error(
@@ -93,7 +96,7 @@ pub(super) fn save_proposal_tx(
         return Ok(proposal);
     }
     let id = Uuid::new_v4().to_string();
-    tx.execute("INSERT INTO proposals(id,requester,owner,summary,request_id,source) VALUES (?1,?2,?3,?4,?5,?6)",params![id,requester,owner,summary,key,source])?;
+    tx.execute("INSERT INTO proposals(id,requester,owner,summary,request_id,source,created_at) VALUES (?1,?2,?3,?4,?5,?6,CURRENT_TIMESTAMP)",params![id,requester,owner,summary,key,source])?;
     let p = tx.query_row(
         &format!("SELECT {PROPOSAL_COLUMNS} FROM proposals WHERE id=?1"),
         [id],
