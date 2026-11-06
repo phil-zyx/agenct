@@ -234,7 +234,9 @@ async fn malformed_provider_result_is_uncertain_and_never_redispatched() {
     assert_eq!(adapter.count(), 1);
 }
 #[tokio::test]
-async fn abandoned_dispatch_remains_uncertain_in_process_and_after_restart() {
+async fn client_disconnect_does_not_strand_the_turn_and_never_redispatches() {
+    // A tab refresh or network drop must not cancel the single dispatch: the
+    // receipt stays pending while it runs, then records the real outcome.
     let adapter = Adapter::new(success(), true).await;
     let db = Database::new();
     let a = adapter.app(&db.path());
@@ -243,30 +245,55 @@ async fn abandoned_dispatch_remains_uncertain_in_process_and_after_restart() {
     adapter.wait().await;
     task.abort();
     let _ = task.await;
-    assert_eq!(lookup(&a, "one").await.1["status"], "uncertain");
+    assert_eq!(lookup(&a, "one").await.1["status"], "pending");
     assert_eq!(
-        request(&a, "alice", "GET", "/api/messages", Value::Null)
-            .await
-            .1[0]["status"],
-        "uncertain"
+        send(&a, "two").await.0,
+        StatusCode::CONFLICT,
+        "gate still held by the detached dispatch"
     );
-    assert_eq!(send(&a, "one").await.1["turn"]["status"], "uncertain");
-    drop(a);
-    let a = adapter.app(&db.path());
-    assert_eq!(send(&a, "one").await.1["turn"]["status"], "uncertain");
+    adapter.release.add_permits(1);
+    let mut status = Value::Null;
+    for _ in 0..200 {
+        status = lookup(&a, "one").await.1;
+        if status["status"] == "complete" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(status["status"], "complete", "{status}");
+    let history = request(&a, "alice", "GET", "/api/messages", Value::Null)
+        .await
+        .1;
+    let roles: Vec<_> = history
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["role"].clone(), m["status"].clone()))
+        .collect();
+    assert_eq!(
+        roles,
+        vec![
+            (json!("user"), json!("complete")),
+            (json!("assistant"), json!("complete"))
+        ]
+    );
+    assert_eq!(send(&a, "one").await.1["turn"]["status"], "complete");
     assert_eq!(adapter.count(), 1);
 }
 #[tokio::test]
 async fn restart_converts_unobserved_pending_to_uncertain() {
-    let adapter = Adapter::new(success(), true).await;
+    // Simulate a crash mid-dispatch: a pending receipt and message left on disk.
+    let adapter = Adapter::new(success(), false).await;
     let db = Database::new();
-    let a = adapter.app(&db.path());
-    let running = a.clone();
-    let task = tokio::spawn(async move { send(&running, "one").await });
-    adapter.wait().await;
-    task.abort();
-    let _ = task.await;
-    drop(a);
+    drop(adapter.app(&db.path()));
+    let sql = rusqlite::Connection::open(db.path()).unwrap();
+    sql.execute_batch(
+        "INSERT INTO messages(id,owner,role,content,status) VALUES (1,'alice','user','review this','pending');
+         INSERT INTO chat_turns(owner,request_id,message,runtime_profile,status,message_id)
+             VALUES ('alice','one','review this','{}','pending',1);",
+    )
+    .unwrap();
+    drop(sql);
     let a = adapter.app(&db.path());
     assert_eq!(lookup(&a, "one").await.1["status"], "uncertain");
     assert_eq!(
@@ -276,7 +303,11 @@ async fn restart_converts_unobserved_pending_to_uncertain() {
         "uncertain"
     );
     assert_eq!(send(&a, "one").await.1["turn"]["status"], "uncertain");
-    assert_eq!(adapter.count(), 1);
+    assert_eq!(
+        adapter.count(),
+        0,
+        "a stranded receipt is never redispatched"
+    );
 }
 #[tokio::test]
 async fn atomic_storage_failure_rolls_back_reply_and_does_not_repeat_adapter() {

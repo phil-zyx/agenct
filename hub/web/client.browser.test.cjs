@@ -99,9 +99,12 @@ function taskFixture(id = 'task-alpha', revision = 7) {
 
 async function showTasks(f, tasks) {
   f.state.tasks = tasks;
+  await f.page.locator('#open-chat').click();
   await f.page.locator('#refresh').click();
   await f.page.waitForFunction(count => [...document.querySelectorAll('#tasks button')]
     .filter(button => button.textContent === '讨论此任务').length === count, tasks.length);
+  await f.page.locator('#toggle-tasks').click();
+  await f.page.locator('#tab-tasks').click();
 }
 
 function discussButtons(f) { return f.page.getByRole('button', { name: '讨论此任务', exact: true }); }

@@ -1,4 +1,5 @@
 //! Agenct local development control plane. Not a production authentication service.
+mod activity;
 mod audit;
 mod audit_migration;
 pub mod browser_auth;
@@ -116,7 +117,8 @@ pub struct Hub {
     db: Arc<Mutex<Connection>>,
     users: Arc<HashMap<String, String>>,
     directory: Arc<directory::Directory>,
-    gates: Arc<HashMap<String, tokio::sync::Mutex<()>>>,
+    // Arc per user so a turn can own its gate across a detached dispatch task.
+    gates: Arc<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     runtime: Runtime,
     client: reqwest::Client,
 }
@@ -161,7 +163,7 @@ impl Hub {
         let directory = directory::Directory::new(config.users.iter().map(|user| user.id.clone()))?;
         let gates = directory
             .ids()
-            .map(|id| (id.clone(), tokio::sync::Mutex::new(())))
+            .map(|id| (id.clone(), Arc::new(tokio::sync::Mutex::new(()))))
             .collect();
         let mut users = HashMap::new();
         for user in config.users {
@@ -296,6 +298,7 @@ pub fn app(hub: Hub) -> Router {
             get(messages::messages).post(chat_turns::chat),
         )
         .route("/api/turns/{id}", get(chat_turns::status))
+        .route("/api/activity", get(activity::activity))
         .route(
             "/api/proposals",
             get(proposals::proposals).post(proposals::propose),
