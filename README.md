@@ -54,7 +54,13 @@ npm run check
 
 新增 `hub/`：Rust/Axum 本地开发服务，开发令牌身份认证、SQLite 持久消息与任务、跨身份隔离及人工接单/交付/验收。它与 `dist/` 静态演示分开运行。真实 DSH 适配层见 `adapters/dsh/`；默认不启用模型或危险工具，mock 与真实模式明确区分且不会自动回退。
 
-开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。生产登录、PostgreSQL、可运行的 Agent 军团、可信代码执行和完整远端交付链路尚未完成。不要将开发服务器暴露到公网。
+本地一条命令启动（需 Python 3.9+ 与 Rust stable；首次构建约 2 分钟，mock 模式，不调用模型）：
+
+```sh
+python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private"
+```
+
+按提示打开地址，用状态目录中 `credentials.json` 里的令牌登录。开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。生产登录、PostgreSQL、可运行的 Agent 军团、可信代码执行和完整远端交付链路尚未完成。不要将开发服务器暴露到公网。
 
 Windows + WSL2 用户可按 [本地拉取与启动指南](docs/wsl-local.md)准备环境，先用现有 launcher 运行 mock；附带只读检查命令，不代表已通过 WSL、浏览器或真实模型验收。
 
