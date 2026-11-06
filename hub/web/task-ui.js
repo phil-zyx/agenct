@@ -54,7 +54,7 @@ function openActionEditor(context, kind, item, action, origin) {
         ...(action === 'deliver' ? { result: input.value, ...(sourceDraftId ? { source_draft_id: sourceDraftId } : {}) } : action === 'cancel' ? { reason: input.value.trim() } : { owner: owner.value.trim(), summary: input.value.trim(), ...(details?.trim() ? { details } : {}) })
       });
       if (!current(context)) return;
-      actionEditors.delete(key); panel.remove?.(); status(action === 'edit' ? '已确认共享摘要并创建任务。' : '已更新。');
+      actionEditors.delete(key); panel.remove?.(); status(action === 'edit' ? '已确认共享摘要并创建任务。' : '已更新。', { transient: true });
     } catch (error) { if (current(context)) { note.textContent = error.message + '。输入已保留，请刷新核对状态后再操作。'; reviewed = null; } }
     finally {
       if (current(context)) { busy.delete(key); review.disabled = false; close.disabled = false; await refresh(context).catch(error => status(error.message)); }
@@ -122,14 +122,25 @@ function applyTaskFilter() {
   $('task-filter-empty').textContent = count ? '' : taskFilter === 'completed' ? '还没有已完成或已取消的任务。' : '这个筛选下暂时没有任务。';
 }
 
+// Index navigation changes only the view, never task state or unsent text.
+function revealTask(taskId) {
+  const task = visibleTasks.get(taskId);
+  const card = [...$('tasks').children].find(card => card.taskId === taskId);
+  if (!task || !card) return;
+  if (card.classList.contains('hide')) {
+    taskFilter = ['completed', 'canceled'].includes(task.status) ? 'completed' : 'active';
+    $('task-filter').value = taskFilter;
+    applyTaskFilter();
+  }
+  card.tabIndex = -1; card.focus?.(); flash(card);
+}
+
 function renderTaskCards(context, tasks) {
   const taskCards = [];
   const slots = new Map();
   for (const task of tasks) {
     const element = el('article', 'card task task-' + task.status);
     element.taskId = task.id;
-    // Remember which card a tool was used from, so its panel opens inside it.
-    element.addEventListener?.('click', () => { panelTask = task.id; }, true);
     const head = el('header', 'card-head');
     const mine = task.owner === context.user ? '我负责' : task.requester === context.user ? '我发起' : '';
     head.append(badge(TASK_STATUS, task.status));
@@ -219,7 +230,7 @@ function addActions(element, context, kind, item, actions) {
         if (!current(context)) return;
         status(kind === 'proposals'
           ? (action === 'confirm' ? (details ? '已确认共享摘要和共享材料，并创建任务。' : '已确认共享摘要并创建任务。') : '已拒绝提案，未创建任务。')
-          : '已更新。');
+          : '已更新。', { transient: true });
       } catch (error) {
         if (current(context)) status(error.message + '。请刷新核对服务端状态后再操作。');
       } finally {
