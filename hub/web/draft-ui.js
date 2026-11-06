@@ -44,7 +44,7 @@ function createDraftUI({ api, current, article, conversation }) {
     editors = [];
     const version = ++generation;
     edit = null;
-    const panel = article('私密文本草稿：不会执行、交付或验收。只发送本任务的共享摘要/结果及所选角色，不发送任何私聊。');
+    const panel = article('私密文本草稿：不会执行、交付或验收。只发送本任务的共享摘要、委派人确认附带的共享材料、交付结果及所选角色，不发送任何私聊；长文本可能截断。');
     if (card) card.replaceChildren(article('已关闭旧草稿视图。'));
     card = panel; conversation().append(panel); panel.scrollIntoView?.({ block: 'nearest' });
     const openedRevision = tasks.get(taskId)?.revision;
@@ -85,8 +85,13 @@ function createDraftUI({ api, current, article, conversation }) {
       const stale = receipt.current_stale || tasks.get(taskId).revision !== draft.task_revision || tasks.get(taskId).status !== 'working';
       panel.append(article(`模型生成文本，未经验证。任务版本 ${draft.task_revision}；角色配置版本 ${response.runtime_profile?.revision ?? '未知'}。`
         + (stale ? ' 已过期，仅供查看，不能直接交付。' : ' 请编辑审阅，再点击任务上的「提交人工交付」并确认。')));
-      if (response.task_context.summary_truncated || response.task_context.result_truncated) {
-        panel.append(article('起草时仅提供了截断的任务摘要或结果；模型未读取完整任务，请核对遗漏后再交付。'));
+      const truncated = [
+        response.task_context.summary_truncated && '共享摘要',
+        response.task_context.details_truncated && '共享材料',
+        response.task_context.result_truncated && '交付结果'
+      ].filter(Boolean);
+      if (truncated.length) {
+        panel.append(article(`起草时${truncated.join('、')}已截断；模型未读取完整任务，请核对遗漏后再交付。`));
       }
       const input = document.createElement('textarea'); input.value = draft.content;
       input.setAttribute('aria-label', '私密交付草稿编辑'); panel.append(input);

@@ -163,11 +163,13 @@ function renderActivity(context, items) {
       body.append(el('span', 'activity-title', item.title), el('span', 'activity-line', activityLine(item, context.user)));
       row.append(icon, body, el('span', 'activity-time', at ? clock(at) : ''));
       row.onclick = () => {
+        if (!current(context)) return;
         if (item.kind === 'task') {
           setPaneTab('tasks');
           panelTask = item.id;
           flash([...$('tasks').children].find(card => card.taskId === item.id));
         } else {
+          returnToChatOnNarrowScreen();
           flash([...$('conversation').children].find(card => card.proposalId === item.id));
         }
       };
@@ -342,6 +344,8 @@ function addDiscussion(element, context, task) {
     if (!visible || taskSignature(visible) !== taskSignature(task)) return;
     selectedTask = { ...visible, invalidated: false };
     renderTaskContext();
+    returnToChatOnNarrowScreen();
+    $('text').focus?.();
     status('已选择任务，下一条消息会附带它。');
   };
   discussionButtons.push(button);
@@ -485,6 +489,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   detailDrafts.clear();
   $('identity').textContent = '';
   $('text').value = '';
+  $('open-agents').disabled = false;
   $('send').disabled = false;
   $('room').classList.add('hide');
   $('login').classList.remove('hide');
@@ -1110,6 +1115,10 @@ function setTasksOpen(open) {
 }
 $('toggle-tasks').onclick = () => setTasksOpen(!$('room').classList.contains('tasks-open'));
 $('close-tasks').onclick = () => setTasksOpen(false);
+function returnToChatOnNarrowScreen() {
+  if (globalThis.innerWidth <= 900) setTasksOpen(false);
+}
+$('open-chat').onclick = () => { setTasksOpen(false); $('text').focus?.(); };
 // Default: docked open on wide screens, closed on phones where it would cover the chat.
 const savedTasksOpen = preference.get('agenct.tasksOpen');
 setTasksOpen(savedTasksOpen === null ? !(globalThis.innerWidth <= 900) : savedTasksOpen === '1');
@@ -1118,12 +1127,20 @@ function setMenuOpen(open) {
   $('composer-menu-toggle').setAttribute('aria-expanded', String(open));
 }
 $('composer-menu-toggle').onclick = () => setMenuOpen($('composer-menu').classList.contains('hide'));
-$('open-help').onclick = () => { setMenuOpen(true); $('help').open = true; };
+$('open-help').onclick = () => { returnToChatOnNarrowScreen(); setMenuOpen(true); $('help').open = true; $('help').focus?.(); };
 // Same path as typing /agents: handled locally by the profile UI, never sent to a model.
-$('open-agents').onclick = () => {
-  if ($('send').disabled) return;
-  $('text').value = '/agents';
-  $('form').requestSubmit?.();
+$('open-agents').onclick = async () => {
+  const context = session();
+  if (!current(context) || $('send').disabled || $('open-agents').disabled) return;
+  returnToChatOnNarrowScreen();
+  $('open-agents').disabled = true;
+  try {
+    // Open the local editor directly. Never replace or submit an unsent message.
+    await profileUI.handle(context, '/agents');
+    if (current(context)) $('conversation').lastElementChild?.scrollIntoView?.({ block: 'nearest' });
+  } finally {
+    if (current(context)) $('open-agents').disabled = false;
+  }
 };
 $('status').onclick = () => { $('status').textContent = ''; };
 $('text').oninput = () => {
