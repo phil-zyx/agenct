@@ -317,7 +317,9 @@ class BridgeSmoke:
             completed = [{"role": m["role"], "content": m["content"]}
                          for m in messages if m["status"] == "complete"]
             check(completed == self.histories[owner], "private completed message history changed")
-            uncertain = [m for m in messages if m["status"] != "complete"]
+            check(all(isinstance(m.get("created_at"), str) for m in messages), "message timestamps missing")
+            uncertain = [{k: m[k] for k in ("role", "content", "status")}
+                         for m in messages if m["status"] != "complete"]
             expected = [{"role": "user", "content": p["message"], "status": "uncertain"}
                         for p in failures] if owner == "alice" else []
             check(uncertain == expected, "failed turn message status or owner isolation changed")

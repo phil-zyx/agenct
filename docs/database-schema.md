@@ -27,6 +27,9 @@ Versions are ordered:
 10. Add `task_details`: optional requester-written shared material attached when a
    proposal is confirmed. One immutable row per task (insert/replace, update and
    delete are blocked by triggers). Existing tasks have none; nothing is inferred.
+11. Add nullable `created_at` to `messages` and `proposals` (UTC `YYYY-MM-DD HH:MM:SS`,
+   written by the Hub on insert; SQLite cannot add a column with a timestamp
+   default). Existing rows stay NULL and are shown as "earlier".
 
 All pending steps, including their version markers, run in one immediate
 transaction. Any migration or validation error rolls the whole upgrade back, so a
