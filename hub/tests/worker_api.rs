@@ -231,7 +231,7 @@ async fn task_state_changes_atomically_revoke_queue_and_scope() {
                 who,
                 "POST",
                 &format!("/api/tasks/{id}/actions"),
-                json!({"action":action,"expected_revision":1,"result":"manual result"})
+                json!({"action":action,"expected_revision":1,"result":"manual result","reason":if action == "cancel" {Some("No longer needed")} else {None}})
             )
             .await
             .0,

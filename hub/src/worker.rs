@@ -116,7 +116,32 @@ pub fn migrate(db: &Connection) -> Result<()> {
     Ok(())
 }
 fn authorized(db: &Connection, job: &Job) -> Result<bool> {
-    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND owner=?2 AND revision=?3 AND status='working')",params![job.request.task_id,job.owner,job.request.task_revision],|r|r.get(0))?)
+    let task = db
+        .query_row(
+            "SELECT owner,status,revision FROM tasks WHERE id=?1",
+            [&job.request.task_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(task.is_some_and(|(owner, status, revision)| {
+        crate::policy::can(
+            &job.owner,
+            crate::policy::Action::WorkerExecute,
+            &crate::policy::Resource::WorkerTask {
+                owner: &owner,
+                status: &status,
+                revision,
+                expected_revision: job.request.task_revision,
+            },
+        )
+        .is_ok()
+    }))
 }
 /// Same transaction as task state changes, so no stale live lease survives commit.
 pub(crate) fn revoke_task(db: &Connection, task: &str) -> rusqlite::Result<()> {
@@ -322,6 +347,21 @@ pub fn fail(db: &mut Connection, lease: &Lease, policy: &Policy, now: i64) -> Re
     Ok(())
 }
 pub fn cancel(db: &Connection, actor: &str, id: &str) -> Result<()> {
+    let job = db
+        .query_row(&format!("{SELECT} WHERE id=?1"), [id], job_row)
+        .optional()?
+        .ok_or(Error::Denied)?;
+    crate::policy::can(
+        actor,
+        crate::policy::Action::WorkerCancel,
+        &crate::policy::Resource::WorkerJob {
+            owner: &job.owner,
+            status: &job.status,
+            task_id: &job.request.task_id,
+            expected_task_id: &job.request.task_id,
+        },
+    )
+    .map_err(|_| Error::Denied)?;
     let n=db.execute("UPDATE worker_jobs SET status='cancelled',lease_hash=NULL,lease_until=NULL WHERE id=?1 AND owner=?2 AND status IN ('queued','running','review_ready','cancelled')",params![id,actor])?;
     if n == 0 {
         return Err(Error::Denied);

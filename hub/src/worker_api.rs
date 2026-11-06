@@ -1,11 +1,10 @@
 //! Queue admission only. No executor, provider, publication or worker-claim routes.
-use crate::{denied, invalid, worker, Error, Hub, Result};
+use crate::{denied, invalid, policy, worker, Error, Hub, Result};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
     Json,
 };
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, HashMap},
@@ -34,7 +33,7 @@ impl Hub {
         }
         let mut entries = HashMap::new();
         for scope in scopes {
-            if !self.gates.contains_key(&scope.owner)
+            if !self.directory.contains(&scope.owner)
                 || scope.task_id.is_empty()
                 || scope.task_id.len() > 128
                 || scope.task_revision < 1
@@ -74,12 +73,25 @@ fn map_error(error: worker::Error) -> Error {
     }
 }
 fn owned_task(db: &rusqlite::Connection, actor: &str, id: &str) -> Result<(String, i64)> {
-    db.query_row(
-        "SELECT status,revision FROM tasks WHERE id=?1 AND owner=?2",
-        params![id, actor],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+    let (owner, status, revision): (String, String, i64) = db
+        .query_row(
+            "SELECT owner,status,revision FROM tasks WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| denied())?;
+    policy::can(
+        actor,
+        policy::Action::WorkerAccess,
+        &policy::Resource::WorkerTask {
+            owner: &owner,
+            status: &status,
+            revision,
+            expected_revision: revision,
+        },
     )
-    .map_err(|_| denied())
+    .map_err(Error::from)?;
+    Ok((status, revision))
 }
 /// Shows only the authenticated task owner's queue and exact current admission scope.
 pub(crate) async fn status(
@@ -90,10 +102,19 @@ pub(crate) async fn status(
     let actor = h.identity(&headers)?;
     let db = h.db()?;
     let (status, revision) = owned_task(&db, &actor, &id)?;
-    let scope = h
-        .worker_scopes
-        .get(&id)
-        .filter(|s| s.owner == actor && s.task_revision == revision && status == "working");
+    let scope = h.worker_scopes.get(&id).filter(|s| {
+        policy::can(
+            &actor,
+            policy::Action::WorkerExecute,
+            &policy::Resource::WorkerTask {
+                owner: &s.owner,
+                status: &status,
+                revision,
+                expected_revision: s.task_revision,
+            },
+        )
+        .is_ok()
+    });
     let jobs = worker::list_for_task(&db, &actor, &id).map_err(map_error)?;
     Ok(Json(
         serde_json::json!({"scope":scope,"jobs":jobs,"execution_enabled":false,"publication_enabled":false}),
@@ -118,23 +139,26 @@ pub(crate) async fn enqueue(
     let actor = h.identity(&headers)?;
     let mut db = h.db()?;
     owned_task(&db, &actor, &id)?;
-    if !input.confirm_queue_only {
-        return Err(invalid("explicit queue-only confirmation required"));
-    }
-    let scope = h
-        .worker_scopes
-        .get(&id)
-        .filter(|s| s.owner == actor)
-        .ok_or_else(denied)?;
-    if scope.task_revision != input.expected_revision
-        || scope.repository != input.repository
-        || scope.base_commit != input.base_commit
-    {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "request does not match operator-approved task scope",
-        ));
-    }
+    let scope = h.worker_scopes.get(&id);
+    policy::can(
+        &actor,
+        policy::Action::WorkerEnqueue,
+        &policy::Resource::WorkerQueue {
+            owner: &actor,
+            confirmed: input.confirm_queue_only,
+            scope: scope.map(|s| policy::QueueScope {
+                owner: &s.owner,
+                revision: s.task_revision,
+                repository: &s.repository,
+                base_commit: &s.base_commit,
+            }),
+            expected_revision: input.expected_revision,
+            repository: &input.repository,
+            base_commit: &input.base_commit,
+        },
+    )
+    .map_err(Error::from)?;
+    let scope = scope.expect("policy requires an approved scope");
     // This reserved ID is only an admission marker. No consumer is constructed or
     // scheduled, and the built-in executor's hard-disable remains unconditional.
     let policy = worker::Policy {
@@ -174,9 +198,17 @@ pub(crate) async fn cancel(
     let db = h.db()?;
     owned_task(&db, &actor, &task)?;
     let (record, _) = worker::inspect(&db, &actor, &job).map_err(map_error)?;
-    if record.request.task_id != task {
-        return Err(denied());
-    }
+    policy::can(
+        &actor,
+        policy::Action::WorkerCancel,
+        &policy::Resource::WorkerJob {
+            owner: &record.owner,
+            status: &record.status,
+            task_id: &record.request.task_id,
+            expected_task_id: &task,
+        },
+    )
+    .map_err(Error::from)?;
     worker::cancel(&db, &actor, &job).map_err(map_error)?;
     Ok(Json(
         serde_json::json!({"id":job,"status":"cancelled","execution_enabled":false,"publication_enabled":false}),

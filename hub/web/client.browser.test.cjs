@@ -11,7 +11,7 @@ const { chromium } = require('playwright');
 const STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 const server = http.createServer((request, response) => {
   const name = request.url === '/' ? 'index.html' : request.url.slice(1);
-  if (!['index.html', 'style.css', 'client.js', 'profiles-ui.js', 'worker-ui.js'].includes(name)) {
+  if (!['index.html', 'style.css', 'client.js', 'profiles-ui.js', 'worker-ui.js', 'draft-ui.js', 'task-timeline-model.js', 'task-timeline-ui.js'].includes(name)) {
     response.writeHead(404).end(); return;
   }
   response.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');

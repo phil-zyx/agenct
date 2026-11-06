@@ -12,6 +12,18 @@ Versions are ordered:
    bindings remain unchanged; missing bindings become NULL.
 4. Add worker execution authority, defaulting unclassified jobs to zero. An upgrade
    does not authorize or start worker execution.
+5. Add the append-only delivery ledger. Existing non-NULL `tasks.result` becomes
+   submitted sequence 1, authored by the task owner at its current revision.
+   `created_at` for backfilled rows is the migration time, not an inferred delivery
+   time. Already overwritten legacy versions cannot be recovered.
+6. Add nullable lifecycle transition fields and append-only guards to events.
+   Legacy transition fields remain unknown; they are not backfilled by inference.
+7. Add owner-private durable draft-generation receipts.
+8. Add canonical event revision and stored delivery links, rebuilding events with
+   a task foreign key. Refuse orphan events or ambiguous recorded delivery links.
+9. Add nullable `events.reason`. Existing rows remain NULL, including old
+   cancellations; new user-confirmed cancellation writes its shared reason
+   atomically with the task transition and worker revocation.
 
 All pending steps, including their version markers, run in one immediate
 transaction. Any migration or validation error rolls the whole upgrade back, so a
@@ -20,7 +32,7 @@ before changing journal mode, schema, messages, receipts or configured sessions.
 Opening a file-backed Hub can still create its normal lock sidecar.
 
 Version zero supports empty databases and subsets of the historical Hub tables,
-including any combination of the five additive columns above. Present tables must
+including historical combinations of the earlier additive columns. Present tables must
 have the historical base columns, declared types, nullability, defaults, primary
 keys and unique keys. Old receipt tables without the status CHECK are supported
 and preserved. The named active-worker index is created if absent on version zero;
@@ -60,3 +72,63 @@ cargo test --locked --manifest-path hub/Cargo.toml
 cargo fmt --manifest-path hub/Cargo.toml -- --check
 cargo clippy --locked --manifest-path hub/Cargo.toml --all-targets -- -D warnings
 ```
+
+## Delivery ledger
+
+A successful explicit owner `deliver` appends one submitted row in the same
+transaction as the task transition, audit event and worker revocation. Returning
+work still clears the compatibility `tasks.result` field, but never deletes any
+ledger version. Stale or unauthorized actions append nothing. Update/delete triggers and a duplicate-identity insert guard enforce immutable
+rows even for SQLite `INSERT OR REPLACE`; validation checks those trigger definitions.
+
+`GET /api/tasks/{id}` includes `deliveries`, ordered by submitted sequence, for
+participants only. Its allowlist is `seq`, `author`, `content`, `created_at` and
+`task_revision`. Draft IDs, source links, contents and counts are not exposed.
+Draft and submitted sequences have separate uniqueness scopes, so private drafts
+cannot create observable gaps. `status=draft` and nullable `source_draft_id` are
+reserved storage for later owner-only drafting. This change introduces no draft
+creation endpoint, provider dispatch, execution authorization or publication.
+Future explicit draft submission must append a distinct submitted row and leave
+the original draft intact; requester-facing projections must stay submitted-only.
+
+### Version 6: participant-visible lifecycle audit
+
+Adds nullable `events.from_status`, `events.to_status`, and
+`events.task_revision`. Historical values stay null; old transitions and delivery
+links are not guessed. New writes capture each task transition in its transaction.
+The task-detail API exposes a dense, filtered, task-local sequence rather than the
+raw global event ID. Only submitted delivery versions can be linked.
+
+The migration installs and validates `events_no_update`, `events_no_delete`, and
+`events_no_replace`. The insert guard rejects duplicate primary keys even under
+SQLite `INSERT OR REPLACE` with recursive triggers disabled. These guards prevent
+ordinary writes from rewriting history; they are not protection against a database
+administrator. See [audit contract and replay limits](task-audit.md).
+
+
+### Version 8: stored audit links and task referential integrity
+
+The transactional rebuild preserves event IDs, timestamps, original columns,
+indexes and triggers. It adds `revision` and `delivery_seq`, plus an actual
+`task_id REFERENCES tasks(id) ON DELETE RESTRICT` foreign key. `task_revision`
+remains for compatibility; new writers populate both revision columns equally.
+Reads use the stored delivery sequence. The event writer captures only an exact
+submitted delivery matching task, resulting revision and author, in the same
+transaction as the delivery and task transition.
+
+For old v6/v7 recorded deliveries, migration requires exactly one matching
+submitted row before storing its sequence. Old null-revision events stay null and
+unlinked. Missing/ambiguous recorded links or orphan task references fail the
+entire upgrade without deleting or rewriting old data. An operator must reconcile
+the inconsistency before retrying; the server never repairs it by guessing. This
+rebuild does not recover earlier overwritten delivery content.
+
+
+Event-table rebuilds preserve views and cross-table triggers in place without
+rewriting or executing their bodies. The final table is recreated directly under
+its original name using owned DDL, rather than renamed while references are
+unresolved. Incoming foreign keys from any other main-schema table are an explicit
+unsupported automatic-upgrade boundary: preflight rejects them before any DROP,
+even when foreign-key enforcement is off. This prevents cascaded deletion or
+nulling of unrelated records under FK-enabled SQLite builds. Operators must plan
+a coordinated migration for those dependent tables instead of bypassing checks.
