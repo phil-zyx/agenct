@@ -368,6 +368,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('conversation').replaceChildren();
   $('tasks').replaceChildren();
   $('task-count').textContent = '';
+  $('rail-badge').textContent = '';
   detailDrafts.clear();
   $('identity').textContent = '';
   $('text').value = '';
@@ -512,8 +513,8 @@ async function readSnapshot(context) {
   const nextSnapshot = JSON.stringify([messages, proposals, tasks]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
-  $('last-refresh').textContent = (changed ? '有新的会话或任务更新。' : '')
-    + '已同步：' + new Date().toLocaleTimeString() + '。页面可见时每 5 秒自动检查。';
+  $('last-refresh').textContent = (changed ? '有新的更新 · ' : '')
+    + '已同步 ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   // Keep focused controls, selection and drafts intact when data did not change.
   const nextBusy = JSON.stringify([...busy].filter(key => key !== 'send').sort());
   if (snapshot === nextSnapshot && renderedBusy === nextBusy) return;
@@ -522,7 +523,8 @@ async function readSnapshot(context) {
   taskView++;
   discussionButtons = [];
   const stream = $('conversation');
-  const stick = !(stream.scrollHeight - stream.scrollTop - stream.clientHeight > 120);
+  const scroller = $('scroller');
+  const stick = !(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 160);
   const entries = messages.map(message => {
     const notice = message.role !== 'user' && /^\[(系统提示|MOCK)/.test(message.content);
     const bubble = el('article', 'msg ' + (message.role === 'user' ? 'msg-user' : notice ? 'msg-notice' : 'msg-assistant')
@@ -548,10 +550,16 @@ async function readSnapshot(context) {
       box.value = detailDrafts.get(key) ?? '';
       box.oninput = () => detailDrafts.set(key, box.value);
       label.append(box);
+      // Collapsed until asked for, unless the user already typed something.
+      const reveal = el('button', 'text-btn add-material', '＋ 附带共享材料（可选）');
+      reveal.type = 'button';
+      if (!box.value) label.classList.add('hide');
+      else reveal.classList.add('hide');
+      reveal.onclick = () => { label.classList.remove('hide'); reveal.classList.add('hide'); box.focus?.(); };
       const actions = el('div', 'actions');
       actions.detailsBox = box;
       element.detailsBox = box;
-      element.append(label, actions);
+      element.append(reveal, label, actions);
       addActions(actions, context, 'proposals', proposal, [['confirm', '确认共享并委派'], ['reject', '拒绝，不共享']]);
     }
     entries.push(element);
@@ -603,7 +611,11 @@ async function readSnapshot(context) {
   stream.replaceChildren(...entries);
   $('tasks').replaceChildren(...taskCards);
   $('task-count').textContent = tasks.length ? String(tasks.length) : '';
-  if (stick) stream.scrollTop = stream.scrollHeight;
+  // The rail badge counts tasks waiting on *this* user, not all tasks.
+  const waiting = tasks.filter(task => (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+    || (task.requester === context.user && task.status === 'ready_for_acceptance')).length;
+  $('rail-badge').textContent = waiting ? String(waiting) : '';
+  if (stick) scroller.scrollTop = scroller.scrollHeight;
   renderTaskContext();
 
 }
@@ -887,4 +899,40 @@ $('text').onkeydown = event => {
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
   if (!$('send').disabled) $('form').requestSubmit?.();
+};
+
+// Presentational chrome only: drawer, composer menu, help, toast, autogrow.
+// Never stores conversation content; the drawer preference is a per-viewer nicety.
+const preference = {
+  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+  set(key, value) { try { localStorage.setItem(key, value); } catch { /* storage unavailable */ } }
+};
+function setTasksOpen(open) {
+  $('room').classList[open ? 'add' : 'remove']('tasks-open');
+  $('toggle-tasks').setAttribute('aria-pressed', String(open));
+  preference.set('agenct.tasksOpen', open ? '1' : '0');
+}
+$('toggle-tasks').onclick = () => setTasksOpen(!$('room').classList.contains('tasks-open'));
+$('close-tasks').onclick = () => setTasksOpen(false);
+// Default: docked open on wide screens, closed on phones where it would cover the chat.
+const savedTasksOpen = preference.get('agenct.tasksOpen');
+setTasksOpen(savedTasksOpen === null ? !(globalThis.innerWidth <= 900) : savedTasksOpen === '1');
+function setMenuOpen(open) {
+  $('composer-menu').classList[open ? 'remove' : 'add']('hide');
+  $('composer-menu-toggle').setAttribute('aria-expanded', String(open));
+}
+$('composer-menu-toggle').onclick = () => setMenuOpen($('composer-menu').classList.contains('hide'));
+$('open-help').onclick = () => { setMenuOpen(true); $('help').open = true; };
+// Same path as typing /agents: handled locally by the profile UI, never sent to a model.
+$('open-agents').onclick = () => {
+  if ($('send').disabled) return;
+  $('text').value = '/agents';
+  $('form').requestSubmit?.();
+};
+$('status').onclick = () => { $('status').textContent = ''; };
+$('text').oninput = () => {
+  const box = $('text');
+  if (!box.style) return;
+  box.style.height = 'auto';
+  box.style.height = Math.min(box.scrollHeight, 200) + 'px';
 };
