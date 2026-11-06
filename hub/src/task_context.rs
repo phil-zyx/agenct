@@ -1,4 +1,5 @@
 //! Read-only snapshots of one explicitly selected, participant-visible shared task.
+use super::tasks::row_task;
 use super::*;
 pub(super) const STALE: &str = "selected task changed; refresh and select it again";
 pub(super) const UNAVAILABLE: &str = "selected task is not available for discussion";

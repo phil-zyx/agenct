@@ -34,9 +34,6 @@ fn defaults() -> Vec<PersonalAgent> {
         enabled: true,
     }]
 }
-pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS personal_profiles (owner TEXT PRIMARY KEY, revision INTEGER NOT NULL, agents_json TEXT NOT NULL);")
-}
 fn read(db: &Connection, owner: &str) -> Result<Profile> {
     let record: Option<(u64, String)> = db
         .query_row(
@@ -191,8 +188,8 @@ mod tests {
     use super::*;
     #[test]
     fn runtime_revalidates_corrupt_stored_profiles() {
-        let db = Connection::open_in_memory().unwrap();
-        initialize(&db).unwrap();
+        let mut db = Connection::open_in_memory().unwrap();
+        schema::migrate(&mut db).unwrap();
         let mut agents = defaults();
         agents[0].model_ref = "http://untrusted".into();
         db.execute(
