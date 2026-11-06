@@ -4,24 +4,24 @@ const { webcrypto } = require('node:crypto');
 class Element { constructor(){this.children=[];this.textContent='';this.value='';} append(e){this.children.push(e);} replaceChildren(...e){this.children=e;this.textContent='';} setAttribute(){} }
 const walk=e=>[e,...e.children.flatMap(walk)];
 function fixture() {
- const conversation=new Element(), calls=[], storage=new Map(), timers=new Map(); let timerId=0; let epoch=1, user='bob', error=null, stale=false, truncated={}, listed=false, hold=false, release, consent=true;
+ const conversation=new Element(), calls=[], storage=new Map(), timers=new Map(); let timerId=0; let epoch=1, user='bob', error=null, stale=false, truncated={}, listed=false, recommended=null, hold=false, release, consent=true;
  let task={id:'task1',owner:'bob',requester:'alice',revision:1,status:'working'};
  const context=()=>({user,epoch,browserMode:false,signal:new AbortController().signal});
  const sandbox=vm.createContext({document:{createElement:()=>new Element()},crypto:webcrypto,TextEncoder,AbortController,setTimeout:(fn,ms)=>{const id=++timerId;timers.set(id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),confirm:()=>consent,sessionStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v),removeItem:k=>storage.delete(k)}});
  vm.runInContext(fs.readFileSync(__dirname+'/draft-ui.js','utf8'),sandbox);
- const response=id=>({kind:'draft_delivery',task_id:task.id,request_id:id,status:'complete',current_stale:stale,response:{draft:{content:'Generated <script> text',task_revision:1,stale:false},task_context:{id:task.id,summary_truncated:false,result_truncated:false,details_truncated:false,...truncated},runtime_profile:{revision:3}}});
+ const response=id=>({kind:'draft_delivery',task_id:task.id,request_id:id,status:'complete',current_stale:stale,response:{draft:{id:'draft-1',seq:1,content:'Generated <script> text',task_revision:1,stale:false},task_context:{id:task.id,summary_truncated:false,result_truncated:false,details_truncated:false,...truncated},runtime_profile:{revision:3}}});
  const ui=sandbox.createDraftUI({current:c=>c.user===user&&c.epoch===epoch,article:t=>{const e=new Element();e.textContent=t;return e;},conversation:()=>conversation,api:async(c,p,m='GET',b)=>{
  calls.push({p,m,b}); if(m==='POST'){if(hold)await new Promise(r=>release=r); if(error)throw error;return response(b.request_id);}
  if(p.includes('/turns/'))return response(p.split('/').at(-1));
  if(p==='profile')return {revision:3,agents:[{id:'writer',name:'Writer',enabled:true}]};
- return {kind:'draft_delivery',task_id:task.id,items:listed?[response("listed-receipt")]:[],next_cursor:null};}});
+ return {kind:'draft_delivery',task_id:task.id,items:listed?[response("listed-receipt")]:[],next_cursor:null,recommended_profile:recommended};}});
  const render=()=>{ui.update(context(),[task]);const e=new Element();ui.attach(e,context(),task);conversation.append(e);return e;};
  const buttons=t=>walk(conversation).filter(e=>e.textContent===t);
- return {ui,calls,storage,conversation,buttons,confirm:v=>consent=v,timeout:()=>{const t=[...timers.values()].find(t=>t.ms===90000);assert(t);t.fn();},task:()=>task,open:async()=>{const e=render();await e.children[0]?.onclick();},click:async t=>buttons(t).at(-1).onclick(),posts:()=>calls.filter(c=>c.m==='POST'),error:e=>error=e,stale:()=>stale=true,truncated:(flags={summary_truncated:true})=>truncated=flags,listed:()=>listed=true,change:p=>{task={...task,...p};ui.update(context(),[task]);},hold:()=>hold=true,release:()=>{hold=false;release();},logout:()=>{epoch++;ui.reset();conversation.replaceChildren();},render};
+ return {ui,calls,storage,conversation,buttons,confirm:v=>consent=v,timeout:()=>{const t=[...timers.values()].find(t=>t.ms===90000);assert(t);t.fn();},task:()=>task,open:async()=>{const e=render();await e.children[0]?.onclick();},click:async t=>buttons(t).at(-1).onclick(),posts:()=>calls.filter(c=>c.m==='POST'),error:e=>error=e,stale:()=>stale=true,truncated:(flags={summary_truncated:true})=>truncated=flags,listed:()=>listed=true,recommend:value=>recommended=value,change:p=>{task={...task,...p};ui.update(context(),[task]);},hold:()=>hold=true,release:()=>{hold=false;release();},logout:()=>{epoch++;ui.reset();conversation.replaceChildren();},render};
 }
 (async()=>{
  const f=fixture();await f.open();assert.equal(f.posts().length,0);await f.click('让我的 Agent 起草（不交付）');assert.equal(f.posts().length,1);assert(f.calls.every(c=>!c.p.endsWith('/actions')));
- assert.equal(f.ui.reviewedText(f.task()),'');await f.click('使用此草稿填入人工交付');const input=walk(f.conversation).find(e=>e.value==='Generated <script> text');input.value='Human edited';assert.equal(f.ui.reviewedText(f.task()),'Human edited');assert.equal(f.posts().length,1);f.confirm(false);await f.click('重新读取私密草稿');assert.equal(f.ui.reviewedText(f.task()),'Human edited');f.confirm(true);f.change({revision:2});assert.equal(f.ui.reviewedText(f.task()),'');
+ assert.equal(f.ui.reviewedText(f.task()),'');assert.equal(f.ui.reviewedSource(f.task()),null);await f.click('使用此草稿填入人工交付');const input=walk(f.conversation).find(e=>e.value==='Generated <script> text');input.value='Human edited';assert.equal(f.ui.reviewedText(f.task()),'Human edited');assert.equal(f.ui.reviewedSource(f.task()),'draft-1');assert.equal(f.posts().length,1);f.confirm(false);await f.click('重新读取私密草稿');assert.equal(f.ui.reviewedText(f.task()),'Human edited');f.confirm(true);f.change({revision:2});assert.equal(f.ui.reviewedText(f.task()),'');assert.equal(f.ui.reviewedSource(f.task()),null);
  const s=fixture();s.stale();await s.open();await s.click('让我的 Agent 起草（不交付）');assert.equal(s.buttons('使用此草稿填入人工交付').length,0,'Live stale overrides saved stale=false');
  const trunc=fixture();trunc.truncated();await trunc.open();await trunc.click('让我的 Agent 起草（不交付）');assert(walk(trunc.conversation).some(e=>e.textContent.includes('模型未读取完整任务')));
  // Each receipt entry path must disclose material-only truncation without
@@ -61,5 +61,19 @@ function fixture() {
  const changed=fixture();await changed.open();changed.change({revision:2});await changed.click('让我的 Agent 起草（不交付）');assert.equal(changed.posts().length,0);
  const timed=fixture();await timed.open();timed.hold();const awaiting=timed.click('让我的 Agent 起草（不交付）');timed.timeout();await awaiting;assert.equal(timed.storage.size,1);assert(timed.buttons('核对起草请求').length);await timed.click('让我的 Agent 起草（不交付）');assert.equal(timed.posts().length,1);timed.release();
  const late=fixture();await late.open();late.hold();const p=late.click('让我的 Agent 起草（不交付）');late.logout();late.release();await p;assert.equal(late.conversation.children.length,0);
+ const revision=fixture();revision.listed();await revision.open();
+ const requirements=walk(revision.conversation).find(e=>e.placeholder==='例如：更简短，保留结论和依据');
+ requirements.value='更简短';await revision.click('按要求生成新版本');
+ assert.equal(revision.posts().length,1);
+ assert.deepEqual(JSON.parse(JSON.stringify(revision.posts()[0].b.revision)),{base_draft_id:'draft-1',instruction:'更简短'});
+ assert(revision.calls.every(c=>!c.p.endsWith('/actions')));
+ assert.equal(walk(revision.conversation).filter(e=>e.value==='Generated <script> text').length,2,'old draft stays visible');
+ const recommended=fixture();recommended.recommend({agent_id:'writer',revision:4,role:'writer'});await recommended.open();
+ assert(walk(recommended.conversation).some(e=>e.textContent.includes('根据任务推荐：写作')));
+ await recommended.click('让我的 Agent 起草（不交付）');assert.equal(recommended.posts()[0].b.agent_id,'writer');
+ assert.equal(recommended.posts()[0].b.expected_profile_revision,4);
+ const staleRevision=fixture();staleRevision.listed();await staleRevision.open();staleRevision.change({revision:2});
+ walk(staleRevision.conversation).find(e=>e.placeholder==='例如：更简短，保留结论和依据').value='Change';
+ await staleRevision.click('按要求生成新版本');assert.equal(staleRevision.posts().length,0);
  console.log('Recipient draft UI privacy, manual-review, recovery, role, stale and identity tests passed');
 })().catch(e=>{console.error(e);process.exitCode=1;});

@@ -381,7 +381,14 @@ async fn bounded_utf8_excerpts_and_long_history_fit_adapter_contract() {
         StatusCode::OK
     );
     let inputs = adapter.payloads.lock().unwrap();
-    let payload = &inputs[0];
+    assert!(inputs
+        .iter()
+        .any(|value| value["kind"] == "context_summary"));
+    let payload = inputs
+        .iter()
+        .rev()
+        .find(|value| value["kind"] != "context_summary")
+        .unwrap();
     let context = &payload["task_context"];
     assert_eq!(context["summary_truncated"], true);
     assert_eq!(context["result_truncated"], true);
@@ -389,7 +396,20 @@ async fn bounded_utf8_excerpts_and_long_history_fit_adapter_contract() {
     assert!(result.starts_with(context["result"].as_str().unwrap()));
     assert!(context.to_string().len() <= 8192);
     assert!(payload.to_string().len() <= 60000);
-    assert_eq!(payload["history"].as_array().unwrap().len(), 40);
+    assert!(payload["history"].as_array().unwrap().len() <= 40);
+    assert!(payload["history"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Private conversation summary"));
+    assert_eq!(
+        sql.query_row(
+            "SELECT count(*) FROM messages WHERE owner='alice' AND content='short'",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        130
+    );
 }
 #[tokio::test]
 async fn task_text_cannot_authorize_proposal_or_change_tasks() {

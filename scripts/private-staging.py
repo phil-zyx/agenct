@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Private, loopback-only staging. Never prints credentials or provisions services."""
 import argparse
+from contextlib import contextmanager, closing
 import fcntl
 import hashlib
 import json
@@ -12,6 +13,8 @@ import shutil
 import signal
 import socket
 import stat
+import sqlite3
+import tempfile
 import subprocess
 import sys
 import time
@@ -111,6 +114,11 @@ def first_free_port(attempts=20):
 
 
 def update_config(directory, key, value):
+    with state_lock(directory, "admin.lock"):
+        _update_config(directory, key, value)
+
+
+def _update_config(directory, key, value):
     environment(directory)  # Validate ownership, permissions and schema before rewriting.
     if hub_running(directory):
         # The running Hub keeps its old port/runtime; changing config now would make
@@ -124,6 +132,118 @@ def update_config(directory, key, value):
         raise ValueError(f"{temporary}: leftover temporary file; inspect and remove it first")
     write_private(temporary, config)
     os.replace(temporary, path)  # Atomic: never leaves a half-written configuration.
+
+
+@contextmanager
+def state_lock(directory, name):
+    secure_path(directory, directory=True)
+    path = directory / name
+    if path.exists() or path.is_symlink():
+        secure_path(path)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError("state is busy; stop the Hub before restoring, or retry after the other administration command")
+        yield
+
+
+def replace_private(path, value):
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(value, stream, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def change_user(directory, user, rotate=False):
+    if not user or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", user):
+        raise ValueError("--user must contain 1–64 ASCII letters, digits, underscores or hyphens")
+    with state_lock(directory, "admin.lock"):
+        environment(directory)
+        config_path, credentials_path = directory / "config.json", directory / "credentials.json"
+        secure_path(credentials_path)
+        config, credentials = json.loads(config_path.read_text()), json.loads(credentials_path.read_text())
+        members = {entry["id"] for entry in config["users"]}
+        if (user in members) != rotate:
+            raise ValueError("rotate-token requires an existing user; add-user requires a new user")
+        if not isinstance(credentials, dict) or set(credentials) != members:
+            raise ValueError("credentials do not match configured users")
+        token = secrets.token_urlsafe(32)
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        old_credentials = credentials.copy()
+        credentials[user] = token
+        if rotate:
+            next(entry for entry in config["users"] if entry["id"] == user)["token_sha256"] = digest
+        else:
+            config["users"].append({"id": user, "token_sha256": digest})
+        if len((json.dumps(config, indent=2) + "\n").encode()) > 131072:
+            raise ValueError("private configuration exceeds 128 KiB")
+        # Publish the secret before enabling it; the live Hub reads only config.json.
+        replace_private(credentials_path, credentials)
+        try:
+            replace_private(config_path, config)
+        except Exception:
+            replace_private(credentials_path, old_credentials)
+            raise
+
+
+def sqlite_snapshot(source, destination):
+    # SQLite's online backup includes committed WAL data and never copies a torn database.
+    with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as src, closing(sqlite3.connect(destination)) as dst:
+        src.backup(dst)
+        if dst.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            raise ValueError("database integrity check failed")
+
+
+def backup_database(directory, destination):
+    with state_lock(directory, "admin.lock"):
+        _backup_database(directory, destination)
+
+
+def _backup_database(directory, destination):
+    environment(directory)
+    source = directory / "hub.sqlite3"
+    secure_path(source)
+    # Exclusive creation prevents overwriting an earlier backup or following a symlink.
+    fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(fd)
+    try:
+        sqlite_snapshot(source, destination)
+    except Exception:
+        destination.unlink()
+        raise
+
+
+def restore_database(directory, source):
+    with state_lock(directory, "admin.lock"), state_lock(directory, "hub.lock"):
+        environment(directory)
+        secure_path(source)
+        target = directory / "hub.sqlite3"
+        if source.resolve() == target.resolve():
+            raise ValueError("restore source must be a separate backup")
+        fd, name = tempfile.mkstemp(prefix="restore-", suffix=".sqlite3", dir=directory)
+        os.close(fd)
+        temporary = Path(name)
+        try:
+            sqlite_snapshot(source, temporary)
+            with closing(sqlite3.connect(temporary)) as db:
+                tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if not {"sessions", "messages", "tasks", "proposals"}.issubset(tables):
+                    raise ValueError("backup is not an Agenct database")
+            # Remove stale sidecars while holding the same lock as the Hub.
+            for suffix in ("-wal", "-shm"):
+                target.with_name(target.name + suffix).unlink(missing_ok=True)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def set_port(directory, port):
@@ -374,22 +494,36 @@ def environment(directory):
             secure_path(path)
     env = os.environ.copy()
     env.update(AGENCT_BIND=f"127.0.0.1:{port}", AGENCT_DATABASE=str(directory / "hub.sqlite3"),
-               AGENCT_RUNTIME=config["runtime"], AGENCT_USERS_JSON=json.dumps(users))
+               AGENCT_RUNTIME=config["runtime"], AGENCT_USERS_JSON=json.dumps(users),
+               AGENCT_PRIVATE_CONFIG=str(config_path))
     return env
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("start", "init", "check", "run", "set-port", "set-runtime"),
+    parser.add_argument("action", choices=("start", "init", "check", "run", "set-port", "set-runtime", "add-user", "rotate-token", "backup", "restore"),
                         help="start = init if missing, build, then run (recommended)")
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--users", nargs="+", default=["alice", "bob"])
     parser.add_argument("--port", type=int, default=None, help=f"loopback port (default {DEFAULT_PORT})")
     parser.add_argument("--runtime", choices=RUNTIMES, default=None,
                         help="mock (offline demo, default) or dsh (real DeepSeek calls; needs DEEPSEEK_API_KEY)")
+    parser.add_argument("--user", help="identity for add-user or rotate-token")
+    parser.add_argument("--backup-file", type=Path, help="new backup destination or restore source")
     args = parser.parse_args()
     # Do not resolve final component: lstat must detect directory symlinks.
     directory = Path(os.path.abspath(args.state_dir))
+    if args.action in ("add-user", "rotate-token"):
+        change_user(directory, args.user, rotate=args.action == "rotate-token")
+        print("User credentials updated. Read the owner-only credentials.json; the running Hub applies this on its next authenticated request.")
+        return
+    if args.action in ("backup", "restore"):
+        if args.backup_file is None:
+            raise ValueError("backup and restore require --backup-file")
+        path = Path(os.path.abspath(args.backup_file))
+        (backup_database if args.action == "backup" else restore_database)(directory, path)
+        print("Database " + ("backed up consistently." if args.action == "backup" else "restored. Start the Hub to resume."))
+        return
     if args.action == "start":
         start(directory, args.users, args.port, args.runtime)
         return
@@ -431,6 +565,6 @@ if __name__ == "__main__":
     except subprocess.CalledProcessError:
         print("Private staging refused: a build/install step failed; see the output above.", file=sys.stderr)
         sys.exit(1)
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
+    except (ValueError, OSError, json.JSONDecodeError, sqlite3.Error) as exc:
         print(f"Private staging refused: {exc}", file=sys.stderr)
         sys.exit(1)

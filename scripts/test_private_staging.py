@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
+import hashlib
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -77,6 +79,67 @@ class PrivateStagingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     staging.environment(self.state)
                 (self.state / "config.json").write_text(old)
+
+    def test_live_user_changes_preserve_other_credentials(self):
+        before = json.loads((self.state / "credentials.json").read_text())
+        with patch.object(staging, "hub_running", return_value=True):
+            staging.change_user(self.state, "carol")
+            staging.change_user(self.state, "alice", rotate=True)
+        after = json.loads((self.state / "credentials.json").read_text())
+        self.assertEqual(before["bob"], after["bob"])
+        self.assertNotEqual(before["alice"], after["alice"])
+        config = json.loads((self.state / "config.json").read_text())
+        self.assertEqual({u["id"]: u["token_sha256"] for u in config["users"]},
+                         {u: hashlib.sha256(t.encode()).hexdigest() for u, t in after.items()})
+        self.assertEqual(staging.environment(self.state)["AGENCT_PRIVATE_CONFIG"], str(self.state / "config.json"))
+        for user, rotate in (("carol", False), ("missing", True), ("bad id", False)):
+            with self.assertRaises(ValueError):
+                staging.change_user(self.state, user, rotate)
+        for name in ("config.json", "credentials.json"):
+            self.assertEqual((self.state / name).stat().st_mode & 0o777, 0o600)
+
+    def database(self):
+        path = self.state / "hub.sqlite3"
+        path.touch(mode=0o600)
+        db = sqlite3.connect(path)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA wal_autocheckpoint=0")
+        for table in ("sessions", "messages", "tasks", "proposals"):
+            db.execute(f"CREATE TABLE {table}(value TEXT)")
+        db.execute("INSERT INTO messages VALUES ('preserved WAL content')")
+        db.commit()
+        for suffix in ("-wal", "-shm"):
+            Path(str(path) + suffix).chmod(0o600)
+        return db
+
+    def test_backup_includes_wal_and_restores_deleted_database(self):
+        db = self.database()
+        backup = Path(self.temp.name) / "backup.sqlite3"
+        staging.backup_database(self.state, backup)
+        self.assertEqual(backup.stat().st_mode & 0o777, 0o600)
+        with sqlite3.connect(backup) as saved:
+            self.assertEqual(saved.execute("SELECT value FROM messages").fetchone()[0], "preserved WAL content")
+        with self.assertRaises(FileExistsError):
+            staging.backup_database(self.state, backup)
+        db.close()
+        (self.state / "hub.sqlite3").unlink()
+        staging.restore_database(self.state, backup)
+        with sqlite3.connect(self.state / "hub.sqlite3") as restored:
+            self.assertEqual(restored.execute("SELECT value FROM messages").fetchone()[0], "preserved WAL content")
+
+    def test_restore_refuses_live_hub_and_invalid_backup(self):
+        db = self.database()
+        backup = Path(self.temp.name) / "backup.sqlite3"
+        staging.backup_database(self.state, backup)
+        with staging.state_lock(self.state, "hub.lock"):
+            with self.assertRaises(ValueError):
+                staging.restore_database(self.state, backup)
+        invalid = Path(self.temp.name) / "invalid.sqlite3"
+        invalid.touch(mode=0o600)
+        with self.assertRaises(ValueError):
+            staging.restore_database(self.state, invalid)
+        self.assertEqual(db.execute("SELECT value FROM messages").fetchone()[0], "preserved WAL content")
+        db.close()
 
     def launch_patches(self):
         return (patch.object(staging, "BINARY", Path(__file__)), patch.object(staging, "stale_binary", lambda: False),

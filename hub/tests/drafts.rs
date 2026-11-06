@@ -689,3 +689,133 @@ async fn historical_replay_ignores_new_profile_and_another_active_turn() {
     );
     assert!(!public.to_string().contains("fixture reply"));
 }
+
+#[tokio::test]
+async fn revision_is_private_version_bound_and_replay_does_not_call_model_twice() {
+    let adapter = Adapter::new(success(), false).await;
+    let db = Database::new();
+    let a = adapter.app(&db.path());
+    let task = working(&a).await;
+    let path = route(&task);
+    let first = request(&a, "bob", "POST", &path, input("original")).await;
+    assert_eq!(first.0, StatusCode::OK);
+    let base = first.1["response"]["draft"]["id"].clone();
+    let mut revision = input("revision");
+    revision["revision"] = json!({"base_draft_id":base,"instruction":"Shorter, keep evidence"});
+    let changed = request(&a, "bob", "POST", &path, revision.clone()).await;
+    assert_eq!(changed.0, StatusCode::OK);
+    assert_eq!(changed.1["response"]["draft"]["seq"], 2);
+    assert_eq!(changed.1["response"]["draft"]["base_draft_id"], base);
+    assert_eq!(
+        request(&a, "bob", "POST", &path, revision.clone()).await.1,
+        changed.1
+    );
+    assert_eq!(adapter.count(), 2);
+    {
+        let payloads = adapter.payloads.lock().unwrap();
+        assert!(payloads[0].get("draft_revision").is_none());
+        assert_eq!(
+            payloads[1]["draft_revision"],
+            json!({"base_draft_id":base,"content":"fixture reply","instruction":"Shorter, keep evidence"})
+        );
+        assert_eq!(payloads[1]["history"], json!([]));
+    }
+    revision["revision"]["instruction"] = json!("Different instruction");
+    assert_eq!(
+        request(&a, "bob", "POST", &path, revision.clone()).await.0,
+        StatusCode::CONFLICT
+    );
+    revision["request_id"] = json!("cross-owner");
+    assert_eq!(
+        request(&a, "alice", "POST", &path, revision.clone())
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let other = working(&a).await;
+    assert_eq!(
+        request(&a, "bob", "POST", &route(&other), revision.clone())
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    let sql = rusqlite::Connection::open(db.path()).unwrap();
+    sql.execute(
+        "UPDATE tasks SET revision=revision+1 WHERE id=?1",
+        [task["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    revision["expected_revision"] = json!(2);
+    assert_eq!(
+        request(&a, "bob", "POST", &path, revision).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(adapter.count(), 2);
+    let list = request(&a, "bob", "GET", &path, Value::Null).await.1;
+    assert_eq!(list["items"].as_array().unwrap().len(), 2);
+    assert!(list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|r| r["current_stale"] == true));
+}
+
+#[tokio::test]
+async fn draft_recommendation_uses_only_enabled_personal_roles() {
+    let a = app(Hub::open(config(":memory:")).unwrap());
+    let task = working(&a).await;
+    let agents = json!([
+      {"id":"butler","name":"管家","role":"coordinator","model_ref":"server-default","enabled":true},
+      {"id":"writer","name":"写作","role":"writer","model_ref":"server-default","enabled":true},
+      {"id":"reviewer","name":"审阅","role":"reviewer","model_ref":"server-default","enabled":false}
+    ]);
+    assert_eq!(
+        request(
+            &a,
+            "bob",
+            "PUT",
+            "/api/profile",
+            json!({"expected_revision":0,"agents":agents})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let list = request(&a, "bob", "GET", &route(&task), Value::Null)
+        .await
+        .1;
+    assert_eq!(list["recommended_profile"]["agent_id"], "writer");
+    assert_eq!(list["recommended_profile"]["revision"], 1);
+    assert_eq!(list["items"], json!([]));
+}
+
+#[tokio::test]
+async fn summary_failure_is_reserved_and_never_rebilled_on_draft_replay() {
+    let adapter = Adapter::new(json!({"reply":"", "proposal":null, "backend":"dsh"}), false).await;
+    let db = Database::new();
+    let a = adapter.app(&db.path());
+    let task = working(&a).await;
+    let sql = rusqlite::Connection::open(db.path()).unwrap();
+    sql.execute(
+        "INSERT INTO task_details(task_id,author,content) VALUES (?1,'alice',?2)",
+        rusqlite::params![task["id"].as_str().unwrap(), "long material ".repeat(1500)],
+    )
+    .unwrap();
+    let path = route(&task);
+    assert_eq!(
+        request(&a, "bob", "POST", &path, input("large-failed"))
+            .await
+            .0,
+        StatusCode::BAD_GATEWAY
+    );
+    let replay = request(&a, "bob", "POST", &path, input("large-failed")).await;
+    assert_eq!(replay.0, StatusCode::OK);
+    assert_eq!(replay.1["status"], "uncertain");
+    assert_eq!(adapter.count(), 1);
+    assert_eq!(
+        sql.query_row("SELECT count(*) FROM deliveries", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}

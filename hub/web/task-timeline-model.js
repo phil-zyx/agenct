@@ -7,7 +7,7 @@ function prepareTaskTimeline(task, events, deliveries, audit) {
   const fields = (value, names) => value && typeof value === 'object' && !Array.isArray(value)
     && Object.keys(value).every(key => names.includes(key));
   const states = ['awaiting_owner', 'working', 'ready_for_acceptance', 'completed', 'canceled'];
-  const labels = { created: '创建任务', accept: '接单', deliver: '提交交付', return: '退回', approve: '验收通过', cancel: '取消' };
+  const labels = { created: '创建任务', accept: '接手', deliver: '提交交付', return: '退回', approve: '验收通过', cancel: '取消' };
   if (!task || !string(task.id) || !integer(task.revision) || !Array.isArray(events)
       || !Array.isArray(deliveries) || !audit || audit.schema_version !== 1
       || typeof audit.legacy_history_incomplete !== 'boolean'

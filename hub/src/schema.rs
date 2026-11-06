@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 11;
+pub(super) const VERSION: i64 = 13;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -72,6 +72,8 @@ const TABLES: &[&str] = &[
     "deliveries",
     "draft_turns",
     "task_details",
+    "context_summaries",
+    "tenant_memberships",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -162,6 +164,8 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
             add_column(db, "messages", "created_at", "TEXT")?;
             add_column(db, "proposals", "created_at", "TEXT")?;
         }
+        12 => db.execute_batch(crate::context_memory::SCHEMA)?,
+        13 => db.execute_batch(crate::tenants::SCHEMA)?,
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -235,6 +239,8 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("deliveries", _) => 5,
         ("draft_turns", _) => 7,
         ("task_details", _) => 10,
+        ("context_summaries", _) => 12,
+        ("tenant_memberships", _) => 13,
         ("messages" | "proposals", "created_at") => 11,
         ("events", "from_status" | "to_status" | "task_revision") => 6,
         ("events", "revision" | "delivery_seq") => 8,
@@ -308,6 +314,8 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 || (table == "deliveries" && version < 5)
                 || (table == "draft_turns" && version < 7)
                 || (table == "task_details" && version < 10)
+                || (table == "context_summaries" && version < 12)
+                || (table == "tenant_memberships" && version < 13)
             {
                 continue;
             }
@@ -343,7 +351,10 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
             return Err(format!("unsupported Hub partial unique key on {table}").into());
         }
         // Tables with foreign keys or table CHECKs are compared by their full owned definition.
-        if table == "draft_turns" || table == "task_details" {
+        if matches!(
+            table,
+            "draft_turns" | "task_details" | "context_summaries" | "tenant_memberships"
+        ) {
             let wanted_sql: String = expected.query_row(
                 "SELECT sql FROM sqlite_schema WHERE name=?1",
                 [table],
@@ -439,6 +450,9 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         ("task_details_no_replace", 10),
         ("task_details_no_update", 10),
         ("task_details_no_delete", 10),
+        ("tenant_memberships_no_replace", 13),
+        ("tenant_memberships_no_update", 13),
+        ("tenant_memberships_no_delete", 13),
     ] {
         let actual: Option<String> = db
             .query_row(

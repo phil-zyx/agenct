@@ -146,8 +146,11 @@ pub(super) struct ProposalAction {
     /// Optional requester-written material shared with the recipient on confirm.
     #[serde(default)]
     details: Option<String>,
+    /// Explicit requester edits, applied atomically with confirmation.
+    owner: Option<String>,
+    summary: Option<String>,
 }
-pub(super) const MAX_DETAILS: usize = 12000;
+pub(super) const MAX_DETAILS: usize = 262144;
 pub(super) async fn proposal_action(
     State(h): State<Hub>,
     headers: HeaderMap,
@@ -163,8 +166,17 @@ pub(super) async fn proposal_action(
         .is_some_and(|d| a.action != "confirm" || d.trim().is_empty() || d.len() > MAX_DETAILS)
     {
         return Err(invalid(
-            "shared details must be 1..12000 bytes and only accompany confirm",
+            "shared details must be 1..262144 bytes and only accompany confirm",
         ));
+    }
+    if (a.owner.is_some() || a.summary.is_some()) && a.action != "confirm" {
+        return Err(invalid("proposal edits may only accompany confirm"));
+    }
+    if a.summary
+        .as_ref()
+        .is_some_and(|s| s.trim().is_empty() || s.len() > 4000)
+    {
+        return Err(invalid("summary must contain 1..4000 bytes"));
     }
     let mut db = h.db()?;
     let tx = db.transaction()?;
@@ -176,6 +188,8 @@ pub(super) async fn proposal_action(
         )
         .optional()?
         .ok_or_else(denied)?;
+    let owner = a.owner.as_deref().unwrap_or(&p.owner);
+    let summary = a.summary.as_deref().unwrap_or(&p.summary);
     let policy::Effect::Proposal {
         status: target,
         replay,
@@ -184,11 +198,11 @@ pub(super) async fn proposal_action(
         policy::Action::Proposal(&a.action),
         &policy::Resource::Proposal {
             requester: &p.requester,
-            owner: &p.owner,
+            owner,
             status: &p.status,
             revision: p.revision,
             expected_revision: a.expected_revision,
-            recipient_available: h.directory.can_delegate(&user, &p.owner),
+            recipient_available: h.directory.can_delegate(&user, owner),
         },
     )
     .map_err(Error::from)?
@@ -197,6 +211,12 @@ pub(super) async fn proposal_action(
     };
     if replay {
         if a.action == "confirm" {
+            if owner != p.owner || summary != p.summary {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "proposal already confirmed with different edits",
+                ));
+            }
             // A replay must restate exactly what was shared; never silently differ.
             let stored: Option<String> = tx
                 .query_row(
@@ -216,7 +236,7 @@ pub(super) async fn proposal_action(
     }
     let task_id = if a.action == "confirm" {
         let task = Uuid::new_v4().to_string();
-        tx.execute("INSERT INTO tasks(id,requester,owner,summary,status) VALUES (?1,?2,?3,?4,'awaiting_owner')",params![task,user,p.owner,p.summary])?;
+        tx.execute("INSERT INTO tasks(id,requester,owner,summary,status) VALUES (?1,?2,?3,?4,'awaiting_owner')",params![task,user,owner,summary])?;
         crate::audit::record(&tx, &task, &user, "created", None, "awaiting_owner", 0)?;
         if let Some(details) = &a.details {
             tx.execute(
@@ -229,8 +249,8 @@ pub(super) async fn proposal_action(
         None
     };
     tx.execute(
-        "UPDATE proposals SET status=?1,revision=revision+1,task_id=?2 WHERE id=?3",
-        params![target, task_id, id],
+        "UPDATE proposals SET status=?1,revision=revision+1,task_id=?2,owner=?4,summary=?5 WHERE id=?3",
+        params![target, task_id, id, owner, summary],
     )?;
     let result = tx.query_row(
         &format!("SELECT {PROPOSAL_COLUMNS} FROM proposals WHERE id=?1"),

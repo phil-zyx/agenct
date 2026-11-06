@@ -732,7 +732,7 @@ async fn proposals_reject_forgery_reuse_and_rejected_confirmation() {
             "alice",
             "POST",
             &path,
-            json!({"action":"confirm","expected_revision":0,"summary":"mutated"})
+            json!({"action":"confirm","expected_revision":0,"requester":"eve"})
         )
         .await
         .0,
