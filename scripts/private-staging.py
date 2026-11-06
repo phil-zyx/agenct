@@ -112,6 +112,10 @@ def first_free_port(attempts=20):
 
 def update_config(directory, key, value):
     environment(directory)  # Validate ownership, permissions and schema before rewriting.
+    if hub_running(directory):
+        # The running Hub keeps its old port/runtime; changing config now would make
+        # later notices describe a process that does not exist.
+        raise ValueError("a Hub is running for this state directory; stop it (Ctrl+C) before changing its configuration")
     path = directory / "config.json"
     config = json.loads(path.read_text())
     config[key] = value
