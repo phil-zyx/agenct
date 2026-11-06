@@ -26,7 +26,7 @@ function createWorkerUI({ api, current, article, conversation }) {
     let view = 0;
     active = { ...task }; saving = false;
     if (card) card.replaceChildren(article('旧队列卡已关闭。'));
-    const panel = article('正在读取待办队列…'); card = panel; conversation().append(panel);
+    const panel = article('正在读取待办队列…'); card = panel; conversation().append(panel); panel.scrollIntoView?.({ block: 'nearest' });
     const valid = () => current(context) && version === generation && tasks.has(task.id) && signature(tasks.get(task.id)) === signature(task);
     function button(text, action) {
       const viewAtCreation = view;

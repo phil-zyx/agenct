@@ -5,16 +5,19 @@ const vm = require('node:vm');
 const { webcrypto } = require('node:crypto');
 
 class Element {
+  // Like the DOM: textContent concatenates descendants, and setting it removes children.
+  get textContent() { return this.ownText + this.children.map(child => child.textContent).join(''); }
+  set textContent(value) { this.ownText = String(value); this.children = []; }
   constructor() {
     this.value = '';
-    this.textContent = '';
+    this.ownText = '';
     this.children = [];
     this.disabled = false;
     const classes = new Set();
     this.classList = { add: value => classes.add(value), remove: value => classes.delete(value), contains: value => classes.has(value) };
   }
   setAttribute() {}
-  append(element) { this.children.push(element); }
+  append(...elements) { this.children.push(...elements); }
   replaceChildren(...elements) { this.children = elements; }
 }
 
@@ -159,8 +162,8 @@ function fixture(auth = { enabled: false }, settings = {}) {
     responseContext(value) { responseContextOverride = value; },
     messageFailure(status, code) { postFailure = status ? { status, code } : null; },
     discussion(id) {
-      const card = $('conversation').children.find(card => card.textContent.startsWith('任务 ·') && card.textContent.includes('任务编号：' + id + ' ·'));
-      return card?.children.find(button => button.textContent === '讨论此任务');
+      const card = $('tasks').children.find(card => card.taskId === id);
+      return card && findButton(card, '讨论此任务');
     },
     confirm(value) { confirmation = value; },
     postTurn(status) { postTurnStatus = status; },
@@ -187,6 +190,15 @@ function fixture(auth = { enabled: false }, settings = {}) {
   };
 }
 
+function findButton(node, label) {
+  for (const child of node.children) {
+    if (child.textContent === label && typeof child.onclick === 'function') return child;
+    const found = findButton(child, label);
+    if (found) return found;
+  }
+  return undefined;
+}
+
 async function test(name, run) {
   await run();
   console.log('PASS ' + name);
@@ -197,9 +209,10 @@ const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'ali
 const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
-  const cancelButton = f => f.$('conversation').children
-    .find(card => card.textContent.startsWith('任务 ·'))?.children
-    .find(button => button.textContent === '取消任务');
+  const cancelButton = f => {
+    const card = f.$('tasks').children.find(card => card.taskId);
+    return card && findButton(card, '取消任务');
+  };
   const taskPosts = f => f.calls.filter(call => call.url === '/api/tasks/task-one/actions' && call.options.method === 'POST');
   await test('cancellation controls match the approved actor and state matrix', async () => {
     for (const who of ['alice', 'bob']) for (const state of ['awaiting_owner', 'working', 'ready_for_acceptance', 'completed', 'canceled', 'unknown']) {
@@ -244,9 +257,9 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const proposal = f.$('conversation').children[0];
     assert.match(proposal.textContent, /接收人：bob/);
     assert.match(proposal.textContent, /Exact <summary>\nsecond line/);
-    assert.equal(proposal.children[1].textContent, '确认共享并委派');
+    assert(findButton(proposal, '确认共享并委派'));
     assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 0);
-    await proposal.children[1].onclick();
+    await findButton(proposal, '确认共享并委派').onclick();
     const call = f.calls.find(call => call.url === '/api/proposals/1/actions');
     assert.deepEqual(JSON.parse(call.options.body), { action: 'confirm', expected_revision: 0 });
   });
@@ -255,12 +268,12 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture();
     await f.login('alice');
     let proposal = f.$('conversation').children[0];
-    const box = proposal.children[3].children[0];
+    const box = proposal.detailsBox;
     box.value = '  README 正文\n第二行  '; box.oninput();
     await f.tick();
     proposal = f.$('conversation').children[0];
-    assert.equal(proposal.children[3].children[0].value, '  README 正文\n第二行  ');
-    await proposal.children[1].onclick();
+    assert.equal(proposal.detailsBox.value, '  README 正文\n第二行  ');
+    await findButton(proposal, '确认共享并委派').onclick();
     const call = f.calls.find(call => call.url === '/api/proposals/1/actions');
     assert.deepEqual(JSON.parse(call.options.body), { action: 'confirm', details: '  README 正文\n第二行  ', expected_revision: 0 });
   });
@@ -269,8 +282,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture();
     await f.login('alice');
     const proposal = f.$('conversation').children[0];
-    proposal.children[3].children[0].value = '材'.repeat(4001);
-    await proposal.children[1].onclick();
+    proposal.detailsBox.value = '材'.repeat(4001);
+    await findButton(proposal, '确认共享并委派').onclick();
     assert(!f.calls.some(call => call.url === '/api/proposals/1/actions'));
     assert.match(f.$('status').textContent, /12000 字节/);
   });
@@ -279,8 +292,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture();
     await f.login('alice');
     const proposal = f.$('conversation').children[0];
-    proposal.children[3].children[0].value = 'should stay private';
-    await proposal.children[2].onclick();
+    proposal.detailsBox.value = 'should stay private';
+    await findButton(proposal, '拒绝，不共享').onclick();
     const call = f.calls.find(call => call.url === '/api/proposals/1/actions');
     assert.deepEqual(Object.keys(JSON.parse(call.options.body)).sort(), ['action', 'expected_revision']);
   });
@@ -288,7 +301,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
   await test('reject proposal without creating a task', async () => {
     const f = fixture();
     await f.login('alice');
-    await f.$('conversation').children[0].children[2].onclick();
+    await findButton(f.$('conversation').children[0], '拒绝，不共享').onclick();
     const call = f.calls.find(call => call.url === '/api/proposals/1/actions');
     assert.equal(JSON.parse(call.options.body).action, 'reject');
     assert(!f.calls.some(call => call.url === '/api/tasks' && call.options.method === 'POST'));
@@ -345,7 +358,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.match(f.$('identity').textContent, /已验证身份/);
     assert.doesNotMatch(f.$('identity').textContent, /开发令牌认证/);
     const before = f.calls.length;
-    await oldCard.children[1].onclick();
+    await findButton(oldCard, '确认共享并委派').onclick();
     assert.equal(f.calls.length, before, 'Stale card must not send under new identity');
   });
 
@@ -499,7 +512,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     await f.ready(); const card = f.$('conversation').children[0];
     f.hold(); const refresh = f.$('refresh').onclick();
     await f.$('logout').onclick(); f.release(); await refresh;
-    const count = f.calls.length; await card.children[1].onclick();
+    const count = f.calls.length; await findButton(card, '确认共享并委派').onclick();
     assert.equal(f.calls.length, count);
     assert.equal(f.$('conversation').children.length, 0);
     assert.equal(f.timers.size, 0);
@@ -571,7 +584,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
     assert.match(html, /直接说你想解决的问题，无需先配置角色/);
     assert.match(html, /aria-describedby="chat-help" placeholder="说说你想解决的问题…"/);
-    assert.match(html, /<details><summary>能力边界、委派示例与恢复说明<\/summary>/);
+    assert.match(html, /<details[^>]*><summary>能力边界、委派示例与恢复说明<\/summary>/);
     assert.match(html, /Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行/);
   });
   await test('pending and uncertain receipts only use GET until complete', async () => {
@@ -1209,11 +1222,11 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(undefined, {tasks:[task],prompt:(label,value)=>{reviewed=value;return value;}});
     await f.login('bob');
     const walk=e=>[e,...e.children.flatMap(walk)];
-    const button=text=>walk(f.$('conversation')).filter(e=>e.textContent===text).at(-1);
+    const button=text=>[f.$('conversation'), f.$('tasks')].flatMap(walk).filter(e=>e.textContent===text).at(-1);
     await button('我的私密交付草稿').onclick();
     await button('让我的 Agent 起草（不交付）').onclick();
     assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length,0);
-    const input=walk(f.$('conversation')).find(e=>e.value==='Generated draft'); input.value='Human reviewed edit';
+    const input=[f.$('conversation'), f.$('tasks')].flatMap(walk).find(e=>e.value==='Generated draft'); input.value='Human reviewed edit';
     await button('使用此草稿填入人工交付').onclick();
     assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length,0);
     await button('提交人工交付').onclick();
@@ -1226,13 +1239,13 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const task={id:'timeline-task',owner:'bob',requester:'alice',revision:1,status:'working',summary:'Shared'};
     const owner=fixture(undefined,{tasks:[task]});await owner.login('bob');
     const walk=e=>[e,...e.children.flatMap(walk)];
-    let nodes=walk(owner.$('conversation'));
+    let nodes=walk(owner.$('tasks'));
     assert(nodes.some(e=>e.textContent==='我的私密交付草稿'));
     await nodes.find(e=>e.textContent==='查看共享时间线').onclick();
-    nodes=walk(owner.$('conversation'));assert(nodes.some(e=>e.textContent.includes('无法恢复')));
+    nodes=walk(owner.$('tasks'));assert(nodes.some(e=>e.textContent.includes('无法恢复')));
     assert.equal(owner.calls.filter(c=>c.options?.method==='POST').length,0);
     const requester=fixture(undefined,{tasks:[task]});await requester.login('alice');
-    nodes=walk(requester.$('conversation'));
+    nodes=walk(requester.$('tasks'));
     assert(nodes.some(e=>e.textContent==='查看共享时间线'));
     assert(!nodes.some(e=>e.textContent==='我的私密交付草稿'));
   });
