@@ -1,12 +1,18 @@
 //! Agenct local development control plane. Not a production authentication service.
+mod audit;
+mod audit_migration;
 pub mod browser_auth;
 mod chat_turns;
+mod directory;
+mod drafts;
 pub mod gitlab;
 mod messages;
 pub mod oidc;
+mod policy;
 mod profiles;
 mod proposals;
 pub mod publication;
+mod runtime;
 mod schema;
 mod task_context;
 mod tasks;
@@ -109,6 +115,7 @@ pub struct Hub {
     _lock: Option<Arc<std::fs::File>>,
     db: Arc<Mutex<Connection>>,
     users: Arc<HashMap<String, String>>,
+    directory: Arc<directory::Directory>,
     gates: Arc<HashMap<String, tokio::sync::Mutex<()>>>,
     runtime: Runtime,
     client: reqwest::Client,
@@ -121,6 +128,10 @@ impl IntoResponse for Error {
         // Only these selection checks run before receipt reservation/dispatch.
         // Generic conflicts and transport failures must remain uncertain to clients.
         let code = match self.1 {
+            drafts::STALE => Some("draft_task_stale_before_reservation"),
+            drafts::STATE => Some("draft_task_state_before_reservation"),
+            drafts::ROLE => Some("draft_role_unavailable_before_reservation"),
+            drafts::BUSY => Some("draft_busy_before_reservation"),
             profiles::STALE => Some("selected_agent_stale_before_dispatch"),
             profiles::UNAVAILABLE => Some("selected_agent_unavailable_before_dispatch"),
             task_context::STALE => Some("selected_task_stale_before_dispatch"),
@@ -147,27 +158,20 @@ fn denied() -> Error {
 }
 impl Hub {
     pub fn open(config: Config) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let directory = directory::Directory::new(config.users.iter().map(|user| user.id.clone()))?;
+        let gates = directory
+            .ids()
+            .map(|id| (id.clone(), tokio::sync::Mutex::new(())))
+            .collect();
         let mut users = HashMap::new();
-        let mut gates = HashMap::new();
         for user in config.users {
-            if user.id.is_empty()
-                || user.id.len() > 64
-                || !user
-                    .id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                || user.token_sha256.len() != 64
+            if user.token_sha256.len() != 64
                 || !user.token_sha256.chars().all(|c| c.is_ascii_hexdigit())
                 || users.contains_key(&user.token_sha256)
-                || gates.contains_key(&user.id)
             {
                 return Err("invalid or duplicated identity configuration".into());
             }
-            gates.insert(user.id.clone(), tokio::sync::Mutex::new(()));
             users.insert(user.token_sha256, user.id);
-        }
-        if users.is_empty() {
-            return Err("at least one configured user is required".into());
         }
         let lock = if config.database.to_str() != Some(":memory:") {
             let mut opts = std::fs::OpenOptions::new();
@@ -204,6 +208,7 @@ impl Hub {
             _lock: lock,
             db: Arc::new(Mutex::new(db)),
             users: Arc::new(users),
+            directory: Arc::new(directory),
             gates: Arc::new(gates),
             runtime: config.runtime,
             client: reqwest::Client::builder()
@@ -221,7 +226,7 @@ impl Hub {
         }
         self.oidc = Some(oidc::Validator::new(
             config,
-            &self.users.values().cloned().collect(),
+            &self.directory.ids().cloned().collect(),
         )?);
         Ok(self)
     }
@@ -234,7 +239,7 @@ impl Hub {
         }
         self.browser_auth = Some(browser_auth::BrowserAuth::new(
             config,
-            &self.users.values().cloned().collect(),
+            &self.directory.ids().cloned().collect(),
         )?);
         Ok(self)
     }
@@ -301,6 +306,14 @@ pub fn app(hub: Hub) -> Router {
         )
         .route("/api/tasks", get(tasks::tasks))
         .route("/api/tasks/{id}", get(tasks::task_detail))
+        .route(
+            "/api/tasks/{id}/drafts",
+            get(drafts::list).post(drafts::create),
+        )
+        .route(
+            "/api/tasks/{id}/drafts/turns/{request_id}",
+            get(drafts::status),
+        )
         .route("/api/tasks/{id}/actions", post(tasks::action))
         .route(
             "/api/tasks/{id}/worker",

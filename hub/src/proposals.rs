@@ -1,5 +1,5 @@
 //! Sender-private proposals and explicit confirmation before task creation.
-use crate::{denied, invalid, Error, Hub, Result};
+use crate::{denied, invalid, policy, Error, Hub, Result};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
@@ -39,7 +39,7 @@ fn save_proposal(
     request_id: Option<&str>,
     source: &str,
 ) -> Result<Proposal> {
-    if owner == requester || !h.gates.contains_key(owner) {
+    if !h.directory.can_delegate(requester, owner) {
         return Err(invalid("select another configured participant"));
     }
     if summary.trim().is_empty() || summary.len() > 4000 {
@@ -161,32 +161,32 @@ pub(super) async fn proposal_action(
         )
         .optional()?
         .ok_or_else(denied)?;
-    // Retry of the identical action at the reviewed revision returns the same result.
-    // This cannot authorize different content: proposal fields are immutable.
-    let target = if a.action == "confirm" {
-        "confirmed"
-    } else {
-        "rejected"
+    let policy::Effect::Proposal {
+        status: target,
+        replay,
+    } = policy::can(
+        &user,
+        policy::Action::Proposal(&a.action),
+        &policy::Resource::Proposal {
+            requester: &p.requester,
+            owner: &p.owner,
+            status: &p.status,
+            revision: p.revision,
+            expected_revision: a.expected_revision,
+            recipient_available: h.directory.can_delegate(&user, &p.owner),
+        },
+    )
+    .map_err(Error::from)?
+    else {
+        unreachable!("proposal decision")
     };
-    if p.status == target && a.expected_revision == 0 && p.revision == 1 {
+    if replay {
         return Ok(Json(p));
-    }
-    if p.status != "pending" || p.revision != a.expected_revision {
-        return Err(Error(
-            StatusCode::CONFLICT,
-            "proposal changed; refresh and review",
-        ));
-    }
-    if a.action == "confirm" && (!h.gates.contains_key(&p.owner) || p.owner == user) {
-        return Err(invalid("recipient is no longer available"));
     }
     let task_id = if a.action == "confirm" {
         let task = Uuid::new_v4().to_string();
         tx.execute("INSERT INTO tasks(id,requester,owner,summary,status) VALUES (?1,?2,?3,?4,'awaiting_owner')",params![task,user,p.owner,p.summary])?;
-        tx.execute(
-            "INSERT INTO events(task_id,actor,action) VALUES (?1,?2,'created')",
-            params![task, user],
-        )?;
+        crate::audit::record(&tx, &task, &user, "created", None, "awaiting_owner", 0)?;
         Some(task)
     } else {
         None

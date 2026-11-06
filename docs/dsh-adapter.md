@@ -97,3 +97,43 @@ This is protocol and **Hub SQLite persistence** coverage, not live DSH acceptanc
 - [Official Python SDK guide](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/python-sdk.md)
 
 Timeout ordering: the adapter kills its process group at 45 seconds; the Hub HTTP deadline is 75 seconds, leaving 30 seconds for cleanup and the error response before its per-user gate releases. Network disconnection or adapter crash is still an uncertain outcome, not a durable cancellation protocol. No automatic retries or side-effecting tools are enabled.
+
+## Recipient delivery drafting protocol (#16)
+
+The adapter accepts `kind: "draft_delivery"` in `/v1/turn`. Omitted `kind` means
+legacy chat; explicit `"chat"` is equivalent. Other kinds are rejected. This is
+an adapter protocol capability, **not** an enabled Hub draft endpoint or UI.
+
+A draft turn requires all existing session/history/message fields, plus validated
+`runtime_profile` and `task_context`. History must be empty, task status must be
+`working`, and message must be exactly:
+
+`Draft a delivery for this task for owner review.`
+
+Use the existing task snapshot schema and 8,192-byte compact JSON bound. The Hub
+must supply only the explicitly reviewed task snapshot, not either participant's
+private chat, and generate a separate request-local session UUID. The adapter
+validates UUID syntax but cannot establish ownership, receipt uniqueness, or that
+a UUID differs from a chat session: these are mandatory #15 Hub responsibilities.
+Profile routing remains server-default; role guidance grants no permissions.
+
+Draft response JSON remains exactly `reply`, `proposal`, `backend`. Model output
+contains only `reply` and `proposal`; the adapter adds backend `dsh`. Reply must be
+nonblank and at most 8,000 UTF-8 bytes, and proposal must be explicitly null. Both
+SDK output and subprocess output undergo kind-specific validation. Draft resume
+is rejected before SDK construction or subprocess launch. Task strings stay quoted
+untrusted data; the prompt grants no action authority. Existing no-tools patch,
+request-local temporary workspace and process cleanup remain unchanged.
+
+Dependent work: #15 must authorize owner/working/revision, reserve a durable receipt
+before dispatch, freeze task/profile/session bindings, reject nonnull proposals
+and oversized text independently, atomically persist private draft plus receipt,
+and recover uncertainty without redispatch. #11 must preserve immutable drafts
+and separate explicitly reviewed submitted records. Neither protocol support nor
+model output authorizes delivery, approval, execution or publication.
+
+Offline tests in `adapters/dsh/test_draft_delivery.py` cover input rejection before
+SDK/runner, context-only prompts, malicious task text, UTF-8 boundaries, forbidden
+proposals, chat compatibility, no resume, and subprocess revalidation/cleanup.
+They use fake SDK/processes and a local fixture HTTP listener. They do not verify
+live DSH behavior, actual tool inventory, cross-user authorization or Hub receipts.
