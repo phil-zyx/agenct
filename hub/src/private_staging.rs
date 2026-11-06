@@ -44,7 +44,10 @@ impl Hub {
         self.reload_private_users_before_read(|| {})
     }
 
-    fn reload_private_users_before_read(&self, before_read: impl FnOnce()) -> Result<Option<Roster>> {
+    fn reload_private_users_before_read(
+        &self,
+        before_read: impl FnOnce(),
+    ) -> Result<Option<Roster>> {
         let Some(path) = &self.private_config else {
             return Ok(None);
         };

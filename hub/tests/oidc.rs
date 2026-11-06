@@ -705,7 +705,8 @@ async fn departed_member_history_remains_bound_without_new_delegation_authority(
         let mut config = organization_config(path, Runtime::Mock);
         config.users.retain(|user| user.id != "bob");
         let mut oidc = policy();
-        oidc["subjects"] = json!({"subject-alice":"alice","subject-carol":"carol","subject-dave":"dave"});
+        oidc["subjects"] =
+            json!({"subject-alice":"alice","subject-carol":"carol","subject-dave":"dave"});
         let mut tenants = organizations();
         tenants.0.remove("bob");
         Hub::open(config)
