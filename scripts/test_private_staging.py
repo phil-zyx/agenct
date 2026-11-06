@@ -228,6 +228,21 @@ class PrivateStagingTests(unittest.TestCase):
                 staging.launch(self.state, env)
         self.assertIn("already running for this state directory", str(caught.exception))
 
+    def test_config_changes_refused_while_hub_running(self):
+        import fcntl
+        lock = open(self.state / "hub.lock", "wb")
+        self.addCleanup(lock.close)
+        (self.state / "hub.lock").chmod(0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        before = (self.state / "config.json").read_bytes()
+        for change in (lambda: staging.set_port(self.state, 18999), lambda: staging.set_runtime(self.state, "dsh")):
+            with self.assertRaises(ValueError) as caught:
+                change()
+            self.assertIn("stop it", str(caught.exception))
+        self.assertEqual(before, (self.state / "config.json").read_bytes())
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        staging.set_port(self.state, 18999)
+
     def test_set_port_preserves_credentials_and_permissions(self):
         before = (self.state / "credentials.json").read_bytes()
         users = json.loads((self.state / "config.json").read_text())["users"]
