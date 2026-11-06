@@ -16,6 +16,7 @@ class Element {
     const classes = new Set();
     this.classList = { add: value => classes.add(value), remove: value => classes.delete(value), contains: value => classes.has(value) };
   }
+  focus() { this.focused = true; }
   setAttribute() {}
   append(...elements) { this.children.push(...elements); }
   replaceChildren(...elements) { this.children = elements; }
@@ -56,6 +57,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
   };
   const context = vm.createContext({
     document,
+    innerWidth: settings.width ?? 1200,
     setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
     clearTimeout: id => timers.delete(id),
     AbortController,
@@ -209,6 +211,53 @@ const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'ali
 const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
+  await test('narrow task discussion and navigation return to chat without dispatch', async () => {
+    const f = fixture({ enabled: false }, { width: 400, tasks: [task()] });
+    await f.login('alice');
+    f.$('toggle-tasks').onclick();
+    assert(f.$('room').classList.contains('tasks-open'));
+    f.discussion('task-one').onclick();
+    assert(!f.$('room').classList.contains('tasks-open'));
+    assert(f.$('text').focused);
+    assert.match(f.$('task-context-details').textContent, /task-one/);
+    f.$('toggle-tasks').onclick(); f.$('open-chat').onclick();
+    assert(!f.$('room').classList.contains('tasks-open'));
+    f.$('toggle-tasks').onclick(); f.$('open-help').onclick();
+    assert(!f.$('room').classList.contains('tasks-open'));
+    assert.equal(f.$('help').open, true);
+    assert.equal(chatPosts(f).length, 0);
+  });
+  await test('role shortcut preserves unsent text and task selection without model or mutation', async () => {
+    const f = fixture({ enabled: false }, { width: 400, tasks: [task()] });
+    await f.login('alice'); f.discussion('task-one').onclick();
+    f.$('text').value = 'Unsent private message';
+    f.$('toggle-tasks').onclick();
+    await f.$('open-agents').onclick();
+    assert.equal(f.$('text').value, 'Unsent private message');
+    assert.match(f.$('task-context-details').textContent, /task-one/);
+    assert(!f.$('room').classList.contains('tasks-open'));
+    assert.match(f.$('conversation').textContent, /个人 Agent 配置/);
+    assert.equal(f.calls.filter(call => call.options?.method === 'POST' || call.options?.method === 'PUT').length, 0);
+  });
+  await test('desktop discussion keeps optional task dock and role shortcut respects unresolved send', async () => {
+    const f = fixture({ enabled: false }, { width: 1200, tasks: [task()] });
+    await f.login('alice'); f.discussion('task-one').onclick();
+    assert(f.$('room').classList.contains('tasks-open'));
+    f.postTurn('uncertain'); await f.send('Question about this task');
+    f.$('text').value = 'Preserve while recovering'; const reads = f.calls.length;
+    await f.$('open-agents').onclick();
+    assert.equal(f.calls.length, reads);
+    assert.equal(f.$('text').value, 'Preserve while recovering');
+  });
+  await test('role shortcut coalesces reads and late callback cannot affect new identity', async () => {
+    const f = fixture(); await f.login('alice'); f.$('text').value = 'Private draft'; f.hold();
+    const pending = f.$('open-agents').onclick();
+    const reads = f.calls.length;
+    await f.$('open-agents').onclick(); assert.equal(f.calls.length, reads);
+    await f.$('logout').onclick(); f.release(); await pending;
+    assert.equal(f.$('conversation').textContent, '');
+    assert.equal(f.$('open-agents').disabled, false);
+  });
   const cancelButton = f => {
     const card = f.$('tasks').children.find(card => card.taskId);
     return card && findButton(card, '取消任务');
