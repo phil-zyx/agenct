@@ -62,6 +62,29 @@ impl AdapterReply {
     }
 }
 
+impl AdapterReply {
+    /// Recipient-only rejection: the user named someone in the current message who
+    /// cannot receive a delegation from them (the model is never told the
+    /// participant list). A recipient the user never named is a protocol violation
+    /// and stays fail-closed. Returns that untrusted name.
+    pub fn unavailable_recipient(
+        &self,
+        backend: &str,
+        requester: &str,
+        message: &str,
+        participant: impl Fn(&str) -> bool,
+    ) -> Option<&str> {
+        let proposal = self.proposal.as_ref()?;
+        (self.backend == backend
+            && !self.reply.trim().is_empty()
+            && self.reply.len() <= 32000
+            && !proposal.owner.trim().is_empty()
+            && message.contains(&proposal.owner)
+            && (proposal.owner == requester || !participant(&proposal.owner)))
+        .then_some(proposal.owner.as_str())
+    }
+}
+
 fn validate_request(request: &TurnRequest<'_>) -> Result<()> {
     if request.kind == TurnKind::DraftDelivery
         && (request.message != DRAFT_MESSAGE

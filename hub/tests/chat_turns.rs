@@ -689,3 +689,117 @@ async fn old_receipt_schema_migrates_revision_without_rebinding_legacy_turns() {
         assert!(conflict.1.get("code").is_none());
     }
 }
+
+#[tokio::test]
+async fn unavailable_recipient_becomes_hub_notice_without_proposal() {
+    for (owner, expected) in [
+        ("carol", "「carol」不是本系统的参与者"),
+        ("alice", "不能把任务委派给你自己"),
+        ("<script>", "指定的接收人不是本系统的参与者"),
+    ] {
+        let reply = json!({"reply":"我先起草一条给对方的请求","backend":"dsh",
+            "proposal":{"owner":owner,"summary":"整理会议纪要"}});
+        let adapter = Adapter::new(reply, false).await;
+        let db = Database::new();
+        let a = adapter.app(&db.path());
+        let message = format!("让 {owner} 帮我整理会议纪要");
+        let (status, body) = request(
+            &a,
+            "alice",
+            "POST",
+            "/api/messages",
+            json!({"request_id":"r1","message":message}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{owner}: {body}");
+        let text = body["reply"].as_str().unwrap();
+        assert!(
+            text.starts_with("[系统提示]") && text.contains(expected),
+            "{text}"
+        );
+        assert!(text.contains("可委派给：bob、eve"), "{text}");
+        assert!(!text.contains("我先起草"), "model reply must not be shown");
+        assert!(body["proposal"].is_null());
+        assert_eq!(
+            request(&a, "alice", "GET", "/api/proposals", Value::Null)
+                .await
+                .1,
+            json!([])
+        );
+        assert_eq!(
+            request(&a, "bob", "GET", "/api/tasks", Value::Null).await.1,
+            json!([])
+        );
+        // The durable receipt replays the same notice instead of redispatching.
+        assert_eq!(send_key(&a, "r1", &message).await.1["reply"], body["reply"]);
+        assert_eq!(adapter.count(), 1);
+        let history = request(&a, "alice", "GET", "/api/messages", Value::Null)
+            .await
+            .1;
+        assert_eq!(
+            history.as_array().unwrap().last().unwrap()["content"],
+            body["reply"]
+        );
+    }
+}
+async fn send_key(a: &Router, key: &str, message: &str) -> (StatusCode, Value) {
+    request(
+        a,
+        "alice",
+        "POST",
+        "/api/messages",
+        json!({"request_id":key,"message":message}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn unnamed_invalid_recipient_still_fails_closed() {
+    // The user named nobody invalid; the model invented "carol". Protocol violation.
+    let reply =
+        json!({"reply":"ok","backend":"dsh","proposal":{"owner":"carol","summary":"整理会议纪要"}});
+    let adapter = Adapter::new(reply, false).await;
+    let db = Database::new();
+    let a = adapter.app(&db.path());
+    let (status, _) = request(
+        &a,
+        "alice",
+        "POST",
+        "/api/messages",
+        json!({"request_id":"r1","message":"帮我整理会议纪要"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        request(&a, "alice", "GET", "/api/proposals", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn other_invalid_proposals_still_fail_closed() {
+    // A configured recipient with a summary that is not an excerpt is a protocol
+    // violation, not a recipient problem: keep the 502 and persist nothing.
+    let reply =
+        json!({"reply":"ok","backend":"dsh","proposal":{"owner":"bob","summary":"invented text"}});
+    let adapter = Adapter::new(reply, false).await;
+    let db = Database::new();
+    let a = adapter.app(&db.path());
+    let (status, _) = request(
+        &a,
+        "alice",
+        "POST",
+        "/api/messages",
+        json!({"request_id":"r1","message":"让 bob 帮我看看"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        request(&a, "alice", "GET", "/api/proposals", Value::Null)
+            .await
+            .1,
+        json!([])
+    );
+}
