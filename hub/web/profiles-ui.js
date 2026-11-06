@@ -9,7 +9,9 @@ function createProfileUI({ api, current, article, conversation, status, onSaved 
     if (card) card.replaceChildren(article('已关闭旧配置卡，正在重新读取。'));
     card = null;
     const valid = () => current(context) && generation === version;
-    const panel = article('正在读取个人 Agent 配置…');
+    const panel = article('正在读取个人角色设置…');
+    panel.className = 'profile-settings';
+    panel.setAttribute?.('aria-label', '个人角色设置');
     card = panel;
     conversation().append(panel);
     let profile, catalog;
@@ -25,7 +27,10 @@ function createProfileUI({ api, current, article, conversation, status, onSaved 
       return;
     }
     if (!valid()) return;
-    panel.textContent = '个人 Agent 配置 · 修订 ' + profile.revision + '\n' + notice;
+    panel.textContent = '';
+    const heading = document.createElement('h2'); heading.textContent = '个人角色设置';
+    const introduction = document.createElement('p'); introduction.className = 'note'; introduction.textContent = notice;
+    panel.append(heading); panel.append(introduction);
     let agents = profile.agents.map(agent => ({ ...agent }));
     let saving = false;
     const controls = document.createElement('div');
@@ -43,7 +48,7 @@ function createProfileUI({ api, current, article, conversation, status, onSaved 
     function select(values, value, change) {
       const input = document.createElement('select');
       for (const item of values) {
-        const option = document.createElement('option'); option.value = item; option.textContent = item;
+        const option = document.createElement('option'); option.value = item; option.textContent = ({ coordinator: '管家', researcher: '研究', writer: '写作', reviewer: '审阅', 'server-default': '默认模型' })[item] || item;
         input.append(option);
       }
       input.value = value; input.onchange = () => { if (valid() && !saving) change(input.value); };
@@ -52,21 +57,25 @@ function createProfileUI({ api, current, article, conversation, status, onSaved 
     function edit() {
       controls.replaceChildren();
       agents.forEach((agent, index) => {
-        const row = article('Agent ID：' + agent.id);
+        const row = document.createElement('section'); row.className = 'profile-role';
+        const title = document.createElement('h3'); title.textContent = agent.name; row.append(title);
+        const description = document.createElement('p'); description.className = 'note';
+        const descriptions = { coordinator: '管家负责理解需求与组织协作。', researcher: '研究角色帮助分析资料、区分证据与推测。', writer: '写作角色帮助组织内容和表达。', reviewer: '审阅角色帮助检查遗漏与问题。' };
+        description.textContent = descriptions[agent.role] || '选择这个角色擅长的工作。'; row.append(description);
         const name = document.createElement('input'); name.value = agent.name; name.maxLength = 96;
         name.oninput = () => { if (valid() && !saving) agent.name = name.value; };
         row.append(field('名称', name));
-        row.append(field('角色', select(catalog.roles, agent.role, value => { agent.role = value; })));
-        row.append(field('模型引用', select(catalog.models.map(model => model.id), agent.model_ref, value => { agent.model_ref = value; })));
-        const enabled = document.createElement('input'); enabled.type = 'checkbox'; enabled.checked = agent.enabled;
+        row.append(field('角色', select(catalog.roles, agent.role, value => { agent.role = value; description.textContent = descriptions[value] || ''; })));
+        row.append(field('使用模型', select(catalog.models.map(model => model.id), agent.model_ref, value => { agent.model_ref = value; })));
+        const enabled = document.createElement('input'); enabled.type = 'checkbox'; enabled.checked = agent.enabled; enabled.setAttribute?.('role', 'switch'); enabled.setAttribute?.('aria-label', '启用 ' + agent.name);
         enabled.onchange = () => { if (valid() && !saving) agent.enabled = enabled.checked; };
-        row.append(field('启用（仅配置）', enabled));
+        row.append(field('启用角色', enabled));
         row.append(button('移除', () => { agents.splice(index, 1); edit(); }, agents.length <= 1));
         controls.append(row);
       });
-      controls.append(button('添加 Agent 配置', () => {
+      controls.append(button('添加角色', () => {
         let id = 1; while (agents.some(agent => agent.id === 'agent-' + id)) id++;
-        agents.push({ id: 'agent-' + id, name: '新 Agent', role: 'researcher', model_ref: catalog.models[0].id, enabled: true }); edit();
+        agents.push({ id: 'agent-' + id, name: '新角色', role: 'researcher', model_ref: catalog.models[0].id, enabled: true }); edit();
       }, agents.length >= catalog.max_agents));
       controls.append(button('检查更改', preview));
       controls.append(button('取消，不保存', close));
@@ -75,10 +84,11 @@ function createProfileUI({ api, current, article, conversation, status, onSaved 
       if (!valid()) return;
       generation++; card = null;
       panel.replaceChildren(article('个人配置编辑已关闭，未发送新的保存请求。'));
+      document.getElementById?.('open-agents')?.focus?.();
     }
     function preview() {
       if (agents.filter(agent => agent.enabled && agent.role === 'coordinator').length !== 1) {
-        status('请保留且只保留一位启用的 coordinator 管家。'); return;
+        status('请保留且只保留一位启用的 管家角色。'); return;
       }
       if (agents.some(agent => !agent.name.trim() || new TextEncoder().encode(agent.name).length > 96 || /[\x00-\x1f\x7f-\x9f]/.test(agent.name))) {
         status('名称需为 1–96 字节，不含控制字符。'); return;
@@ -91,7 +101,7 @@ function createProfileUI({ api, current, article, conversation, status, onSaved 
           const saved = await api(context, 'profile', 'PUT', { expected_revision: profile.revision, agents: snapshot });
           if (!valid()) return;
           onSaved(saved.revision);
-          controls.replaceChildren(article('已保存个人配置 · 修订 ' + saved.revision + '\n' + notice));
+          controls.replaceChildren(article('已保存个人配置 · 版本 ' + saved.revision + '\n' + notice));
           saving = false;
           controls.append(button('重新读取配置', () => open(context)));
         } catch (error) {
@@ -105,6 +115,7 @@ function createProfileUI({ api, current, article, conversation, status, onSaved 
       const cancel = button('取消，不保存', close);
       controls.append(confirm); controls.append(back); controls.append(cancel);
     }
+    panel.onkeydown = event => { if (event.key === 'Escape' && !saving) { event.stopPropagation?.(); close(); } };
     edit();
   }
   return { reset, append, async handle(context, text) {

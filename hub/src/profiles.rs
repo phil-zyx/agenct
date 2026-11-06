@@ -183,6 +183,36 @@ pub(super) fn route(
     })
 }
 
+/// Deterministic suggestion among the owner's enabled roles. No new authority.
+pub(super) fn recommend(db: &Connection, owner: &str, summary: &str) -> Result<RuntimeProfile> {
+    let profile = read(db, owner)?;
+    validate(&profile.agents)?;
+    let text = summary.to_lowercase();
+    let desired = if ["审阅", "审查", "检查", "review", "audit"]
+        .iter()
+        .any(|s| text.contains(s))
+    {
+        "reviewer"
+    } else if ["研究", "调研", "对比", "research", "compare"]
+        .iter()
+        .any(|s| text.contains(s))
+    {
+        "researcher"
+    } else {
+        "writer"
+    };
+    let selected = profile
+        .agents
+        .iter()
+        .find(|a| a.enabled && a.role == desired);
+    route(
+        db,
+        owner,
+        selected.map(|a| a.id.as_str()),
+        Some(profile.revision as i64),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

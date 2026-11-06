@@ -1,0 +1,37 @@
+# Template: operator-provided paths and pinned OIDC/tenant configuration required.
+# Unlike private-staging.py, this starts the Hub directly without development-token
+# hot reload. Example EnvironmentFile (owner-readable only, no shell expansion):
+# AGENCT_BIND=127.0.0.1:8080
+# AGENCT_DATABASE=/var/lib/agenct/hub.sqlite3
+# AGENCT_RUNTIME=mock
+# AGENCT_USERS_JSON=[{"id":"alice","token_sha256":"<64 hex placeholder>"},...]
+# AGENCT_BROWSER_OIDC_CONFIG_FILE=/etc/agenct/browser-oidc.json
+# AGENCT_TENANTS_FILE=/etc/agenct/tenants.json
+# Browser OIDC disables development bearer tokens; never unset it to bypass login.
+[Unit]
+Description=Agenct OIDC Hub behind a local TLS ingress
+After=network.target
+
+[Service]
+Type=simple
+User=agenct
+Group=agenct
+WorkingDirectory=/opt/agenct
+EnvironmentFile=/etc/agenct/hub.env
+ExecStart=/opt/agenct/hub/target/release/agenct-hub
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/agenct
+KillSignal=SIGINT
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agenct-oidc
+
+[Install]
+WantedBy=multi-user.target

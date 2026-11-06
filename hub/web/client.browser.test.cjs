@@ -11,7 +11,7 @@ const { chromium } = require('playwright');
 const STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 const server = http.createServer((request, response) => {
   const name = request.url === '/' ? 'index.html' : request.url.slice(1);
-  if (!['index.html', 'style.css', 'client.js', 'profiles-ui.js', 'worker-ui.js', 'draft-ui.js', 'task-timeline-model.js', 'task-timeline-ui.js'].includes(name)) {
+  if (!/^[a-z][a-z0-9-]*\.(?:html|css|js)$/.test(name) || !fs.existsSync(path.join(__dirname, name))) {
     response.writeHead(404).end(); return;
   }
   response.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
@@ -23,7 +23,7 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
   const page = await context.newPage();
   if (useClock) await page.clock.install();
   const calls = [], errors = [];
-  const state = { user: 'alice', authenticated: true, post: 'complete', receipt: 'complete', receiptCode: 200, tasks: [] };
+  const state = { user: 'alice', authenticated: true, post: 'complete', receipt: 'complete', receiptCode: 200, tasks: [], reply: 'Saved reply', proposals: [{ id: 1, owner: 'bob', summary: 'Share only this exact summary', status: 'pending', revision: 0 }] };
   const taskContexts = new Map();
   let messages = [];
   page.on('pageerror', error => errors.push(error.message));
@@ -51,8 +51,8 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
         } : null);
         if (state.post === 'stall') return; // Leave this POST unanswered until the browser aborts.
         if (state.post === 'network-failure') { await route.abort('failed'); return; }
-        if (state.post === 'complete') messages.push({ role: 'assistant', status: 'complete', content: 'Saved reply' });
-        data = { turn: { request_id: body.request_id, status: state.post }, reply: state.post === 'complete' ? 'Saved reply' : null, task_context: taskContexts.get(body.request_id) };
+        if (state.post === 'complete') messages.push({ role: 'assistant', status: 'complete', content: state.reply });
+        data = { turn: { request_id: body.request_id, status: state.post }, reply: state.post === 'complete' ? state.reply : null, task_context: taskContexts.get(body.request_id) };
       } else data = messages;
     }
     if (pathname.startsWith('/api/turns/')) {
@@ -70,7 +70,22 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
     if (pathname === '/api/tasks' && method === 'GET') data = state.tasks;
     if (pathname === '/api/profile') data = { revision: 0, agents: [] };
     if (pathname === '/api/profile/catalog') data = { roles: [], models: [] };
-    if (pathname === '/api/proposals' && method === 'GET') data = [{ id: 1, owner: 'bob', summary: 'Share only this exact summary', status: 'pending', revision: 0 }];
+    if (pathname === '/api/proposals' && method === 'GET') data = state.proposals;
+    if (/^\/api\/proposals\/[^/]+\/actions$/.test(pathname) && method === 'POST') {
+      const proposal = state.proposals.find(p => String(p.id) === pathname.split('/')[3]);
+      if (proposal) { proposal.status = body.action === 'reject' ? 'rejected' : 'confirmed'; proposal.revision++; }
+    }
+    if (/^\/api\/tasks\/[^/]+\/drafts$/.test(pathname)) {
+      const task = state.tasks.find(t => t.id === pathname.split('/')[3]);
+      data = method === 'GET' ? { kind: 'draft_delivery', task_id: task.id, items: [] } : {
+        kind: 'draft_delivery', task_id: task.id, request_id: body.request_id, status: 'complete', current_stale: false,
+        response: { draft: { content: 'Private generated draft\nSecond paragraph', task_revision: task.revision }, task_context: { id: task.id }, runtime_profile: { revision: 0 } }
+      };
+    }
+    if (/^\/api\/tasks\/[^/]+\/actions$/.test(pathname) && method === 'POST') {
+      const task = state.tasks.find(t => t.id === pathname.split('/')[3]);
+      if (task && body.action === 'deliver') { task.status = 'ready_for_acceptance'; task.result = body.result; task.revision++; }
+    }
     await route.fulfill({ json: data });
   });
   await page.goto(origin);
@@ -113,7 +128,7 @@ async function settled(f) {
   await f.page.waitForFunction(() => !document.getElementById('send').disabled);
 }
 
-(async () => {
+if (require.main === module) (async () => {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const browser = await chromium.launch({ headless: true,
@@ -214,11 +229,9 @@ async function settled(f) {
       assert.equal(await f.stored(), receipt);
       f.state.authenticated = true; await f.page.reload();
       await f.page.waitForSelector('#room:not(.hide)');
-      assert.equal(await f.page.locator('#send').isDisabled(), true);
-      assert.equal(await f.stored(), receipt);
-      assert.equal(f.posts().length, 1);
-      await f.page.locator('#check-turn').click();
       await f.page.waitForSelector('#turn-recovery.hide', { state: 'attached' });
+      await settled(f);
+      assert.equal(f.posts().length, 1, 'Reauthentication must only read the receipt');
       assert.equal(await f.stored(), null);
       await f.close(); console.log('PASS Chromium unauthenticated reload and same-owner reauthentication retain recovery');
     }
@@ -314,13 +327,16 @@ async function settled(f) {
       assert.equal(await discussButtons(f).isDisabled(), true);
       assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
       assert.deepEqual(f.posts()[0].body, original, 'Refresh must not retarget the in-flight task context');
+      f.state.receipt = 'pending';
       if (outcome !== 'new-attempt-before-reload') { await f.page.reload(); await f.login(); }
+      await f.page.locator('#tab-tasks').click();
       await discussButtons(f).waitFor();
       assert.equal(await discussButtons(f).isDisabled(), true);
       assert.equal(await f.page.locator('#send').isDisabled(), true);
       assert.equal(f.posts().length, 1, 'Reload must not replay selected-context chat');
       if (outcome === 'new-attempt-before-reload') assert.equal(await f.page.locator('#task-context').isVisible(), true);
       if (outcome === 'recover') {
+        f.state.receipt = 'complete';
         await f.page.locator('#check-turn').click();
         await f.page.waitForSelector('#turn-recovery.hide', { state: 'attached' });
         await settled(f);
@@ -338,6 +354,7 @@ async function settled(f) {
     }
     for (const browserMode of [false, true]) {
       const f = await fixture(browser, origin, browserMode); await f.uncertain();
+      f.state.receipt = 'pending';
       const receipt = await f.stored(); await f.page.reload();
       if (!browserMode) {
         assert.equal(await f.page.locator('#room').isVisible(), false);
@@ -361,5 +378,99 @@ async function settled(f) {
       assert.equal(await f.page.locator('#room').isVisible(), false);
       await f.close(); console.log(`PASS Chromium ${browserMode ? 'cookie' : 'bearer'} refresh/logout/owner isolation`);
     }
+    await nextStepsInteractions(browser, origin);
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; }).finally(() => server.close());
+
+module.exports = { fixture, server, taskFixture, showTasks, settled, nextStepsInteractions };
+
+async function nextStepsInteractions(browser, origin) {
+  for (const browserMode of [false, true]) {
+    const f = await fixture(browser, origin, browserMode);
+    await f.uncertain();
+    await f.page.reload();
+    if (!browserMode) await f.login();
+    await f.page.waitForFunction(key => sessionStorage.getItem(key) === null, STORAGE_KEY);
+    await settled(f);
+    assert.equal(f.posts().length, 1);
+    // Clearing the receipt unlocks sending before its follow-up refresh renders.
+    await f.page.waitForFunction(() => document.getElementById('conversation').textContent.includes('Recovered saved reply'));
+    assert((await f.page.locator('#conversation').textContent()).includes('Recovered saved reply'));
+    assert(f.calls.some(c => c.pathname.startsWith('/api/turns/') && c.method === 'GET'));
+    await f.close();
+  }
+  console.log('PASS Chromium reload automatically reads complete receipts without resending');
+  {
+    const f = await fixture(browser, origin);
+    await f.page.getByRole('button', { name: '修改后确认', exact: true }).click();
+    await f.page.getByLabel('共享摘要', { exact: true }).fill('My manually rewritten summary');
+    await f.page.getByLabel('接收人', { exact: true }).fill('carol');
+    const confirm = f.page.getByRole('button', { name: '确认修改并委派', exact: true });
+    assert(await confirm.isDisabled());
+    await f.page.getByRole('button', { name: '预览', exact: true }).click();
+    assert(!f.calls.some(c => c.pathname.includes('/actions')));
+    await confirm.click();
+    await f.page.waitForFunction(() => document.getElementById('status').textContent.includes('已'));
+    const action = f.calls.find(c => c.pathname === '/api/proposals/1/actions');
+    assert.equal(action.body.action, 'confirm');
+    assert.equal(action.body.owner, 'carol'); assert.equal(action.body.summary, 'My manually rewritten summary');
+    f.state.proposals = [2, 3].map(id => ({ id, owner: 'bob', summary: 'Old pending ' + id, status: 'pending', revision: 0, created_at: '2020-01-01 00:00:00' }));
+    await f.page.locator('#refresh').click();
+    const group = f.page.locator('details').filter({ has: f.page.locator('summary', { hasText: '2 个未处理的提案' }) });
+    await group.waitFor(); assert.equal(await group.getAttribute('open'), null);
+    await group.locator('summary').click();
+    await group.getByRole('button', { name: /全部拒绝/ }).click();
+    await f.page.waitForFunction(() => !document.querySelector('.old-proposals'));
+    assert.equal(f.calls.filter(c => c.pathname.match(/\/proposals\/[23]\/actions/) && c.body.action === 'reject').length, 2);
+    await f.close(); console.log('PASS Chromium edited proposal preview boundary and old-proposal bulk rejection');
+  }
+  {
+    const f = await fixture(browser, origin);
+    await f.page.setViewportSize({ width: 400, height: 900 });
+    const task = { id: 'draft-task', revision: 2, requester: 'bob', owner: 'alice', status: 'working', summary: 'Draft a delivery' };
+    await showTasks(f, [task]);
+    await f.page.getByRole('button', { name: '我的私密交付草稿', exact: true }).click();
+    await f.page.getByRole('button', { name: '让我的 Agent 起草（不交付）', exact: true }).click();
+    await f.page.getByLabel('私密交付草稿编辑').fill('Human reviewed delivery\nSecond paragraph');
+    await f.page.getByRole('button', { name: '使用此草稿填入人工交付', exact: true }).click();
+    assert(!f.calls.some(c => c.pathname.endsWith('/actions')));
+    await f.page.getByRole('button', { name: '提交人工交付', exact: true }).click();
+    assert.equal(await f.page.getByLabel('人工交付内容').inputValue(), 'Human reviewed delivery\nSecond paragraph');
+    const submit = f.page.getByRole('button', { name: '确认交付', exact: true });
+    assert(await submit.isDisabled());
+    await f.page.getByRole('button', { name: '预览', exact: true }).click();
+    assert(!f.calls.some(c => c.pathname.endsWith('/actions')));
+    await submit.click();
+    await f.page.waitForFunction(() => document.getElementById('tasks').textContent.includes('待验收'));
+    assert.equal(f.calls.find(c => c.pathname === '/api/tasks/draft-task/actions').body.result, 'Human reviewed delivery\nSecond paragraph');
+    await f.close(); console.log('PASS Chromium private draft, human editing, preview and explicit delivery');
+  }
+  {
+    const f = await fixture(browser, origin);
+    await f.page.setViewportSize({ width: 400, height: 900 });
+    await f.page.locator('#open-chat').click();
+    f.state.proposals = [];
+    const long = 'LongUnbrokenValue'.repeat(100);
+    f.state.reply = '# Structured reply\n\n- first\n- second\n\n| Name | Details |\n| --- | --- |\n| example | ' + long + ' |\n\n```js\n' + long + '\n```\n\n' + long + '\n<img src=x onerror=alert(1)>';
+    await f.send('Show a long structured reply'); await settled(f);
+    assert.equal(await f.page.locator('#conversation table').count(), 1);
+    assert.equal(await f.page.locator('#conversation li').count(), 2);
+    assert.equal(await f.page.locator('#conversation img').count(), 0);
+    assert.equal(await f.page.locator('#conversation pre code').textContent(), long);
+    const bounds = await f.page.evaluate(() => ({
+      page: document.documentElement.scrollWidth <= innerWidth,
+      bubbles: [...document.querySelectorAll('#conversation .markdown')].every(el => el.getBoundingClientRect().right <= innerWidth),
+      composer: document.getElementById('send').getBoundingClientRect().bottom <= innerHeight
+    }));
+    assert.deepEqual(bounds, { page: true, bubbles: true, composer: true });
+    await f.close(); console.log('PASS Chromium narrow long Markdown table/code/reply containment and inert HTML');
+  }
+  {
+    const f = await fixture(browser, origin, false, true);
+    f.state.tasks = [{ id: 'new-task', revision: 0, requester: 'bob', owner: 'alice', status: 'awaiting_owner', summary: 'New assignment' }];
+    await f.page.clock.fastForward(4000);
+    await f.page.waitForFunction(() => document.title.startsWith('('));
+    assert.equal(await f.page.title(), '(1) Agenct');
+    await f.close(); console.log('PASS Chromium incoming task updates tab title within five seconds');
+  }
+}

@@ -6,9 +6,16 @@
   "license": "MIT",
   "scripts": {
     "test": "node test.cjs && node test-chat.cjs && node hub/web/client.test.cjs && node hub/web/profiles-ui.test.cjs && node hub/web/worker-ui.test.cjs && node hub/web/draft-ui.test.cjs && node hub/web/task-timeline-model.test.cjs && node hub/web/task-timeline-ui.test.cjs",
-    "check": "node --check dist/chat.js && node --check dist/chat-engine.js && node --check dist/engine.js && node --check dist/dashboard-app.js && node --check hub/web/client.js && node --check hub/web/profiles-ui.js && node --check hub/web/worker-ui.js && node --check hub/web/draft-ui.js && node --check hub/web/task-timeline-model.js && node --check hub/web/task-timeline-ui.js"
+    "check": "node --check dist/chat.js && node --check dist/chat-engine.js && node --check dist/engine.js && node --check dist/dashboard-app.js && node --check hub/web/client.js && node --check hub/web/profiles-ui.js && node --check hub/web/worker-ui.js && node --check hub/web/draft-ui.js && node --check hub/web/task-timeline-model.js && node --check hub/web/task-timeline-ui.js && node --check hub/web/activity-ui.js && node --check hub/web/chat-ui.js && node --check hub/web/task-ui.js && node --check hub/web/client-chrome.js && node --check hub/web/repo-ui.js",
+    "test:browser": "node hub/web/client.browser.test.cjs",
+    "test:visual": "playwright test",
+    "test:visual:update": "playwright test --update-snapshots",
+    "test:local": "node scripts/local-browser-acceptance.cjs"
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.58.2"
   }
 }

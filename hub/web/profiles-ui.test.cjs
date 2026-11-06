@@ -39,7 +39,7 @@ function fixture() {
   const f = fixture(); await f.open();
   assert.equal(f.calls.filter(c => c.method === 'PUT').length,0);
   assert(walk(f.conversation).some(e => e.textContent.includes('不启动 Agent')));
-  await f.button('添加 Agent 配置').onclick();
+  await f.button('添加角色').onclick();
   await f.button('检查更改').onclick();
   assert(walk(f.conversation).some(e => e.textContent.includes('<safe name>')));
   assert.equal(f.calls.filter(c => c.method === 'PUT').length,0);

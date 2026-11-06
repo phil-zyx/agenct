@@ -9,6 +9,7 @@ pub(super) const DRAFT_MESSAGE: &str = "Draft a delivery for this task for owner
 pub(super) enum TurnKind {
     Chat,
     DraftDelivery,
+    ContextSummary,
 }
 pub(super) struct TurnRequest<'a> {
     pub kind: TurnKind,
@@ -17,6 +18,7 @@ pub(super) struct TurnRequest<'a> {
     pub history: &'a [Message],
     pub profile: &'a RuntimeProfile,
     pub task_context: Option<&'a serde_json::Value>,
+    pub draft_revision: Option<&'a serde_json::Value>,
 }
 
 /// Static dispatch keeps the transport replaceable without exposing Hub/DB authority.
@@ -86,6 +88,15 @@ impl AdapterReply {
 }
 
 fn validate_request(request: &TurnRequest<'_>) -> Result<()> {
+    if request.kind == TurnKind::ContextSummary
+        && (request.message != crate::context_memory::SUMMARY_MESSAGE
+            || request.history.is_empty()
+            || request.task_context.is_some()
+            || request.draft_revision.is_some()
+            || uuid::Uuid::parse_str(request.session_id).is_err())
+    {
+        return Err(invalid("invalid summary runtime context"));
+    }
     if request.kind == TurnKind::DraftDelivery
         && (request.message != DRAFT_MESSAGE
             || !request.history.is_empty()
@@ -111,6 +122,13 @@ pub(super) struct MockRuntime;
 impl Runtime for MockRuntime {
     async fn turn(&self, request: TurnRequest<'_>) -> Result<AdapterReply> {
         validate_request(&request)?;
+        if request.kind == TurnKind::ContextSummary {
+            return Ok(AdapterReply {
+                reply: crate::context_memory::mock_summary(request.history),
+                backend: "mock".into(),
+                proposal: None,
+            });
+        }
         if request.kind == TurnKind::DraftDelivery {
             return Ok(AdapterReply { reply: "[MOCK · draft only] 请根据任务共享摘要核对、编辑并明确提交交付。这不是执行或完成证据。".into(), backend: "mock".into(), proposal: None });
         }
@@ -148,16 +166,21 @@ impl Runtime for DshRuntime<'_> {
         if request.kind == TurnKind::DraftDelivery {
             payload["kind"] = serde_json::json!("draft_delivery");
         }
+        if request.kind == TurnKind::ContextSummary {
+            payload["kind"] = serde_json::json!("context_summary");
+        }
+        if let Some(revision) = request.draft_revision {
+            payload["draft_revision"] = revision.clone();
+        }
         if let Some(context) = request.task_context {
             payload["task_context"] = context.clone();
         }
-        while payload["history"].as_array().unwrap().len() > 100
+        if payload["history"].as_array().unwrap().len() > 100
             || serde_json::to_vec(&payload).unwrap().len() > 60000
         {
-            if payload["history"].as_array().unwrap().is_empty() {
-                return Err(invalid("chat context exceeds adapter limit"));
-            }
-            payload["history"].as_array_mut().unwrap().remove(0);
+            return Err(invalid(
+                "chat context exceeds adapter limit; summarize before dispatch",
+            ));
         }
         let response = self
             .client
@@ -212,6 +235,7 @@ mod tests {
                 history: &[],
                 profile: &profile(),
                 task_context: None,
+                draft_revision: None,
             })
             .await
             .unwrap()
