@@ -91,6 +91,9 @@ textarea, input { font: inherit; color: var(--text); background: var(--surface);
   box-shadow: var(--shadow); font-size: 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .toast:empty { display: none; }
+.toast.show { animation: toast-life var(--life, 4s) ease forwards; }
+@keyframes toast-life { 0% { opacity: 0; transform: translate(-50%, -6px); } 6%, 85% { opacity: 1; transform: translate(-50%, 0); } 100% { opacity: 0; visibility: hidden; } }
+@media (prefers-reduced-motion: reduce) { .toast.show { animation: toast-life var(--life, 4s) steps(1, end) forwards; } }
 
 /* Login */
 .login { grid-column: 1 / -1; display: grid; place-items: center; padding: 32px 16px; min-height: 100vh; }
@@ -327,3 +330,53 @@ article select { appearance: auto; }
 .flash { animation: flash 1.6s ease-out; }
 @keyframes flash { 0% { box-shadow: 0 0 0 3px var(--brand); } 100% { box-shadow: 0 0 0 3px transparent; } }
 @media (prefers-reduced-motion: reduce) { .flash { animation: none; outline: 2px solid var(--brand); } }
+
+/* Identity pill: name first, mode quiet. */
+.identity b { font-weight: 600; }
+.identity .muted { font-weight: 400; }
+
+/* Task card footer: one primary row, quiet links, everything else under 更多. */
+.card-foot { display: flex; flex-direction: column; gap: 6px; }
+.tools { align-items: center; }
+.more { position: relative; }
+.more > summary {
+  list-style: none; cursor: pointer; padding: 5px 8px; border-radius: 8px; font-size: 13px; color: var(--muted);
+}
+.more > summary::-webkit-details-marker { display: none; }
+.more > summary::after { content: " ▾"; font-size: 11px; }
+.more > summary:hover { background: var(--soft); color: var(--text); }
+.more-menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 10; min-width: 168px; display: flex; flex-direction: column;
+  padding: 6px; background: var(--surface); border-radius: 14px; box-shadow: var(--shadow);
+}
+.more-menu > button { text-align: left; border: none; background: transparent; border-radius: 8px; padding: 8px 10px; font-size: 13.5px; color: var(--text); }
+.more-menu > button:hover:not(:disabled) { background: var(--soft); }
+.more-menu > button.danger { color: var(--danger); }
+.tools .more { margin-left: auto; }
+.card-panels:empty { display: none; }
+.card-panels > article { margin-top: 4px; background: var(--surface); box-shadow: none; border: 1px solid var(--line); font-size: 13.5px; }
+details.delivery > summary { list-style: none; }
+details.delivery > summary::-webkit-details-marker { display: none; }
+details.delivery > summary::after { content: " ▸"; }
+details.delivery[open] > summary::after { content: " ▾"; }
+
+/* Discussion chip above the composer */
+.chip-bar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 6px 8px 6px 14px; margin-bottom: 8px;
+  background: var(--brand-soft); border-radius: 999px; font-size: 13.5px;
+}
+.chip-label { font-weight: 600; color: var(--brand); }
+.chip-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chip-more > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+.chip-more[open] { flex-basis: 100%; order: 5; }
+.chip-more[open] p { margin: 6px 0 4px; max-height: 160px; overflow: auto; font-size: 12.5px; color: var(--muted); white-space: pre-wrap; }
+.chip-bar:has(.chip-more[open]) { border-radius: 18px; }
+.icon-btn.small { width: 28px; height: 28px; }
+.icon-btn.small svg { width: 16px; height: 16px; }
+
+/* Panels inside a task card: compact text, wide editor, inline small buttons. */
+.card-panels > article { font-size: 12.5px; color: var(--muted); line-height: 1.55; padding: 12px; }
+.card-panels article article { font-size: 12.5px; color: var(--muted); background: var(--soft); padding: 8px 10px; }
+.card-panels textarea { display: block; width: 100%; min-height: 180px; margin: 8px 0 2px; font-size: 14px; line-height: 1.6; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 12px; resize: vertical; }
+.card-panels button { padding: 6px 12px; font-size: 12.5px; margin: 8px 6px 0 0; }
+.card-panels button.primary { font-size: 13px; }

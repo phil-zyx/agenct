@@ -56,6 +56,8 @@ function createDraftUI({ api, current, article, conversation }) {
     const route = 'tasks/' + encodeURIComponent(taskId) + '/drafts';
     function button(label, fn) {
       const stamp = view, b = document.createElement('button'); b.type = 'button'; b.textContent = label;
+      // The panel's main actions read as primary; the rest stay quiet.
+      if (/^让我的 Agent 起草|^使用此草稿填入人工交付/.test(label)) b.className = 'primary';
       b.onclick = async () => { if (valid() && stamp === view && !working) await fn(); };
       panel.append(b); return b;
     }
