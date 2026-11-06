@@ -2,56 +2,105 @@
 <html lang="zh">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Agenct · Rust Hub</title>
+<title>Agenct</title>
 <link rel="stylesheet" href="style.css">
-<h1>Agenct</h1>
-<p>一个窗口，与你的管家协作。</p>
-<small>验证版 · 无真实代码执行或 GitHub 发布。开发令牌仅保留在页面内存；浏览器登录由服务器管理会话。</small>
-<section id="login">
-  <p id="dev-login" class="hide"><input type="password" id="token" placeholder="输入开发访问令牌" aria-label="开发访问令牌" autocomplete="off"><button id="enter">进入</button></p>
-  <button id="oidc-login" class="hide">通过身份提供方登录</button>
-  <button id="auth-retry" class="hide">重试登录状态检查</button>
+<body>
+<nav class="rail" aria-label="主导航">
+  <div class="rail-logo" aria-hidden="true">A</div>
+  <button type="button" class="rail-btn active" title="聊天" aria-label="聊天" aria-current="page">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 1 3.4 6.5L4 20l1.3-3.6A7.9 7.9 0 0 1 4 12Z"/></svg>
+  </button>
+  <button type="button" id="toggle-tasks" class="rail-btn" title="任务" aria-label="任务" aria-pressed="false">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>
+    <span id="rail-badge" class="rail-badge"></span>
+  </button>
+  <button type="button" id="open-agents" class="rail-btn" title="个人角色配置" aria-label="个人角色配置">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9" r="2.4"/><path d="M15.5 14.2A4.5 4.5 0 0 1 20.5 18.5"/></svg>
+  </button>
+  <button type="button" id="open-help" class="rail-btn" title="能力边界与说明" aria-label="能力边界与说明">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3Z"/></svg>
+  </button>
+  <div class="rail-spacer"></div>
+  <button type="button" id="logout" class="rail-btn" title="退出" aria-label="退出">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"/></svg>
+  </button>
+</nav>
+
+<p id="status" class="toast" role="status" title="点击关闭"></p>
+
+<section id="login" class="login">
+  <div class="login-card">
+    <div class="avatar big" aria-hidden="true">A</div>
+    <h1>Agenct</h1>
+    <p class="lead">一个窗口，与你的管家协作。</p>
+    <p id="dev-login" class="hide login-form"><input type="password" id="token" placeholder="输入开发访问令牌" aria-label="开发访问令牌" autocomplete="off"><button id="enter" class="primary">进入</button></p>
+    <button id="oidc-login" class="hide primary wide">通过身份提供方登录</button>
+    <button id="auth-retry" class="hide">重试登录状态检查</button>
+    <small class="hint">开发令牌在状态目录的 <code>credentials.json</code> 中，只保留在本页内存里。验证版 · 无真实代码执行或 GitHub 发布。</small>
+  </div>
 </section>
-<section id="room" class="hide">
-  <p id="identity"></p>
-  <button id="logout">退出</button><button id="refresh">刷新本账号会话与任务</button>
-  <p><small id="last-refresh"></small></p>
-  <p id="sync-notice" role="status" aria-live="polite"></p>
-  <div id="conversation" aria-label="私聊、待确认提案与任务"></div>
-  <section id="turn-recovery" class="hide" aria-label="消息发送恢复">
-    <p id="turn-status" role="status" aria-live="polite"></p>
-    <button type="button" id="check-turn">核对发送状态</button>
-    <button type="button" id="new-turn">开始新尝试</button>
+
+<main id="room" class="app hide">
+  <section class="chat-pane" aria-label="与管家的对话">
+    <div class="float-pill left"><span id="identity" class="identity"></span></div>
+    <div class="float-pill right">
+      <span class="sync"><small id="last-refresh"></small><span id="sync-notice" class="sync-notice" role="status" aria-live="polite"></span></span>
+      <button type="button" id="refresh" class="icon-btn" title="刷新本账号会话与任务" aria-label="刷新本账号会话与任务">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
+      </button>
+    </div>
+    <div id="scroller" class="scroller">
+      <div class="stream-head" aria-hidden="true"><div class="avatar">A</div><span class="avatar-name">管家</span></div>
+      <div id="conversation" class="stream" aria-label="私聊与待确认提案"></div>
+      <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
+    </div>
+    <div class="composer">
+      <section id="turn-recovery" class="sheet warn hide" aria-label="消息发送恢复">
+        <p id="turn-status" role="status" aria-live="polite"></p>
+        <div class="row"><button type="button" id="check-turn" class="primary">核对发送状态</button><button type="button" id="new-turn">开始新尝试</button></div>
+      </section>
+      <section id="task-context" class="sheet context hide" aria-label="下一条聊天的任务上下文">
+        <div class="sheet-head"><strong>正在讨论任务</strong><button type="button" id="clear-task-context" class="text-btn">清除</button></div>
+        <p id="task-context-details" role="status" aria-live="polite"></p>
+      </section>
+      <section id="role-picker" class="sheet hide" aria-label="启用的个人角色">
+        <p class="muted">每次只选一个角色，沿用本账号私聊历史。不创建团队、分离会话或增加工具权限。</p>
+        <div id="role-options" class="chips"></div>
+        <button type="button" id="close-role-picker" class="text-btn">关闭角色选择</button>
+      </section>
+      <section id="composer-menu" class="sheet menu hide" aria-label="更多选项">
+        <div class="menu-row" aria-label="下一条聊天的角色">
+          <span id="role-details" class="role-details" role="status" aria-live="polite">下一条普通聊天默认使用你的管家。</span>
+          <button type="button" id="choose-role" class="text-btn">选择本次角色</button>
+          <button type="button" id="clear-role" class="text-btn">恢复默认管家</button>
+        </div>
+        <details id="help" class="help"><summary>能力边界、委派示例与恢复说明</summary>
+        <p>输入 /agents 可配置个人角色。Mock 委派示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。</p>
+        <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，页面可见时每 5 秒自动检查更新，离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号、所属账号及显式选择的角色 ID 和配置版本，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。验证版 · 无真实代码执行或 GitHub 发布。</small>
+        </details>
+      </section>
+      <form id="form" class="composer-pill">
+        <button type="button" id="composer-menu-toggle" class="icon-btn plus" title="角色与说明" aria-label="角色与说明" aria-expanded="false">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+        <textarea id="text" aria-label="给管家发消息" aria-describedby="chat-help" placeholder="说说你想解决的问题…" rows="1"></textarea>
+        <button id="send" class="send-btn" title="发送" aria-label="发送">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
+        </button>
+      </form>
+      <p id="chat-help" class="sr-only">直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。Enter 发送，Shift+Enter 换行。</p>
+    </div>
   </section>
-  <section id="task-context" class="hide" aria-label="下一条聊天的任务上下文">
-    <p id="task-context-details" role="status" aria-live="polite"></p>
-    <button type="button" id="clear-task-context">清除任务上下文</button>
-  </section>
-  <section aria-label="下一条聊天的角色">
-    <p id="role-details" role="status" aria-live="polite">下一条普通聊天默认使用你的管家。</p>
-    <button type="button" id="choose-role">选择本次角色</button>
-    <button type="button" id="clear-role">恢复默认管家</button>
-    <section id="role-picker" class="hide" aria-label="启用的个人角色">
-      <p>每次只选一个角色，沿用本账号私聊历史。不创建团队、分离会话或增加工具权限。</p>
-      <div id="role-options"></div>
-      <button type="button" id="close-role-picker">关闭角色选择</button>
-    </section>
-  </section>
-  <p id="chat-help">直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。</p>
-  <form id="form">
-    <textarea id="text" aria-label="给管家发消息" aria-describedby="chat-help" placeholder="说说你想解决的问题…"></textarea>
-    <button id="send">发送</button>
-  </form>
-  <details><summary>能力边界、委派示例与恢复说明</summary>
-  <p>输入 /agents 可配置个人角色。Mock 委派示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。</p>
-  <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，页面可见时每 5 秒自动检查更新，离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号、所属账号及显式选择的角色 ID 和配置版本，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。</small>
-  </details>
-</section>
-<p id="status" role="status"></p>
+  <aside class="task-pane" aria-label="任务">
+    <div class="pane-head"><h2>任务</h2><span id="task-count" class="count"></span><button type="button" id="close-tasks" class="icon-btn" title="收起任务" aria-label="收起任务"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>
+    <div id="tasks" class="task-list" aria-label="与你相关的任务"></div>
+  </aside>
+</main>
 <script src="profiles-ui.js"></script>
 <script src="worker-ui.js"></script>
 <script src="draft-ui.js"></script>
 <script src="task-timeline-model.js"></script>
 <script src="task-timeline-ui.js"></script>
 <script src="client.js"></script>
+</body>
 </html>
