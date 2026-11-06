@@ -17,15 +17,19 @@ pub struct Message {
     pub role: String,
     pub content: String,
     pub status: String,
+    /// UTC "YYYY-MM-DD HH:MM:SS"; None for messages written before schema v11.
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 pub(super) fn history(h: &Hub, owner: &str) -> Result<Vec<Message>> {
     let db = h.db()?;
-    let mut stmt=db.prepare("SELECT role,content,status FROM (SELECT id,role,content,status FROM messages WHERE owner=?1 ORDER BY id DESC LIMIT 40) ORDER BY id")?;
+    let mut stmt=db.prepare("SELECT role,content,status,created_at FROM (SELECT id,role,content,status,created_at FROM messages WHERE owner=?1 ORDER BY id DESC LIMIT 40) ORDER BY id")?;
     let rows = stmt.query_map([owner], |r| {
         Ok(Message {
             role: r.get(0)?,
             content: r.get(1)?,
             status: r.get(2)?,
+            created_at: r.get(3)?,
         })
     })?;
     Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -84,7 +88,7 @@ pub(super) async fn execute_chat(
         let mut db = h.db()?;
         let tx = db.transaction()?;
         tx.execute(
-            "INSERT INTO messages(owner,role,content,status) VALUES (?1,'user',?2,'pending')",
+            "INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'user',?2,'pending',CURRENT_TIMESTAMP)",
             params![id, input.message],
         )?;
         let message_id = tx.last_insert_rowid();
@@ -179,7 +183,7 @@ pub(super) async fn execute_chat(
                 [message_id],
             )?;
             if message_id.is_some() {
-                tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
+                tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
             }
             let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context});
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;

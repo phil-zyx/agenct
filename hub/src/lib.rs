@@ -1,4 +1,5 @@
 //! Agenct local development control plane. Not a production authentication service.
+mod activity;
 mod audit;
 mod audit_migration;
 pub mod browser_auth;
@@ -296,6 +297,7 @@ pub fn app(hub: Hub) -> Router {
             get(messages::messages).post(chat_turns::chat),
         )
         .route("/api/turns/{id}", get(chat_turns::status))
+        .route("/api/activity", get(activity::activity))
         .route(
             "/api/proposals",
             get(proposals::proposals).post(proposals::propose),
