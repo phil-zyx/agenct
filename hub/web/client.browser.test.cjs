@@ -100,7 +100,7 @@ function taskFixture(id = 'task-alpha', revision = 7) {
 async function showTasks(f, tasks) {
   f.state.tasks = tasks;
   await f.page.locator('#refresh').click();
-  await f.page.waitForFunction(count => [...document.querySelectorAll('#conversation button')]
+  await f.page.waitForFunction(count => [...document.querySelectorAll('#tasks button')]
     .filter(button => button.textContent === '讨论此任务').length === count, tasks.length);
 }
 
@@ -231,8 +231,8 @@ async function settled(f) {
       await discussButtons(f).click();
       f.state.tasks = change === 'revision' ? [{ ...alpha, revision: 8, summary: 'Updated public summary' }] : [];
       await f.page.locator('#refresh').click();
-      if (change === 'revision') await f.page.waitForFunction(() => document.getElementById('conversation').textContent.includes('Updated public summary'));
-      else await f.page.waitForFunction(() => ![...document.querySelectorAll('#conversation button')].some(button => button.textContent === '讨论此任务'));
+      if (change === 'revision') await f.page.waitForFunction(() => document.getElementById('room').textContent.includes('Updated public summary'));
+      else await f.page.waitForFunction(() => ![...document.querySelectorAll('#tasks button')].some(button => button.textContent === '讨论此任务'));
       await f.page.locator('#text').fill('Do not silently drop my selected context');
       await f.page.locator('#form').evaluate(form => form.requestSubmit());
       assert.equal(f.posts().length, 0, 'Invalid selection must block even direct form submission');
@@ -268,7 +268,7 @@ async function settled(f) {
       assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
       f.state.tasks = [{ ...alpha, revision: 8, summary: 'Changed while previous turn unresolved' }];
       await f.page.locator('#refresh').click();
-      await f.page.waitForFunction(() => document.getElementById('conversation').textContent.includes('Changed while previous turn unresolved'));
+      await f.page.waitForFunction(() => document.getElementById('room').textContent.includes('Changed while previous turn unresolved'));
       assert.equal(await discussButtons(f).isDisabled(), true);
       assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
       assert.deepEqual(f.posts()[0].body, original, 'Refresh must not retarget the in-flight task context');
