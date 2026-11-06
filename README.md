@@ -1,102 +1,42 @@
 # Agenct
 
-Repository: https://github.com/phil-zyx/agenct
+一个以个人管家聊天窗口为入口的跨人 Agent 协作原型：私聊 → 私有委派提案 → 人工确认共享 → 对方接手 → 私密起草与多轮修改 → 人工交付 → 验收或退回。
 
-一个以个人管家聊天窗口为入口的跨人 Agent 协作原型。每个人只关注自己的会话，任务、状态与交付在后台协调。
+Rust Hub 提供真实服务端存储与身份边界；默认 `mock` 不调用模型，`dsh` 接入 DeepSeek。`dist/` 是独立的浏览器脚本演示，不代表真实账号或多人同步。当前用于可信主机上的小范围试用，尚未完成公网生产部署；代码执行和自动发布保持关闭。
 
-**在线演示仍是浏览器内脚本模拟，不是真实 AI 服务。** Alice 与 Bob 是虚构演示角色。该静态页面没有真实账号认证、服务端、多人同步、模型调用、GitLab 连接或安全隔离；仓库中的 Rust Hub 需另行启动。两个角色的数据都在同一浏览器 localStorage 中。不要输入个人信息、凭据或敏感代码。
+## 开始使用
 
-## 快速开始
-
-需要 Python 3 运行静态服务器；Node.js 22 或更高版本用于测试。没有第三方运行依赖。
-
-```sh
-python -m http.server 8000 --directory dist
-# 打开 http://localhost:8000
-npm test
-npm run check
-```
-
-以 Alice 身份输入“请 Bob 修复报告单位显示问题”，切换 Bob 接单并推进，再切回 Alice 验收。角色切换仅用于演示，不代表访问控制。刷新保留本浏览器数据，重置会清空演示数据。
-
-## 静态演示已实现
-
-- 单窗口聊天、预设意图匹配、跨角色任务摘要路由。
-- 接单、模拟执行与发布、证据核验、验收和退回。
-- CI 失败、超时、未知结果、SHA 失效、取消和重试。
-- 可折叠的关注事项、通信事件及审计导出。
-
-## 目录
-
-- `dist/`：可直接运行的静态源文件，无构建步骤。
-- `test.cjs`、`test-chat.cjs`：状态机与聊天路由测试。
-- `hub/`：Rust 服务、单窗口客户端、未接通的 Worker/发布库。
-- `adapters/dsh/`：DSH SDK 适配器与离线协议测试。
-- `scripts/`、`deploy/`：私有试运行工具和服务模板。
-- `docs/architecture.md`：当前实现与未来边界。
-- `docs/roadmap.md`：尚未实现的里程碑。
-
-旧看板保留在 `/dashboard.html`，只作原型对照；聊天始终是主入口。
-
-## 开发状态
-
-这是实验性原型，不能作为生产系统的认证或授权基础。网页中的状态、费用、MR 和提交均为模拟数据。测试通过不意味着完成安全审计。协议不声明符合 A2A，也不隶属于 DeepSeek 或其他执行器厂商。
-
-## 贡献与安全
-
-请先阅读 [贡献指南](CONTRIBUTING.md) 和 [安全说明](SECURITY.md)。请勿在 Issue、日志或截图中提交秘密或真实私聊。
-
-## 许可证
-
-本项目采用 [MIT License](LICENSE)。第三方工具与服务仍适用各自条款；本仓库不包含任何第三方执行器。
-
-## Rust Hub + DSH 技术验证（v0.2）
-
-新增 `hub/`：Rust/Axum 本地开发服务，开发令牌身份认证、SQLite 持久消息与任务、跨身份隔离及人工接单/交付/验收。它与 `dist/` 静态演示分开运行。真实 DSH 适配层见 `adapters/dsh/`；默认不启用模型或危险工具，mock 与真实模式明确区分且不会自动回退。
-
-本地一条命令启动（需 Python 3.9+ 与 Rust stable；首次构建约 2 分钟，mock 模式，不调用模型）：
+在 Linux/WSL 准备 Python 3.9+、Rust stable，从仓库根目录启动：
 
 ```sh
 python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private"
 ```
 
-按提示打开地址，用状态目录中 `credentials.json` 里的令牌登录。要接真实模型（DeepSeek，需自备 key 并产生费用），先 `export DEEPSEEK_API_KEY=...`，再执行 `set-runtime --runtime dsh` 后 `start`，见 [DSH 适配器](docs/dsh-adapter.md#launcher-managed-mode-recommended)。开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。生产登录、PostgreSQL、可运行的 Agent 军团、可信代码执行和完整远端交付链路尚未完成。不要将开发服务器暴露到公网。
+打开终端显示的本机地址，通过私有状态目录 `credentials.json` 中自己的令牌登录。初次构建需要等待；后续启动保留身份和数据。
 
-Windows + WSL2 用户可按 [本地拉取与启动指南](docs/wsl-local.md)准备环境，先用现有 launcher 运行 mock；附带只读检查命令，不代表已通过 WSL、浏览器或真实模型验收。
+- [入门](docs/getting-started.md)：模型接入、完整委派与草稿修改流程、双电脑 SSH 使用、在线加人和备份恢复。
+- [技术与运行参考](docs/reference.md)：架构、API、角色与摘要、文件材料、数据迁移、日志、测试与验收门槛。
+- [开发计划](docs/next-steps-plan.md)：本轮实现范围及待真实环境验收的项目。
+- [界面用语](docs/ui-terminology.md)：产品用词约定。
 
+## 当前能力
 
-### Controlled delegation demo
+私聊持久化与只读回执恢复；可编辑确认的委派提案；文本/Markdown/PDF 共享材料预览；任务筛选和提醒；角色设置与起草推荐；长聊天和大材料摘要；保留版本的私密改稿；人工多行交付预览；共享时间线；在线用户/令牌管理；一致数据库备份恢复和无正文运行日志。可选 OIDC 组织映射限制跨组织委派；通过本地固定边界检查后，可配置白名单仓库的只读提交上下文。
 
-The Rust chat UI now supports sender-private delegation proposals, explicit sharing confirmation, recipient acceptance/manual reply and requester acceptance. In `mock` mode, try `请让 bob 帮我检查公开文档` (optional whitespace after `帮我`) or `ask bob to review the public docs`. This is a **deterministic test double**, not live DSH language understanding. `/delegate bob ...` also prepares a proposal rather than immediately sharing. See [the acceptance walkthrough and limitations](docs/rust-hub.md#controlled-delegation-acceptance-offline-test-double). The browser-only `dist/` simulation remains separate.
+模型角色不增加权限，草稿不会自动交付，私聊不会自动转发。通知是轮询加可选浏览器通知，后台节流和断网仍需在试用设备验证。真实浏览器回归使用模拟 API；它不能代替两位真人在各自电脑完成试用。
 
-## 当前能力与明确缺口
+## 开发
 
-- 单窗口服务端聊天、持久任务、私有提案确认和人工交付可在本机运行；开发令牌不是生产账号。UI 自动轮询，不是实时推送。
-- [个人配置 API](docs/personal-profiles.md)可保存角色与模型引用；目前仅支持 `server-default`，不改变运行时、不启动 Agent，也不提供个人密钥输入或配置 UI。
-- [DSH 适配器](docs/dsh-adapter.md)实现 SDK 路径与严格结构化提案校验；真实模型调用和有效工具限制仍未验收。无静默 mock 回退。
-- [Worker 队列](docs/worker-contract.md)已提供按任务授权的 HTTP 入队、查询和取消接口，须由接单人明确确认；仅记录排队，不授权执行。接单人的聊天任务卡可查看、确认入队和取消，尚无运行中的消费者。[发布合同与 GitLab 传输](docs/gitlab-transport.md)仍是库。内置执行器因证据可信性问题保持禁用；没有自动编码、分支上传、真实 MR 或 CI 验收结果。
-- [私有试运行工具](docs/private-staging.md)可准备本地服务和 SSH 访问；未部署远端实例，没有已验证的云端后端 URL。不要公开开发令牌或将服务暴露到公网。
-- Hub 的任务创建必须经过发送者私有提案和明确确认，服务端校验所确认的修订与不可变内容。旧 `POST /api/tasks` 已移除，返回 405；`GET /api/tasks` 保留。普通模型聊天超时也不能自动重试。
+```sh
+npm ci
+npm test
+npm run check
+cargo test --locked --manifest-path hub/Cargo.toml
+npx playwright install chromium
+npm run test:browser
+npm run test:visual
+```
 
-完整边界见 [架构](docs/architecture.md)，后续验收门槛见 [路线图](docs/roadmap.md)。离线/API/模拟 DOM 测试通过不等于真实浏览器、提供商或沙箱验收。
+`hub/` 是服务与网页，`adapters/dsh/` 是模型适配器，`scripts/` 和 `deploy/` 是运维工具，`sandbox/` 保存执行边界验证。旧静态演示可用 `python3 -m http.server 8000 --directory dist` 运行，其中 Alice/Bob、费用、MR 与执行结果均是模拟数据。
 
-### Durable chat recovery
-
-The Rust chat client now retains owner-scoped turn receipts across a tab refresh
-and checks an uncertain request's status instead of resending it. Keyed API calls
-are dispatched at most once per owner/request ID; replies and private proposals
-commit atomically with their receipt. Legacy API calls without a request ID are
-not deduplicated. This does not enable code execution or publication. See
-[recovery behavior and limits](docs/chat-turn-recovery.md).
-
-### Selected-task discussion
-
-Use “讨论此任务” on a Rust Hub task card to include a bounded, participant-authorized
-snapshot in your next chat question. No task is included automatically, and this
-read-only context does not accept, execute, deliver or publish work. Task revisions
-and selections are bound to durable turn receipts. See
-[scope, confirmation boundaries and validation limits](docs/task-discussion.md).
-
-### 单次角色选择
-
-在同一聊天输入框上方点击“选择本次角色”，可让下一条普通聊天使用自己已启用的研究、写作或审阅角色；不选则仍使用管家。选择不会发送消息，配置变更后会要求重新选择，不会悄悄改用别的角色。每次仍是一个模型调用，不是自动工作的 Agent 团队。详见 [角色选择与恢复](docs/role-selection.md)。
+请阅读[贡献指南](CONTRIBUTING.md)和[安全说明](SECURITY.md)。项目使用 [MIT License](LICENSE)，不隶属于 DeepSeek，也不声明符合 A2A。不要在 Issue、日志、截图或提交中放入令牌、提供商密钥或真实私聊。
