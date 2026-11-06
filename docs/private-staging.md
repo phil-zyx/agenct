@@ -55,9 +55,11 @@ Run API tests and browser acceptance independently. Passing launcher tests does 
 
 ## DSH mode
 
-Keep the separate adapter on the **same trusted host**, following [dsh-adapter.md](dsh-adapter.md). Provisioning a provider credential, granting persistent access and making billable model calls require the appropriate authorization. The launcher does not request, generate, store or expose provider API keys.
+Provisioning a provider credential and making billable model calls require the appropriate authorization. The launcher never requests, generates, stores or prints provider API keys; it only passes `DEEPSEEK_API_KEY` from the current shell to the adapter process.
 
-After independently configuring the adapter, change only `runtime` to `dsh` in the private `config.json` and supply `AGENCT_ADAPTER_URL` and `AGENCT_ADAPTER_TOKEN` to the Hub through your approved secret mechanism. The Hub validates the adapter's loopback URL. Missing configuration fails closed; there is no silent mock fallback. The adapter's provider secret belongs to the adapter process, not the browser. A mock smoke test is not real-model acceptance.
+Simplest: `start --runtime dsh` for a new directory, or `set-runtime --runtime dsh` for an existing one, then `start` with `DEEPSEEK_API_KEY` exported. The launcher installs the pinned adapter dependencies into `<state-dir>/dsh-venv` and supervises adapter + Hub together; see [launcher-managed mode](dsh-adapter.md#launcher-managed-mode-recommended). `check` reports whether that environment is installed and whether the key is set (never its value).
+
+To run the adapter yourself instead (on the **same trusted host**), follow [dsh-adapter.md](dsh-adapter.md#manual-configuration), set `runtime` to `dsh` and supply both `AGENCT_ADAPTER_URL` and `AGENCT_ADAPTER_TOKEN` to the launcher through your approved secret mechanism. The Hub validates the adapter's loopback URL. Missing configuration fails closed; there is no silent mock fallback. The adapter's provider secret belongs to the adapter process, not the browser. A mock smoke test is not real-model acceptance.
 
 ## Optional service operation
 
