@@ -213,6 +213,57 @@ const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'ali
 const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
+  await test('only routine feedback expires; errors and saved-reply fallback remain keyboard dismissible', async () => {
+    const f = fixture(undefined, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick(); assert(f.$('status').classList.contains('show'));
+    f.failReads(500); await f.$('refresh').onclick();
+    assert.match(f.$('status').textContent, /Read unavailable/);
+    assert(!f.$('status').classList.contains('show'), 'critical status must not receive fading animation');
+    f.$('status').onkeydown({ key: 'Escape', preventDefault() {} });
+    assert.equal(f.$('status').textContent, '');
+    await f.send('Reply must stay readable');
+    assert.match(f.$('status').textContent, /已保存的回复：Saved chat reply/);
+    assert(!f.$('status').classList.contains('show'));
+    assert.equal(f.storage.size, 0, 'no private reply text retained in storage');
+  });
+  await test('task invalidation is announced outside collapsed context details', async () => {
+    const f = fixture(undefined, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick();
+    assert.match(f.$('task-context-status').textContent, /已选择讨论任务/);
+    f.tasks([task({ revision: 4 })]); await f.$('refresh').onclick();
+    assert.match(f.$('task-context-status').textContent, /已失效/);
+    f.$('clear-task-context').onclick(); assert.equal(f.$('task-context-status').textContent, '');
+    const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+    assert.match(html, /id="task-context-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert(html.indexOf('id="task-context-status"') < html.indexOf('<section id="task-context"'));
+    let writes = 0, content = f.$('task-context-status').textContent;
+    Object.defineProperty(f.$('task-context-status'), 'textContent', {get: () => content, set: value => { writes++; content = value; }});
+    await f.$('refresh').onclick(); assert.equal(writes, 0, 'unchanged polls do not repeat live announcements');
+  });
+  await test('each task panel retains its owner across other tool clicks and snapshot rerenders', async () => {
+    const all = ['A', 'B', 'C'].map(id => task({ id, summary: 'Task ' + id }));
+    const f = fixture(undefined, { tasks: all }); await f.login('bob');
+    const card = id => f.$('tasks').children.find(e => e.taskId === id);
+    const slot = id => card(id).children.find(e => e.className === 'card-panels');
+    await findButton(card('A'), '我的私密交付草稿').onclick();
+    const draft = slot('A').children[0]; assert(draft);
+    await findButton(draft, '让我的 Agent 起草（不交付）').onclick();
+    const walk = e => [e, ...e.children.flatMap(walk)];
+    const editor = walk(draft).find(e => e.value === 'Generated draft'); editor.value = 'Private edited A';
+    await findButton(card('B'), '查看共享时间线').onclick();
+    const timeline = slot('B').children[0]; assert(timeline);
+    await findButton(card('C'), '查看待办队列（不执行）').onclick();
+    const queue = slot('C').children[0]; assert(queue);
+    f.discussion('B').onclick(); f.change(); await f.$('refresh').onclick();
+    assert.deepEqual(slot('A').children, [draft]);
+    assert.deepEqual(slot('B').children, [timeline]);
+    assert.deepEqual(slot('C').children, [queue]);
+    assert.equal(editor.value, 'Private edited A');
+    assert(!slot('B').textContent.includes('Private edited A'));
+    assert.equal(f.calls.filter(c => c.url?.endsWith('/actions')).length, 0);
+    await f.$('logout').onclick(); await f.login('alice');
+    assert(!f.$('tasks').textContent.includes('私密文本草稿'));
+  });
   await test('narrow task discussion and navigation return to chat without dispatch', async () => {
     const f = fixture({ enabled: false }, { width: 400, tasks: [task()] });
     await f.login('alice');
