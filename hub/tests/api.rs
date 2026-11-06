@@ -55,12 +55,58 @@ async fn request(
     let body = r.into_body().collect().await.unwrap().to_bytes();
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
+async fn confirmed_task(app: &Router, who: &str, owner: &str, summary: &str) -> Value {
+    let (status, proposal) = request(
+        app,
+        who,
+        "POST",
+        "/api/proposals",
+        json!({"owner":owner,"summary":summary}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, confirmed) = request(
+        app,
+        who,
+        "POST",
+        &format!(
+            "/api/proposals/{}/actions",
+            proposal["id"].as_str().unwrap()
+        ),
+        json!({"action":"confirm","expected_revision":proposal["revision"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, detail) = request(
+        app,
+        who,
+        "GET",
+        &format!("/api/tasks/{}", confirmed["task_id"].as_str().unwrap()),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    detail["task"].clone()
+}
 #[tokio::test]
 async fn unauthorized_is_rejected() {
+    let a = setup();
+    for path in ["/api/me", "/api/tasks", "/api/proposals"] {
+        assert_eq!(
+            request(&a, "mallory", "GET", path, Value::Null).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+    }
     assert_eq!(
-        request(&setup(), "mallory", "GET", "/api/me", Value::Null)
-            .await
-            .0,
+        request(
+            &a,
+            "mallory",
+            "POST",
+            "/api/proposals",
+            json!({"owner":"bob","summary":"unauthorized"})
+        )
+        .await
+        .0,
         StatusCode::UNAUTHORIZED
     );
 }
@@ -115,6 +161,62 @@ async fn caller_cannot_choose_identity_or_session() {
     );
 }
 #[tokio::test]
+async fn direct_task_creation_is_removed_without_storage_side_effects() {
+    let dir = std::env::temp_dir().join(format!("agenct-no-direct-task-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("hub.db");
+    let a = app(Hub::open(config(path.to_str().unwrap())).unwrap());
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let db = rusqlite::Connection::open_with_flags(&path, flags).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            request(
+                &a,
+                "alice",
+                "POST",
+                "/api/tasks",
+                json!({"owner":"bob","summary":"must not be shared directly"})
+            )
+            .await
+            .0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+    for table in ["tasks", "events", "proposals"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "legacy POST wrote to {table}");
+    }
+    for who in ["alice", "bob", "eve"] {
+        assert_eq!(
+            request(&a, who, "GET", "/api/tasks", Value::Null).await,
+            (StatusCode::OK, json!([]))
+        );
+    }
+    assert_eq!(
+        request(&a, "mallory", "GET", "/api/tasks", Value::Null)
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+    let task = confirmed_task(&a, "alice", "bob", "explicitly confirmed summary").await;
+    assert_eq!(task["requester"], "alice");
+    assert_eq!(task["owner"], "bob");
+    assert_eq!(task["summary"], "explicitly confirmed summary");
+    assert_eq!(task["status"], "awaiting_owner");
+    assert_eq!(task["revision"], 0);
+    for table in ["tasks", "events"] {
+        let count: i64 = db
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "confirmation must create exactly one {table} row");
+    }
+    drop(db);
+    drop(a);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[tokio::test]
 async fn task_lifecycle_checks_roles_and_no_private_history() {
     let a = setup();
     request(
@@ -125,15 +227,7 @@ async fn task_lifecycle_checks_roles_and_no_private_history() {
         json!({"message":"private note"}),
     )
     .await;
-    let (s, t) = request(
-        &a,
-        "alice",
-        "POST",
-        "/api/tasks",
-        json!({"owner":"bob","summary":"shared task only"}),
-    )
-    .await;
-    assert_eq!(s, StatusCode::OK);
+    let t = confirmed_task(&a, "alice", "bob", "shared task only").await;
     let path = format!("/api/tasks/{}/actions", t["id"].as_str().unwrap());
     assert_eq!(
         request(
@@ -206,14 +300,7 @@ async fn task_lifecycle_checks_roles_and_no_private_history() {
 #[tokio::test]
 async fn cancellation_is_terminal() {
     let a = setup();
-    let (_, t) = request(
-        &a,
-        "alice",
-        "POST",
-        "/api/tasks",
-        json!({"owner":"bob","summary":"x"}),
-    )
-    .await;
+    let t = confirmed_task(&a, "alice", "bob", "x").await;
     let p = format!("/api/tasks/{}/actions", t["id"].as_str().unwrap());
     request(
         &a,
@@ -257,14 +344,7 @@ async fn adapter_failure_never_silently_falls_back() {
 #[tokio::test]
 async fn result_required_before_delivery() {
     let a = setup();
-    let (_, t) = request(
-        &a,
-        "alice",
-        "POST",
-        "/api/tasks",
-        json!({"owner":"bob","summary":"x"}),
-    )
-    .await;
+    let t = confirmed_task(&a, "alice", "bob", "x").await;
     let p = format!("/api/tasks/{}/actions", t["id"].as_str().unwrap());
     request(
         &a,
@@ -342,14 +422,7 @@ async fn adapter_contract_uses_scoped_role_content_history() {
 #[tokio::test]
 async fn stale_actions_cannot_accept_unseen_redelivery() {
     let a = setup();
-    let (_, t) = request(
-        &a,
-        "alice",
-        "POST",
-        "/api/tasks",
-        json!({"owner":"bob","summary":"review"}),
-    )
-    .await;
+    let t = confirmed_task(&a, "alice", "bob", "review").await;
     let path = format!("/api/tasks/{}/actions", t["id"].as_str().unwrap());
     for (revision, (who, action, result)) in [
         ("bob", "accept", Value::Null),
@@ -482,7 +555,7 @@ async fn natural_language_proposal_requires_confirmation_and_is_private() {
         json!([])
     );
     let path = format!("/api/proposals/{}/actions", p["id"].as_str().unwrap());
-    for who in ["bob", "eve"] {
+    for who in ["bob", "eve", "mallory"] {
         assert_eq!(
             request(
                 &app,
@@ -493,7 +566,11 @@ async fn natural_language_proposal_requires_confirmation_and_is_private() {
             )
             .await
             .0,
-            StatusCode::NOT_FOUND
+            if who == "mallory" {
+                StatusCode::UNAUTHORIZED
+            } else {
+                StatusCode::NOT_FOUND
+            }
         );
     }
     assert_eq!(

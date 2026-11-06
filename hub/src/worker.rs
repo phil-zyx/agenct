@@ -110,27 +110,9 @@ fn job_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
 }
 const SELECT: &str = "SELECT id,owner,task_id,task_revision,repository,base_commit,request_id,status,attempt FROM worker_jobs";
 
+/// Standalone worker storage setup; Hub schema versions are managed by Hub::open.
 pub fn migrate(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS worker_jobs (
-      id TEXT PRIMARY KEY, owner TEXT NOT NULL, task_id TEXT NOT NULL,
-      task_revision INTEGER NOT NULL, repository TEXT NOT NULL, base_commit TEXT NOT NULL,
-      request_id TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('queued','running','review_ready','failed','cancelled')),
-      attempt INTEGER NOT NULL DEFAULT 0, executor TEXT, lease_hash TEXT, lease_until INTEGER,
-      candidate TEXT, candidate_sha256 TEXT, failure TEXT, created_at INTEGER NOT NULL,
-      UNIQUE(owner,request_id));
-      CREATE UNIQUE INDEX IF NOT EXISTS worker_one_active_task ON worker_jobs(task_id)
-      WHERE status IN ('queued','running','review_ready');")?;
-    let columns = db
-        .prepare("PRAGMA table_info(worker_jobs)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    if !columns.iter().any(|c| c == "execution_authorized") {
-        // Existing unclassified receipts fail closed after migration.
-        db.execute(
-            "ALTER TABLE worker_jobs ADD COLUMN execution_authorized INTEGER NOT NULL DEFAULT 0",
-            [],
-        )?;
-    }
+    crate::schema::migrate_worker(db)?;
     Ok(())
 }
 fn authorized(db: &Connection, job: &Job) -> Result<bool> {

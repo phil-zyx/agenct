@@ -64,6 +64,9 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
         ? { turn: { request_id: id, status: 'complete' }, reply: 'Recovered saved reply', task_context: taskContexts.get(id) || null } : null };
       if (state.receipt === 'complete') messages = [{ role: 'assistant', status: 'complete', content: 'Recovered saved reply' }];
     }
+    if (pathname === '/api/tasks' && method === 'POST') {
+      await route.fulfill({ status: 405, json: { error: 'Method Not Allowed' } }); return;
+    }
     if (pathname === '/api/tasks' && method === 'GET') data = state.tasks;
     if (pathname === '/api/profile') data = { revision: 0, agents: [] };
     if (pathname === '/api/profile/catalog') data = { roles: [], models: [] };
