@@ -6,6 +6,7 @@ let selectedAgent = null, roleGeneration = 0, roleRead = null, roleButtons = [];
 let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
 const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 const detailDrafts = new Map(); // Unsent shared-material text survives poll re-renders.
+let lastActivity = [];
 let pollTimer = null, pollDelay = 5000, refreshFlight = null, snapshot = '', renderedBusy = '';
 const POLL_INTERVAL = 5000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000, CHAT_SEND_TIMEOUT = 90000;
 const busy = new Set();
@@ -86,6 +87,95 @@ function badge(table, value) {
   const [label, tone] = table[value] || [value, 'muted'];
   return el('span', 'badge badge-' + tone, label);
 }
+// Server times are UTC "YYYY-MM-DD HH:MM:SS"; anything else is treated as unknown.
+function parseUtc(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) return null;
+  const date = new Date(value.replace(' ', 'T') + 'Z');
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+const pad = n => String(n).padStart(2, '0');
+function dayLabel(date) {
+  const today = new Date();
+  const start = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((start(today) - start(date)) / 86400000);
+  if (days === 0) return '今天';
+  if (days === 1) return '昨天';
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+const clock = date => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+const formatWhen = date => (dayLabel(date) === '今天' ? '' : dayLabel(date) + ' ') + clock(date);
+
+const ACTIVITY_ICON = {
+  pending: '○', awaiting_owner: '○', working: '◔', ready_for_acceptance: '◑', completed: '✓', canceled: '✕', rejected: '✕'
+};
+function activityLine(item, me) {
+  const l = item.latest || {};
+  const who = l.actor === me ? '你' : l.actor + ' ';
+  switch (l.action) {
+    case 'proposal_pending': return `等你确认 · 委派给 ${item.counterpart}`;
+    case 'proposal_rejected': return '已拒绝，未共享';
+    case 'created': return item.role === 'owner' ? `${item.counterpart} 委派给你，待接单` : `已委派给 ${item.counterpart}，等对方接单`;
+    case 'accept': return `${who}已接单`;
+    case 'deliver': return `${who}提交了交付`;
+    case 'approve': return `${who}验收通过`;
+    case 'return': return `${who}退回了交付`;
+    case 'cancel': return `${who}取消了任务` + (l.reason ? `：${l.reason}` : '');
+    case 'draft_complete': return '你的 Agent 起草了交付草稿（仅你可见）';
+    case 'draft_uncertain': return '起草结果未知，可在草稿中核对';
+    case 'draft_pending': return '你的 Agent 正在起草…';
+    default: return String(l.action || '');
+  }
+}
+function flash(element) {
+  if (!element) return;
+  element.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+  element.classList.add('flash');
+  setTimeout(() => element.classList.remove('flash'), 1600);
+}
+function renderActivity(context, items) {
+  const groups = [];
+  for (const item of Array.isArray(items) ? items : []) {
+    if (!item || typeof item.id !== 'string') continue;
+    const at = parseUtc(item.latest?.at);
+    const label = at ? dayLabel(at) : '更早';
+    if (!groups.length || groups[groups.length - 1].label !== label) groups.push({ label, items: [] });
+    groups[groups.length - 1].items.push({ item, at });
+  }
+  const nodes = [];
+  for (const group of groups) {
+    nodes.push(el('h3', 'day', group.label));
+    for (const { item, at } of group.items) {
+      const row = el('button', 'activity-item status-' + item.status);
+      row.type = 'button';
+      const icon = el('span', 'activity-icon', ACTIVITY_ICON[item.status] || '•');
+      const body = el('span', 'activity-body');
+      body.append(el('span', 'activity-title', item.title), el('span', 'activity-line', activityLine(item, context.user)));
+      row.append(icon, body, el('span', 'activity-time', at ? clock(at) : ''));
+      row.onclick = () => {
+        if (!current(context)) return;
+        if (item.kind === 'task') {
+          setPaneTab('tasks');
+          flash([...$('tasks').children].find(card => card.taskId === item.id));
+        } else {
+          returnToChatOnNarrowScreen();
+          flash([...$('conversation').children].find(card => card.proposalId === item.id));
+        }
+      };
+      nodes.push(row);
+    }
+  }
+  $('activity').replaceChildren(...nodes);
+}
+function setPaneTab(tab) {
+  const tasks = tab === 'tasks';
+  $('tasks').classList[tasks ? 'remove' : 'add']('hide');
+  $('activity').classList[tasks ? 'add' : 'remove']('hide');
+  $('tab-tasks').classList[tasks ? 'add' : 'remove']('on');
+  $('tab-activity').classList[tasks ? 'remove' : 'add']('on');
+  $('tab-tasks').setAttribute('aria-selected', String(tasks));
+  $('tab-activity').setAttribute('aria-selected', String(!tasks));
+}
+
 // Panels opened from a task card live in the task pane, next to the tasks.
 const taskPane = () => $('tasks');
 
@@ -376,6 +466,8 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   else renderTurn();
   $('conversation').replaceChildren();
   $('tasks').replaceChildren();
+  $('activity').replaceChildren();
+  lastActivity = [];
   $('task-count').textContent = '';
   $('rail-badge').textContent = '';
   detailDrafts.clear();
@@ -503,12 +595,14 @@ async function readSnapshot(context) {
   const abort = () => reads.abort();
   context.signal.addEventListener('abort', abort, { once: true });
   const timeout = setTimeout(abort, READ_TIMEOUT);
-  let messages, proposals, tasks;
+  let messages, proposals, tasks, activity;
   try {
-    [messages, proposals, tasks] = await Promise.all([
+    [messages, proposals, tasks, activity] = await Promise.all([
       api({ ...context, signal: reads.signal }, 'messages'),
       api({ ...context, signal: reads.signal }, 'proposals'),
-      api({ ...context, signal: reads.signal }, 'tasks')
+      api({ ...context, signal: reads.signal }, 'tasks'),
+      // Index is derived and optional: a failure must not block the conversation.
+      api({ ...context, signal: reads.signal }, 'activity').catch(() => null)
     ]);
   } finally {
     clearTimeout(timeout);
@@ -520,7 +614,9 @@ async function readSnapshot(context) {
   draftUI.update(context, tasks);
   timelineUI.update(context, tasks);
   updateTaskContext(context, tasks);
-  const nextSnapshot = JSON.stringify([messages, proposals, tasks]);
+  if (!Array.isArray(activity)) activity = lastActivity;
+  lastActivity = activity;
+  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
   $('last-refresh').textContent = (changed ? '有新的更新 · ' : '')
@@ -535,6 +631,16 @@ async function readSnapshot(context) {
   const stream = $('conversation');
   const scroller = $('scroller');
   const stick = !(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 160);
+  const separators = new Map();
+  let previous = null;
+  messages.forEach((message, index) => {
+    const at = parseUtc(message.created_at);
+    if (!at) return;
+    if (!previous || at - previous >= 10 * 60 * 1000 || at.toDateString() !== previous.toDateString()) {
+      separators.set(index, el('div', 'time-sep', formatWhen(at)));
+    }
+    previous = at;
+  });
   const entries = messages.map(message => {
     const notice = message.role !== 'user' && /^\[(系统提示|MOCK)/.test(message.content);
     const bubble = el('article', 'msg ' + (message.role === 'user' ? 'msg-user' : notice ? 'msg-notice' : 'msg-assistant')
@@ -563,20 +669,37 @@ async function readSnapshot(context) {
     if (!after.has(anchor)) after.set(anchor, []);
     after.get(anchor).push(proposal);
   }
-  // Unmatched settled proposals predate the loaded history window (only recent
-  // messages are returned); unmatched pending ones stay last, near the composer,
-  // as an open to-do.
-  const ordered = trailing.filter(proposal => proposal.status !== 'pending').map(proposal => ({ proposal }));
+  // Unmatched proposals (e.g. /delegate, or a source message outside the loaded
+  // window) are placed by their own timestamp; undated legacy ones predate the
+  // window and go first. Nothing piles up at the bottom of the conversation.
+  const leading = [];
+  for (const proposal of trailing) {
+    const at = parseUtc(proposal.created_at);
+    let anchor = -1, anyDated = false;
+    if (at) messages.forEach((message, index) => {
+      const when = parseUtc(message.created_at);
+      if (when) { anyDated = true; if (when <= at) anchor = index; }
+    });
+    if (anchor >= 0) {
+      if (!after.has(anchor)) after.set(anchor, []);
+      after.get(anchor).push(proposal);
+    } else if (at && !anyDated && messages.length) {
+      if (!after.has(messages.length - 1)) after.set(messages.length - 1, []);
+      after.get(messages.length - 1).push(proposal);
+    } else leading.push(proposal);
+  }
+  const ordered = leading.map(proposal => ({ proposal }));
   entries.forEach((bubble, index) => {
+    if (separators.has(index)) ordered.push({ bubble: separators.get(index) });
     ordered.push({ bubble });
     for (const proposal of after.get(index) || []) ordered.push({ proposal });
   });
-  for (const proposal of trailing) if (proposal.status === 'pending') ordered.push({ proposal });
   entries.length = 0;
   for (const item of ordered) {
     if (item.bubble) { entries.push(item.bubble); continue; }
     const proposal = item.proposal;
     const element = el('article', 'card proposal' + (proposal.status === 'pending' ? '' : ' settled'));
+    element.proposalId = proposal.id;
     const head = el('header', 'card-head');
     head.append(el('span', 'card-kicker', '委派提案'), badge(PROPOSAL_STATUS, proposal.status));
     element.append(head, el('div', 'field', '接收人：' + proposal.owner), el('blockquote', 'summary-quote', proposal.summary));
@@ -652,6 +775,7 @@ async function readSnapshot(context) {
   timelineUI.append(taskCards);
   stream.replaceChildren(...entries);
   $('tasks').replaceChildren(...taskCards);
+  renderActivity(context, activity);
   $('task-count').textContent = tasks.length ? String(tasks.length) : '';
   // The rail badge counts tasks waiting on *this* user, not all tasks.
   const waiting = tasks.filter(task => (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
@@ -990,3 +1114,6 @@ $('text').oninput = () => {
   box.style.height = 'auto';
   box.style.height = Math.min(box.scrollHeight, 200) + 'px';
 };
+$('tab-activity').onclick = () => setPaneTab('activity');
+$('tab-tasks').onclick = () => setPaneTab('tasks');
+setPaneTab('activity');

@@ -43,7 +43,7 @@ fn hub_rejects_future_version_without_wal_schema_session_or_recovery_writes() {
     let db = Connection::open(&file.0).unwrap();
     db.execute_batch(
         "PRAGMA journal_mode=DELETE;
-         INSERT INTO messages VALUES (1,'alice','user','pending message','pending');
+         INSERT INTO messages(id,owner,role,content,status) VALUES (1,'alice','user','pending message','pending');
          INSERT INTO chat_turns(owner,request_id,message,runtime_profile,status,message_id)
              VALUES ('alice','receipt','pending message','{}','pending',1);
          PRAGMA user_version=999;",
@@ -78,9 +78,9 @@ fn repeated_hub_opens_recover_new_pending_work_without_remigrating() {
         .unwrap();
     assert!(version > 0);
     db.execute_batch(
-        "INSERT INTO messages VALUES (1,'alice','user','tracked','pending');
-         INSERT INTO messages VALUES (2,'alice','user','untracked','pending');
-         INSERT INTO messages VALUES (3,'alice','assistant','finished','complete');
+        "INSERT INTO messages(id,owner,role,content,status) VALUES (1,'alice','user','tracked','pending');
+         INSERT INTO messages(id,owner,role,content,status) VALUES (2,'alice','user','untracked','pending');
+         INSERT INTO messages(id,owner,role,content,status) VALUES (3,'alice','assistant','finished','complete');
          INSERT INTO chat_turns(owner,request_id,message,runtime_profile,status,message_id)
              VALUES ('alice','receipt','tracked','{}','pending',1);",
     )
