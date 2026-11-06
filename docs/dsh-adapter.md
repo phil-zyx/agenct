@@ -9,7 +9,25 @@ The Rust Hub is the identity, authorization and conversation authority. This ada
 - Twenty-four offline boundary/lifecycle tests use a fake SDK, process, or guarded local storage. **No provider credentials were used, no model request was sent, and the actual runtime plus patch has not yet passed a live integration test.** This is a foundation, not a claim that real DSH chat is already operating.
 - There is no mock model response inside this service. Missing credentials, version mismatch, timeouts, and runtime failures fail explicitly. Rust's separately selected mock runtime is for UI/Hub development only.
 
-## Local configuration
+## Launcher-managed mode (recommended)
+
+```sh
+export DEEPSEEK_API_KEY=...   # your own key, from your secret manager; never commit it
+python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private" --runtime dsh
+# For an existing state directory:
+python3 scripts/private-staging.py set-runtime --state-dir "$HOME/agenct-private" --runtime dsh
+```
+
+The launcher then:
+
+- creates a private venv at `<state-dir>/dsh-venv` once and installs exactly the pinned packages in `requirements.txt` (re-checked by installed version on every start, without network access when they already match);
+- generates a fresh internal adapter token and a free loopback port **per launch**; neither is written to disk;
+- starts the adapter with `python -I` and an allowlisted environment (`PATH`, `LANG`, `LC_ALL`, `DEEPSEEK_API_KEY`, optional `AGENCT_DSH_MODEL`) in its own process group, waits until it listens, then starts the Hub with the adapter URL/token and **without** the provider key;
+- stops both on Ctrl+C, and stops the Hub with a non-zero exit if the adapter dies.
+
+Without `DEEPSEEK_API_KEY` it refuses before building or installing anything; it never falls back to mock. `set-runtime --runtime mock` returns to the offline demo. If both `AGENCT_ADAPTER_URL` and `AGENCT_ADAPTER_TOKEN` are already set in the shell, the launcher keeps the original operator-managed mode below and does not start an adapter.
+
+## Manual configuration
 
 Requires Python 3.11+ and Linux/macOS (process-group termination). In the repository root:
 

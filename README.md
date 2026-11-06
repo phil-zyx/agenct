@@ -60,7 +60,7 @@ npm run check
 python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private"
 ```
 
-按提示打开地址，用状态目录中 `credentials.json` 里的令牌登录。开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。生产登录、PostgreSQL、可运行的 Agent 军团、可信代码执行和完整远端交付链路尚未完成。不要将开发服务器暴露到公网。
+按提示打开地址，用状态目录中 `credentials.json` 里的令牌登录。要接真实模型（DeepSeek，需自备 key 并产生费用），先 `export DEEPSEEK_API_KEY=...`，再执行 `set-runtime --runtime dsh` 后 `start`，见 [DSH 适配器](docs/dsh-adapter.md#launcher-managed-mode-recommended)。开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。生产登录、PostgreSQL、可运行的 Agent 军团、可信代码执行和完整远端交付链路尚未完成。不要将开发服务器暴露到公网。
 
 Windows + WSL2 用户可按 [本地拉取与启动指南](docs/wsl-local.md)准备环境，先用现有 launcher 运行 mock；附带只读检查命令，不代表已通过 WSL、浏览器或真实模型验收。
 

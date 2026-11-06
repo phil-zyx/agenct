@@ -68,6 +68,16 @@ python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private"
 
 ## 4. DSH / Claude Code 的边界
 
-先验收 mock 聊天和人工委派，再单独考虑 [DSH 适配器](dsh-adapter.md)。DSH 需要 Python 3.11+、单独的 SDK/runtime、提供商凭据和付费调用许可；本指南不收集密钥、不安装 SDK、不启用真实模式，也不证明账户余额、运行时工具限制或 WSL 架构兼容性。已审查的 Linux x86_64 依赖不能推断适用于 ARM64，实际平台支持须单独核实。不得把不确定的调用自动重试，mock 也不会静默接替真实模式。
+先验收 mock 聊天和人工委派，再切换到真实模型。需要 Python 3.11+ 和你自己的 DeepSeek API key（真实调用，会产生费用，聊天内容会发送给提供商）：
+
+```sh
+export DEEPSEEK_API_KEY=...   # 从你的密钥管理工具读取，不要写进仓库或聊天
+python3 scripts/private-staging.py set-runtime --state-dir "$HOME/agenct-private" --runtime dsh
+python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private"
+```
+
+首次会在状态目录内创建 `dsh-venv` 并安装 `adapters/dsh/requirements.txt` 中固定版本的 SDK；之后由 launcher 同时管理 adapter 和 Hub，Ctrl+C 一起停止。key 只传给 adapter 进程，不会写入磁盘，也不会传给 Hub。没有 key 时直接拒绝启动，不会退回 mock。改回离线演示：`set-runtime --runtime mock`。详见 [DSH 适配器](dsh-adapter.md#launcher-managed-mode-recommended)。
+
+launcher 不证明账户余额、运行时工具限制或 WSL 架构兼容性。已审查的 Linux x86_64 依赖不能推断适用于 ARM64，实际平台支持须单独核实。不得把不确定的调用自动重试，mock 也不会静默接替真实模式。
 
 Claude Code 目前没有接入此 Hub 的可运行执行链路。你可以按它自己的说明在 WSL 中独立使用，但安装或登录它不会让本项目自动编码、上传分支、创建 MR 或运行 Agent 团队。
