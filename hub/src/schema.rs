@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 9;
+pub(super) const VERSION: i64 = 10;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -46,6 +46,20 @@ BEGIN SELECT RAISE(ABORT,'deliveries are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS deliveries_no_delete BEFORE DELETE ON deliveries
 BEGIN SELECT RAISE(ABORT,'deliveries are append-only'); END;";
 
+/// Requester-written material attached at confirmation. One immutable row per task;
+/// never derived from model output or private chat.
+pub(super) const TASK_DETAILS_SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS task_details (
+    task_id TEXT PRIMARY KEY REFERENCES tasks(id), author TEXT NOT NULL,
+    content TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+CREATE TRIGGER IF NOT EXISTS task_details_no_replace BEFORE INSERT ON task_details
+WHEN EXISTS (SELECT 1 FROM task_details WHERE task_id=NEW.task_id)
+BEGIN SELECT RAISE(ABORT,'task details are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS task_details_no_update BEFORE UPDATE ON task_details
+BEGIN SELECT RAISE(ABORT,'task details are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS task_details_no_delete BEFORE DELETE ON task_details
+BEGIN SELECT RAISE(ABORT,'task details are immutable'); END;";
+
 const TABLES: &[&str] = &[
     "sessions",
     "messages",
@@ -57,6 +71,7 @@ const TABLES: &[&str] = &[
     "worker_jobs",
     "deliveries",
     "draft_turns",
+    "task_details",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -140,6 +155,7 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
         7 => db.execute_batch(crate::drafts::SCHEMA)?,
         8 => crate::audit_migration::upgrade(db)?,
         9 => add_column(db, "events", "reason", "TEXT")?,
+        10 => db.execute_batch(TASK_DETAILS_SCHEMA)?,
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -212,6 +228,7 @@ fn introduced(table: &str, column: &str) -> i64 {
     match (table, column) {
         ("deliveries", _) => 5,
         ("draft_turns", _) => 7,
+        ("task_details", _) => 10,
         ("events", "from_status" | "to_status" | "task_revision") => 6,
         ("events", "revision" | "delivery_seq") => 8,
         ("events", "reason") => 9,
@@ -283,6 +300,7 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
             if version == 0
                 || (table == "deliveries" && version < 5)
                 || (table == "draft_turns" && version < 7)
+                || (table == "task_details" && version < 10)
             {
                 continue;
             }
@@ -317,14 +335,15 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         if extra_partial_keys != 0 {
             return Err(format!("unsupported Hub partial unique key on {table}").into());
         }
-        if table == "draft_turns" {
+        // Tables with foreign keys or table CHECKs are compared by their full owned definition.
+        if table == "draft_turns" || table == "task_details" {
             let wanted_sql: String = expected.query_row(
-                "SELECT sql FROM sqlite_schema WHERE name='draft_turns'",
-                [],
+                "SELECT sql FROM sqlite_schema WHERE name=?1",
+                [table],
                 |r| r.get(0),
             )?;
             if normalized(&sql) != normalized(&wanted_sql) {
-                return Err("incompatible draft receipt schema".into());
+                return Err(format!("incompatible Hub schema for {table}").into());
             }
             continue;
         }
@@ -410,6 +429,9 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         ("draft_turns_no_delete", 7),
         ("draft_turns_binding_immutable", 7),
         ("draft_turns_terminal", 7),
+        ("task_details_no_replace", 10),
+        ("task_details_no_update", 10),
+        ("task_details_no_delete", 10),
     ] {
         let actual: Option<String> = db
             .query_row(

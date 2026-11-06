@@ -251,6 +251,40 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.deepEqual(JSON.parse(call.options.body), { action: 'confirm', expected_revision: 0 });
   });
 
+  await test('optional shared material is sent only on confirm and kept across re-render', async () => {
+    const f = fixture();
+    await f.login('alice');
+    let proposal = f.$('conversation').children[0];
+    const box = proposal.children[3].children[0];
+    box.value = '  README 正文\n第二行  '; box.oninput();
+    await f.tick();
+    proposal = f.$('conversation').children[0];
+    assert.equal(proposal.children[3].children[0].value, '  README 正文\n第二行  ');
+    await proposal.children[1].onclick();
+    const call = f.calls.find(call => call.url === '/api/proposals/1/actions');
+    assert.deepEqual(JSON.parse(call.options.body), { action: 'confirm', details: '  README 正文\n第二行  ', expected_revision: 0 });
+  });
+
+  await test('oversized shared material is refused before any request', async () => {
+    const f = fixture();
+    await f.login('alice');
+    const proposal = f.$('conversation').children[0];
+    proposal.children[3].children[0].value = '材'.repeat(4001);
+    await proposal.children[1].onclick();
+    assert(!f.calls.some(call => call.url === '/api/proposals/1/actions'));
+    assert.match(f.$('status').textContent, /12000 字节/);
+  });
+
+  await test('reject never sends shared material', async () => {
+    const f = fixture();
+    await f.login('alice');
+    const proposal = f.$('conversation').children[0];
+    proposal.children[3].children[0].value = 'should stay private';
+    await proposal.children[2].onclick();
+    const call = f.calls.find(call => call.url === '/api/proposals/1/actions');
+    assert.deepEqual(Object.keys(JSON.parse(call.options.body)).sort(), ['action', 'expected_revision']);
+  });
+
   await test('reject proposal without creating a task', async () => {
     const f = fixture();
     await f.login('alice');

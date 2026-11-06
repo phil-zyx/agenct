@@ -31,9 +31,9 @@ Changing cancellation rights is out of scope; drafting follows the current polic
 ## Privacy and context
 
 The Hub constructs one immutable task snapshot in the reservation transaction:
-`task_id`, `revision`, `requester`, `owner`, `status`, `summary`, `result`,
-`summary_truncated`, `result_truncated`. Reuse the selected-task context validator
-and bounds (2,000 JSON-encoded bytes of summary, 5,000 of result, 8,192 total),
+`task_id`, `revision`, `requester`, `owner`, `status`, `summary`, `result`, `details`,
+`summary_truncated`, `result_truncated`, `details_truncated`. Reuse the selected-task context validator
+and bounds (2,000 JSON-encoded bytes of summary, 12,000 of requester-shared details, 5,000 of result, 20,480 total),
 with the wire field names used there (`id` for task ID). Require `working` when
 reserving. A prior result is included only if it is already shared task data.
 Truncation is explicit in the prompt and review UI; this is not a promise that the

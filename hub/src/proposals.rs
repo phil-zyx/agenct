@@ -140,7 +140,11 @@ pub(super) async fn proposals(
 pub(super) struct ProposalAction {
     action: String,
     expected_revision: i64,
+    /// Optional requester-written material shared with the recipient on confirm.
+    #[serde(default)]
+    details: Option<String>,
 }
+pub(super) const MAX_DETAILS: usize = 12000;
 pub(super) async fn proposal_action(
     State(h): State<Hub>,
     headers: HeaderMap,
@@ -150,6 +154,14 @@ pub(super) async fn proposal_action(
     let user = h.identity(&headers)?;
     if a.action != "confirm" && a.action != "reject" {
         return Err(invalid("unsupported proposal action"));
+    }
+    if a.details
+        .as_ref()
+        .is_some_and(|d| a.action != "confirm" || d.trim().is_empty() || d.len() > MAX_DETAILS)
+    {
+        return Err(invalid(
+            "shared details must be 1..12000 bytes and only accompany confirm",
+        ));
     }
     let mut db = h.db()?;
     let tx = db.transaction()?;
@@ -181,12 +193,34 @@ pub(super) async fn proposal_action(
         unreachable!("proposal decision")
     };
     if replay {
+        if a.action == "confirm" {
+            // A replay must restate exactly what was shared; never silently differ.
+            let stored: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM task_details WHERE task_id=?1",
+                    [&p.task_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if stored != a.details {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "proposal already confirmed with different shared details",
+                ));
+            }
+        }
         return Ok(Json(p));
     }
     let task_id = if a.action == "confirm" {
         let task = Uuid::new_v4().to_string();
         tx.execute("INSERT INTO tasks(id,requester,owner,summary,status) VALUES (?1,?2,?3,?4,'awaiting_owner')",params![task,user,p.owner,p.summary])?;
         crate::audit::record(&tx, &task, &user, "created", None, "awaiting_owner", 0)?;
+        if let Some(details) = &a.details {
+            tx.execute(
+                "INSERT INTO task_details(task_id,author,content) VALUES (?1,?2,?3)",
+                params![task, user, details],
+            )?;
+        }
         Some(task)
     } else {
         None
