@@ -19,7 +19,8 @@ def request():
 def task_context():
     return {"id": "task-1", "revision": 1, "requester": "alice", "owner": "bob",
             "status": "working", "summary": "Review the result", "result": None,
-            "summary_truncated": False, "result_truncated": False}
+            "details": None, "summary_truncated": False, "result_truncated": False,
+            "details_truncated": False}
 
 
 def next_turn(turn, result):

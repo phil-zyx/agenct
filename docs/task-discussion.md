@@ -26,16 +26,17 @@ certify that; receipt recovery must remain conservative for them.
 Under the same task-mutation mutex as receipt reservation, the Hub copies:
 
 - Task ID, revision, requester, owner and status.
-- A bounded excerpt of the shared summary and, when present, delivered result.
-- Explicit `summary_truncated` and `result_truncated` flags.
+- A bounded excerpt of the shared summary and, when present, the requester's shared
+  material (`details`, see below) and the delivered result.
+- Explicit `summary_truncated`, `result_truncated` and `details_truncated` flags.
 
 Only this snapshot is sent to the configured adapter. No event history, other task,
 private proposal, credential, execution grant or another participant's private chat
 is included. The caller's own existing private chat history remains part of the
 turn as before. Snapshot strings are data, not instructions or authorization.
 
-Summary excerpts are capped at 2,000 JSON-encoded bytes and result excerpts at
-5,000, preserving Unicode characters. The full snapshot is capped at 8,192 compact
+Summary excerpts are capped at 2,000 JSON-encoded bytes, details at 12,000 and result
+excerpts at 5,000, preserving Unicode characters. The full snapshot is capped at 20,480 compact
 UTF-8 JSON bytes. Escaped control characters count toward these limits. Empty or
 partial excerpts are possible for unusual input; the truncation flags must not be
 interpreted as a complete delivery. Existing total adapter payload bounds remain.
@@ -80,3 +81,14 @@ selection and stale/identity/recovery flows. These tests do not establish live
 model accuracy, prompt-injection resistance in general, real DSH tool isolation,
 real-browser acceptance or production deployment. A model answer is not verified
 execution evidence and never changes the authoritative task record.
+
+## Shared material (`details`)
+
+When confirming a proposal, the requester may attach up to 12,000 bytes of material
+the recipient needs (for example the document under review). It is sent as
+`details` in `POST /api/proposals/{id}/actions` with `"action":"confirm"` only, is
+stored once and immutably in `task_details`, and is visible only to the two
+participants (`GET /api/tasks`, `GET /api/tasks/{id}`). It is never derived from
+model output or private chat. A confirm replay must restate identical details, or
+the Hub returns 409. Task discussion and recipient drafting receive it inside the
+same bounded snapshot; it remains untrusted quoted data, not instructions.
