@@ -128,7 +128,7 @@ A draft turn requires all existing session/history/message fields, plus validate
 
 `Draft a delivery for this task for owner review.`
 
-Use the existing task snapshot schema and 8,192-byte compact JSON bound. The Hub
+Use the existing task snapshot schema (including `details`/`details_truncated`) and 20,480-byte compact JSON bound. The Hub
 must supply only the explicitly reviewed task snapshot, not either participant's
 private chat, and generate a separate request-local session UUID. The adapter
 validates UUID syntax but cannot establish ownership, receipt uniqueness, or that

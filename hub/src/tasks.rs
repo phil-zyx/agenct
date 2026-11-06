@@ -5,7 +5,7 @@ use axum::{
     http::HeaderMap,
     Json,
 };
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize)]
@@ -29,12 +29,37 @@ pub(super) fn row_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
         revision: r.get(6)?,
     })
 }
-pub(super) async fn tasks(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<Task>>> {
+/// Requester-written shared material, visible to both participants only.
+pub(super) fn details(db: &rusqlite::Connection, task: &str) -> Result<Option<serde_json::Value>> {
+    Ok(db
+        .query_row(
+            "SELECT author,content,created_at FROM task_details WHERE task_id=?1",
+            [task],
+            |r| {
+                Ok(serde_json::json!({"author":r.get::<_,String>(0)?,
+                    "content":r.get::<_,String>(1)?,"created_at":r.get::<_,String>(2)?}))
+            },
+        )
+        .optional()?)
+}
+pub(super) async fn tasks(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>> {
     let id = h.identity(&headers)?;
     let db = h.db()?;
     let mut q=db.prepare("SELECT id,requester,owner,summary,status,result,revision FROM tasks WHERE requester=?1 OR owner=?1 ORDER BY rowid DESC")?;
-    let rows = q.query_map([id], row_task)?;
-    Ok(Json(rows.collect::<std::result::Result<Vec<_>, _>>()?))
+    let rows = q
+        .query_map([id], row_task)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut out = Vec::with_capacity(rows.len());
+    for task in rows {
+        let shared = details(&db, &task.id)?;
+        let mut value = serde_json::to_value(&task).map_err(|_| invalid("invalid task"))?;
+        value["details"] = shared.map_or(serde_json::Value::Null, |d| d["content"].clone());
+        out.push(value);
+    }
+    Ok(Json(out))
 }
 pub(super) async fn task_detail(
     State(h): State<Hub>,
@@ -63,7 +88,7 @@ pub(super) async fn task_detail(
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(Json(
-        serde_json::json!({"task":t,"events":events,"deliveries":deliveries,"audit":audit,
+        serde_json::json!({"task":t,"details":details(&db,&task)?,"events":events,"deliveries":deliveries,"audit":audit,
             "timeline":{"events":events,"deliveries":deliveries,"audit":audit}}),
     ))
 }
