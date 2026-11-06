@@ -70,7 +70,7 @@ The Rust chat UI now supports sender-private delegation proposals, explicit shar
 - [DSH 适配器](docs/dsh-adapter.md)实现 SDK 路径与严格结构化提案校验；真实模型调用和有效工具限制仍未验收。无静默 mock 回退。
 - [Worker 队列](docs/worker-contract.md)已提供按任务授权的 HTTP 入队、查询和取消接口，须由接单人明确确认；仅记录排队，不授权执行。接单人的聊天任务卡可查看、确认入队和取消，尚无运行中的消费者。[发布合同与 GitLab 传输](docs/gitlab-transport.md)仍是库。内置执行器因证据可信性问题保持禁用；没有自动编码、分支上传、真实 MR 或 CI 验收结果。
 - [私有试运行工具](docs/private-staging.md)可准备本地服务和 SSH 访问；未部署远端实例，没有已验证的云端后端 URL。不要公开开发令牌或将服务暴露到公网。
-- 确认委派是聊天 UI 的流程保证；兼容 `POST /api/tasks` 接口可直接创建任务且不幂等。普通模型聊天超时也不能自动重试。
+- Hub 的任务创建必须经过发送者私有提案和明确确认，服务端校验所确认的修订与不可变内容。旧 `POST /api/tasks` 已移除，返回 405；`GET /api/tasks` 保留。普通模型聊天超时也不能自动重试。
 
 完整边界见 [架构](docs/architecture.md)，后续验收门槛见 [路线图](docs/roadmap.md)。离线/API/模拟 DOM 测试通过不等于真实浏览器、提供商或沙箱验收。
 

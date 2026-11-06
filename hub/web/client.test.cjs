@@ -107,6 +107,9 @@ function fixture(auth = { enabled: false }, settings = {}) {
       if (url.endsWith('/proposals') && options.method === 'GET') {
         data = [{ id: 1, owner: 'bob', summary: 'Exact <summary>\nsecond line', status: 'pending', revision }];
       }
+      if (url === '/api/tasks' && options.method === 'POST') {
+        return { ok: false, status: 405, json: async () => ({ error: 'Method Not Allowed' }) };
+      }
       if (url === '/api/tasks' && options.method === 'GET') data = tasks;
       if (url === '/api/messages' && options.method === 'POST') {
         const requestId = JSON.parse(options.body).request_id;
