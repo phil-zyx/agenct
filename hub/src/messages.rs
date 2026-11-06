@@ -2,7 +2,10 @@
 use crate::{
     chat_turns, invalid, profiles,
     proposals::save_proposal_tx,
-    runtime::{adapter_failed, DshRuntime, MockRuntime, Runtime as RuntimeBackend, TurnRequest},
+    runtime::{
+        adapter_failed, AdapterReply, DshRuntime, MockRuntime, Runtime as RuntimeBackend,
+        TurnRequest,
+    },
     task_context, Hub, Result, Runtime,
 };
 use axum::{extract::State, http::HeaderMap, Json};
@@ -117,10 +120,20 @@ pub(super) async fn execute_chat(
         _ => unreachable!("mock reply is generated above"),
     }
     .and_then(|answer| {
-        if answer.valid(h.runtime.label(), id, &input.message, |owner| {
-            h.directory.can_delegate(id, owner)
-        }) {
+        let participant = |owner: &str| h.directory.can_delegate(id, owner);
+        if answer.valid(h.runtime.label(), id, &input.message, participant) {
             Ok(answer)
+        } else if let (Runtime::Dsh { .. }, Some(owner)) = (
+            &h.runtime,
+            answer.unavailable_recipient(h.runtime.label(), id, &input.message, participant),
+        ) {
+            // Never show the model's reply here: it presumes a draft exists. Replace it
+            // with a Hub-authored correction and persist no proposal.
+            Ok(AdapterReply {
+                reply: recipient_notice(h, id, owner),
+                backend: answer.backend.clone(),
+                proposal: None,
+            })
         } else if matches!(h.runtime, Runtime::Mock) {
             Err(invalid(
                 "select another configured participant and bounded summary",
@@ -182,4 +195,34 @@ pub(super) async fn execute_chat(
             Err(error)
         }
     }
+}
+
+/// Hub-authored, deterministic text. The model-supplied name is shown only when it
+/// is a plain identifier; anything else is summarized generically.
+fn recipient_notice(h: &Hub, requester: &str, owner: &str) -> String {
+    let mut others: Vec<&str> = h
+        .directory
+        .ids()
+        .map(String::as_str)
+        .filter(|id| *id != requester)
+        .collect();
+    others.sort_unstable();
+    let reason = if owner == requester {
+        "不能把任务委派给你自己".to_string()
+    } else if !owner.is_empty()
+        && owner.len() <= 64
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        format!("「{owner}」不是本系统的参与者")
+    } else {
+        "指定的接收人不是本系统的参与者".to_string()
+    };
+    let options = if others.is_empty() {
+        "当前没有其他可委派的参与者".to_string()
+    } else {
+        format!("可委派给：{}", others.join("、"))
+    };
+    format!("[系统提示] 未生成委派提案：{reason}。{options}。没有创建任何提案或任务，请重新说明接收人。")
 }
