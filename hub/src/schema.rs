@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 10;
+pub(super) const VERSION: i64 = 11;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -156,6 +156,12 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
         8 => crate::audit_migration::upgrade(db)?,
         9 => add_column(db, "events", "reason", "TEXT")?,
         10 => db.execute_batch(TASK_DETAILS_SCHEMA)?,
+        // SQLite cannot ADD COLUMN with a CURRENT_TIMESTAMP default; writers set it.
+        // Existing rows stay NULL ("earlier"); nothing is inferred.
+        11 => {
+            add_column(db, "messages", "created_at", "TEXT")?;
+            add_column(db, "proposals", "created_at", "TEXT")?;
+        }
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -229,6 +235,7 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("deliveries", _) => 5,
         ("draft_turns", _) => 7,
         ("task_details", _) => 10,
+        ("messages" | "proposals", "created_at") => 11,
         ("events", "from_status" | "to_status" | "task_revision") => 6,
         ("events", "revision" | "delivery_seq") => 8,
         ("events", "reason") => 9,
@@ -751,7 +758,7 @@ mod tests {
         db.execute_batch(LEGACY).unwrap();
         migrate(&mut db).unwrap();
         db.execute_batch(
-            "INSERT INTO messages VALUES (2,'bob','user','untracked','pending');
+            "INSERT INTO messages(id,owner,role,content,status) VALUES (2,'bob','user','untracked','pending');
             CREATE TRIGGER fail_recovery BEFORE UPDATE ON chat_turns
             BEGIN SELECT RAISE(ABORT,'injected recovery failure'); END;",
         )
