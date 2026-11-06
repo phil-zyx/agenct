@@ -59,9 +59,10 @@
         <p id="turn-status" role="status" aria-live="polite"></p>
         <div class="row"><button type="button" id="check-turn" class="primary">核对发送状态</button><button type="button" id="new-turn">开始新尝试</button></div>
       </section>
-      <section id="task-context" class="sheet context hide" aria-label="下一条聊天的任务上下文">
-        <div class="sheet-head"><strong>正在讨论任务</strong><button type="button" id="clear-task-context" class="text-btn">清除</button></div>
-        <p id="task-context-details" role="status" aria-live="polite"></p>
+      <section id="task-context" class="chip-bar hide" aria-label="下一条聊天的任务上下文">
+        <span class="chip-label">讨论</span><span id="task-context-title" class="chip-title"></span>
+        <details class="chip-more"><summary>附带内容</summary><p id="task-context-details" role="status" aria-live="polite"></p></details>
+        <button type="button" id="clear-task-context" class="icon-btn small" title="清除讨论的任务" aria-label="清除讨论的任务"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </section>
       <section id="role-picker" class="sheet hide" aria-label="启用的个人角色">
         <p class="muted">每次只选一个角色，沿用本账号私聊历史。不创建团队、分离会话或增加工具权限。</p>
