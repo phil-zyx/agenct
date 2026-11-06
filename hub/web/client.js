@@ -288,6 +288,13 @@ function restoreTurn(context) {
 function renderTurn() {
   const waiting = !!pendingTurn;
   $('turn-recovery').classList[waiting ? 'remove' : 'add']('hide');
+  // A normal in-flight send is not a problem to resolve: show a typing bubble and
+  // keep the recovery sheet visually quiet (its text stays available to tests and
+  // assistive tech). It becomes prominent only once the outcome is unresolved.
+  const inFlight = waiting && busy.has('send');
+  $('turn-recovery').classList[inFlight ? 'add' : 'remove']('quiet');
+  $('typing').classList[inFlight ? 'remove' : 'add']('hide');
+  if (inFlight) { const scroller = $('scroller'); scroller.scrollTop = scroller.scrollHeight; }
   $('turn-status').textContent = waiting
     ? (pendingTurn.status === 'sending' ? '正在发送，尚未收到服务端回执。'
       : pendingTurn.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。'
@@ -533,7 +540,39 @@ async function readSnapshot(context) {
     if (message.status !== 'complete') bubble.append(el('div', 'msg-status', MESSAGE_STATUS[message.status] || message.status));
     return bubble;
   });
+  // Place each proposal right after the exchange that produced it. A proposal's
+  // summary is an exact excerpt of its source user message; unmatched proposals
+  // (e.g. /delegate or test-double turns) stay at the end as before.
+  // Each proposal claims the latest unclaimed matching user message, so the
+  // result does not depend on the order the proposals API returns.
+  const after = new Map();
+  const claimed = new Set();
+  const trailing = [];
   for (const proposal of proposals) {
+    let at = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (!claimed.has(i) && messages[i].role === 'user' && typeof proposal.summary === 'string' && proposal.summary
+          && String(messages[i].content).includes(proposal.summary)) { at = i; break; }
+    }
+    if (at === -1) { trailing.push(proposal); continue; }
+    claimed.add(at);
+    const anchor = messages[at + 1] && messages[at + 1].role !== 'user' ? at + 1 : at;
+    if (!after.has(anchor)) after.set(anchor, []);
+    after.get(anchor).push(proposal);
+  }
+  // Unmatched settled proposals predate the loaded history window (only recent
+  // messages are returned); unmatched pending ones stay last, near the composer,
+  // as an open to-do.
+  const ordered = trailing.filter(proposal => proposal.status !== 'pending').map(proposal => ({ proposal }));
+  entries.forEach((bubble, index) => {
+    ordered.push({ bubble });
+    for (const proposal of after.get(index) || []) ordered.push({ proposal });
+  });
+  for (const proposal of trailing) if (proposal.status === 'pending') ordered.push({ proposal });
+  entries.length = 0;
+  for (const item of ordered) {
+    if (item.bubble) { entries.push(item.bubble); continue; }
+    const proposal = item.proposal;
     const element = el('article', 'card proposal' + (proposal.status === 'pending' ? '' : ' settled'));
     const head = el('header', 'card-head');
     head.append(el('span', 'card-kicker', '委派提案'), badge(PROPOSAL_STATUS, proposal.status));
