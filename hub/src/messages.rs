@@ -1,13 +1,11 @@
 //! Owner-private message history and mock/adapter chat execution.
 use crate::{
-    chat_turns, invalid, profiles, proposals::save_proposal_tx, task_context, Error, Hub, Result,
-    Runtime,
+    chat_turns, invalid, profiles,
+    proposals::save_proposal_tx,
+    runtime::{adapter_failed, DshRuntime, MockRuntime, Runtime as RuntimeBackend, TurnRequest},
+    task_context, Hub, Result, Runtime,
 };
-use axum::{
-    extract::State,
-    http::{HeaderMap, StatusCode},
-    Json,
-};
+use axum::{extract::State, http::HeaderMap, Json};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
@@ -45,36 +43,6 @@ pub(super) struct ChatInput {
     pub(super) request_id: Option<String>,
     pub(super) selected_task: Option<task_context::Selection>,
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdapterProposal {
-    owner: String,
-    summary: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AdapterReply {
-    reply: String,
-    backend: String,
-    // Explicit null means no proposal; an omitted field is a protocol error.
-    #[serde(deserialize_with = "Option::deserialize")]
-    proposal: Option<AdapterProposal>,
-}
-impl AdapterReply {
-    fn valid(&self, h: &Hub, requester: &str, message: &str) -> bool {
-        self.backend == "dsh"
-            && !self.reply.trim().is_empty()
-            && self.reply.len() <= 32000
-            && self.proposal.as_ref().is_none_or(|p| {
-                p.owner != requester
-                    && h.gates.contains_key(&p.owner)
-                    && message.contains(&p.owner)
-                    && !p.summary.trim().is_empty()
-                    && p.summary.len() <= 4000
-                    && message.contains(&p.summary)
-            })
-    }
-}
 pub(super) async fn execute_chat(
     h: &Hub,
     id: &str,
@@ -82,43 +50,34 @@ pub(super) async fn execute_chat(
     runtime_profile: profiles::RuntimeProfile,
     task_context: Option<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
-    // The deterministic mock is a test double, not a model or DSH tool call.
-    // No prior/private history is consulted when constructing the shared summary.
-    if matches!(h.runtime, Runtime::Mock) {
-        if let Some((owner, summary)) = mock_delegation(&input.message) {
-            if owner == id
-                || !h.gates.contains_key(&owner)
-                || summary.trim().is_empty()
-                || summary.len() > 4000
-            {
-                return Err(invalid(
-                    "select another configured participant and bounded summary",
-                ));
-            }
-            let mut db = h.db()?;
-            let tx = db.transaction()?;
-            let proposal = save_proposal_tx(
-                &tx,
-                id,
-                &owner,
-                &summary,
-                input.request_id.as_deref(),
-                &input.message,
-            )?;
-            let mut response = serde_json::json!({
-                "reply":"[MOCK · deterministic test double] 请检查接收人和将共享的任务内容，再明确确认。确认前对方不会收到任务。",
-                "backend":"mock", "proposal":proposal, "runtime_profile":runtime_profile,"task_context":task_context
-            });
-            chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
-            tx.commit()?;
-            return Ok(Json(response));
-        }
-    }
     let prior: Vec<_> = history(h, id)?
         .into_iter()
         .filter(|m| m.status == "complete")
         .collect();
-    let (message_id, session_id) = {
+    // Generate the test double's reply without DB access. Preserve its established
+    // proposal-only history behavior, but never bypass shared output validation.
+    let mock_answer = if matches!(h.runtime, Runtime::Mock) {
+        Some(
+            MockRuntime
+                .turn(TurnRequest {
+                    kind: crate::runtime::TurnKind::Chat,
+                    message: &input.message,
+                    session_id: "",
+                    history: &prior,
+                    profile: &runtime_profile,
+                    task_context: task_context.as_ref(),
+                })
+                .await?,
+        )
+    } else {
+        None
+    };
+    let proposal_only = mock_answer
+        .as_ref()
+        .is_some_and(|answer| answer.proposal.is_some());
+    let (message_id, session_id) = if proposal_only {
+        (None, String::new())
+    } else {
         let mut db = h.db()?;
         let tx = db.transaction()?;
         tx.execute(
@@ -135,24 +94,41 @@ pub(super) async fn execute_chat(
             |r| r.get(0),
         )?;
         tx.commit()?;
-        (message_id, sid)
+        (Some(message_id), sid)
     };
-    let answer=match &h.runtime {
-        Runtime::Mock=>Ok(AdapterReply {reply: format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。",prior.len()), backend:"mock".into(), proposal:None}),
-        Runtime::Dsh{url,token}=>{
-            let mut payload=serde_json::json!({"session_id":session_id,"runtime_profile":runtime_profile,"history":prior.iter().map(|m|serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),"message":input.message});
-            if let Some(context) = &task_context {payload["task_context"] = context.clone();}
-            while payload["history"].as_array().unwrap().len()>100 || serde_json::to_vec(&payload).unwrap().len()>60000 {
-                if payload["history"].as_array().unwrap().is_empty() {return Err(invalid("chat context exceeds adapter limit"));}
-                payload["history"].as_array_mut().unwrap().remove(0);
+    let answer = match (&h.runtime, mock_answer) {
+        (Runtime::Mock, Some(answer)) => Ok(answer),
+        (Runtime::Dsh { url, token }, _) => {
+            DshRuntime {
+                client: &h.client,
+                url,
+                token,
             }
-            let response=h.client.post(url).bearer_auth(token).json(&payload).send().await;
-            match response {
-                Ok(r) if r.status().is_success()=>match r.json::<AdapterReply>().await {Ok(r) if r.valid(h,id,&input.message)=>Ok(r),_=>Err(())},
-                _=>Err(()),
-            }
+            .turn(TurnRequest {
+                kind: crate::runtime::TurnKind::Chat,
+                message: &input.message,
+                session_id: &session_id,
+                history: &prior,
+                profile: &runtime_profile,
+                task_context: task_context.as_ref(),
+            })
+            .await
         }
-    };
+        _ => unreachable!("mock reply is generated above"),
+    }
+    .and_then(|answer| {
+        if answer.valid(h.runtime.label(), id, &input.message, |owner| {
+            h.directory.can_delegate(id, owner)
+        }) {
+            Ok(answer)
+        } else if matches!(h.runtime, Runtime::Mock) {
+            Err(invalid(
+                "select another configured participant and bounded summary",
+            ))
+        } else {
+            Err(adapter_failed())
+        }
+    });
     let mut db = h.db()?;
     let tx = db.transaction()?;
     match answer {
@@ -189,37 +165,21 @@ pub(super) async fn execute_chat(
                 "UPDATE messages SET status='complete' WHERE id=?1",
                 [message_id],
             )?;
-            tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
+            if message_id.is_some() {
+                tx.execute("INSERT INTO messages(owner,role,content,status) VALUES (?1,'assistant',?2,'complete')",params![id,reply])?;
+            }
             let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context});
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
             Ok(Json(response))
         }
-        Err(()) => {
+        Err(error) => {
             tx.execute(
                 "UPDATE messages SET status='failed' WHERE id=?1",
                 [message_id],
             )?;
             tx.commit()?;
-            Err(Error(
-                StatusCode::BAD_GATEWAY,
-                "adapter failed; no mock fallback; task actions were not executed",
-            ))
+            Err(error)
         }
     }
-}
-
-// Intentionally bounded recognition for the offline acceptance fixture. DSH replies
-// remain plain text and have no task-creation authority.
-fn mock_delegation(message: &str) -> Option<(String, String)> {
-    let text = message.trim();
-    let rest = text
-        .strip_prefix("请让 ")
-        .or_else(|| text.strip_prefix("ask "))?;
-    let (owner, rest) = rest.split_once(' ')?;
-    let summary = rest
-        .strip_prefix("帮我")
-        .map(str::trim_start)
-        .or_else(|| rest.strip_prefix("to "))?;
-    Some((owner.to_owned(), summary.to_owned()))
 }
