@@ -236,10 +236,16 @@ impl Provider {
         let mut hub = Hub::open(crate::Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             database: ":memory:".into(),
-            users: vec![crate::UserConfig {
-                id: "alice".into(),
-                token_sha256: hash("test-bearer"),
-            }],
+            users: vec![
+                crate::UserConfig {
+                    id: "alice".into(),
+                    token_sha256: hash("test-bearer"),
+                },
+                crate::UserConfig {
+                    id: "bob".into(),
+                    token_sha256: hash("test-bob-bearer"),
+                },
+            ],
             runtime: crate::Runtime::Mock,
         })
         .unwrap();
@@ -424,6 +430,109 @@ async fn browser_tls_login_session_guards_and_logout() {
         .unwrap()
         .identity(&headers)
         .is_err());
+}
+async fn post_json(hub: &Hub, path: &str, mut headers: HeaderMap, body: Value) -> Response {
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    *request.headers_mut() = headers;
+    crate::app(hub.clone()).oneshot(request).await.unwrap()
+}
+#[tokio::test]
+async fn browser_task_creation_requires_guarded_proposal_confirmation() {
+    let provider = Provider::new();
+    let hub = provider.hub();
+    let (headers, query) = provider.begin(&hub).await;
+    let response = callback(State(hub.clone()), headers, Query(query))
+        .await
+        .unwrap();
+    let mut headers = session_headers(&response);
+    let response = request(&hub, "GET", "/auth/session", headers.clone()).await;
+    let session: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    headers.insert(
+        "x-csrf-token",
+        session["csrf_token"].as_str().unwrap().parse().unwrap(),
+    );
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://hub.example.test"),
+    );
+    let body = json!({"owner":"bob","summary":"exact browser-confirmed summary"});
+    let response = post_json(&hub, "/api/proposals", headers.clone(), body.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let proposal: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    let action = format!(
+        "/api/proposals/{}/actions",
+        proposal["id"].as_str().unwrap()
+    );
+    let counts = || {
+        hub.db()
+            .unwrap()
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM tasks), (SELECT COUNT(*) FROM events)",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap()
+    };
+    assert_eq!(counts(), (0, 0));
+    for path in ["/api/proposals", action.as_str(), "/api/tasks"] {
+        for (name, status) in [
+            (header::COOKIE, StatusCode::UNAUTHORIZED),
+            (
+                axum::http::HeaderName::from_static("x-csrf-token"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (header::ORIGIN, StatusCode::FORBIDDEN),
+        ] {
+            let mut missing = headers.clone();
+            missing.remove(name);
+            assert_eq!(
+                post_json(&hub, path, missing, body.clone()).await.status(),
+                status
+            );
+        }
+        let mut wrong = headers.clone();
+        wrong.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert_eq!(
+            post_json(&hub, path, wrong, body.clone()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        post_json(&hub, "/api/tasks", headers.clone(), body)
+            .await
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(counts(), (0, 0));
+    for _ in 0..2 {
+        let response = post_json(
+            &hub,
+            &action,
+            headers.clone(),
+            json!({"action":"confirm","expected_revision":proposal["revision"]}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let confirmed: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+        assert_eq!(confirmed["status"], "confirmed");
+        assert_eq!(confirmed["owner"], proposal["owner"]);
+        assert_eq!(confirmed["summary"], proposal["summary"]);
+        assert_eq!(counts(), (1, 1));
+    }
 }
 #[tokio::test]
 async fn browser_rejects_state_binding_replay_and_invalid_pkce() {

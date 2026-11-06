@@ -1,39 +1,7 @@
 //! Durable, owner-private at-most-once dispatch receipts, not provider exactly-once execution.
+use super::messages::{execute_chat, ChatInput};
 use super::*;
 
-pub(super) fn initialize(db: &Connection) -> rusqlite::Result<()> {
-    db.execute_batch(
-        "BEGIN IMMEDIATE; CREATE TABLE IF NOT EXISTS chat_turns (
-        owner TEXT NOT NULL, request_id TEXT NOT NULL, message TEXT NOT NULL,
-        agent_id TEXT, expected_profile_revision INTEGER, runtime_profile TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('pending','uncertain','complete')),
-        response TEXT, message_id INTEGER, selected_task TEXT, task_context TEXT, PRIMARY KEY(owner,request_id));
-        UPDATE messages SET status='uncertain' WHERE status IN ('pending','interrupted') AND id IN (SELECT message_id FROM chat_turns WHERE status='pending');
-        UPDATE chat_turns SET status='uncertain' WHERE status='pending'; COMMIT;",
-    )?;
-    let columns = db
-        .prepare("PRAGMA table_info(chat_turns)")?
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    for column in ["selected_task", "task_context"] {
-        if !columns.iter().any(|name| name == column) {
-            db.execute(
-                &format!("ALTER TABLE chat_turns ADD COLUMN {column} TEXT"),
-                [],
-            )?;
-        }
-    }
-    if !columns
-        .iter()
-        .any(|name| name == "expected_profile_revision")
-    {
-        db.execute(
-            "ALTER TABLE chat_turns ADD COLUMN expected_profile_revision INTEGER",
-            [],
-        )?;
-    }
-    Ok(())
-}
 fn mark_uncertain(db: &mut Connection, owner: &str, key: &str) -> Result<()> {
     let tx = db.transaction()?;
     tx.execute("UPDATE messages SET status='uncertain' WHERE owner=?1 AND status IN ('pending','failed','interrupted') AND id IN (SELECT message_id FROM chat_turns WHERE owner=?1 AND request_id=?2 AND status='pending')", params![owner,key])?;
@@ -225,6 +193,7 @@ pub(super) async fn status(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::history;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]

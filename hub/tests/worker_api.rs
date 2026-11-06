@@ -53,17 +53,44 @@ async fn request(
     (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
 }
 
+async fn confirmed_task(app: &Router, who: &str, owner: &str, summary: &str) -> Value {
+    let (status, proposal) = request(
+        app,
+        who,
+        "POST",
+        "/api/proposals",
+        json!({"owner":owner,"summary":summary}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, confirmed) = request(
+        app,
+        who,
+        "POST",
+        &format!(
+            "/api/proposals/{}/actions",
+            proposal["id"].as_str().unwrap()
+        ),
+        json!({"action":"confirm","expected_revision":proposal["revision"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, detail) = request(
+        app,
+        who,
+        "GET",
+        &format!("/api/tasks/{}", confirmed["task_id"].as_str().unwrap()),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    detail["task"].clone()
+}
+
 async fn setup_queue() -> (Router, String, Value) {
     let hub = Hub::open(config(":memory:")).unwrap();
     let a = app(hub.clone());
-    let (_, t) = request(
-        &a,
-        "alice",
-        "POST",
-        "/api/tasks",
-        json!({"owner":"bob","summary":"prepare code"}),
-    )
-    .await;
+    let t = confirmed_task(&a, "alice", "bob", "prepare code").await;
     let id = t["id"].as_str().unwrap().to_owned();
     let scope = agenct_hub::worker_api::Scope {
         task_id: id.clone(),
@@ -229,14 +256,7 @@ async fn task_state_changes_atomically_revoke_queue_and_scope() {
 #[tokio::test]
 async fn admission_disabled_without_operator_scope() {
     let a = app(Hub::open(config(":memory:")).unwrap());
-    let (_, t) = request(
-        &a,
-        "alice",
-        "POST",
-        "/api/tasks",
-        json!({"owner":"bob","summary":"work"}),
-    )
-    .await;
+    let t = confirmed_task(&a, "alice", "bob", "work").await;
     let id = t["id"].as_str().unwrap();
     accept(&a, id).await;
     let path = format!("/api/tasks/{id}/worker");
@@ -269,14 +289,7 @@ async fn queued_receipt_persists_after_restart_without_execution() {
     let p = path.to_str().unwrap();
     let hub = Hub::open(config(p)).unwrap();
     let a = app(hub.clone());
-    let (_, t) = request(
-        &a,
-        "alice",
-        "POST",
-        "/api/tasks",
-        json!({"owner":"bob","summary":"work"}),
-    )
-    .await;
+    let t = confirmed_task(&a, "alice", "bob", "work").await;
     let id = t["id"].as_str().unwrap();
     accept(&a, id).await;
     let scope = agenct_hub::worker_api::Scope {
