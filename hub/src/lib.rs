@@ -117,7 +117,8 @@ pub struct Hub {
     db: Arc<Mutex<Connection>>,
     users: Arc<HashMap<String, String>>,
     directory: Arc<directory::Directory>,
-    gates: Arc<HashMap<String, tokio::sync::Mutex<()>>>,
+    // Arc per user so a turn can own its gate across a detached dispatch task.
+    gates: Arc<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     runtime: Runtime,
     client: reqwest::Client,
 }
@@ -162,7 +163,7 @@ impl Hub {
         let directory = directory::Directory::new(config.users.iter().map(|user| user.id.clone()))?;
         let gates = directory
             .ids()
-            .map(|id| (id.clone(), tokio::sync::Mutex::new(())))
+            .map(|id| (id.clone(), Arc::new(tokio::sync::Mutex::new(()))))
             .collect();
         let mut users = HashMap::new();
         for user in config.users {
