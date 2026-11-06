@@ -81,7 +81,13 @@ class LocalDoctorTests(unittest.TestCase):
             self.assertTrue(any(level == "FAIL" and message.startswith(name + " is missing") for level, message in results))
         for name in ("git", "node", "npm"):
             self.assertTrue(any(level == "WARN" and message.startswith(name + " is missing") for level, message in results))
-        self.assertTrue(any(level == "FAIL" and message.startswith("Release Hub") for level, message in results))
+        self.assertTrue(any(level == "NOTE" and message.startswith("Release Hub not built yet") for level, message in results))
+        self.assertFalse(any(level == "FAIL" and message.startswith("Release Hub") for level, message in results))
+
+    def test_fresh_clone_without_build_is_not_a_blocker(self):
+        self.binary.unlink()
+        results = self.inspect()
+        self.assertFalse(any(level == "FAIL" for level, _ in results))
 
     def test_prebuilt_does_not_require_cargo_to_be_present(self):
         results = self.inspect(which=lambda name: None)
