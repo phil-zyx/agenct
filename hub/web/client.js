@@ -69,9 +69,29 @@ function article(text) {
   return element;
 }
 
-const timelineUI = createTaskTimelineUI({ api, current, article, conversation: () => $('conversation') });
+function el(tag, className, text) {
+  const element = document.createElement(tag);
+  if (className) element.className = className;
+  if (text !== undefined) element.textContent = text;
+  return element;
+}
+const TASK_STATUS = {
+  awaiting_owner: ['待接单', 'wait'], working: ['进行中', 'work'], ready_for_acceptance: ['待验收', 'review'],
+  completed: ['已完成', 'done'], canceled: ['已取消', 'muted']
+};
+const PROPOSAL_STATUS = { pending: ['待你确认', 'review'], confirmed: ['已确认', 'done'], rejected: ['已拒绝', 'muted'] };
+const MESSAGE_STATUS = { pending: '发送中…', failed: '发送失败', interrupted: '已中断', uncertain: '结果未知，可核对发送状态' };
+const ACTION_STYLE = { confirm: 'primary', accept: 'primary', deliver: 'primary', approve: 'primary', cancel: 'danger' };
+function badge(table, value) {
+  const [label, tone] = table[value] || [value, 'muted'];
+  return el('span', 'badge badge-' + tone, label);
+}
+// Panels opened from a task card live in the task pane, next to the tasks.
+const taskPane = () => $('tasks');
 
-const draftUI = createDraftUI({ api, current, article, conversation: () => $('conversation') });
+const timelineUI = createTaskTimelineUI({ api, current, article, conversation: taskPane });
+
+const draftUI = createDraftUI({ api, current, article, conversation: taskPane });
 
 const profileUI = createProfileUI({ api, current, article, conversation: () => $('conversation'), status,
   onSaved: revision => {
@@ -170,7 +190,7 @@ $('clear-role').onclick = () => {
   status('已明确恢复默认管家；下一条普通聊天不指定其他角色。');
 };
 
-const workerUI = createWorkerUI({ api, current, article, conversation: () => $('conversation') });
+const workerUI = createWorkerUI({ api, current, article, conversation: taskPane });
 
 const taskSignature = task => JSON.stringify([
   task.id, task.revision, task.requester, task.owner, task.status, task.summary, task.result, task.details ?? null
@@ -346,6 +366,8 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   if (!preserveRecovery) forgetTurn();
   else renderTurn();
   $('conversation').replaceChildren();
+  $('tasks').replaceChildren();
+  $('task-count').textContent = '';
   detailDrafts.clear();
   $('identity').textContent = '';
   $('text').value = '';
@@ -358,7 +380,9 @@ function addActions(element, context, kind, item, actions) {
   const key = kind + ':' + item.id;
   const buttons = actions.map(([action, label]) => {
     const button = document.createElement('button');
+    button.type = 'button';
     button.textContent = label;
+    if (ACTION_STYLE[action]) button.className = ACTION_STYLE[action];
     button.disabled = busy.has(key);
     button.onclick = async () => {
       if (!current(context) || busy.has(key)) return;
@@ -497,28 +521,64 @@ async function readSnapshot(context) {
   renderedBusy = nextBusy;
   taskView++;
   discussionButtons = [];
-  const entries = messages.map(message => article(`${message.role} · ${message.status}\n${message.content}`));
+  const stream = $('conversation');
+  const stick = !(stream.scrollHeight - stream.scrollTop - stream.clientHeight > 120);
+  const entries = messages.map(message => {
+    const notice = message.role !== 'user' && /^\[(系统提示|MOCK)/.test(message.content);
+    const bubble = el('article', 'msg ' + (message.role === 'user' ? 'msg-user' : notice ? 'msg-notice' : 'msg-assistant')
+      + (message.status === 'failed' ? ' msg-failed' : ''));
+    bubble.append(el('div', 'msg-body', message.content));
+    if (message.status !== 'complete') bubble.append(el('div', 'msg-status', MESSAGE_STATUS[message.status] || message.status));
+    return bubble;
+  });
   for (const proposal of proposals) {
-    const element = article(`委派提案 · ${proposal.status}\n接收人：${proposal.owner}\n将共享的完整任务摘要（原文）：\n${proposal.summary}\n\n确认后，仅将所示接收人与任务摘要用于跨人委派；对方会看到发起人身份和任务记录，不会收到你的完整私聊。${proposal.task_id ? '\n任务编号：' + proposal.task_id : ''}`);
+    const element = el('article', 'card proposal' + (proposal.status === 'pending' ? '' : ' settled'));
+    const head = el('header', 'card-head');
+    head.append(el('span', 'card-kicker', '委派提案'), badge(PROPOSAL_STATUS, proposal.status));
+    element.append(head, el('div', 'field', '接收人：' + proposal.owner), el('blockquote', 'summary-quote', proposal.summary));
+    if (proposal.task_id) element.append(el('div', 'meta', '已创建任务 #' + String(proposal.task_id).slice(0, 8)));
     if (proposal.status === 'pending') {
-      element.append(article('尚未发送给对方，也未创建任务。请核对接收人及摘要后确认。'));
-      addActions(element, context, 'proposals', proposal, [['confirm', '确认共享并委派'], ['reject', '拒绝，不共享']]);
-      const label = document.createElement('label');
-      label.textContent = '附带共享材料（可选）：粘贴对方完成任务需要的内容，例如文档正文或需求说明。确认后会原样发给接收人，接收人的 Agent 起草时也会读取；请勿粘贴密钥或私密信息。';
-      const box = document.createElement('textarea');
-      box.rows = 4;
+      element.append(el('p', 'note', '尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材料，不会收到你的私聊。'));
+      const label = el('label', null, '附带共享材料（可选）· 会原样发给接收人，对方的 Agent 起草时也会读取；请勿粘贴密钥或私密信息。');
+      const box = el('textarea');
+      box.rows = 3;
       box.maxLength = MAX_DETAILS_BYTES;
+      box.placeholder = '粘贴对方完成任务需要的内容，例如文档正文或需求说明…';
       const key = 'proposals:' + proposal.id;
       box.value = detailDrafts.get(key) ?? '';
       box.oninput = () => detailDrafts.set(key, box.value);
       label.append(box);
-      element.append(label);
+      const actions = el('div', 'actions');
+      actions.detailsBox = box;
       element.detailsBox = box;
+      element.append(label, actions);
+      addActions(actions, context, 'proposals', proposal, [['confirm', '确认共享并委派'], ['reject', '拒绝，不共享']]);
     }
     entries.push(element);
   }
+  const taskCards = [];
   for (const task of tasks) {
-    const element = article(`任务 · ${task.status}\n任务编号：${task.id} · 版本：${task.revision}\n${task.requester} → ${task.owner}\n${task.summary}${task.details ? '\n共享材料：\n' + task.details : ''}${task.result ? '\n交付：' + task.result : ''}`);
+    const element = el('article', 'card task task-' + task.status);
+    element.taskId = task.id;
+    const head = el('header', 'card-head');
+    const mine = task.owner === context.user ? '我负责' : task.requester === context.user ? '我发起' : '';
+    head.append(badge(TASK_STATUS, task.status));
+    if (mine) head.append(el('span', 'badge badge-mine', mine));
+    const id = el('span', 'card-id', '#' + String(task.id).slice(0, 8));
+    id.title = '任务编号：' + task.id + ' · 版本：' + task.revision;
+    head.append(id);
+    element.append(head, el('h3', 'task-title', task.summary),
+      el('div', 'meta', `${task.requester} → ${task.owner} · 第 ${task.revision} 版`));
+    if (task.details) {
+      const material = el('details', 'material');
+      material.append(el('summary', null, '共享材料'), el('pre', null, task.details));
+      element.append(material);
+    }
+    if (task.result) {
+      const delivery = el('div', 'delivery');
+      delivery.append(el('span', 'delivery-label', '最新交付'), el('pre', null, task.result));
+      element.append(delivery);
+    }
     const actions = [];
     if (task.owner === context.user && task.status === 'awaiting_owner') actions.push(['accept', '接单']);
     if (task.owner === context.user && task.status === 'working') actions.push(['deliver', '提交人工交付']);
@@ -526,18 +586,24 @@ async function readSnapshot(context) {
     const canCancel = (task.requester === context.user && ['awaiting_owner', 'working', 'ready_for_acceptance'].includes(task.status))
       || (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status));
     if (canCancel) actions.push(['cancel', '取消任务']);
-    addActions(element, context, 'tasks', task, actions);
-    addDiscussion(element, context, task);
-    workerUI.attach(element, context, task);
-    draftUI.attach(element, context, task);
-    timelineUI.attach(element, context, task);
-    entries.push(element);
+    const actionRow = el('div', 'actions');
+    const tools = el('div', 'tools');
+    element.append(actionRow, tools);
+    addActions(actionRow, context, 'tasks', task, actions);
+    addDiscussion(tools, context, task);
+    workerUI.attach(tools, context, task);
+    draftUI.attach(tools, context, task);
+    timelineUI.attach(tools, context, task);
+    taskCards.push(element);
   }
   profileUI.append(entries);
-  workerUI.append(entries);
-  draftUI.append(entries);
-  timelineUI.append(entries);
-  $('conversation').replaceChildren(...entries);
+  workerUI.append(taskCards);
+  draftUI.append(taskCards);
+  timelineUI.append(taskCards);
+  stream.replaceChildren(...entries);
+  $('tasks').replaceChildren(...taskCards);
+  $('task-count').textContent = tasks.length ? String(tasks.length) : '';
+  if (stick) stream.scrollTop = stream.scrollHeight;
   renderTaskContext();
 
 }
@@ -549,7 +615,7 @@ async function enterRoom(context) {
   user = me.user;
   context.user = user;
   restoreTurn(context);
-  $('identity').textContent = `${user} 的管家 · 运行时 ${me.runtime} · 已验证身份`;
+  $('identity').textContent = `${user} 的管家 · ${me.runtime === 'dsh' ? '真实模型' : me.runtime === 'mock' ? '离线演示' : '运行时 ' + me.runtime} · 已验证身份`;
   $('login').classList.add('hide');
   $('room').classList.remove('hide');
   await refresh(context);
@@ -814,3 +880,11 @@ $('form').onsubmit = async event => {
 };
 
 void checkSession();
+
+// Enter sends, Shift+Enter inserts a newline. Never send while an IME is composing
+// (Chinese input confirms candidates with Enter).
+$('text').onkeydown = event => {
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  if (!$('send').disabled) $('form').requestSubmit?.();
+};
