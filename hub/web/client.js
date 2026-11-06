@@ -664,16 +664,31 @@ async function readSnapshot(context) {
     if (!after.has(anchor)) after.set(anchor, []);
     after.get(anchor).push(proposal);
   }
-  // Unmatched settled proposals predate the loaded history window (only recent
-  // messages are returned); unmatched pending ones stay last, near the composer,
-  // as an open to-do.
-  const ordered = trailing.filter(proposal => proposal.status !== 'pending').map(proposal => ({ proposal }));
+  // Unmatched proposals (e.g. /delegate, or a source message outside the loaded
+  // window) are placed by their own timestamp; undated legacy ones predate the
+  // window and go first. Nothing piles up at the bottom of the conversation.
+  const leading = [];
+  for (const proposal of trailing) {
+    const at = parseUtc(proposal.created_at);
+    let anchor = -1, anyDated = false;
+    if (at) messages.forEach((message, index) => {
+      const when = parseUtc(message.created_at);
+      if (when) { anyDated = true; if (when <= at) anchor = index; }
+    });
+    if (anchor >= 0) {
+      if (!after.has(anchor)) after.set(anchor, []);
+      after.get(anchor).push(proposal);
+    } else if (at && !anyDated && messages.length) {
+      if (!after.has(messages.length - 1)) after.set(messages.length - 1, []);
+      after.get(messages.length - 1).push(proposal);
+    } else leading.push(proposal);
+  }
+  const ordered = leading.map(proposal => ({ proposal }));
   entries.forEach((bubble, index) => {
     if (separators.has(index)) ordered.push({ bubble: separators.get(index) });
     ordered.push({ bubble });
     for (const proposal of after.get(index) || []) ordered.push({ proposal });
   });
-  for (const proposal of trailing) if (proposal.status === 'pending') ordered.push({ proposal });
   entries.length = 0;
   for (const item of ordered) {
     if (item.bubble) { entries.push(item.bubble); continue; }
