@@ -383,7 +383,9 @@ def validate_daemon_fixture(plan, observation):
     """Offline terminal schema only. No fixture result is accepted by the Rust executor."""
     validate_container_policy(plan, observation)
     state = observation.get('State', {})
-    if state.get('Status') != 'exited' or state.get('Running') is not False or type(state.get('ExitCode')) is not int or state.get('ExitCode') != 0 or state.get('OOMKilled') is not False or state.get('Error'):
+    memory_probe = plan.checker == '/opt/agenct-checks/memory'
+    expected_exit = 137 if memory_probe else 0
+    if state.get('Status') != 'exited' or state.get('Running') is not False or type(state.get('ExitCode')) is not int or state.get('ExitCode') != expected_exit or state.get('OOMKilled') is not memory_probe or state.get('Error'):
         raise Rejected('check did not exit successfully')
     return {'status': 'offline-fixture-only', 'snapshot_digest': plan.snapshot_digest,
             'commit': plan.commit, 'checker': plan.checker}

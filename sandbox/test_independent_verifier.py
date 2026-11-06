@@ -213,6 +213,22 @@ class PlanningTests(unittest.TestCase):
                 'State': {'Status': 'exited', 'Running': False, 'ExitCode': 0,
                           'OOMKilled': False, 'Error': ''}}
 
+    def test_memory_probe_requires_actual_oom_and_never_changes_normal_success(self):
+        plan = v.plan_check(self.snapshot, self.image, 'memory')
+        observed = self.observation()
+        observed['Config']['Entrypoint'] = [plan.checker]
+        with self.assertRaises(v.Rejected):
+            v.validate_daemon_fixture(plan, observed)
+        observed['State'].update(ExitCode=137, OOMKilled=True)
+        self.assertEqual(v.validate_daemon_fixture(plan, observed)['status'], 'offline-fixture-only')
+        for changes in ({'ExitCode': 0}, {'OOMKilled': False}, {'Running': True}):
+            changed = dict(observed, State=observed['State'] | changes)
+            with self.assertRaises(v.Rejected):
+                v.validate_daemon_fixture(plan, changed)
+        observed['Config']['Entrypoint'] = [self.plan.checker]
+        with self.assertRaises(v.Rejected):
+            v.validate_daemon_fixture(self.plan, observed)
+
     def test_observation_output_is_explicitly_offline_only(self):
         observed = v.validate_daemon_fixture(self.plan, self.observation())
         self.assertEqual(observed['status'], 'offline-fixture-only')
