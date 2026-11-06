@@ -19,42 +19,52 @@ cd "$HOME/src/agenct"
 python3 scripts/local-doctor.py --state-dir "$HOME/agenct-private"
 ```
 
-doctor 只检查 OS/WSL 标记、正在使用的 Python、PATH 中的工具、现有 release 文件/UI 资产和路径挂载信息。首次未构建时会报告缺少 release 文件，这是预期结果。它不执行发现的工具、不确认 Rust/Node 版本、不读取私有配置/令牌、不创建文件、不安装软件、不启动服务、不探测网络。WSL 版本和挂载识别只是启发式检查；未知情况需自己确认。退出码 `1` 表示发现阻碍项，`0` 也不代表运行时或安全验收通过。
+首次 clone 时 doctor 会提示 release 文件尚未构建（NOTE，不是阻碍项）；只有缺少 cargo/rustc 等真正阻碍时才返回 `1`。
 
-## 2. 构建并初始化一次
+doctor 只检查 OS/WSL 标记、正在使用的 Python、PATH 中的工具、现有 release 文件/UI 资产和路径挂载信息。它不执行发现的工具、不确认 Rust/Node 版本、不读取私有配置/令牌、不创建文件、不安装软件、不启动服务、不探测网络。WSL 版本和挂载识别只是启发式检查；未知情况需自己确认。退出码 `1` 表示发现阻碍项，`0` 也不代表运行时或安全验收通过。
+
+## 2. 一条命令启动
 
 launcher 会继承 shell 中的其他环境变量。若 doctor 提示存在 OIDC/browser/worker 配置，请先检查自己的 shell 设置，简单 mock 试用应移除 `AGENCT_OIDC_CONFIG_FILE`、`AGENCT_BROWSER_OIDC_CONFIG_FILE`、`AGENCT_WORKER_SCOPES_FILE` 的遗留设置；不要把环境变量内容或秘密贴到聊天/日志中。`runtime=mock` 并不保证这些额外配置已关闭。
 
 ```sh
-cargo build --locked --release --manifest-path hub/Cargo.toml
+python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private"
+```
+
+`start` 依次完成：状态目录不存在时初始化一次（生成 alice/bob 令牌，不会覆盖或轮换已有状态）→ `cargo build --locked --release`（已是最新时只需约 1 秒）→ 检查端口 → 启动。启动前会打印访问地址、登录用户列表和令牌文件位置；令牌本身不会打印。
+
+- 首次初始化时如果默认端口 8080 已被占用（例如本机 nginx），会自动选择 8081 起的空闲端口并打印出来。也可以用 `--port` 指定。
+- 已有状态目录的端口被占用时会拒绝启动并说明原因；此时浏览器在该端口看到的页面**不是**本 Hub。用 `set-port` 改端口，不影响令牌和数据：
+
+  ```sh
+  python3 scripts/private-staging.py set-port --state-dir "$HOME/agenct-private" --port 8090
+  ```
+- 同一状态目录的 Hub 已在运行时，再次 `start` 会提示使用已有窗口，而不是报端口错误。
+
+Cargo 首次构建会下载锁文件中的依赖，需网络和本机允许的构建环境。可选的离线检查（不是 WSL 浏览器或真实 DSH 验收）：
+
+```sh
 python3 -m unittest discover -s scripts -p 'test_*.py' -v
 npm test
 npm run check
-python3 scripts/local-doctor.py --state-dir "$HOME/agenct-private"
-
-# 仅首次执行。最终目录必须尚不存在；不会覆盖旧状态或轮换令牌。
-python3 scripts/private-staging.py init --state-dir "$HOME/agenct-private" --users alice bob
-python3 scripts/private-staging.py check --state-dir "$HOME/agenct-private"
-python3 scripts/private-staging.py run --state-dir "$HOME/agenct-private"
 ```
 
-Cargo 首次构建可能下载锁文件中的依赖，需网络和本机允许的构建环境。测试是离线配置/模拟 DOM 检查，不是 WSL 浏览器或真实 DSH 验收。现有 launcher 负责生成私有配置和凭据，doctor 不复制这套逻辑。`check` 应显示 `runtime=mock`，但它只校验配置，不证明服务正在运行。
+`init`、`check`、`run` 分步命令仍然可用，见 [私有试运行指南](private-staging.md)。
 
 ## 3. 登录与重启
 
-服务留在前台运行。在 Windows 浏览器尝试打开 `http://localhost:8080`；WSL2 通常支持 localhost 转发，但这里没有验证你的机器配置。若打不开，先检查 WSL 终端是否报错、服务是否仍在运行及本机 WSL 的 localhost 转发配置。**不要改成 `0.0.0.0`、开放防火墙或用公网隧道来绕过问题。** Hub 始终仅监听 loopback。
+服务留在前台运行。在 Windows 浏览器打开启动时打印的地址（默认 `http://localhost:8080`）；WSL2 通常支持 localhost 转发，但这里没有验证你的机器配置。若打不开，先检查 WSL 终端是否报错、服务是否仍在运行及本机 WSL 的 localhost 转发配置。**不要改成 `0.0.0.0`、开放防火墙或用公网隧道来绕过问题。** Hub 始终仅监听 loopback。
 
 用可信的本地私有编辑器打开 `$HOME/agenct-private/credentials.json`，取 Alice 的令牌填入登录表单。令牌不要放入 URL、截图、命令参数或提交到仓库。两人演示可用不同浏览器配置文件分别登录 Alice/Bob；只输入虚构测试内容。试用 `请让 bob 帮我检查公开文档`，检查私有提案、确认共享、接单和人工交付流程，见 [Hub 验收步骤](rust-hub.md#controlled-delegation-acceptance-offline-test-double)。
 
-按 `Ctrl+C` 停止。以后重启只需以下命令，**不要再次 init**：
+按 `Ctrl+C` 停止。以后重启使用同一条命令即可，它会复用已有状态、不会重新生成令牌：
 
 ```sh
 cd "$HOME/src/agenct"
-python3 scripts/private-staging.py check --state-dir "$HOME/agenct-private"
-python3 scripts/private-staging.py run --state-dir "$HOME/agenct-private"
+python3 scripts/private-staging.py start --state-dir "$HOME/agenct-private"
 ```
 
-更新前先停止 Hub、私下备份完整状态目录，并记下当前提交。运行 `git status --short` 检查本地改动，保留自己的工作，再执行 `git pull --ff-only`；不要为更新强制丢弃本地改动。更新后重新构建并运行上述检查。已有 release 文件不证明它与当前源码一致；数据库升级也不保证能回退。备份/恢复边界见 [私有试运行指南](private-staging.md#optional-service-operation)。
+更新前先停止 Hub、私下备份完整状态目录，并记下当前提交。运行 `git status --short` 检查本地改动，保留自己的工作，再执行 `git pull --ff-only`；不要为更新强制丢弃本地改动。更新后 `start` 会自动重新构建；单独使用 `run` 时，若源码比 release 文件新会给出警告。数据库升级也不保证能回退。备份/恢复边界见 [私有试运行指南](private-staging.md#optional-service-operation)。
 
 ## 4. DSH / Claude Code 的边界
 

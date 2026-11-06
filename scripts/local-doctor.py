@@ -97,8 +97,11 @@ def inspect_local(root, state, *, system, release, env, python_version, which, m
             add("FAIL" if required else "WARN", f"{name} is missing from PATH; needed for {purpose}.")
     if built:
         add("PASS", "Release Hub file is executable. Its source revision/compatibility were not verified; rebuild after pull.")
+    elif binary.exists() or binary.is_symlink():
+        add("FAIL", "Release Hub exists but is not an executable file. Rebuild: cargo build --locked --release --manifest-path hub/Cargo.toml")
     else:
-        add("FAIL", "Release Hub missing/not executable. Build: cargo build --locked --release --manifest-path hub/Cargo.toml")
+        # Expected on a fresh clone; missing cargo/rustc is reported separately as the real blocker.
+        add("NOTE", "Release Hub not built yet (expected on a fresh clone). `private-staging.py start` builds it.")
     if all((root / name).is_file() for name in ("hub/web/index.html", "hub/web/client.js", "scripts/private-staging.py")):
         add("PASS", "Launcher and Hub UI files are present.")
     else:
@@ -123,7 +126,7 @@ def inspect_local(root, state, *, system, release, env, python_version, which, m
     elif not state.parent.is_dir():
         add("FAIL", "State parent directory is missing. Choose an existing trusted private Linux directory.")
     else:
-        add("NOTE", "State path does not exist; initialize once with private-staging.py. Nothing was created.")
+        add("NOTE", "State path does not exist; `private-staging.py start` initializes it once. Nothing was created.")
     inherited = [name for name in ("AGENCT_OIDC_CONFIG_FILE", "AGENCT_BROWSER_OIDC_CONFIG_FILE", "AGENCT_WORKER_SCOPES_FILE") if name in env]
     if inherited:
         add("WARN", "Inherited optional OIDC/browser/worker configuration: " + ", ".join(inherited)

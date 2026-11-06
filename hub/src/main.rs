@@ -42,7 +42,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hub = hub.with_worker_scopes(serde_json::from_slice(&bytes)?)?;
         eprintln!("Worker queue admission configured; execution and publication remain disabled");
     }
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "Cannot start: {bind} is already in use by another program. Anything answering \
+                 there is not this Hub instance. Stop that program or choose another port \
+                 (AGENCT_BIND, or `python3 scripts/private-staging.py set-port`)."
+            );
+            std::process::exit(1);
+        }
+        Err(error) => return Err(error.into()),
+    };
     eprintln!("Agenct Hub listening at http://{bind}; runtime={mode}; loopback development only");
     axum::serve(listener, app(hub))
         .with_graceful_shutdown(async {
