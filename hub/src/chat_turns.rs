@@ -124,11 +124,12 @@ pub(super) async fn chat(
     if let Some(response) = replay(&*h.db()?, &id, &input)? {
         return Ok(Json(response));
     }
-    let _guard = h
+    let guard = h
         .gates
         .get(&id)
         .unwrap()
-        .try_lock()
+        .clone()
+        .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, "a turn is already running"))?;
     if let Some(response) = replay(&*h.db()?, &id, &input)? {
         return Ok(Json(response));
@@ -165,14 +166,36 @@ pub(super) async fn chat(
         }
         (runtime_profile, task_context)
     };
-    let result = execute_chat(&h, &id, &input, runtime_profile, task_context).await;
-    if result.is_err() {
-        // A timeout/error cannot prove the provider never acted. Never retry dispatch.
-        if let Some(key) = input.request_id.as_deref() {
-            mark_uncertain(&mut *h.db()?, &id, key)?;
+    // Dispatch in a detached task that owns the per-user gate. If the client
+    // disconnects (tab refresh, network drop), the single dispatch still runs to
+    // completion and its receipt is recorded, so a later status check returns the
+    // real outcome instead of a receipt stranded in `pending`. Still at most once.
+    let key = input.request_id.clone();
+    let (task_hub, task_id) = (h.clone(), id.clone());
+    let dispatch = tokio::spawn(async move {
+        let _guard = guard;
+        let result = execute_chat(&task_hub, &task_id, &input, runtime_profile, task_context).await;
+        if result.is_err() {
+            // A timeout/error cannot prove the provider never acted. Never retry dispatch.
+            if let Some(key) = input.request_id.as_deref() {
+                mark_uncertain(&mut *task_hub.db()?, &task_id, key)?;
+            }
+        }
+        result
+    });
+    match dispatch.await {
+        Ok(result) => result,
+        Err(_) => {
+            // Panicked dispatch: the outcome is unknown, never "not sent".
+            if let Some(key) = key.as_deref() {
+                mark_uncertain(&mut *h.db()?, &id, key)?;
+            }
+            Err(Error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "chat dispatch ended unexpectedly; outcome unknown",
+            ))
         }
     }
-    result
 }
 pub(super) async fn status(
     State(h): State<Hub>,
