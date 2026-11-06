@@ -17,3 +17,6 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo +stable build --locked --release --manifest-path hub/Cargo.toml
       - run: python3 scripts/smoke-private-staging.py
+      # Real Rust/Python HTTP boundary, deterministic fixture only. No SDK/key.
+      - name: Smoke Hub to Python adapter contract
+        run: python3 scripts/smoke-hub-adapter.py
