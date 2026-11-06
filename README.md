@@ -56,6 +56,8 @@ npm run check
 
 开始运行与局限见 [Rust Hub 指南](docs/rust-hub.md)。生产登录、PostgreSQL、可运行的 Agent 军团、可信代码执行和完整远端交付链路尚未完成。不要将开发服务器暴露到公网。
 
+Windows + WSL2 用户可按 [本地拉取与启动指南](docs/wsl-local.md)准备环境，先用现有 launcher 运行 mock；附带只读检查命令，不代表已通过 WSL、浏览器或真实模型验收。
+
 
 ### Controlled delegation demo
 
