@@ -24,6 +24,9 @@ Versions are ordered:
 9. Add nullable `events.reason`. Existing rows remain NULL, including old
    cancellations; new user-confirmed cancellation writes its shared reason
    atomically with the task transition and worker revocation.
+10. Add `task_details`: optional requester-written shared material attached when a
+   proposal is confirmed. One immutable row per task (insert/replace, update and
+   delete are blocked by triggers). Existing tasks have none; nothing is inferred.
 
 All pending steps, including their version markers, run in one immediate
 transaction. Any migration or validation error rolls the whole upgrade back, so a

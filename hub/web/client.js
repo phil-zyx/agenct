@@ -5,6 +5,7 @@ let turnStorageAvailable = true;
 let selectedAgent = null, roleGeneration = 0, roleRead = null, roleButtons = [];
 let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
 const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
+const detailDrafts = new Map(); // Unsent shared-material text survives poll re-renders.
 let pollTimer = null, pollDelay = 5000, refreshFlight = null, snapshot = '', renderedBusy = '';
 const POLL_INTERVAL = 5000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000, CHAT_SEND_TIMEOUT = 90000;
 const busy = new Set();
@@ -172,8 +173,9 @@ $('clear-role').onclick = () => {
 const workerUI = createWorkerUI({ api, current, article, conversation: () => $('conversation') });
 
 const taskSignature = task => JSON.stringify([
-  task.id, task.revision, task.requester, task.owner, task.status, task.summary, task.result
+  task.id, task.revision, task.requester, task.owner, task.status, task.summary, task.result, task.details ?? null
 ]);
+const MAX_DETAILS_BYTES = 12000;
 
 function renderTaskContext() {
   const task = pendingTurn?.selectedTask || selectedTask;
@@ -184,8 +186,10 @@ function renderTaskContext() {
       : task.invalidated ? '所选任务已变更或不再可见，此选择已失效。请重新选择任务，或清除后再发送。'
         : '仅用于下一条普通聊天；选择本身不会发送消息。')
       + `\n任务编号：${task.id}\n版本：${task.revision}\n${task.requester} → ${task.owner} · ${task.status}`
-      + '\n上下文范围：仅此任务的参与人、状态、共享摘要和交付结果；服务端核实后提供，长文本可能截断。不包含其他任务或完整私聊，不授权任何任务操作或执行。'
-      + `\n共享摘要：\n${task.summary}\n交付结果：\n${task.result ?? '尚无交付结果'}`
+      + '\n上下文范围：仅此任务的参与人、状态、共享摘要、共享材料和交付结果；服务端核实后提供，长文本可能截断。不包含其他任务或完整私聊，不授权任何任务操作或执行。'
+      + `\n共享摘要：\n${task.summary}`
+      + (task.details ? `\n共享材料：\n${task.details}` : '')
+      + `\n交付结果：\n${task.result ?? '尚无交付结果'}`
     : '';
   $('clear-task-context').disabled = !selectedTask || locked;
   discussionButtons.forEach(button => { button.disabled = locked; });
@@ -298,6 +302,7 @@ async function completeTurn(context, response) {
     ? `\n本次任务上下文：${task.id} · 版本 ${task.revision}。`
       + (task.summary_truncated ? '共享摘要已截断。' : '')
       + (task.result_truncated ? '交付结果已截断。' : '')
+      + (task.details_truncated ? '共享材料已截断。' : '')
     : '';
   forgetTurn();
   if (text !== null && $('text').value.trim() === text) $('text').value = '';
@@ -341,6 +346,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   if (!preserveRecovery) forgetTurn();
   else renderTurn();
   $('conversation').replaceChildren();
+  detailDrafts.clear();
   $('identity').textContent = '';
   $('text').value = '';
   $('send').disabled = false;
@@ -356,7 +362,16 @@ function addActions(element, context, kind, item, actions) {
     button.disabled = busy.has(key);
     button.onclick = async () => {
       if (!current(context) || busy.has(key)) return;
-      let result, reason;
+      let result, reason, details;
+      if (kind === 'proposals' && action === 'confirm') {
+        const entered = element.detailsBox?.value ?? '';
+        if (entered.trim()) {
+          if (new TextEncoder().encode(entered).length > MAX_DETAILS_BYTES) {
+            status('共享材料最多 12000 字节（约 4000 个汉字）。尚未确认。'); return;
+          }
+          details = entered;
+        }
+      }
       if (action === 'deliver') {
         result = prompt('填写并确认人工交付结果（不会执行任何代码；确认后对方可见）', draftUI.reviewedText(item));
         if (!result || !current(context)) return;
@@ -372,11 +387,12 @@ function addActions(element, context, kind, item, actions) {
       status('');
       try {
         await api(context, kind + '/' + encodeURIComponent(item.id) + '/actions', 'POST', {
-          action, result, ...(reason === undefined ? {} : { reason }), expected_revision: item.revision
+          action, result, ...(reason === undefined ? {} : { reason }),
+          ...(details === undefined ? {} : { details }), expected_revision: item.revision
         });
         if (!current(context)) return;
         status(kind === 'proposals'
-          ? (action === 'confirm' ? '已确认共享摘要并创建任务。' : '已拒绝提案，未创建任务。')
+          ? (action === 'confirm' ? (details ? '已确认共享摘要和共享材料，并创建任务。' : '已确认共享摘要并创建任务。') : '已拒绝提案，未创建任务。')
           : '任务状态已更新。');
       } catch (error) {
         if (current(context)) status(error.message + '。请刷新核对服务端状态后再操作。');
@@ -487,11 +503,22 @@ async function readSnapshot(context) {
     if (proposal.status === 'pending') {
       element.append(article('尚未发送给对方，也未创建任务。请核对接收人及摘要后确认。'));
       addActions(element, context, 'proposals', proposal, [['confirm', '确认共享并委派'], ['reject', '拒绝，不共享']]);
+      const label = document.createElement('label');
+      label.textContent = '附带共享材料（可选）：粘贴对方完成任务需要的内容，例如文档正文或需求说明。确认后会原样发给接收人，接收人的 Agent 起草时也会读取；请勿粘贴密钥或私密信息。';
+      const box = document.createElement('textarea');
+      box.rows = 4;
+      box.maxLength = MAX_DETAILS_BYTES;
+      const key = 'proposals:' + proposal.id;
+      box.value = detailDrafts.get(key) ?? '';
+      box.oninput = () => detailDrafts.set(key, box.value);
+      label.append(box);
+      element.append(label);
+      element.detailsBox = box;
     }
     entries.push(element);
   }
   for (const task of tasks) {
-    const element = article(`任务 · ${task.status}\n任务编号：${task.id} · 版本：${task.revision}\n${task.requester} → ${task.owner}\n${task.summary}${task.result ? '\n交付：' + task.result : ''}`);
+    const element = article(`任务 · ${task.status}\n任务编号：${task.id} · 版本：${task.revision}\n${task.requester} → ${task.owner}\n${task.summary}${task.details ? '\n共享材料：\n' + task.details : ''}${task.result ? '\n交付：' + task.result : ''}`);
     const actions = [];
     if (task.owner === context.user && task.status === 'awaiting_owner') actions.push(['accept', '接单']);
     if (task.owner === context.user && task.status === 'working') actions.push(['deliver', '提交人工交付']);

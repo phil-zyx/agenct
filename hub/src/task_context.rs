@@ -3,6 +3,8 @@ use super::tasks::row_task;
 use super::*;
 pub(super) const STALE: &str = "selected task changed; refresh and select it again";
 pub(super) const UNAVAILABLE: &str = "selected task is not available for discussion";
+/// Must match the adapter's MAX_TASK_CONTEXT_BYTES.
+pub(super) const MAX_CONTEXT_BYTES: usize = 20480;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -79,10 +81,25 @@ pub(super) fn capture(
         }
         None => (None, false),
     };
+    let stored: Option<String> = db
+        .query_row(
+            "SELECT content FROM task_details WHERE task_id=?1",
+            [&task.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let (details, details_truncated) = match &stored {
+        Some(value) => {
+            let (text, cut) = excerpt(value, 12000);
+            (Some(text), cut)
+        }
+        None => (None, false),
+    };
     let context = serde_json::json!({"id":task.id,"revision":task.revision,"requester":task.requester,
         "owner":task.owner,"status":task.status,"summary":summary,"result":result,
-        "summary_truncated":summary_truncated,"result_truncated":result_truncated});
-    if context.to_string().len() > 8192 {
+        "details":details,"summary_truncated":summary_truncated,"result_truncated":result_truncated,
+        "details_truncated":details_truncated});
+    if context.to_string().len() > MAX_CONTEXT_BYTES {
         return Err(invalid("selected task context exceeds limit"));
     }
     Ok(Some(context))

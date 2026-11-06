@@ -17,7 +17,8 @@ def draft():
             "runtime_profile": {"revision": 2, "agent_id": "writer", "role": "writer", "model_ref": "server-default"},
             "task_context": {"id": "task-1", "revision": 3, "requester": "alice", "owner": "bob",
                              "status": "working", "summary": "Draft release notes", "result": None,
-                             "summary_truncated": False, "result_truncated": False}}
+                             "details": None, "summary_truncated": False, "result_truncated": False,
+                             "details_truncated": False}}
 
 
 class DraftDeliveryTests(unittest.TestCase):
