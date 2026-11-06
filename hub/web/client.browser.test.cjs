@@ -131,7 +131,9 @@ async function settled(f) {
       assert(await f.page.locator('#status').evaluate(el => {
         const r = el.getBoundingClientRect(); return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
       }), 'Task error toast must not be covered by the mobile drawer');
-      await f.page.locator('#status').click();
+      assert.equal(await f.page.locator('#status').evaluate(el => getComputedStyle(el).animationName), 'none', 'critical error must not expire');
+      await f.page.locator('#status').focus(); await f.page.keyboard.press('Escape');
+      assert.equal(await f.page.locator('#status').textContent(), '');
       await discussButtons(f).click();
       assert.equal(await f.page.locator('.task-pane').isVisible(), false);
       assert.equal(await f.page.locator('#text').evaluate(el => el === document.activeElement), true);
@@ -280,6 +282,8 @@ async function settled(f) {
       assert.equal(f.posts().length, 0, 'Invalid selection must block even direct form submission');
       assert.equal(await f.page.locator('#task-context').isVisible(), true);
       assert((await f.page.locator('#task-context-details').textContent()).includes('失效'));
+      assert.match(await f.page.locator('#task-context-status').ariaSnapshot(), /已失效/);
+      assert.equal(await f.page.locator('.chip-more').getAttribute('open'), null, 'announcement does not depend on expanded details');
       if (change === 'revision') {
         await discussButtons(f).click();
         await f.send('Discuss the new revision'); await settled(f);
