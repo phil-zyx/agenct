@@ -134,6 +134,8 @@ pub struct Hub {
     /// Summaries of large, append-only shared task material, so a turn that
     /// references the same material does not re-summarize it every time.
     material_summaries: Arc<Mutex<HashMap<String, String>>>,
+    /// Start the owner's private draft when a task enters `working`.
+    auto_draft: bool,
     extra_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     directory: Arc<directory::Directory>,
     // Arc per user so a turn can own its gate across a detached dispatch task.
@@ -234,6 +236,7 @@ impl Hub {
             private_users: Arc::new(Mutex::new(None)),
             startup_ok: None,
             material_summaries: Arc::new(Mutex::new(HashMap::new())),
+            auto_draft: false,
             extra_gates: Arc::new(Mutex::new(HashMap::new())),
             directory: Arc::new(directory),
             gates: Arc::new(gates),
@@ -244,6 +247,12 @@ impl Hub {
                 .timeout(Duration::from_secs(75))
                 .build()?,
         })
+    }
+    /// When a task is accepted or returned to `working`, draft privately for its
+    /// owner in the background. Drafts are never shared or delivered automatically.
+    pub fn with_auto_draft(mut self, enabled: bool) -> Self {
+        self.auto_draft = enabled;
+        self
     }
     /// Switches authentication exclusively to pinned external access tokens.
     /// Existing users remain the authorization roster; dev tokens no longer work.

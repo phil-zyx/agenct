@@ -479,3 +479,10 @@ textarea, input { caret-color: var(--brand); }
   #repository-options > .note, #repository-options > pre { grid-column: 1 / -1; }
   #repository-options label { margin: 0; }
 }
+
+/* Owner-only automatic draft progress on a task card. */
+.draft-status { margin: 4px 0 0; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.draft-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--brand); flex: none; }
+.draft-status.working::before { animation: draft-pulse 1.2s ease-in-out infinite; }
+@keyframes draft-pulse { 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .draft-status.working::before { animation: none; } }
