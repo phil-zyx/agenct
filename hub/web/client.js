@@ -333,7 +333,7 @@ function renderTurn() {
 }
 
 async function completeTurn(context, response) {
-  const { text, selectedTask: expectedTask, selectedAgent: expectedAgent } = pendingTurn;
+  const { id: requestId, text, selectedTask: expectedTask, selectedAgent: expectedAgent } = pendingTurn;
   if (!repositoryReceiptMatches(pendingTurn.selectedRepository, response.repository_context)) throw Error('仓库回执与本次选择不符，保留恢复凭据');
   const profile = response.runtime_profile;
   if (pendingTurn.invalidAgentBinding || (expectedAgent && (!profile
@@ -354,7 +354,7 @@ async function completeTurn(context, response) {
       + (task.details_truncated ? '共享材料已截断。' : '')
     : '';
   forgetTurn();
-  if (current(context)) handleTaskAction(context, response.task_action);
+  if (current(context)) handleTaskAction(context, response.task_action, requestId);
   if (text !== null && $('text').value.trim() === text) $('text').value = '';
   status('已核实消息处理完成。' + receiptContext + receiptRole);
   try { await refresh(context); }
