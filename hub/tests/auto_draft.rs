@@ -310,6 +310,20 @@ async fn plain_language_suggests_only_the_steps_the_caller_may_take() {
         f.say("alice", &task, "退回，再补充一段经历", "m6").await["task_action"]["action"],
         "return"
     );
+    f.act(
+        "alice",
+        &id,
+        json!({"action":"approve","expected_revision":2}),
+    )
+    .await;
+    // A step that no longer fits is not offered, and the Hub says why instead
+    // of leaving the model's "confirm below" with nothing to confirm.
+    let done = f.task("alice", &id).await;
+    let out = f.say("alice", &done, "还是退回吧", "m8").await;
+    assert!(out["task_action"].is_null());
+    let reply = out["reply"].as_str().unwrap();
+    assert!(reply.starts_with("[系统提示] 这一步现在做不了"), "{reply}");
+    assert!(reply.contains("已完成"), "{reply}");
     // Without a selected task there is never a task action.
     let (_, out) = f
         .call(

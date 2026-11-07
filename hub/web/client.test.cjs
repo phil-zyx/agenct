@@ -1576,6 +1576,23 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const g = fixture(); await g.login('alice'); await g.send('确认'); await settle();
     assert.equal(chatPosts(g).length, 1);
   });
+  await test('a waiting step sits at the end of the conversation and survives a reload, not a logout', async () => {
+    const storage = new Map();
+    const settings = { storage, tasks: [task({ status: 'ready_for_acceptance', result: 'done' })],
+      messages: [{ role: 'user', content: 'later question', status: 'complete', created_at: '2099-01-01 00:00:00' }],
+      activity: [{ kind: 'task', id: 'task-one', latest: { action: 'deliver', actor: 'bob', at: '2000-01-01 00:00:00' } }],
+      taskAction: body => /退回/.test(body.message) ? { action: 'return', task_id: 'task-one', expected_revision: 3 } : null };
+    const f = fixture(undefined, settings); await f.login('alice'); await settle();
+    const cardIndex = g => g.$('conversation').children.findIndex(node => node.taskId === 'task-one');
+    assert(cardIndex(f) < f.$('conversation').children.length - 1, 'an older step stays in place');
+    await f.send('退回'); await settle();
+    assert.equal(cardIndex(f), f.$('conversation').children.length - 1, 'the card asking for an answer is last');
+    const again = fixture(undefined, settings); await again.login('alice'); await settle();
+    assert(findButton(again.$('conversation'), '确认退回'), 'the waiting step survives a reload');
+    await again.$('logout').onclick();
+    const after = fixture(undefined, settings); await after.login('alice'); await settle();
+    assert(!findButton(after.$('conversation'), '确认退回'), 'logout drops it');
+  });
   await test('the composer clears as soon as a message is sent', async () => {
     const f = fixture(); await f.login('alice'); f.stallPosts();
     const send = f.send('long question'); await f.ready();
