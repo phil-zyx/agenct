@@ -244,7 +244,10 @@ async fn generate_inner(
                 |r| r.get(0),
             )?;
             if existing {
-                return Err(Error(StatusCode::CONFLICT, "automatic draft superseded by an existing attempt"));
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "automatic draft superseded by an existing attempt",
+                ));
             }
         }
         let (status, revision) = owner_task(&tx, &owner, &task)?;
@@ -301,10 +304,9 @@ async fn generate_inner(
     // Reserve before any summarization/model call: even a lost summary response
     // leaves this request uncertain rather than permitting duplicate billing.
     let source_snapshot = snapshot.clone();
-    let snapshot = task_context::prepare_large_details_with_guard(
-        h, &owner, &profile, snapshot, &authorized,
-    )
-    .await?;
+    let snapshot =
+        task_context::prepare_large_details_with_guard(h, &owner, &profile, snapshot, &authorized)
+            .await?;
     let request = TurnRequest {
         kind: TurnKind::DraftDelivery,
         message: runtime::DRAFT_MESSAGE,
@@ -554,7 +556,9 @@ mod tests {
         let users: Vec<_> = ["alice", "bob"]
             .into_iter()
             .filter(|id| *id != "bob" || include_bob)
-            .map(|id| json!({"id":id,"token_sha256":format!("{:x}", Sha256::digest(id.as_bytes()))}))
+            .map(
+                |id| json!({"id":id,"token_sha256":format!("{:x}", Sha256::digest(id.as_bytes()))}),
+            )
             .collect();
         json!({"version":1,"port":8080,"runtime":"dsh","users":users}).to_string()
     }
@@ -595,21 +599,36 @@ mod tests {
             let h = Hub::open(Config {
                 bind: "127.0.0.1:0".parse().unwrap(),
                 database: ":memory:".into(),
-                users: ["alice", "bob"].map(|id| UserConfig {
-                    id: id.into(),
-                    token_sha256: format!("{:x}", Sha256::digest(id.as_bytes())),
-                }).into(),
-                runtime: Runtime::Dsh { url, token: "fake-adapter-token".into() },
+                users: ["alice", "bob"]
+                    .map(|id| UserConfig {
+                        id: id.into(),
+                        token_sha256: format!("{:x}", Sha256::digest(id.as_bytes())),
+                    })
+                    .into(),
+                runtime: Runtime::Dsh {
+                    url,
+                    token: "fake-adapter-token".into(),
+                },
             })
             .unwrap()
             .with_private_config(roster.clone())
             .unwrap();
             h.db().unwrap().execute("INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('task','alice','bob','shared','working',1)", []).unwrap();
-            Self { h, root, roster, calls, server }
+            Self {
+                h,
+                root,
+                roster,
+                calls,
+                server,
+            }
         }
         fn input(&self, automatic: bool) -> Input {
             Input {
-                request_id: if automatic { auto_request_id("task", 1) } else { "manual".into() },
+                request_id: if automatic {
+                    auto_request_id("task", 1)
+                } else {
+                    "manual".into()
+                },
                 expected_revision: 1,
                 agent_id: None,
                 expected_profile_revision: None,
@@ -617,7 +636,11 @@ mod tests {
             }
         }
         fn receipt_count(&self) -> i64 {
-            self.h.db().unwrap().query_row("SELECT count(*) FROM draft_turns", [], |r| r.get(0)).unwrap()
+            self.h
+                .db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM draft_turns", [], |r| r.get(0))
+                .unwrap()
         }
     }
 
@@ -629,11 +652,21 @@ mod tests {
             let first = generate_inner(&f.h, "bob", "task", f.input(true), true).await;
             assert!(matches!(first, Err(Error(StatusCode::CONFLICT, BUSY))));
             assert_eq!(f.receipt_count(), 0);
-            std::fs::write(&f.roster, if malformed { "broken".into() } else { roster_value(false) }).unwrap();
+            std::fs::write(
+                &f.roster,
+                if malformed {
+                    "broken".into()
+                } else {
+                    roster_value(false)
+                },
+            )
+            .unwrap();
             drop(gate);
             // Same entry point as the next scheduled automatic attempt. It must
             // refresh even when no intervening authenticated request did so.
-            assert!(generate_inner(&f.h, "bob", "task", f.input(true), true).await.is_err());
+            assert!(generate_inner(&f.h, "bob", "task", f.input(true), true)
+                .await
+                .is_err());
             assert_eq!(f.calls.load(Ordering::SeqCst), 0);
             assert_eq!(f.receipt_count(), 0);
         }
@@ -644,13 +677,17 @@ mod tests {
         for fail in [false, true] {
             let f = AutoFixture::new(false, fail).await;
             let gate = f.h.gate("bob").unwrap().lock_owned().await;
-            assert!(matches!(generate_inner(&f.h, "bob", "task", f.input(true), true).await,
-                Err(Error(StatusCode::CONFLICT, BUSY))));
+            assert!(matches!(
+                generate_inner(&f.h, "bob", "task", f.input(true), true).await,
+                Err(Error(StatusCode::CONFLICT, BUSY))
+            ));
             drop(gate);
             let manual = generate(&f.h, "bob", "task", f.input(false)).await;
             assert_eq!(manual.is_err(), fail);
             assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-            assert!(generate_inner(&f.h, "bob", "task", f.input(true), true).await.is_err());
+            assert!(generate_inner(&f.h, "bob", "task", f.input(true), true)
+                .await
+                .is_err());
             assert_eq!(f.calls.load(Ordering::SeqCst), 1);
             assert_eq!(f.receipt_count(), 1);
             let mut explicit_retry = f.input(false);
@@ -666,20 +703,33 @@ mod tests {
         // revocation between summary calls. All responses come from the fake adapter.
         for size in [16000, 90000] {
             let f = AutoFixture::new(true, false).await;
-            f.h.db().unwrap().execute("INSERT INTO task_details(task_id,author,content) VALUES ('task','alice',?1)", ["x".repeat(size)]).unwrap();
-            assert!(generate_inner(&f.h, "bob", "task", f.input(true), true).await.is_err());
+            f.h.db()
+                .unwrap()
+                .execute(
+                    "INSERT INTO task_details(task_id,author,content) VALUES ('task','alice',?1)",
+                    ["x".repeat(size)],
+                )
+                .unwrap();
+            assert!(generate_inner(&f.h, "bob", "task", f.input(true), true)
+                .await
+                .is_err());
             assert_eq!(f.calls.load(Ordering::SeqCst), 1);
             let db = f.h.db().unwrap();
-            let state: String = db.query_row("SELECT status FROM draft_turns", [], |r| r.get(0)).unwrap();
+            let state: String = db
+                .query_row("SELECT status FROM draft_turns", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(state, "uncertain");
-            let count: i64 = db.query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0)).unwrap();
+            let count: i64 = db
+                .query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(count, 0);
             drop(db);
             std::fs::write(&f.roster, roster_value(true)).unwrap();
-            let replay = generate_inner(&f.h, "bob", "task", f.input(true), true).await.unwrap();
+            let replay = generate_inner(&f.h, "bob", "task", f.input(true), true)
+                .await
+                .unwrap();
             assert_eq!(replay["status"], "uncertain");
             assert_eq!(f.calls.load(Ordering::SeqCst), 1);
         }
     }
-
 }
