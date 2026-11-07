@@ -388,6 +388,8 @@ class BridgeSmoke:
             "summary": PROPOSAL_SUMMARY, "status": "awaiting_owner", "revision": 0, "result": None,
             # No shared material was attached at confirmation, so nothing beyond the summary.
             "details": None,
+            # Owner-only draft state for this version: none yet (not accepted).
+            "my_draft": None,
         }, "recipient saw more than the confirmed shared task")
         self.unchanged(before)
 
