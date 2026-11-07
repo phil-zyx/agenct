@@ -114,6 +114,60 @@ pub(super) async fn create(
     Json(input): Json<Input>,
 ) -> Result<Json<Value>> {
     let owner = h.identity(&headers)?;
+    generate(&h, &owner, &task, input).await.map(Json)
+}
+
+/// Prefix of the Hub-chosen request ID for an automatic draft. Deterministic per
+/// task revision, so a task version is drafted automatically at most once.
+pub(super) const AUTO_PREFIX: &str = "auto-";
+pub(super) fn auto_request_id(task: &str, revision: i64) -> String {
+    format!("{AUTO_PREFIX}{task}-r{revision}")
+}
+
+/// Starts the owner's private draft in the background once a task is (back) in
+/// `working`. It is exactly the draft a click would make: owner-only, the owner's
+/// recommended enabled role, same receipt and at-most-once rules; nothing is
+/// shared, delivered or approved without the owner. Skipped silently if the
+/// task moves on first; waits briefly while the owner's own turn is running.
+pub(super) fn spawn_auto(h: Hub, owner: String, task: String, revision: i64) {
+    tokio::spawn(async move {
+        for _ in 0..40 {
+            let profile = {
+                let Ok(db) = h.db() else { return };
+                let summary: Option<String> = db
+                    .query_row(
+                        "SELECT summary FROM tasks WHERE id=?1 AND owner=?2 AND status='working' AND revision=?3",
+                        params![task, owner, revision],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten();
+                let Some(summary) = summary else { return };
+                match profiles::recommend(&db, &owner, &summary) {
+                    Ok(profile) => profile,
+                    Err(_) => return,
+                }
+            };
+            let input = Input {
+                request_id: auto_request_id(&task, revision),
+                expected_revision: revision,
+                agent_id: Some(profile.agent_id.clone()),
+                expected_profile_revision: Some(profile.revision as i64),
+                revision: None,
+            };
+            match generate(&h, &owner, &task, input).await {
+                Err(Error(StatusCode::CONFLICT, BUSY)) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await
+                }
+                _ => return,
+            }
+        }
+    });
+}
+
+pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> Result<Value> {
+    let (owner, task) = (owner.to_owned(), task.to_owned());
     if !key(&task)
         || !key(&input.request_id)
         || input.expected_revision < 0
@@ -133,7 +187,7 @@ pub(super) async fn create(
         let db = h.db()?;
         owner_task(&db, &owner, &task)?;
         if let Some(value) = replay(&db, &owner, &task, &input)? {
-            return Ok(Json(value));
+            return Ok(value);
         }
     }
     let _gate = h
@@ -145,7 +199,7 @@ pub(super) async fn create(
         let tx = db.transaction()?;
         owner_task(&tx, &owner, &task)?;
         if let Some(value) = replay(&tx, &owner, &task, &input)? {
-            return Ok(Json(value));
+            return Ok(value);
         }
         let (status, revision) = owner_task(&tx, &owner, &task)?;
         if revision != input.expected_revision {
@@ -194,14 +248,14 @@ pub(super) async fn create(
         (profile, snapshot, session, revision_context)
     };
     let _reservation = Reservation {
-        h: &h,
+        h,
         owner: &owner,
         request_id: &input.request_id,
     };
     // Reserve before any summarization/model call: even a lost summary response
     // leaves this request uncertain rather than permitting duplicate billing.
     let source_snapshot = snapshot.clone();
-    let snapshot = task_context::prepare_large_details(&h, &owner, &profile, snapshot).await?;
+    let snapshot = task_context::prepare_large_details(h, &owner, &profile, snapshot).await?;
     let request = TurnRequest {
         kind: TurnKind::DraftDelivery,
         message: runtime::DRAFT_MESSAGE,
@@ -252,9 +306,9 @@ pub(super) async fn create(
         receipt(&db, &owner, &task, &input.request_id)?.ok_or_else(denied)
     })();
     if completed.is_err() {
-        uncertain(&h, &owner, &input.request_id);
+        uncertain(h, &owner, &input.request_id);
     }
-    completed.map(Json)
+    completed
 }
 
 pub(super) async fn status(
