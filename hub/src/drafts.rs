@@ -714,16 +714,17 @@ mod tests {
                 .await
                 .is_err());
             assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-            let db = f.h.db().unwrap();
-            let state: String = db
-                .query_row("SELECT status FROM draft_turns", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(state, "uncertain");
-            let count: i64 = db
-                .query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0))
-                .unwrap();
-            assert_eq!(count, 0);
-            drop(db);
+            {
+                let db = f.h.db().unwrap();
+                let state: String = db
+                    .query_row("SELECT status FROM draft_turns", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(state, "uncertain");
+                let count: i64 = db
+                    .query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
             std::fs::write(&f.roster, roster_value(true)).unwrap();
             let replay = generate_inner(&f.h, "bob", "task", f.input(true), true)
                 .await
