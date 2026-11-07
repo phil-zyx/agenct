@@ -26,6 +26,14 @@ pub(super) struct Input {
     expected_revision: i64,
     agent_id: Option<String>,
     expected_profile_revision: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    revision: Option<Revision>,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct Revision {
+    base_draft_id: String,
+    instruction: String,
 }
 fn key(value: &str) -> bool {
     !value.is_empty()
@@ -115,6 +123,9 @@ pub(super) async fn create(
             .as_ref()
             .is_some_and(|id| !key(id) || id.len() > 32)
         || input.expected_profile_revision.is_some_and(|r| r < 0)
+        || input.revision.as_ref().is_some_and(|r| {
+            !key(&r.base_draft_id) || r.instruction.trim().is_empty() || r.instruction.len() > 4000
+        })
     {
         return Err(invalid("invalid draft request"));
     }
@@ -125,10 +136,11 @@ pub(super) async fn create(
             return Ok(Json(value));
         }
     }
-    let _gate = h.gates[&owner]
-        .try_lock()
+    let _gate = h
+        .gate(&owner)?
+        .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, BUSY))?;
-    let (profile, snapshot, session) = {
+    let (profile, snapshot, session, revision_context) = {
         let mut db = h.db()?;
         let tx = db.transaction()?;
         owner_task(&tx, &owner, &task)?;
@@ -166,17 +178,30 @@ pub(super) async fn create(
             expected_revision: revision,
         };
         let snapshot = task_context::capture(&tx, &owner, Some(&selection))?.ok_or_else(denied)?;
+        // Resolve the immutable base server-side. Neither another owner's draft nor a
+        // draft from a previous task revision can enter this private model request.
+        let revision_context = input.revision.as_ref().map(|change| -> Result<Value> {
+            let content: Option<String> = tx.query_row(
+                "SELECT content FROM deliveries WHERE id=?1 AND task_id=?2 AND author=?3 AND status='draft' AND task_revision=?4",
+                params![change.base_draft_id, task, owner, revision], |r| r.get(0)).optional()?;
+            let content = content.ok_or_else(|| invalid("base draft unavailable for this task revision"))?;
+            Ok(json!({"base_draft_id":change.base_draft_id,"content":content,"instruction":change.instruction}))
+        }).transpose()?;
         let session = Uuid::new_v4().to_string();
         tx.execute("INSERT INTO draft_turns(owner,request_id,task_id,binding,status,task_context,runtime_profile,session_id) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7)",
             params![owner,input.request_id,task,serde_json::to_string(&input).map_err(|_|invalid("invalid draft input"))?,snapshot.to_string(),serde_json::to_string(&profile).map_err(|_|invalid("invalid runtime profile"))?,session])?;
         tx.commit()?;
-        (profile, snapshot, session)
+        (profile, snapshot, session, revision_context)
     };
     let _reservation = Reservation {
         h: &h,
         owner: &owner,
         request_id: &input.request_id,
     };
+    // Reserve before any summarization/model call: even a lost summary response
+    // leaves this request uncertain rather than permitting duplicate billing.
+    let source_snapshot = snapshot.clone();
+    let snapshot = task_context::prepare_large_details(&h, &owner, &profile, snapshot).await?;
     let request = TurnRequest {
         kind: TurnKind::DraftDelivery,
         message: runtime::DRAFT_MESSAGE,
@@ -184,6 +209,7 @@ pub(super) async fn create(
         history: &[],
         profile: &profile,
         task_context: Some(&snapshot),
+        draft_revision: revision_context.as_ref(),
     };
     let answer = match &h.runtime {
         Runtime::Mock => runtime::MockRuntime.turn(request).await,
@@ -209,12 +235,16 @@ pub(super) async fn create(
         let draft_id = Uuid::new_v4().to_string();
         tx.execute("INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision) SELECT ?1,?2,COALESCE(MAX(seq),0)+1,?3,?4,'draft',?5 FROM deliveries WHERE task_id=?2 AND status='draft'",
             params![draft_id,task,owner,answer.reply,input.expected_revision])?;
+        let seq: i64 =
+            tx.query_row("SELECT seq FROM deliveries WHERE id=?1", [&draft_id], |r| {
+                r.get(0)
+            })?;
         let created_at: String = tx.query_row(
             "SELECT created_at FROM deliveries WHERE id=?1",
             [&draft_id],
             |r| r.get(0),
         )?;
-        let response = json!({"draft":{"id":draft_id,"content":answer.reply,"created_at":created_at,"task_revision":input.expected_revision,"stale":stale},"task_context":snapshot,"runtime_profile":profile,"backend":h.runtime.label()});
+        let response = json!({"draft":{"id":draft_id,"seq":seq,"base_draft_id":input.revision.as_ref().map(|r| &r.base_draft_id),"instruction":input.revision.as_ref().map(|r| &r.instruction),"content":answer.reply,"created_at":created_at,"task_revision":input.expected_revision,"stale":stale},"task_context":snapshot,"source_task_context":source_snapshot,"runtime_profile":profile,"backend":h.runtime.label()});
         if tx.execute("UPDATE draft_turns SET status='complete',response=?3,draft_id=?4 WHERE owner=?1 AND request_id=?2 AND status='pending'",params![owner,input.request_id,response.to_string(),draft_id])? != 1 {
             return Err(Error(StatusCode::CONFLICT,"draft reservation unavailable"));
         }
@@ -263,6 +293,10 @@ pub(super) async fn list(
     }
     let db = h.db()?;
     owner_task(&db, &owner, &task)?;
+    let summary: String = db.query_row("SELECT summary FROM tasks WHERE id=?1", [&task], |r| {
+        r.get(0)
+    })?;
+    let recommended = profiles::recommend(&db, &owner, &summary)?;
     let limit = page.limit.unwrap_or(20);
     let mut query = db.prepare("SELECT request_id FROM draft_turns WHERE owner=?1 AND task_id=?2 AND request_id>?3 ORDER BY request_id LIMIT ?4")?;
     let keys = query
@@ -282,7 +316,7 @@ pub(super) async fn list(
     }
 
     Ok(Json(
-        json!({"kind":"draft_delivery","task_id":task,"items":items,"next_cursor":next}),
+        json!({"kind":"draft_delivery","task_id":task,"items":items,"next_cursor":next,"recommended_profile":recommended}),
     ))
 }
 

@@ -18,3 +18,6 @@ __pycache__/
 
 /.venv-dsh/
 /agenct.lock
+
+/playwright-report/
+/test-results/

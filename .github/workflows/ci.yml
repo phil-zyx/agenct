@@ -3,6 +3,53 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
+  local-acceptance:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: sudo apt-get install --yes poppler-utils
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo +stable build --locked --manifest-path hub/Cargo.toml
+      - run: npm run test:local
+  browser:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: sudo apt-get install --yes fonts-dejavu-core fonts-droid-fallback
+      - name: Browser interaction regressions (fixture API)
+        run: npm run test:browser
+      - name: Desktop, mobile and dark-mode visual regressions
+        run: npm run test:visual
+      - name: Upload screenshots, diffs and traces
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-regressions
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -41,7 +88,7 @@ jobs:
       - name: Install ephemeral OIDC fixture dependency
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends openssl
+          sudo apt-get install --yes --no-install-recommends openssl poppler-utils
       - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - run: cargo +stable fmt --manifest-path hub/Cargo.toml -- --check
       - run: cargo +stable test --locked --manifest-path hub/Cargo.toml

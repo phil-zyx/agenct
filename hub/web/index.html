@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="zh">
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
 <title>Agenct</title>
 <link rel="stylesheet" href="style.css">
 <body>
@@ -14,7 +14,7 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>
     <span id="rail-badge" class="rail-badge"></span>
   </button>
-  <button type="button" id="open-agents" class="rail-btn" title="个人角色配置" aria-label="个人角色配置">
+  <button type="button" id="open-agents" class="rail-btn" title="个人角色设置" aria-label="个人角色设置">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9" r="2.4"/><path d="M15.5 14.2A4.5 4.5 0 0 1 20.5 18.5"/></svg>
   </button>
   <button type="button" id="open-help" class="rail-btn" title="能力边界与说明" aria-label="能力边界与说明">
@@ -45,6 +45,7 @@
     <div class="float-pill left"><span id="identity" class="identity"></span></div>
     <div class="float-pill right">
       <span class="sync"><small id="last-refresh"></small><span id="sync-notice" class="sync-notice" role="status" aria-live="polite"></span></span>
+      <button type="button" id="enable-notifications">开启系统通知</button>
       <button type="button" id="refresh" class="icon-btn" title="刷新本账号会话与任务" aria-label="刷新本账号会话与任务">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
       </button>
@@ -55,6 +56,7 @@
       <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
     </div>
     <div class="composer">
+      <section id="onboarding" class="onboarding hide" aria-label="初次使用指引"><p id="onboarding-step" aria-live="polite"></p><div class="actions"><button type="button" id="onboarding-next">下一步</button><button type="button" id="onboarding-skip" class="text-btn">跳过引导</button></div></section>
       <section id="turn-recovery" class="sheet warn hide" aria-label="消息发送恢复">
         <p id="turn-status" role="status" aria-live="polite"></p>
         <div class="row"><button type="button" id="check-turn" class="primary">核对发送状态</button><button type="button" id="new-turn">开始新尝试</button></div>
@@ -64,6 +66,8 @@
         <details class="chip-more"><summary>附带内容</summary><p id="task-context-details" role="status" aria-live="polite"></p></details>
         <button type="button" id="clear-task-context" class="icon-btn small" title="清除讨论的任务" aria-label="清除讨论的任务"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </section>
+      <section id="repository-context" class="chip-bar hide" aria-label="下一条聊天的仓库内容"><span id="repository-context-text"></span><button type="button" id="clear-repository" class="text-btn">清除仓库选择</button></section>
+      <section id="repository-picker" class="sheet hide" aria-label="只读仓库选择"><div id="repository-options"></div><button type="button" id="close-repository-picker" class="text-btn">关闭仓库选择</button></section>
       <section id="role-picker" class="sheet hide" aria-label="启用的个人角色">
         <p class="muted">每次只选一个角色，沿用本账号私聊历史。不创建团队、分离会话或增加工具权限。</p>
         <div id="role-options" class="chips"></div>
@@ -75,9 +79,12 @@
           <button type="button" id="choose-role" class="text-btn">选择本次角色</button>
           <button type="button" id="clear-role" class="text-btn">恢复默认管家</button>
         </div>
+        <button type="button" id="choose-repository" class="text-btn">选择只读仓库</button>
         <details id="help" class="help"><summary>能力边界、委派示例与恢复说明</summary>
+        <button type="button" id="replay-onboarding" class="text-btn">重新查看使用指引</button>
         <p>输入 /agents 可配置个人角色。Mock 委派示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。</p>
-        <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，页面可见时每 5 秒自动检查更新，离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号、所属账号及显式选择的角色 ID 和配置版本，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。验证版 · 无真实代码执行或 GitHub 发布。</small>
+        <p>管理员启用只读仓库后，可输入 <code>/repo 仓库ID 完整提交ID 文件路径</code>，换行写问题；或 <code>/repo-search 仓库ID 完整提交ID 关键词</code>，换行写问题。仅限你的白名单仓库与固定提交，不执行代码。</p>
+        <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，每 3 秒自动检查更新（后台标签页可能被浏览器延迟），离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号、所属账号及显式选择的角色 ID 和角色版本，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。验证版 · 无真实代码执行或 GitHub 发布。</small>
         </details>
       </section>
       <form id="form" class="composer-pill">
@@ -95,13 +102,14 @@
   <aside class="task-pane" aria-label="任务">
     <div class="pane-head">
       <div class="seg" role="tablist" aria-label="工作视图">
-        <button type="button" id="tab-activity" class="on" role="tab" aria-selected="true">工作</button>
-        <button type="button" id="tab-tasks" role="tab" aria-selected="false">任务<span id="task-count" class="count"></span></button>
+        <button type="button" id="tab-activity" aria-controls="activity" class="on" role="tab" aria-selected="true">工作</button>
+        <button type="button" id="tab-tasks" aria-controls="tasks" role="tab" aria-selected="false">任务<span id="task-count" class="count"></span></button>
       </div>
       <button type="button" id="close-tasks" class="icon-btn" title="收起" aria-label="收起"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
     </div>
-    <div id="activity" class="activity-list" aria-label="工作记录：每件事的最近进展"></div>
-    <div id="tasks" class="task-list hide" aria-label="与你相关的任务"></div>
+    <div id="activity" role="tabpanel" aria-labelledby="tab-activity" class="activity-list" aria-label="工作记录：每件事的最近进展"></div>
+    <div id="task-filters" class="task-filters hide"><label for="task-filter">筛选任务</label><select id="task-filter"><option value="active">进行中的任务</option><option value="waiting">待我处理</option><option value="mine">我发起的</option><option value="completed">已完成 / 已取消</option></select><p id="task-filter-empty" class="note" role="status"></p></div>
+    <div id="tasks" role="tabpanel" aria-labelledby="tab-tasks" class="task-list hide" aria-label="与你相关的任务"></div>
   </aside>
 </main>
 <script src="profiles-ui.js"></script>
@@ -109,6 +117,11 @@
 <script src="draft-ui.js"></script>
 <script src="task-timeline-model.js"></script>
 <script src="task-timeline-ui.js"></script>
+<script src="activity-ui.js"></script>
+<script src="chat-ui.js"></script>
+<script src="task-ui.js"></script>
+<script src="repo-ui.js"></script>
 <script src="client.js"></script>
+<script src="client-chrome.js"></script>
 </body>
 </html>

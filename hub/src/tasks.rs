@@ -99,6 +99,7 @@ pub(super) struct Action {
     expected_revision: i64,
     result: Option<String>,
     reason: Option<String>,
+    source_draft_id: Option<String>,
 }
 pub(super) async fn action(
     State(h): State<Hub>,
@@ -132,6 +133,17 @@ pub(super) async fn action(
     {
         return Err(invalid("delivery requires a 1..8000 byte result"));
     }
+    if let Some(source) = &a.source_draft_id {
+        if a.action != "deliver" || source.is_empty() || source.len() > 128 {
+            return Err(invalid("draft source is only accepted for delivery"));
+        }
+        let valid: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE id=?1 AND task_id=?2 AND author=?3 AND status='draft' AND task_revision=?4)",
+            params![source, id, user, t.revision], |r| r.get(0))?;
+        if !valid {
+            return Err(invalid("draft source unavailable for this task version"));
+        }
+    }
     let reason = if a.action == "cancel" {
         Some(policy::cancellation_reason(a.reason.as_deref()).map_err(Error::from)?)
     } else {
@@ -151,15 +163,16 @@ pub(super) async fn action(
         // Number submitted versions independently of private drafts. The task
         // transition, immutable content and audit event commit together.
         tx.execute(
-            "INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision)
-             SELECT ?1,?2,COALESCE(MAX(seq),0)+1,?3,?4,'submitted',?5
+            "INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision,source_draft_id)
+             SELECT ?1,?2,COALESCE(MAX(seq),0)+1,?3,?4,'submitted',?5,?6
              FROM deliveries WHERE task_id=?2 AND status='submitted'",
             params![
                 uuid::Uuid::new_v4().to_string(),
                 id,
                 user,
                 result,
-                t.revision + 1
+                t.revision + 1,
+                a.source_draft_id
             ],
         )?;
     }

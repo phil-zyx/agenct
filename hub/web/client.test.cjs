@@ -30,8 +30,10 @@ function fixture(auth = { enabled: false }, settings = {}) {
   let failReads = 0;
   let stallReads = false, stallPosts = false;
   let revision = 0;
-  let postTurnStatus = 'complete', checkTurnStatus = 'complete', turnFailure = 0;
+  let postTurnStatus = 'complete', checkTurnStatus = settings.receipt || 'complete', turnFailure = 0;
   let tasks = settings.tasks || [];
+  let repositoryPreview = null;
+  const repositoryTurns = settings.repositoryTurns || new Map();
   const turnContexts = settings.turnContexts || new Map();
   let responseContextOverride, responseProfileOverride;
   const defaultProfile = { revision: 0, agents: [{ id: 'butler', name: '管家', role: 'coordinator', model_ref: 'server-default', enabled: true }] };
@@ -47,7 +49,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
   const document = {
     hidden: false,
     getElementById: id => $(id),
-    createElement: () => new Element(),
+    createElement: tag => { const node = new Element(); node.tagName = tag; return node; },
     addEventListener: (name, callback) => listeners.set(name, callback)
   };
   let failNextPost = false;
@@ -61,7 +63,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
     setTimeout: (callback, delay) => { const id = ++timerId; timers.set(id, { callback, delay }); return id; },
     clearTimeout: id => timers.delete(id),
     AbortController,
-    TextEncoder,
+    TextEncoder, TextDecoder, btoa,
     crypto: webcrypto,
     Date,
     prompt: (label, value) => settings.prompt ? settings.prompt(label, value) : '',
@@ -71,6 +73,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       setItem: (key, value) => { if (settings.storageFailure) throw Error('Storage unavailable'); storage.set(key, value); },
       removeItem: key => { if (settings.storageFailure) throw Error('Storage unavailable'); storage.delete(key); }
     },
+    localStorage: { getItem: key => settings.preferences?.get(key) || null, setItem: (key, value) => settings.preferences?.set(key, value) },
     window: { location: { assign: url => calls.push({ redirect: url }) } },
     fetch: async (url, options) => {
       calls.push({ url, options });
@@ -85,6 +88,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       // Capture the context at dispatch, including an eventually lost response.
       if (url === '/api/messages' && options.method === 'POST') {
         const body = JSON.parse(options.body), selected = body.selected_task;
+        repositoryTurns.set(body.request_id, /^\/repo(?:-search)? /.test(body.message) ? repositoryPreview : null);
         const agent = profile.agents?.find(agent => body.agent_id ? agent.id === body.agent_id : agent.role === 'coordinator');
         turnProfiles.set(body.request_id, agent ? { revision: profile.revision, agent_id: agent.id,
           role: agent.role, model_ref: agent.model_ref } : null);
@@ -111,17 +115,23 @@ function fixture(auth = { enabled: false }, settings = {}) {
       const identity = (options.headers.Authorization || auth.user || '').endsWith('bob') ? 'bob' : 'alice';
       let data = url.endsWith('/me') ? { user: identity, runtime: 'mock' } : [];
       if (url.endsWith('/proposals') && options.method === 'GET') {
-        data = [{ id: 1, owner: 'bob', summary: 'Exact <summary>\nsecond line', status: 'pending', revision }];
+        data = settings.proposals || [{ id: 1, owner: 'bob', summary: 'Exact <summary>\nsecond line', status: 'pending', revision }];
       }
       if (url === '/api/tasks' && options.method === 'POST') {
         return { ok: false, status: 405, json: async () => ({ error: 'Method Not Allowed' }) };
       }
       if (url === '/api/tasks' && options.method === 'GET') data = tasks;
+      if (url === '/api/repositories') data = settings.repositories || [];
+      if (url === '/api/repositories/context') {
+        const choice = JSON.parse(options.body);
+        repositoryPreview = { ...choice, path: choice.path ?? null, query: choice.query ?? null, snapshot_digest: 'b'.repeat(64), read_only: true, text: 'Private repository source', truncated: false };
+        data = repositoryPreview;
+      }
       if (url === '/api/activity') data = settings.activity || [];
       if (url === '/api/messages' && options.method === 'GET' && settings.messages) data = settings.messages;
       if (url === '/api/messages' && options.method === 'POST') {
         const requestId = JSON.parse(options.body).request_id;
-        data = { reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null,
+        data = { repository_context: settings.repositoryMismatch ? null : repositoryTurns.get(requestId), reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null,
           runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
           task_context: responseContextOverride === undefined ? turnContexts.get(requestId) : responseContextOverride,
           turn: { request_id: requestId, status: postTurnStatus } };
@@ -130,7 +140,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
         if (turnFailure) return { ok: false, status: turnFailure, json: async () => ({ error: 'Receipt unavailable' }) };
         const requestId = decodeURIComponent(url.split('/').at(-1));
         data = { request_id: requestId, status: checkTurnStatus,
-          response: checkTurnStatus === 'complete' ? { reply: 'Saved chat reply',
+          response: checkTurnStatus === 'complete' ? { repository_context: settings.repositoryMismatch ? null : repositoryTurns.get(requestId), reply: 'Saved chat reply',
             runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
             task_context: responseContextOverride === undefined ? turnContexts.get(requestId) ?? null : responseContextOverride,
             turn: { request_id: requestId, status: 'complete' } } : null };
@@ -142,7 +152,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       if (url.includes('/drafts')) {
         const task = tasks[0];
         data = options.method === 'POST'
-          ? {kind:'draft_delivery',task_id:task.id,request_id:JSON.parse(options.body).request_id,status:'complete',current_stale:false,response:{draft:{content:'Generated draft',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}}
+          ? {kind:'draft_delivery',task_id:task.id,request_id:JSON.parse(options.body).request_id,status:'complete',current_stale:false,response:{draft:{id:'fixture-generated-draft',content:'Generated draft',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}}
           : {kind:'draft_delivery',task_id:task.id,items:[],next_cursor:null};
       }
       if (url.endsWith('/profile/catalog')) data = { roles: ['coordinator', 'researcher'], models: [{ id: 'server-default' }], max_agents: 8 };
@@ -155,9 +165,10 @@ function fixture(auth = { enabled: false }, settings = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'draft-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-model.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-ui.js'), 'utf8'), context);
-  vm.runInContext(fs.readFileSync(path.join(__dirname, 'client.js'), 'utf8'), context);
+  for (const name of ['activity-ui.js', 'chat-ui.js', 'task-ui.js', 'repo-ui.js', 'client.js', 'client-chrome.js']) vm.runInContext(fs.readFileSync(path.join(__dirname, name), 'utf8'), context);
   return {
-    $, calls, timers, storage, confirmations, turnContexts, turnProfiles,
+    $, calls, timers, storage, confirmations, turnContexts, turnProfiles, document,
+    key(event) { listeners.get('keydown')?.({ preventDefault() {}, ...event }); },
     profile(value) { profile = value; },
     responseProfile(value) { responseProfileOverride = value; },
     role(id) { return $('role-options').children.find(button => button.textContent.endsWith(' · ' + id)); },
@@ -238,7 +249,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(f.$('text').value, 'Unsent private message');
     assert.match(f.$('task-context-details').textContent, /task-one/);
     assert(!f.$('room').classList.contains('tasks-open'));
-    assert.match(f.$('conversation').textContent, /个人 Agent 配置/);
+    assert.match(f.$('conversation').textContent, /个人角色设置/);
     assert.equal(f.calls.filter(call => call.options?.method === 'POST' || call.options?.method === 'PUT').length, 0);
   });
   await test('desktop discussion keeps optional task dock and role shortcut respects unresolved send', async () => {
@@ -276,32 +287,170 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture({ enabled: false }, { tasks: [task({ requester: 'other', owner: 'someone' })] });
     await f.login('alice'); assert.equal(cancelButton(f), undefined);
   });
-  await test('cancel prompt discloses sharing and limits, and dismissal or invalid reason sends nothing', async () => {
-    for (const value of [null, '', ' \n\t ', 'x'.repeat(501), '🦀'.repeat(501)]) {
-      const labels = [];
-      const f = fixture({ enabled: false }, { tasks: [task()], prompt: label => { labels.push(label); return value; } });
+  const walk = node => [node, ...node.children.flatMap(walk)];
+  const editor = f => walk(f.$('tasks')).find(node => node.className === 'action-editor');
+  const editorInput = f => walk(editor(f)).find(node => node.rows === 6);
+  await test('cancel inline editor requires valid content and preview before any mutation', async () => {
+    for (const value of ['', ' \n\t ', 'x'.repeat(501), '🦀'.repeat(501)]) {
+      const f = fixture({ enabled: false }, { tasks: [task()] });
       await f.login('alice'); await cancelButton(f).onclick();
-      assert.equal(labels.length, 1); assert.match(labels[0], /双方可见/);
-      assert.match(labels[0], /交付记录会保留/); assert.match(labels[0], /模型请求可能继续/);
+      assert.match(editor(f).textContent, /双方/); assert.match(editor(f).textContent, /模型请求可能继续/);
+      editorInput(f).value = value; findButton(editor(f), '预览').onclick();
+      assert.equal(findButton(editor(f), '确认取消任务').disabled, true);
       assert.equal(taskPosts(f).length, 0);
-      assert.equal(chatPosts(f).length, 0);
     }
   });
-  await test('only explicitly entered trimmed cancellation reason is shared once', async () => {
-    let prompts = 0;
-    const f = fixture({ enabled: false }, { tasks: [task()], prompt: () => { prompts++; return '  Shared reason <script>literal</script>  '; } });
-    await f.login('alice'); f.hold(); const button = cancelButton(f), pending = button.onclick();
-    await button.onclick(); assert.equal(prompts, 1); assert.equal(taskPosts(f).length, 1);
-    const body = JSON.parse(taskPosts(f)[0].options.body);
-    assert.deepEqual(body, { action: 'cancel', reason: 'Shared reason <script>literal</script>', expected_revision: 3 });
-    f.release(); await pending; assert.equal(taskPosts(f).length, 1); assert.equal(chatPosts(f).length, 0);
+  await test('only previewed cancellation reason is shared once', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    await cancelButton(f).onclick(); editorInput(f).value = '  Shared reason <script>literal</script>  ';
+    findButton(editor(f), '预览').onclick(); f.hold();
+    const submit = findButton(editor(f), '确认取消任务'), pending = submit.onclick();
+    await submit.onclick(); assert.equal(taskPosts(f).length, 1);
+    assert.deepEqual(JSON.parse(taskPosts(f)[0].options.body), { action: 'cancel', reason: 'Shared reason <script>literal</script>', expected_revision: 3 });
+    f.release(); await pending; assert.equal(taskPosts(f).length, 1);
   });
-  await test('uncertain cancellation is not automatically retried', async () => {
-    const f = fixture({ enabled: false }, { tasks: [task()], prompt: () => 'Shared reason' });
-    await f.login('alice'); f.failNextPost(); await cancelButton(f).onclick();
+  await test('uncertain cancellation keeps input and is not automatically retried', async () => {
+    const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+    await cancelButton(f).onclick(); editorInput(f).value = 'Shared reason'; findButton(editor(f), '预览').onclick();
+    f.failNextPost(); await findButton(editor(f), '确认取消任务').onclick();
+    assert.equal(editorInput(f).value, 'Shared reason');
     assert.equal(taskPosts(f).length, 1); await f.tick(); assert.equal(taskPosts(f).length, 1);
   });
 
+  async function chooseRepository(f, search = false) {
+    await f.$('choose-repository').onclick();
+    const inputs = walk(f.$('repository-options')).filter(node => node.tagName === 'input');
+    inputs[0].value = 'a'.repeat(40); inputs[1].value = search ? 'literal word' : 'README.md';
+    if (search) walk(f.$('repository-options')).filter(node => node.tagName === 'select')[1].value = 'query';
+    await findButton(f.$('repository-options'),'预览仓库内容').onclick();
+    assert(f.$('repository-options').textContent.includes('Private repository source'));
+    findButton(f.$('repository-options'),'确认用于下一条聊天').onclick();
+  }
+  await test('repository context requires preview and explicit confirmation, attaches once and never goes to proposals', async () => {
+    for (const search of [false,true]) {
+      const f = fixture(undefined,{repositories:[{id:'repo',label:'My repository'}]}); await f.login('alice');
+      await chooseRepository(f, search); assert.equal(chatPosts(f).length,0);
+      await f.send('/delegate bob Share only this summary');
+      const proposal = f.calls.find(call=>call.url==='/api/proposals'&&call.options.method==='POST');
+      assert.equal(JSON.parse(proposal.options.body).summary,'Share only this summary');
+      assert(!f.$('repository-context').classList.contains('hide'));
+      await f.send('Explain the selected source');
+      const message = JSON.parse(chatPosts(f)[0].options.body).message;
+      assert.equal(message, (search?'/repo-search':'/repo')+' repo '+'a'.repeat(40)+' '+(search?'literal word':'README.md')+'\nExplain the selected source');
+      assert(f.$('repository-context').classList.contains('hide')); assert.equal(f.storage.size,0);
+      await f.send('Ordinary next question'); assert.equal(JSON.parse(chatPosts(f)[1].options.body).message,'Ordinary next question');
+    }
+  });
+  await test('repository selection clears across identities and late reads cannot restore it', async () => {
+    const f = fixture(undefined,{repositories:[{id:'repo',label:'My repository'}]}); await f.login('alice'); await chooseRepository(f);
+    await f.login('bob'); assert(f.$('repository-context').classList.contains('hide')); await f.send('No repository');
+    assert.equal(JSON.parse(chatPosts(f)[0].options.body).message,'No repository');
+    f.hold(); const pending=f.$('choose-repository').onclick(); await f.ready(); f.$('logout').onclick(); f.release(); await pending;
+    assert.equal(f.$('repository-options').textContent,''); assert(f.$('repository-picker').classList.contains('hide'));
+  });
+  await test('mismatched repository receipt stays unresolved without repeating the command', async () => {
+    const f = fixture(undefined,{repositories:[{id:'repo',label:'My repository'}],repositoryMismatch:true}); await f.login('alice'); await chooseRepository(f);
+    await f.send('Question'); assert.equal(f.storage.size,1); assert(f.$('status').textContent.includes('仓库回执'));
+    assert(!JSON.stringify([...f.storage]).includes('Private repository source'));
+    await f.$('check-turn').onclick(); assert.equal(chatPosts(f).length,1); assert.equal(f.storage.size,1);
+    f.confirm(true); f.$('new-turn').onclick(); await f.send('Fresh ordinary question');
+    assert.equal(JSON.parse(chatPosts(f)[1].options.body).message,'Fresh ordinary question');
+  });
+  await test('handwritten delivery never claims a private draft source', async () => {
+    const f=fixture(undefined,{tasks:[task()]}); await f.login('bob');
+    await findButton(f.$('tasks'),'提交人工交付').onclick(); editorInput(f).value='Handwritten delivery';
+    findButton(editor(f),'预览').onclick(); await findButton(editor(f),'确认交付').onclick();
+    assert.equal(Object.hasOwn(JSON.parse(taskPosts(f)[0].options.body),'source_draft_id'),false);
+  });
+  await test('task filters archive finished work while retaining explicit access', async () => {
+    const f = fixture(undefined, {tasks:[task(), task({id:'done',status:'completed'}), task({id:'owned',owner:'alice',requester:'bob'})]}); await f.login('alice');
+    const card = id => f.$('tasks').children.find(node => node.taskId === id);
+    assert(card('done').classList.contains('hide')); assert(!card('task-one').classList.contains('hide'));
+    f.$('task-filter').value = 'waiting'; f.$('task-filter').onchange(); assert(card('task-one').classList.contains('hide')); assert(!card('owned').classList.contains('hide'));
+    f.$('task-filter').value = 'mine'; f.$('task-filter').onchange(); assert(!card('task-one').classList.contains('hide')); assert(card('owned').classList.contains('hide'));
+    f.$('task-filter').value = 'completed'; f.$('task-filter').onchange(); assert(!card('done').classList.contains('hide'));
+    assert.equal(f.calls.filter(call => call.options.method !== 'GET').length, 0);
+  });
+  await test('message delegation creates only a proposal and repeat-question never sends', async () => {
+    const message = {role:'user',content:'Only this selected message',status:'complete'};
+    const f = fixture(undefined, {messages:[message]}); await f.login('alice');
+    const bubble = f.$('conversation').children.find(node => node.className.includes('msg-user'));
+    await findButton(bubble, '重新问').onclick(); assert.equal(f.$('text').value, message.content); assert.equal(chatPosts(f).length, 0);
+    await findButton(bubble, '把这段交给某人').onclick();
+    const panel = walk(bubble).find(node => node.className === 'message-delegation');
+    walk(panel).find(node => node.tagName === 'input').value = 'bob';
+    await findButton(panel, '生成委派提案').onclick();
+    const writes = f.calls.filter(call => call.options.method === 'POST'); assert.equal(writes.length, 1); assert.equal(writes[0].url, '/api/proposals');
+    const body = JSON.parse(writes[0].options.body); assert.equal(body.owner,'bob'); assert.equal(body.summary, message.content); assert(body.request_id);
+  });
+  await test('file import validates UTF-8 and size without sending or losing existing material', async () => {
+    const f = fixture(); await f.login('alice'); const proposal = f.$('conversation').children[0];
+    const picker = walk(proposal).find(node => node.type === 'file');
+    const file = (name, bytes, size = bytes.length) => ({name,size,arrayBuffer:async()=>Uint8Array.from(bytes).buffer});
+    picker.files = [file('notes.md',new TextEncoder().encode('# 文档\n可共享正文'))]; await picker.onchange();
+    assert.equal(proposal.detailsBox.value, '# 文档\n可共享正文'); assert.equal(f.calls.filter(call=>call.options.method==='POST').length,0);
+    for (const invalid of [file('bad.md',[0xff]), file('binary.txt',[0]), file('huge.md',[65],262145), file('image.png',[65])]) {
+      picker.files=[invalid]; await picker.onchange(); assert.equal(proposal.detailsBox.value, '# 文档\n可共享正文');
+    }
+    await findButton(proposal,'确认共享并委派').onclick();
+    assert.equal(JSON.parse(f.calls.find(call=>call.url.endsWith('/actions')).options.body).details, '# 文档\n可共享正文');
+  });
+  await test('first-login guide is per user and example selection fills without sending', async () => {
+    const preferences = new Map(); const f = fixture(undefined,{preferences,proposals:[]}); await f.login('alice');
+    assert(!f.$('onboarding').classList.contains('hide')); f.$('onboarding-next').onclick(); assert(f.$('onboarding-step').textContent.startsWith('2 / 3'));
+    f.$('onboarding-next').onclick(); f.$('onboarding-next').onclick(); assert.equal(preferences.get('agenct.onboarding.v1:alice'),'done');
+    await f.login('alice'); assert(f.$('onboarding').classList.contains('hide'));
+    const example = findButton(f.$('conversation'),'帮我梳理今天的工作重点'); assert(example); example.onclick(); assert.equal(f.$('text').value,'帮我梳理今天的工作重点'); assert.equal(chatPosts(f).length,0);
+    await f.login('bob'); assert(!f.$('onboarding').classList.contains('hide'));
+  });
+  await test('keyboard shortcut toggles drawer and Escape returns focus', async () => {
+    const f = fixture(undefined,{width:400}); await f.login('alice'); f.$('onboarding-skip').onclick();
+    f.key({key:'K',ctrlKey:true,shiftKey:true}); assert(f.$('room').classList.contains('tasks-open')); assert(f.$('tab-activity').focused);
+    f.key({key:'Escape'}); assert(!f.$('room').classList.contains('tasks-open')); assert(f.$('toggle-tasks').focused);
+    assert.equal(f.calls.filter(call=>call.options.method==='POST').length,0);
+  });
+  await test('Markdown creates safe structured text, code and tables without HTML execution', async () => {
+    const content = '# 标题\n- 条目\n\n| 名称 | 值 |\n| --- | --- |\n| a | b |\n```js\n<script>alert(1)</script>\n```\n<img src=x onerror=alert(1)> **粗体**';
+    const f = fixture(undefined, { messages: [{role: 'assistant', status: 'complete', content}] }); await f.login('alice');
+    const nodes = walk(f.$('conversation'));
+    for (const tag of ['h3', 'ul', 'table', 'code', 'strong']) assert(nodes.some(node => node.tagName === tag), tag);
+    assert(!nodes.some(node => ['img', 'script'].includes(node.tagName)));
+    assert(f.$('conversation').textContent.includes('<img src=x onerror=alert(1)>'));
+    assert(findButton(f.$('conversation'), '复制代码'));
+  });
+  await test('manual proposal edit previews new recipient and summary and preserves material after refresh', async () => {
+    const f = fixture(); await f.login('alice');
+    let card = f.$('conversation').children[0]; await findButton(card, '修改后确认').onclick();
+    let panel = walk(card).find(node => node.className === 'action-editor');
+    const fields = walk(panel); fields.find(node => node.tagName === 'input').value = 'carol';
+    fields.find(node => node.tagName === 'textarea').value = 'Manually rewritten summary';
+    f.change(); await f.tick(); card = f.$('conversation').children[0];
+    assert(walk(card).includes(panel)); card.detailsBox.value = 'New shared material'; card.detailsBox.oninput();
+    findButton(panel, '预览').onclick(); assert(panel.textContent.includes('New shared material'));
+    await findButton(panel, '确认修改并委派').onclick();
+    const body = JSON.parse(f.calls.find(call => call.url === '/api/proposals/1/actions')?.options.body || '{}');
+    // A changed proposal revision invalidates an open editor instead of overwriting new server data.
+    assert.deepEqual(body, {});
+  });
+  await test('manual proposal edits require preview and send only explicitly entered fields', async () => {
+    const f = fixture(); await f.login('alice'); const card = f.$('conversation').children[0];
+    await findButton(card, '修改后确认').onclick(); const panel = walk(card).find(node => node.className === 'action-editor');
+    const fields = walk(panel); fields.find(node => node.tagName === 'input').value = 'carol'; fields.find(node => node.tagName === 'textarea').value = 'Human summary';
+    assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 0);
+    findButton(panel, '预览').onclick(); await findButton(panel, '确认修改并委派').onclick();
+    assert.deepEqual(JSON.parse(f.calls.find(call => call.url === '/api/proposals/1/actions').options.body), {action:'confirm',expected_revision:0,owner:'carol',summary:'Human summary'});
+  });
+  await test('old pending proposals collapse and bulk rejection never shares content', async () => {
+    const f = fixture(undefined, { proposals: [{id: 8, owner:'bob', summary:'Old summary', status:'pending', revision:2, created_at:'2020-01-01 00:00:00'}] }); await f.login('alice');
+    const group = f.$('conversation').children.find(node => node.className === 'old-proposals');
+    assert.equal(group.open, false); assert(group.textContent.includes('1 个未处理的提案'));
+    await findButton(group, '全部拒绝，不共享').onclick();
+    assert.deepEqual(JSON.parse(f.calls.find(call => call.url === '/api/proposals/8/actions').options.body), {action:'reject',expected_revision:2});
+  });
+  await test('tab title counts this users pending work and resets on logout', async () => {
+    const f = fixture(undefined, {tasks:[task(), task({id:'mine', owner:'alice', requester:'bob'})]}); await f.login('alice');
+    assert.equal(f.document.title, '(1) Agenct'); f.$('logout').onclick(); assert.equal(f.document.title, 'Agenct');
+  });
   await test('exact proposal text, explicit confirmation and revision', async () => {
     const f = fixture();
     await f.login('alice');
@@ -333,10 +482,10 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture();
     await f.login('alice');
     const proposal = f.$('conversation').children[0];
-    proposal.detailsBox.value = '材'.repeat(4001);
+    proposal.detailsBox.value = '材'.repeat(87382);
     await findButton(proposal, '确认共享并委派').onclick();
     assert(!f.calls.some(call => call.url === '/api/proposals/1/actions'));
-    assert.match(f.$('status').textContent, /12000 字节/);
+    assert.match(f.$('status').textContent, /256 KiB/);
   });
 
   await test('reject never sends shared material', async () => {
@@ -366,7 +515,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const list = f.$('activity').children;
     assert.deepEqual(list.filter(n => n.className === 'day').map(n => n.textContent), ['今天', '昨天', '更早']);
     const rows = list.filter(n => n.className.startsWith('activity-item'));
-    assert.match(rows[0].textContent, /Shared task.*bob 已接单/s);
+    assert.match(rows[0].textContent, /Shared task.*bob 已接手/s);
     assert.match(rows[1].textContent, /等你确认 · 委派给 bob/);
     assert.match(rows[2].textContent, /carol 取消了任务：不需要了/);
     assert(f.$('tasks').classList.contains('hide'), 'index is the default view');
@@ -496,14 +645,15 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.match(f.$('last-refresh').textContent, /有新的/);
     assert.equal(f.$('text').value, 'unsent private draft');
     assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 0);
-    assert([...f.timers.values()].some(timer => timer.delay === 5000));
+    assert([...f.timers.values()].some(timer => timer.delay === 3000));
   });
 
-  await test('hidden tabs pause polling; logout clears timers and stale polling', async () => {
+  await test('hidden tabs retain notification polling; logout clears timers and stale polling', async () => {
     const f = fixture();
     await f.login('alice');
     f.visible(false);
-    assert.equal(f.timers.size, 0);
+    await f.ready();
+    assert([...f.timers.values()].some(timer => timer.delay === 3000));
     f.hold();
     f.visible(true);
     const count = f.calls.length;
@@ -522,7 +672,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     await f.login('alice');
     const original = f.$('conversation').children[0];
     f.failReads(503);
-    for (const delay of [10000, 20000, 40000, 60000, 60000]) {
+    for (const delay of [6000, 12000, 24000, 48000, 60000]) {
       await f.tick();
       assert([...f.timers.values()].some(timer => timer.delay === delay));
     }
@@ -530,7 +680,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.match(f.$('last-refresh').textContent, /无法同步/);
     f.failReads(0);
     await f.tick();
-    assert([...f.timers.values()].some(timer => timer.delay === 5000));
+    assert([...f.timers.values()].some(timer => timer.delay === 3000));
     assert.match(f.$('last-refresh').textContent, /已同步/);
   });
 
@@ -567,13 +717,13 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     timer[1].callback();
     await poll;
     assert.match(f.$('last-refresh').textContent, /无法同步/);
-    assert([...f.timers.values()].some(value => value.delay === 10000));
+    assert([...f.timers.values()].some(value => value.delay === 6000));
   });
   await test('profile command stays in single chat and survives refresh without sending to model', async () => {
     const f = fixture(); await f.login('alice'); await f.send('/agents');
     assert.equal(f.calls.filter(call => call.options.method === 'POST' || call.options.method === 'PUT').length, 0);
     const panel = f.$('conversation').children.at(-1);
-    assert.match(panel.textContent, /个人 Agent 配置/);
+    assert.match(panel.textContent, /个人角色设置/);
     await f.$('refresh').onclick();
     assert.equal(f.$('conversation').children.at(-1), panel);
     const controls = panel.children[0];
@@ -757,7 +907,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
         assert.equal(reloaded.$('turn-status').textContent, '', 'Receipt is not shown before authenticating');
         await reloaded.login('secret-token-alice');
       }
-      assert.equal(reloaded.$('send').disabled, true);
+      assert.equal(reloaded.$('send').disabled, false);
       assert.equal(reloaded.$('text').value, '', 'Private draft is not persisted');
       assert.equal(reloaded.calls.filter(call => call.options.method === 'POST').length, 0);
       await reloaded.$('check-turn').onclick();
@@ -786,7 +936,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(auth); await f.ready(); f.hold();
     const send = f.send('question'); await f.ready();
     assert.equal(f.storage.size, 1);
-    const reloaded = fixture(auth, { storage: new Map(f.storage) }); await reloaded.ready();
+    const reloaded = fixture(auth, { storage: new Map(f.storage), receipt: 'pending' }); await reloaded.ready();
     assert.equal(reloaded.$('send').disabled, true);
     assert.equal(reloaded.calls.filter(call => call.options.method === 'POST').length, 0);
     f.release(); await send;
@@ -838,8 +988,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(f.$('turn-status').textContent, '');
     assert.equal(f.$('room').classList.contains('hide'), true);
     f.failReads(0); await f.login('alice');
-    assert.equal(f.$('send').disabled, true);
-    assert.equal([...f.storage.values()][0], receipt);
+    assert.equal(f.$('send').disabled, false);
+    assert.equal(f.storage.size, 0);
     assert.equal(f.calls.filter(call => call.options.method === 'POST').length, 1);
     await f.$('check-turn').onclick(); assert.equal(f.storage.size, 0);
   });
@@ -852,8 +1002,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(f.$('turn-status').textContent, '');
     assert.equal(f.$('room').classList.contains('hide'), true);
     auth.authenticated = true; auth.csrf_token = 'new-csrf'; await f.$('auth-retry').onclick();
-    assert.equal(f.$('send').disabled, true);
-    assert.equal([...f.storage.values()][0], receipt);
+    assert.equal(f.$('send').disabled, false);
+    assert.equal(f.storage.size, 0);
     await f.$('check-turn').onclick();
     assert.equal(f.calls.findLast(call => call.url.startsWith('/api/turns/')).options.headers['X-CSRF-Token'], 'new-csrf');
     assert.equal(f.storage.size, 0);
@@ -1054,13 +1204,13 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     f.discussion('task-one').onclick(); f.failNextPost(); await f.send('private question');
     const serialized = JSON.stringify([...f.storage]);
     for (const privateText of ['task-one', 'Shared', 'private question', 'revision']) assert(!serialized.includes(privateText));
-    const reloaded = fixture({ enabled: false }, { tasks: [task({ revision: 9 })], storage: f.storage, turnContexts: f.turnContexts });
+    const reloaded = fixture({ enabled: false }, { tasks: [task({ revision: 9 })], storage: f.storage, turnContexts: f.turnContexts, receipt: 'pending' });
     await reloaded.login('alice');
     assert.equal(reloaded.$('task-context-details').textContent, '');
     assert.equal(reloaded.discussion('task-one').disabled, true);
     reloaded.discussion('task-one').onclick(); await reloaded.send('another question');
     assert.equal(chatPosts(reloaded).length, 0);
-    await reloaded.$('check-turn').onclick();
+    reloaded.receipt('complete'); await reloaded.$('check-turn').onclick();
     assert.match(reloaded.$('status').textContent, /本次任务上下文：task-one · 版本 3/);
     assert.equal(chatPosts(reloaded).length, 0);
   });
@@ -1230,7 +1380,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const saved = [...f.storage.values()][0];
     assert(saved.includes('research')); assert(!saved.includes('secret draft')); assert(!saved.includes('<研究员>'));
     const second = fixture(undefined, { profile: roles(8), storage: f.storage, turnProfiles: f.turnProfiles });
-    await second.login('alice'); assert(second.$('choose-role').disabled);
+    await second.login('alice'); assert(!second.$('choose-role').disabled);
     await second.$('check-turn').onclick(); assert.equal(second.storage.size, 0);
     assert(second.$('status').textContent.includes('版本 3')); assert.equal(chatPosts(second).length, 0);
   });
@@ -1274,9 +1424,9 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
     f.failNextPost(); await f.send('private draft'); f.failReads(401); await f.tick();
     assert(f.$('room').classList.contains('hide')); assert(!f.$('role-details').textContent.includes('research'));
-    f.failReads(0); f.profile(roles(9)); await f.login('alice');
+    f.failReads(0); f.profile(roles(9)); f.receipt('pending'); await f.login('alice');
     assert(f.$('choose-role').disabled); assert(f.$('role-details').textContent.includes('版本 3'));
-    await f.$('check-turn').onclick(); assert.equal(f.storage.size, 0);
+    f.receipt('complete'); await f.$('check-turn').onclick(); assert.equal(f.storage.size, 0);
     await f.chooseRole(); f.failNextPost(); await f.send('another draft');
     await f.login('bob'); assert.equal(f.storage.size, 0);
     assert(!f.$('role-details').textContent.includes('research'));
@@ -1336,9 +1486,13 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     await button('使用此草稿填入人工交付').onclick();
     assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length,0);
     await button('提交人工交付').onclick();
+    assert.equal(editorInput(f).value, 'Human reviewed edit');
+    assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length, 0);
+    findButton(editor(f), '预览').onclick();
+    await findButton(editor(f), '确认交付').onclick();
     const action=f.calls.find(c=>c.url?.endsWith('/actions'));
-    assert.equal(reviewed,'Human reviewed edit');
     assert.equal(JSON.parse(action.options.body).result,'Human reviewed edit');
+    assert.equal(JSON.parse(action.options.body).source_draft_id,'fixture-generated-draft');
     assert.equal(JSON.parse(action.options.body).expected_revision,1);
   });
   await test('shared timeline and private draft hooks coexist in task cards', async () => {
