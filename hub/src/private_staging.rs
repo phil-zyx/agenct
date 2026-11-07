@@ -41,6 +41,13 @@ impl Hub {
     }
 
     pub(super) fn reload_private_users(&self) -> Result<Option<Roster>> {
+        self.reload_private_users_before_read(|| {})
+    }
+
+    fn reload_private_users_before_read(
+        &self,
+        before_read: impl FnOnce(),
+    ) -> Result<Option<Roster>> {
         let Some(path) = &self.private_config else {
             return Ok(None);
         };
@@ -50,6 +57,10 @@ impl Hub {
                 "private configuration unavailable",
             )
         };
+        // Serialize the snapshot read as well as its application. Otherwise an
+        // older reader can overwrite a newer rotation after waiting for this lock.
+        let mut cache = self.private_users.lock().map_err(|_| unavailable())?;
+        before_read();
         let metadata = std::fs::symlink_metadata(path).map_err(|_| unavailable())?;
         if !metadata.is_file() {
             return Err(unavailable());
@@ -74,7 +85,6 @@ impl Hub {
         // revocation take effect immediately, a broken file fails closed), but an
         // unchanged roster is not re-parsed, re-applied or re-written to the database.
         let digest = format!("{:x}", Sha256::digest(&bytes));
-        let mut cache = self.private_users.lock().map_err(|_| unavailable())?;
         if let Some((cached, users)) = cache.as_ref() {
             if *cached == digest {
                 return Ok(Some(users.clone()));
@@ -229,7 +239,30 @@ mod tests {
                 |r| r.get::<_, String>(0)
             )
             .is_ok());
+        // A queued reload must read after the preceding update, never capture an
+        // old file before waiting and then overwrite a completed token rotation.
+        let cache = hub.private_users.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader_hub = hub.clone();
+        let reader = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            reader_hub.reload_private_users_before_read(|| {
+                assert!(reader_hub.private_users.try_lock().is_err());
+                read_tx.send(()).unwrap();
+            })
+        });
+        started_rx.recv().unwrap();
+        assert!(read_rx.try_recv().is_err());
         write(vec![user("alice", &rotated), user("bob", &bob)]);
+        drop(cache);
+        read_rx.recv().unwrap();
+        let roster = reader.join().unwrap().unwrap().unwrap();
+        assert!(!roster.contains_key(&format!("{:x}", Sha256::digest(alice.as_bytes()))));
+        assert_eq!(
+            roster.get(&format!("{:x}", Sha256::digest(rotated.as_bytes()))),
+            Some(&"alice".to_owned())
+        );
         assert_eq!(
             hub.identity(&headers(&alice)).unwrap_err().0,
             StatusCode::UNAUTHORIZED
