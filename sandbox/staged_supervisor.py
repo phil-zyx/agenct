@@ -74,7 +74,7 @@ def observe_benign(engine, image_id, checker='probe', *, still_authorized=lambda
     must be individually bounded. Container output is never a source of evidence.
     Success is staging-only and is emitted only after cleanup and final authorization.
     """
-    if checker not in ('probe', 'hang') or type(timeout) not in (int, float) or not 0 < timeout <= 60:
+    if checker not in ('probe', 'hang', 'memory') or type(timeout) not in (int, float) or not 0 < timeout <= 60:
         raise StageRejected('fixed fixture/check deadline required')
     snapshot = fixture_snapshot()
     plan = verifier.plan_check(snapshot, image_id, checker)
