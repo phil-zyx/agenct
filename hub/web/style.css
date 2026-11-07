@@ -91,6 +91,7 @@ textarea, input { font: inherit; color: var(--text); background: var(--surface);
   box-shadow: var(--shadow); font-size: 14px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .toast:empty { display: none; }
+.toast.show:hover, .toast.show:focus { animation-play-state: paused; }
 .toast.show { animation: toast-life var(--life, 4s) ease forwards; }
 @keyframes toast-life { 0% { opacity: 0; transform: translate(-50%, -6px); } 6%, 85% { opacity: 1; transform: translate(-50%, 0); } 100% { opacity: 0; visibility: hidden; } }
 @media (prefers-reduced-motion: reduce) { .toast.show { animation: toast-life var(--life, 4s) steps(1, end) forwards; } }
