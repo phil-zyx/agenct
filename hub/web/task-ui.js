@@ -153,10 +153,10 @@ function renderTaskCards(context, tasks) {
     }
     const draftNote = draftUI.status?.(task);
     if (draftNote) element.append(el('p', 'draft-status' + (task.my_draft?.status === 'pending' ? ' working' : ''), draftNote));
-    const primary = [];
-    if (task.owner === context.user && task.status === 'awaiting_owner') primary.push(['accept', '接手']);
-    if (task.owner === context.user && task.status === 'working') primary.push(['deliver', '提交人工交付']);
-    if (task.requester === context.user && task.status === 'ready_for_acceptance') primary.push(['approve', '验收'], ['return', '退回']);
+    // Overview only: accepting, drafting, delivering and accepting results happen
+    // in the conversation, where the matching card sits at the time of its last step.
+    const waitingOnMe = (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+      || (task.requester === context.user && task.status === 'ready_for_acceptance');
     const canCancel = (task.requester === context.user && ['awaiting_owner', 'working', 'ready_for_acceptance'].includes(task.status))
       || (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status));
     const foot = el('div', 'card-foot');
@@ -166,14 +166,12 @@ function renderTaskCards(context, tasks) {
     const menu = el('div', 'more-menu');
     more.append(el('summary', null, '更多'), menu);
     foot.append(actionRow, tools);
-    addActions(actionRow, context, 'tasks', task, primary);
-    // Once the Agent's draft is ready, reviewing it is the one primary step;
-    // hand-writing the delivery stays available but quiet.
-    if (task.owner === context.user && task.status === 'working' && task.my_draft?.status === 'complete') {
-      for (const button of Array.from(actionRow.children || [])) if (button.textContent === '提交人工交付') button.className = '';
-    }
+    const open = el('button', waitingOnMe ? 'primary' : null, waitingOnMe ? '在对话中处理' : '在对话中查看');
+    open.type = 'button';
+    open.onclick = () => showTaskInChat(task.id);
+    actionRow.append(open);
     addDiscussion(tools, context, task);
-    draftUI.attach(tools, context, task);
+    draftUI.attach(menu, context, task);
     timelineUI.attach(menu, context, task);
     workerUI.attach(menu, context, task);
     if (canCancel) addActions(menu, context, 'tasks', task, [['cancel', '取消任务']]);

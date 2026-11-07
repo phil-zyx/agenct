@@ -53,10 +53,9 @@ function createDraftUI({ api, current, article, conversation }) {
   }
   function attach(element, context, task) {
     if (task.owner !== context.user) return;
-    const ready = draftState(task)?.status === 'complete';
+    // Version history and role choice; the everyday draft lives in the conversation.
     const b = document.createElement('button'); b.type = 'button';
-    b.textContent = ready ? '审阅 Agent 草稿' : '我的私密交付草稿';
-    if (ready) b.className = 'primary';
+    b.textContent = '我的私密交付草稿';
     b.onclick = () => { if (current(context) && tasks.has(task.id)) return open(context, task.id); };
     element.append(b);
   }
@@ -120,7 +119,8 @@ function createDraftUI({ api, current, article, conversation }) {
       editors.push({ input, original: draft.content });
       if (!stale) button('使用此草稿填入人工交付', () => {
         edit = { task: taskId, revision: draft.task_revision, source: draft.id, input };
-        panel.append(article('已选择编辑稿；尚未交付。请点击任务上的人工交付按钮审阅并确认。'));
+        if (typeof useDraftInChat === 'function') useDraftInChat(context, taskId, draft.id, input.value);
+        panel.append(article('已填入对话中的交付框；尚未交付。请在对话里核对后确认交付。'));
       });
       if (!stale && key(draft.id)) {
         const label = document.createElement('label'); label.className = 'draft-revision-field'; label.textContent = '修改这版草稿的要求（基于保存版本，当前手改内容不会自动发送）';

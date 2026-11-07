@@ -486,3 +486,12 @@ textarea, input { caret-color: var(--brand); }
 .draft-status.working::before { animation: draft-pulse 1.2s ease-in-out infinite; }
 @keyframes draft-pulse { 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) { .draft-status.working::before { animation: none; } }
+
+/* Task work inside the conversation. */
+.task-chat { border-color: var(--line-strong); }
+.task-chat.flash { box-shadow: 0 0 0 3px var(--brand-soft); transition: box-shadow .3s; }
+.task-line { align-self: center; max-width: 100%; font-size: 13px; color: var(--muted); background: var(--soft); border-radius: 999px; padding: 5px 14px; text-align: center; overflow-wrap: anywhere; }
+.agent-draft { margin: 10px 0 4px; padding: 12px 14px; background: var(--soft); border-radius: 10px; min-width: 0; }
+.agent-draft-meta { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.agent-draft-ask { font-size: 13px; color: var(--text); margin-bottom: 8px; padding-left: 8px; border-left: 2px solid var(--line-strong); }
+.agent-draft .markdown { font-size: 14.5px; }
