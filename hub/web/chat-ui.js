@@ -123,7 +123,7 @@ function renderChatExamples() {
   return box;
 }
 
-function renderConversation(context, messages, proposals) {
+function renderConversation(context, messages, proposals, moments = []) {
   const separators = new Map();
   let previous = null;
   messages.forEach((message, index) => {
@@ -183,13 +183,30 @@ function renderConversation(context, messages, proposals) {
       after.get(messages.length - 1).push(proposal);
     } else leading.push(proposal);
   }
-  if (!messages.length && !proposals.length) entries.push(renderChatExamples());
+  // Task steps sit after the last message at or before their time; steps older
+  // than the loaded window lead, undated ones (pre-timestamp records) close it.
+  const momentsAfter = new Map(), momentsLeading = [], momentsTrailing = [];
+  for (const moment of moments) {
+    if (!moment.at) { momentsTrailing.push(moment.element); continue; }
+    let anchor = -1;
+    messages.forEach((message, index) => {
+      const when = parseUtc(message.created_at);
+      if (when && when <= moment.at) anchor = index;
+    });
+    if (anchor === -1 && messages.some(message => parseUtc(message.created_at))) momentsLeading.push(moment.element);
+    else if (anchor === -1) momentsTrailing.push(moment.element);
+    else { if (!momentsAfter.has(anchor)) momentsAfter.set(anchor, []); momentsAfter.get(anchor).push(moment.element); }
+  }
+  if (!messages.length && !proposals.length && !moments.length) entries.push(renderChatExamples());
   const ordered = leading.map(proposal => ({ proposal }));
+  for (const bubble of momentsLeading) ordered.push({ bubble });
   entries.forEach((bubble, index) => {
     if (separators.has(index)) ordered.push({ bubble: separators.get(index) });
     ordered.push({ bubble });
     for (const proposal of after.get(index) || []) ordered.push({ proposal });
+    for (const moment of momentsAfter.get(index) || []) ordered.push({ bubble: moment });
   });
+  for (const bubble of momentsTrailing) ordered.push({ bubble });
   entries.length = 0;
   for (const item of ordered) {
     if (item.bubble) { entries.push(item.bubble); continue; }

@@ -149,7 +149,11 @@ function fixture(auth = { enabled: false }, settings = {}) {
         const task = tasks.find(t => url === '/api/tasks/' + t.id);
         if (task) data = { task, timeline: {events: [], deliveries: [], audit: {schema_version:1,legacy_history_incomplete:true,legacy_notice:'Earlier history unknown'}} };
       }
-      if (url.includes('/drafts')) {
+      if (url.includes('/drafts/turns/') && options.method === 'GET') {
+        const task = tasks[0], requestId = decodeURIComponent(url.split('/').pop());
+        data = {kind:'draft_delivery',task_id:task.id,request_id:requestId,status:'complete',current_stale:false,
+          response:{draft:{id:'auto-draft-id',seq:1,content:'Auto draft 需要补充的信息',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}};
+      } else if (url.includes('/drafts')) {
         const task = tasks[0];
         data = options.method === 'POST'
           ? {kind:'draft_delivery',task_id:task.id,request_id:JSON.parse(options.body).request_id,status:'complete',current_stale:false,response:{draft:{id:'fixture-generated-draft',content:'Generated draft',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}}
@@ -165,7 +169,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'draft-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-model.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-ui.js'), 'utf8'), context);
-  for (const name of ['activity-ui.js', 'chat-ui.js', 'task-ui.js', 'repo-ui.js', 'client.js', 'client-chrome.js']) vm.runInContext(fs.readFileSync(path.join(__dirname, name), 'utf8'), context);
+  for (const name of ['activity-ui.js', 'chat-ui.js', 'task-ui.js', 'repo-ui.js', 'client.js', 'task-chat.js', 'client-chrome.js']) vm.runInContext(fs.readFileSync(path.join(__dirname, name), 'utf8'), context);
   return {
     $, calls, timers, storage, confirmations, turnContexts, turnProfiles, document,
     key(event) { listeners.get('keydown')?.({ preventDefault() {}, ...event }); },
@@ -358,8 +362,10 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
   });
   await test('handwritten delivery never claims a private draft source', async () => {
     const f=fixture(undefined,{tasks:[task()]}); await f.login('bob');
-    await findButton(f.$('tasks'),'提交人工交付').onclick(); editorInput(f).value='Handwritten delivery';
-    findButton(editor(f),'预览').onclick(); await findButton(editor(f),'确认交付').onclick();
+    await findButton(f.$('conversation'),'手写交付').onclick();
+    const box = walk(f.$('conversation')).find(node => node.className === 'action-editor');
+    walk(box).find(node => node.tagName === 'textarea').value = 'Handwritten delivery';
+    await findButton(box,'确认交付').onclick();
     assert.equal(Object.hasOwn(JSON.parse(taskPosts(f)[0].options.body),'source_draft_id'),false);
   });
   await test('task filters archive finished work while retaining explicit access', async () => {
@@ -1484,12 +1490,12 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length,0);
     const input=[f.$('conversation'), f.$('tasks')].flatMap(walk).find(e=>e.value==='Generated draft'); input.value='Human reviewed edit';
     await button('使用此草稿填入人工交付').onclick();
+    await new Promise(resolve => setImmediate(resolve));
     assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length,0);
-    await button('提交人工交付').onclick();
-    assert.equal(editorInput(f).value, 'Human reviewed edit');
+    const box = walk(f.$('conversation')).find(node => node.className === 'action-editor');
+    assert.equal(walk(box).find(node => node.tagName === 'textarea').value, 'Human reviewed edit');
     assert.equal(f.calls.filter(c=>c.url?.endsWith('/actions')).length, 0);
-    findButton(editor(f), '预览').onclick();
-    await findButton(editor(f), '确认交付').onclick();
+    await findButton(box, '确认交付').onclick();
     const action=f.calls.find(c=>c.url?.endsWith('/actions'));
     assert.equal(JSON.parse(action.options.body).result,'Human reviewed edit');
     assert.equal(JSON.parse(action.options.body).source_draft_id,'fixture-generated-draft');
@@ -1508,6 +1514,49 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     nodes=walk(requester.$('tasks'));
     assert(nodes.some(e=>e.textContent==='查看共享时间线'));
     assert(!nodes.some(e=>e.textContent==='我的私密交付草稿'));
+  });
+  const settle = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve)); };
+  const posts = (f, suffix) => f.calls.filter(c => c.options?.method === 'POST' && c.url.endsWith(suffix));
+  await test('incoming work is accepted in the conversation; the task pane is an overview', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'awaiting_owner', revision: 0 })] }); await f.login('bob');
+    const walk = e => [e, ...e.children.flatMap(walk)];
+    assert(findButton(f.$('conversation'), '接手'), 'accept lives in the conversation');
+    assert(!walk(f.$('tasks')).some(e => e.textContent === '接手'), 'no duplicate accept in the pane');
+    assert(walk(f.$('tasks')).some(e => e.textContent === '在对话中处理'));
+    await findButton(f.$('conversation'), '接手').onclick();
+    assert.deepEqual(JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body), { action: 'accept', expected_revision: 0 });
+  });
+  await test('agent draft is supplemented and delivered from the conversation', async () => {
+    const draft = { status: 'complete', automatic: true, request_id: 'auto-task-one-r3' };
+    const f = fixture(undefined, { tasks: [task({ result: null, my_draft: draft })] }); await f.login('bob'); await settle();
+    assert.match(f.$('conversation').textContent, /Auto draft 需要补充的信息/);
+    assert.match(f.$('conversation').textContent, /仅你可见/);
+    await findButton(f.$('conversation'), '补充信息 / 让 Agent 修改').onclick();
+    assert.equal(f.$('draft-reply').classList.contains('hide'), false);
+    await f.send('我是 bob，用于面试，语气正式'); await settle();
+    assert.equal(chatPosts(f).length, 0, 'a supplement is not a chat message');
+    const revision = JSON.parse(posts(f, '/tasks/task-one/drafts')[0].options.body);
+    assert.deepEqual(revision.revision, { base_draft_id: 'auto-draft-id', instruction: '我是 bob，用于面试，语气正式' });
+    assert.equal(revision.expected_revision, 3);
+    assert.equal(f.$('draft-reply').classList.contains('hide'), true);
+    assert.equal(posts(f, '/actions').length, 0, 'drafting never delivers');
+    await findButton(f.$('conversation'), '交付给 alice').onclick();
+    const walk = e => [e, ...e.children.flatMap(walk)];
+    const box = walk(f.$('conversation')).find(node => node.className === 'action-editor');
+    assert.equal(walk(box).find(node => node.tagName === 'textarea').value, 'Auto draft 需要补充的信息');
+    await findButton(box, '确认交付').onclick();
+    const body = JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body);
+    assert.deepEqual([body.action, body.source_draft_id, body.expected_revision], ['deliver', 'auto-draft-id', 3]);
+  });
+  await test('requester accepts or returns a delivery in the conversation and never reads drafts', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance', result: '**交付**内容' })] }); await f.login('alice'); await settle();
+    assert.match(f.$('conversation').textContent, /bob 交付了结果/);
+    assert(findButton(f.$('conversation'), '退回修改'));
+    await findButton(f.$('conversation'), '验收通过').onclick();
+    assert.equal(JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body).action, 'approve');
+    const g = fixture(undefined, { tasks: [task({ my_draft: undefined })] }); await g.login('alice'); await settle();
+    assert.match(g.$('conversation').textContent, /bob 已接手/);
+    assert.equal(g.calls.filter(c => c.url.includes('/drafts')).length, 0);
   });
   console.log('Client regression tests passed');
 
