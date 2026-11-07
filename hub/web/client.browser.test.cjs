@@ -52,7 +52,11 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
         if (state.post === 'stall') return; // Leave this POST unanswered until the browser aborts.
         if (state.post === 'network-failure') { await route.abort('failed'); return; }
         if (state.post === 'complete') messages.push({ role: 'assistant', status: 'complete', content: state.reply });
-        data = { turn: { request_id: body.request_id, status: state.post }, reply: state.post === 'complete' ? state.reply : null, task_context: taskContexts.get(body.request_id) };
+        // Stand-in for the model's reading of a plain-language task reply.
+        const context = taskContexts.get(body.request_id);
+        const action = context && state.taskAction ? state.taskAction(body.message, context) : null;
+        data = { turn: { request_id: body.request_id, status: state.post }, reply: state.post === 'complete' ? state.reply : null, task_context: context,
+          task_action: action ? { task_id: context.id, expected_revision: context.revision, instruction: null, ...action } : null };
       } else data = messages;
     }
     if (pathname.startsWith('/api/turns/')) {
@@ -259,7 +263,8 @@ if (require.main === module) (async () => {
     }
     {
       const f = await fixture(browser, origin);
-      const alpha = taskFixture(), beta = taskFixture('task-beta', 3);
+      // In progress with bob: nothing waits on alice, so no automatic binding applies.
+      const alpha = { ...taskFixture(), status: 'working' }, beta = { ...taskFixture('task-beta', 3), status: 'working' };
       await showTasks(f, [alpha, beta]);
       const writesBefore = f.calls.filter(call => call.method !== 'GET').length;
       await discussButtons(f).nth(0).click();
@@ -432,22 +437,27 @@ async function nextStepsInteractions(browser, origin) {
     await f.page.setViewportSize({ width: 400, height: 900 });
     const task = { id: 'draft-task', revision: 2, requester: 'bob', owner: 'alice', status: 'working', summary: 'Draft a delivery' };
     await showTasks(f, [task]);
-    // The pane only points into the conversation, where the work happens.
+    // The pane only points into the conversation, where the work happens by talking.
+    f.state.taskAction = message => /交付/.test(message) ? { action: 'deliver' } : { action: 'revise', instruction: message };
     await f.page.getByRole('button', { name: '在对话中处理', exact: true }).click();
     assert.equal(await f.page.locator('.task-pane').isVisible(), false);
     const card = f.page.locator('#task-chat-draft-task');
-    await card.getByRole('button', { name: '让 Agent 起草', exact: true }).click();
+    assert.equal(await card.getByRole('button').count(), 0, 'no action buttons on the card');
+    assert((await f.page.locator('#task-context-label').textContent()).includes('回复给任务'));
+    await f.page.locator('#text').fill('帮我写一版，语气正式'); await f.page.locator('#text').press('Enter');
     await card.locator('.agent-draft').waitFor();
     assert((await card.textContent()).includes('Private generated draft'));
+    const asked = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').at(-1).body;
+    assert.equal(asked.revision, undefined, 'no earlier draft: a fresh one');
     assert(!f.calls.some(c => c.pathname.endsWith('/actions')), 'drafting never delivers');
-    await card.getByRole('button', { name: '补充信息 / 让 Agent 修改', exact: true }).click();
-    await f.page.locator('#draft-reply:not(.hide)').waitFor();
     await f.page.locator('#text').fill('更正式一些'); await f.page.locator('#text').press('Enter');
-    await f.page.waitForFunction(() => document.getElementById('draft-reply').classList.contains('hide'));
-    const supplement = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').at(-1).body;
+    await f.page.waitForFunction(() => document.querySelectorAll('.task-chat .agent-draft').length >= 1);
+    const supplement = await (async () => { for (let i = 0; i < 50; i++) {
+      const last = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').at(-1).body;
+      if (last.revision) return last; await f.page.waitForTimeout(100); } })();
     assert.equal(supplement.revision.instruction, '更正式一些');
-    assert.equal(f.posts().length, 0, 'a supplement is not a chat message');
-    await card.getByRole('button', { name: '交付给 bob', exact: true }).click();
+    await f.page.locator('#text').fill('可以，交付'); await f.page.locator('#text').press('Enter');
+    await card.getByRole('button', { name: '先改一下再交付', exact: true }).click();
     const box = card.getByLabel('交付内容', { exact: true });
     await box.fill('Human reviewed delivery\nSecond paragraph');
     assert(!f.calls.some(c => c.pathname.endsWith('/actions')));
@@ -456,7 +466,7 @@ async function nextStepsInteractions(browser, origin) {
     const delivered = f.calls.find(c => c.pathname === '/api/tasks/draft-task/actions').body;
     assert.equal(delivered.result, 'Human reviewed delivery\nSecond paragraph');
     assert(delivered.source_draft_id.startsWith('draft-'));
-    await f.close(); console.log('PASS Chromium conversation drafting, supplement, human editing and explicit delivery');
+    await f.close(); console.log('PASS Chromium plain-language drafting, supplement, one-step delivery confirmation and human editing');
   }
   {
     const f = await fixture(browser, origin);

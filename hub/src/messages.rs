@@ -80,6 +80,15 @@ pub(super) async fn execute_chat(
         repository_message,
     )
     .await?;
+    let task_role = task_context.as_ref().and_then(|context| {
+        if context["owner"] == id {
+            Some("owner")
+        } else if context["requester"] == id {
+            Some("requester")
+        } else {
+            None
+        }
+    });
     // Generate the test double's reply without DB access. Preserve its established
     // proposal-only history behavior, but never bypass shared output validation.
     let mock_answer = if matches!(h.runtime, Runtime::Mock) {
@@ -93,6 +102,7 @@ pub(super) async fn execute_chat(
                     profile: &runtime_profile,
                     task_context: task_context.as_ref(),
                     draft_revision: None,
+                    task_role,
                 })
                 .await?,
         )
@@ -139,6 +149,7 @@ pub(super) async fn execute_chat(
                 profile: &runtime_profile,
                 task_context: task_context.as_ref(),
                 draft_revision: None,
+                task_role,
             })
             .await
         }
@@ -158,6 +169,7 @@ pub(super) async fn execute_chat(
                 reply: recipient_notice(h, id, owner),
                 backend: answer.backend.clone(),
                 proposal: None,
+                task_action: None,
             })
         } else if matches!(h.runtime, Runtime::Mock) {
             Err(invalid(
@@ -198,7 +210,7 @@ pub(super) async fn execute_chat(
                     return Err(error);
                 }
             };
-            let reply = answer.reply;
+            let reply = answer.reply.clone();
             tx.execute(
                 "UPDATE messages SET status='complete' WHERE id=?1",
                 [message_id],
@@ -206,7 +218,14 @@ pub(super) async fn execute_chat(
             if message_id.is_some() {
                 tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
             }
-            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context});
+            // A proposal and a task action never travel together; a delegation wins.
+            let task_action = match (&proposal, &answer.task_action, &task_context) {
+                (None, Some(action), Some(context)) => {
+                    checked_task_action(action, context, task_role)
+                }
+                _ => None,
+            };
+            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context,"task_action":task_action});
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
             Ok(Json(response))
@@ -220,6 +239,40 @@ pub(super) async fn execute_chat(
             Err(error)
         }
     }
+}
+
+/// The model's suggested task step, kept only if the caller may take it in the
+/// task's state as snapshotted for this turn. It is returned for the client to
+/// confirm (or, for a private draft revision, to request); nothing runs here.
+fn checked_task_action(
+    action: &crate::runtime::TaskAction,
+    context: &serde_json::Value,
+    role: Option<&str>,
+) -> Option<serde_json::Value> {
+    let allowed: &[&str] = match (role?, context["status"].as_str()?) {
+        ("owner", "awaiting_owner") => &["accept"],
+        ("owner", "working") => &["revise", "deliver"],
+        ("requester", "ready_for_acceptance") => &["approve", "return"],
+        _ => &[],
+    };
+    if !allowed.contains(&action.action.as_str()) {
+        return None;
+    }
+    let instruction = if action.action == "revise" {
+        let text = action.instruction.as_deref()?.trim();
+        if text.is_empty() || text.len() > 4000 {
+            return None;
+        }
+        Some(text.to_owned())
+    } else {
+        None
+    };
+    Some(serde_json::json!({
+        "action": action.action,
+        "task_id": context["id"],
+        "expected_revision": context["revision"],
+        "instruction": instruction,
+    }))
 }
 
 /// Hub-authored, deterministic text. The model-supplied name is shown only when it

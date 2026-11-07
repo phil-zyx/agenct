@@ -225,6 +225,7 @@ pub(super) async fn summarize(
             profile,
             task_context: None,
             draft_revision: None,
+            task_role: None,
         };
         let answer = match &h.runtime {
             Runtime::Mock => MockRuntime.turn(request).await,
