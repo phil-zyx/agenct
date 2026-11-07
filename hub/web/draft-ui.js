@@ -36,9 +36,27 @@ function createDraftUI({ api, current, article, conversation }) {
       && tasks.has(task.id) && key(edit.source) ? edit.source : null;
   }
   function append(entries) { if (card) entries.push(card); }
+  // Hub-started drafts (receipt key "auto-…") are the Hub's to finish; the browser
+  // never needs to keep a recovery key for them.
+  const automatic = id => typeof id === 'string' && id.startsWith('auto-');
+  function draftState(task) {
+    const d = task.status === 'working' ? task.my_draft : null;
+    return d && ['pending', 'complete', 'uncertain'].includes(d.status) ? d : null;
+  }
+  // Owner-only status line for the current task version; never draft content.
+  function status(task) {
+    const d = draftState(task);
+    if (!d) return '';
+    if (d.status === 'pending') return d.automatic ? 'Agent 正在自动起草，完成后在这里审阅。' : '起草中…';
+    if (d.status === 'complete') return d.automatic ? 'Agent 已自动起草，仅你可见。审阅、修改后再交付。' : '草稿已就绪，仅你可见。';
+    return '起草结果未知，打开草稿可核对；不会自动重发。';
+  }
   function attach(element, context, task) {
     if (task.owner !== context.user) return;
-    const b = document.createElement('button'); b.type = 'button'; b.textContent = '我的私密交付草稿';
+    const ready = draftState(task)?.status === 'complete';
+    const b = document.createElement('button'); b.type = 'button';
+    b.textContent = ready ? '审阅 Agent 草稿' : '我的私密交付草稿';
+    if (ready) b.className = 'primary';
     b.onclick = () => { if (current(context) && tasks.has(task.id)) return open(context, task.id); };
     element.append(b);
   }
@@ -127,13 +145,15 @@ function createDraftUI({ api, current, article, conversation }) {
           try {
             const receipt = await request(route + '/turns/' + encodeURIComponent(unresolved.id));
             if (!valid()) return;
-            if (display(receipt, unresolved.id)) { sessionStorage.removeItem(storageKey); unresolved = null; }
+            if (display(receipt, unresolved.id)) { if (!automatic(unresolved.id)) sessionStorage.removeItem(storageKey); unresolved = null; }
           } catch (error) { if (valid()) panel.append(article('仍未核实：' + error.message)); }
           finally { if (valid()) { working = false; controls(); } }
         });
+        if (automatic(unresolved.id) && tasks.get(taskId)?.my_draft?.status === 'pending') return;
         button('明确开始新的起草尝试', () => {
           if (!confirm('原请求可能已调用模型并产生费用。新请求可能重复工作。确认仅允许下一次手动起草？')) return;
-          sessionStorage.removeItem(storageKey); unresolved = null; controls();
+          if (!automatic(unresolved.id)) sessionStorage.removeItem(storageKey);
+          unresolved = null; controls();
         });
         return;
       }
@@ -189,7 +209,7 @@ function createDraftUI({ api, current, article, conversation }) {
             display(receipt);
             if (!unresolved && ['pending', 'uncertain'].includes(receipt.status)) {
               unresolved = { owner: context.user, mode: context.browserMode, task: taskId, id: receipt.request_id };
-              sessionStorage.setItem(storageKey, JSON.stringify(unresolved));
+              if (!automatic(receipt.request_id)) sessionStorage.setItem(storageKey, JSON.stringify(unresolved));
             }
           }
           if (page.next_cursor && page.next_cursor !== cursor) nextPage(page.next_cursor);
@@ -212,12 +232,12 @@ function createDraftUI({ api, current, article, conversation }) {
         display(receipt);
         if (!unresolved && ['pending', 'uncertain'].includes(receipt.status)) {
           unresolved = { owner: context.user, mode: context.browserMode, task: taskId, id: receipt.request_id };
-          sessionStorage.setItem(storageKey, JSON.stringify(unresolved));
+          if (!automatic(receipt.request_id)) sessionStorage.setItem(storageKey, JSON.stringify(unresolved));
         }
       }
       if (page.next_cursor) nextPage(page.next_cursor);
     } catch (error) { if (valid()) panel.append(article('读取失败：' + error.message)); }
     finally { if (valid()) { working = false; controls(); } }
   }
-  return { reset, update, append, attach, reviewedText, reviewedSource };
+  return { reset, update, append, attach, status, reviewedText, reviewedSource };
 }

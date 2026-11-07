@@ -71,8 +71,13 @@ async function freePort() {
   }
   async function login(page, identity) {
     await page.bringToFront();
-    await page.goto(origin); await page.locator('#token').fill(credentials()[identity]); await page.locator('#enter').click();
-    await page.locator('#room:not(.hide)').waitFor();
+    await page.goto(origin);
+    // A still-valid tab session may resume straight into the room; either is fine.
+    const form = page.locator('#token'), room = page.locator('#room:not(.hide)');
+    await Promise.race([form.waitFor(), room.waitFor()]);
+    if (await form.isVisible()) { await form.fill(credentials()[identity]); await page.locator('#enter').click(); }
+    await room.waitFor();
+    assert((await page.locator('#identity').textContent()).includes(identity), 'resumed the expected identity');
   }
   async function activate(page, name) {
     const control = page.getByRole('button', { name, exact: true });
@@ -150,9 +155,11 @@ async function freePort() {
     await bob.locator('#refresh').click(); await tasks(bob);
     await activate(bob, '接手');
     await bob.locator('.task-working').waitFor();
-    await bob.getByRole('button', { name: '我的私密交付草稿', exact: true }).click();
-    await bob.getByRole('button', { name: '让我的 Agent 起草（不交付）', exact: true }).click();
+    // Accepting starts the owner's private draft; the card says when it is ready.
+    await bob.locator('.task-working .draft-status').waitFor();
+    await bob.getByRole('button', { name: '审阅 Agent 草稿', exact: true }).click({ timeout: 15000 });
     await bob.getByLabel('私密交付草稿编辑', { exact: true }).waitFor();
+    assert.equal((await (await api('alice', 'tasks')).json())[0].my_draft, undefined, 'Requester never sees draft state');
     await bob.getByLabel('草稿修改要求', { exact: true }).fill('请缩短并保留验收清单');
     await bob.getByRole('button', { name: '按要求生成新版本', exact: true }).click();
     await bob.waitForFunction(() => document.querySelectorAll('textarea[aria-label="私密交付草稿编辑"]').length >= 2);

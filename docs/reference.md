@@ -2,6 +2,8 @@
 
 本文与[入门](getting-started.md)是当前维护入口。`archive/` 保存原专题合同、决策和历史验收记录，避免把历史阶段的限制误当作现状。当前开发项与外部验收见[计划](next-steps-plan.md)，界面用词见[用语表](ui-terminology.md)。
 
+联系人入口位于左侧导航，列表在右侧打开。`GET /api/contacts` 需要登录，只返回可委派的其他成员账号（启用租户时限同租户），不返回令牌或在线状态。选择联系人并填写摘要只生成待确认提案，确认后才共享。
+
 ## 架构与边界
 
 | 部分 | 职责 | 不授予的能力 |
@@ -33,6 +35,7 @@ Hub 只监听 loopback。试用由 SSH 隧道连接，不公开开发令牌。SQ
 | `AGENCT_ADAPTER_URL` / `AGENCT_ADAPTER_TOKEN` | 手动管理 adapter 时的本机地址与独立认证 |
 | `DEEPSEEK_API_KEY` | 仅由 adapter 使用的提供商凭据 |
 | `AGENCT_DSH_MODEL` | adapter 的服务器模型设置；个人角色只引用 `server-default` |
+| `AGENCT_AUTO_DRAFT` | 默认开启：任务进入“进行中”后为接收人自动生成私密草稿（每个任务版本最多一次，回执键 `auto-<任务>-r<版本>`）；设为 `0` 关闭。草稿从不自动共享或交付 |
 | `AGENCT_TENANTS_FILE` | 可选完整用户→组织映射；须与OIDC结合且禁用热成员变更 |
 | `AGENCT_WORKER_SCOPES_FILE` | 按任务限制入队权限；不能启用执行 |
 
