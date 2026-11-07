@@ -151,6 +151,8 @@ function renderTaskCards(context, tasks) {
       delivery.append(el(finished ? 'summary' : 'span', 'delivery-label', '最新交付'), el('pre', null, task.result));
       element.append(delivery);
     }
+    const draftNote = draftUI.status?.(task);
+    if (draftNote) element.append(el('p', 'draft-status' + (task.my_draft?.status === 'pending' ? ' working' : ''), draftNote));
     const primary = [];
     if (task.owner === context.user && task.status === 'awaiting_owner') primary.push(['accept', '接手']);
     if (task.owner === context.user && task.status === 'working') primary.push(['deliver', '提交人工交付']);
@@ -165,6 +167,11 @@ function renderTaskCards(context, tasks) {
     more.append(el('summary', null, '更多'), menu);
     foot.append(actionRow, tools);
     addActions(actionRow, context, 'tasks', task, primary);
+    // Once the Agent's draft is ready, reviewing it is the one primary step;
+    // hand-writing the delivery stays available but quiet.
+    if (task.owner === context.user && task.status === 'working' && task.my_draft?.status === 'complete') {
+      for (const button of Array.from(actionRow.children || [])) if (button.textContent === '提交人工交付') button.className = '';
+    }
     addDiscussion(tools, context, task);
     draftUI.attach(tools, context, task);
     timelineUI.attach(menu, context, task);

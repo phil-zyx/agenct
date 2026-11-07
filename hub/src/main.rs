@@ -63,6 +63,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hub = hub.with_tenants(assignments)?;
         eprintln!("Organization isolation enabled; cross-organization delegation disabled");
     }
+    // On by default: the owner still reviews, edits and explicitly delivers.
+    let auto_draft = std::env::var("AGENCT_AUTO_DRAFT").map_or(true, |v| v != "0");
+    hub = hub.with_auto_draft(auto_draft);
+    if !auto_draft {
+        eprintln!("Automatic drafting disabled (AGENCT_AUTO_DRAFT=0)");
+    }
     hub.validate_startup()?;
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => listener,

@@ -50,13 +50,33 @@ pub(super) async fn tasks(
     let db = h.db()?;
     let mut q=db.prepare("SELECT id,requester,owner,summary,status,result,revision FROM tasks WHERE requester=?1 OR owner=?1 ORDER BY rowid DESC")?;
     let rows = q
-        .query_map([id], row_task)?
+        .query_map([&id], row_task)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for task in rows {
         let shared = details(&db, &task.id)?;
         let mut value = serde_json::to_value(&task).map_err(|_| invalid("invalid task"))?;
         value["details"] = shared.map_or(serde_json::Value::Null, |d| d["content"].clone());
+        if task.owner == id {
+            // Owner-only: whether a private draft exists for this task version.
+            // Status and receipt key only; never content, and never for the requester.
+            value["my_draft"] = db
+                .query_row(
+                    "SELECT status,request_id FROM draft_turns WHERE owner=?1 AND task_id=?2
+                     AND json_extract(binding,'$.expected_revision')=?3 ORDER BY rowid DESC LIMIT 1",
+                    params![id, task.id, task.revision],
+                    |r| {
+                        let request_id: String = r.get(1)?;
+                        Ok(serde_json::json!({
+                            "status": r.get::<_, String>(0)?,
+                            "automatic": request_id.starts_with(crate::drafts::AUTO_PREFIX),
+                            "request_id": request_id,
+                        }))
+                    },
+                )
+                .optional()?
+                .unwrap_or(serde_json::Value::Null);
+        }
         out.push(value);
     }
     Ok(Json(out))
@@ -196,7 +216,13 @@ pub(super) async fn action(
     // Task revision changes revoke queued work and lease capabilities atomically.
     worker::revoke_task(&tx, &id)?;
     tx.commit()?;
-    Ok(Json(
-        serde_json::json!({"id":id,"status":next,"revision":t.revision+1}),
-    ))
+    drop(db);
+    let mut out = serde_json::json!({"id":id,"status":next,"revision":t.revision+1});
+    if h.auto_draft && next == "working" {
+        out["auto_draft"] = serde_json::json!({
+            "request_id": crate::drafts::auto_request_id(&id, t.revision + 1)
+        });
+        crate::drafts::spawn_auto(h.clone(), t.owner.clone(), id.clone(), t.revision + 1);
+    }
+    Ok(Json(out))
 }
