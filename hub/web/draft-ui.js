@@ -31,6 +31,10 @@ function createDraftUI({ api, current, article, conversation }) {
     return edit && edit.task === task.id && edit.revision === task.revision && task.status === 'working'
       ? edit.input.value : '';
   }
+  function reviewedSource(task) {
+    return edit && edit.task === task.id && edit.revision === task.revision && task.status === 'working'
+      && tasks.has(task.id) && key(edit.source) ? edit.source : null;
+  }
   function append(entries) { if (card) entries.push(card); }
   function attach(element, context, task) {
     if (task.owner !== context.user) return;
@@ -83,7 +87,7 @@ function createDraftUI({ api, current, article, conversation }) {
           || !Number.isSafeInteger(draft.task_revision) || typeof receipt.current_stale !== 'boolean'
           || response.task_context?.id !== taskId) throw Error('草稿响应无效');
       const stale = receipt.current_stale || tasks.get(taskId).revision !== draft.task_revision || tasks.get(taskId).status !== 'working';
-      panel.append(article(`模型生成文本，未经验证。任务版本 ${draft.task_revision}；角色配置版本 ${response.runtime_profile?.revision ?? '未知'}。`
+      panel.append(article(`草稿第 ${draft.seq ?? '—'} 版${draft.base_draft_id ? ' · 根据已有草稿修改' : ''}。模型生成文本，未经验证。任务版本 ${draft.task_revision}；角色版本 ${response.runtime_profile?.revision ?? '未知'}。`
         + (stale ? ' 已过期，仅供查看，不能直接交付。' : ' 请编辑审阅，再点击任务上的「提交人工交付」并确认。')));
       const truncated = [
         response.task_context.summary_truncated && '共享摘要',
@@ -97,9 +101,22 @@ function createDraftUI({ api, current, article, conversation }) {
       input.setAttribute('aria-label', '私密交付草稿编辑'); panel.append(input);
       editors.push({ input, original: draft.content });
       if (!stale) button('使用此草稿填入人工交付', () => {
-        edit = { task: taskId, revision: draft.task_revision, input };
+        edit = { task: taskId, revision: draft.task_revision, source: draft.id, input };
         panel.append(article('已选择编辑稿；尚未交付。请点击任务上的人工交付按钮审阅并确认。'));
       });
+      if (!stale && key(draft.id)) {
+        const label = document.createElement('label'); label.className = 'draft-revision-field'; label.textContent = '修改这版草稿的要求（基于保存版本，当前手改内容不会自动发送）';
+        const instruction = document.createElement('textarea'); instruction.rows = 2;
+        instruction.setAttribute('aria-label', '草稿修改要求');
+        instruction.placeholder = '例如：更简短，保留结论和依据'; label.append(instruction); panel.append(label);
+        button('按要求生成新版本', async () => {
+          const text = instruction.value.trim();
+          if (!text || new TextEncoder().encode(text).length > 4000) {
+            panel.append(article('请填写 1–4000 字节的修改要求。')); return;
+          }
+          await generate({ base_draft_id: draft.id, instruction: text });
+        });
+      }
       return true;
     }
     function controls() {
@@ -134,30 +151,31 @@ function createDraftUI({ api, current, article, conversation }) {
         } catch (error) { if (valid()) panel.append(article(error.message)); }
         finally { if (valid()) working = false; }
       });
-      button('让我的 Agent 起草（不交付）', async () => {
-        if (unresolved) return;
-        if (roleInvalid) { panel.append(article('所选角色已失效，请重新选择或明确改用默认管家。')); return; }
-        const task = tasks.get(taskId);
-        if (task?.status !== 'working' || task.revision !== openedRevision) { panel.append(article('任务版本已改变，请重新打开并审阅。')); return; }
-        const id = crypto.randomUUID(), body = { request_id: id, expected_revision: task.revision, ...role };
-        unresolved = { owner: context.user, mode: context.browserMode, task: taskId, id };
-        try { sessionStorage.setItem(storageKey, JSON.stringify(unresolved)); }
-        catch { unresolved = null; panel.append(article('无法保存恢复编号，未发送。')); return; }
-        view++; working = true;
-        panel.append(article('正在发送，尚未收到服务端回执。'));
-        try {
-          const receipt = await request(route, 'POST', body);
-          if (!valid()) return;
-          if (display(receipt, id)) { sessionStorage.removeItem(storageKey); unresolved = null; }
-        } catch (error) {
-          if (!valid()) return;
-          if (error.httpStatus === 409 && codes.has(error.code)) {
-            sessionStorage.removeItem(storageKey); unresolved = null;
-            if (error.code === 'draft_role_unavailable_before_reservation') roleInvalid = true;
-            panel.append(article('请求未登记、未调用模型。请重新核对任务和角色后手动操作。'));
-          } else panel.append(article('起草结果未知：' + error.message + '。只核对，不自动重发。'));
-        } finally { if (valid()) { working = false; controls(); } }
-      });
+      button('让我的 Agent 起草（不交付）', () => generate());
+    }
+    async function generate(revision) {
+      if (unresolved) return;
+      if (roleInvalid) { panel.append(article('所选角色已失效，请重新选择或明确改用默认管家。')); return; }
+      const task = tasks.get(taskId);
+      if (task?.status !== 'working' || task.revision !== openedRevision) { panel.append(article('任务版本已改变，请重新打开并审阅。')); return; }
+      const id = crypto.randomUUID(), body = { request_id: id, expected_revision: task.revision, ...role, ...(revision ? { revision } : {}) };
+      unresolved = { owner: context.user, mode: context.browserMode, task: taskId, id };
+      try { sessionStorage.setItem(storageKey, JSON.stringify(unresolved)); }
+      catch { unresolved = null; panel.append(article('无法保存恢复编号，未发送。')); return; }
+      view++; working = true;
+      panel.append(article('正在发送，尚未收到服务端回执。'));
+      try {
+        const receipt = await request(route, 'POST', body);
+        if (!valid()) return;
+        if (display(receipt, id)) { sessionStorage.removeItem(storageKey); unresolved = null; }
+      } catch (error) {
+        if (!valid()) return;
+        if (error.httpStatus === 409 && codes.has(error.code)) {
+          sessionStorage.removeItem(storageKey); unresolved = null;
+          if (error.code === 'draft_role_unavailable_before_reservation') roleInvalid = true;
+          panel.append(article('请求未登记、未调用模型。请重新核对任务和角色后手动操作。'));
+        } else panel.append(article('起草结果未知：' + error.message + '。只核对，不自动重发。'));
+      } finally { if (valid()) { working = false; controls(); } }
     }
     function nextPage(cursor) {
       if (!key(cursor)) throw Error('分页游标无效');
@@ -184,6 +202,12 @@ function createDraftUI({ api, current, article, conversation }) {
       const page = await request(route + '?limit=20');
       if (!valid()) return;
       if (page.kind !== 'draft_delivery' || page.task_id !== taskId || !Array.isArray(page.items)) throw Error('列表响应无效');
+      const recommendation = page.recommended_profile;
+      if (recommendation && key(recommendation.agent_id) && Number.isSafeInteger(recommendation.revision)) {
+        role = { agent_id: recommendation.agent_id, expected_profile_revision: recommendation.revision };
+        const labels = { writer: '写作', reviewer: '审阅', researcher: '研究', coordinator: '管家' };
+        panel.append(article('根据任务推荐：' + (labels[recommendation.role] || recommendation.role) + '。已选中，可在下方改选角色或使用默认管家。'));
+      }
       for (const receipt of page.items) {
         display(receipt);
         if (!unresolved && ['pending', 'uncertain'].includes(receipt.status)) {
@@ -195,5 +219,5 @@ function createDraftUI({ api, current, article, conversation }) {
     } catch (error) { if (valid()) panel.append(article('读取失败：' + error.message)); }
     finally { if (valid()) { working = false; controls(); } }
   }
-  return { reset, update, append, attach, reviewedText };
+  return { reset, update, append, attach, reviewedText, reviewedSource };
 }

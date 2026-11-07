@@ -104,7 +104,7 @@ function createWorkerUI({ api, current, article, conversation }) {
       // Preserve this key after an uncertain POST; rereads never silently create a new request.
       const key = JSON.stringify([task.id, task.revision, scope.repository, scope.base_commit]);
       const reviewed = { expected_revision: task.revision, repository: scope.repository, base_commit: scope.base_commit };
-      panel.append(article(`请核对仅入队范围：\n任务：${task.id}\n任务修订：${task.revision}\n仓库：${scope.repository}\n不可变基线：${scope.base_commit}\n${notice}`));
+      panel.append(article(`请核对仅入队范围：\n任务：${task.id}\n任务版本：${task.revision}\n仓库：${scope.repository}\n不可变基线：${scope.base_commit}\n${notice}`));
       const terminal = data.jobs.some(job => ['cancelled', 'failed'].includes(job.status));
       const unresolved = pending.has(key);
       if (terminal && !unresolved) panel.append(article('已有请求结束。下面的确认会创建一个独立的新请求，不会恢复旧记录。'));

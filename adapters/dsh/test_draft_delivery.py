@@ -22,6 +22,35 @@ def draft():
 
 
 class DraftDeliveryTests(unittest.TestCase):
+    def test_revision_protocol_and_distinct_role_prompts(self):
+        revision = {"base_draft_id": "base-1", "content": "Existing private draft", "instruction": "Shorter"}
+        value = draft() | {"draft_revision": revision}
+        self.assertEqual(validate_turn(value), value)
+        for change in ({"draft_revision": None}, {"draft_revision": revision | {"extra": True}},
+                       {"draft_revision": revision | {"instruction": " "}},
+                       {"draft_revision": revision | {"content": "x" * 8001}},
+                       {"draft_revision": revision | {"base_draft_id": "../bad"}},
+                       {"kind": "chat"}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                validate_turn(value | change)
+        prompts = []
+        class Fake:
+            def __init__(self, **kwargs): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def run(self, prompt, session_id):
+                prompts.append(prompt)
+                return SimpleNamespace(finish_reason="completed", final_response='{"reply":"Revised","proposal":null}')
+        for role in ("researcher", "writer", "reviewer"):
+            value["runtime_profile"]["role"] = role
+            run_sdk(value, Path('/unused'), Path('/unused'), Fake)
+        self.assertEqual(len(set(prompts)), 3)
+        for prompt in prompts:
+            instruction, payload = prompt.split('\n', 1)
+            self.assertIn('complete revised text', instruction)
+            self.assertEqual(json.loads(payload)["draft_revision"], revision)
+            self.assertEqual(json.loads(payload)["history"], [])
+
     def test_kind_backward_compatibility(self):
         old = {"session_id": str(uuid.uuid4()), "history": [], "message": "hello"}
         self.assertEqual(validate_turn(old), old)

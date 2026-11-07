@@ -143,7 +143,7 @@ async fn details_are_bounded_confirm_only_and_replay_exact() {
     let p = f.proposal("p1").await;
     for body in [
         json!({"action":"confirm","expected_revision":0,"details":"   "}),
-        json!({"action":"confirm","expected_revision":0,"details":"x".repeat(12001)}),
+        json!({"action":"confirm","expected_revision":0,"details":"x".repeat(262145)}),
         json!({"action":"reject","expected_revision":0,"details":"no"}),
         json!({"action":"confirm","expected_revision":0,"details":7}),
     ] {
@@ -153,7 +153,7 @@ async fn details_are_bounded_confirm_only_and_replay_exact() {
         f.request("bob", "GET", "/api/tasks", Value::Null).await.1,
         json!([])
     );
-    let ok = json!({"action":"confirm","expected_revision":0,"details":"x".repeat(12000)});
+    let ok = json!({"action":"confirm","expected_revision":0,"details":"x".repeat(262144)});
     let (status, first) = f.act(&p, ok.clone()).await;
     assert_eq!(status, StatusCode::OK);
     // Identical replay returns the same task; any different details are refused.
@@ -187,7 +187,7 @@ async fn details_reach_task_context_for_discussion_and_drafting() {
     let f = Fixture::new();
     let p = f.proposal("p1").await;
     // 12000 stored bytes; newlines JSON-escape to two bytes, so the snapshot excerpt
-    // (bounded at 12000 encoded bytes) must truncate and say so.
+    // exceeds the raw context bound and must be summarized from the full material.
     let long = "行\n".repeat(3000);
     let (_, confirmed) = f
         .act(
@@ -204,7 +204,8 @@ async fn details_reach_task_context_for_discussion_and_drafting() {
     let context = &chat["task_context"];
     assert_eq!(context["details_truncated"], true);
     let excerpt = context["details"].as_str().unwrap();
-    assert!(!excerpt.is_empty() && long.starts_with(excerpt) && excerpt.len() <= 12000);
+    assert!(excerpt.starts_with("[共享材料摘要：已读取全部原文生成") && excerpt.len() <= 12000);
+    assert!(excerpt.contains("MOCK"));
     assert!(context.to_string().len() <= 20480);
 
     f.request(
@@ -226,5 +227,174 @@ async fn details_reach_task_context_for_discussion_and_drafting() {
     assert_eq!(
         draft["response"]["task_context"]["details"],
         context["details"]
+    );
+}
+
+#[tokio::test]
+async fn edited_confirmation_is_atomic_private_and_replay_safe() {
+    let f = Fixture::new();
+    let p = f.proposal("edited-confirm").await;
+    let path = format!("/api/proposals/{}/actions", p["id"].as_str().unwrap());
+    let body = json!({"action":"confirm","expected_revision":0,"owner":"eve","summary":"手动改写的摘要","details":MATERIAL});
+    assert_eq!(
+        f.request("bob", "POST", &path, body.clone()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, confirmed) = f.act(&p, body.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(confirmed["owner"], "eve");
+    assert_eq!(confirmed["summary"], "手动改写的摘要");
+    assert_eq!(confirmed["revision"], 1);
+    assert_eq!(f.act(&p, body.clone()).await.1, confirmed);
+    let mut changed = body.clone();
+    changed["summary"] = json!("different");
+    assert_eq!(f.act(&p, changed).await.0, StatusCode::CONFLICT);
+    let task = confirmed["task_id"].as_str().unwrap();
+    assert_eq!(
+        f.request("bob", "GET", &format!("/api/tasks/{task}"), Value::Null)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, details) = f
+        .request("eve", "GET", &format!("/api/tasks/{task}"), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(details["details"]["content"], MATERIAL);
+    assert_eq!(
+        f.db()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn invalid_edits_do_not_consume_pending_proposal() {
+    let f = Fixture::new();
+    let p = f.proposal("invalid-edit").await;
+    for body in [
+        json!({"action":"confirm","expected_revision":0,"owner":"unknown"}),
+        json!({"action":"confirm","expected_revision":0,"owner":"alice"}),
+        json!({"action":"confirm","expected_revision":0,"summary":"  "}),
+        json!({"action":"confirm","expected_revision":0,"summary":"x".repeat(4001)}),
+        json!({"action":"reject","expected_revision":0,"owner":"eve"}),
+        json!({"action":"confirm","expected_revision":9,"summary":"edited"}),
+    ] {
+        assert!(f.act(&p, body).await.0.is_client_error());
+        assert_eq!(
+            f.db()
+                .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        f.act(&p, json!({"action":"confirm","expected_revision":0}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn pdf_extraction_rejects_invalid_and_unconfigured_callers_without_persistence() {
+    let f = Fixture::new();
+    assert_eq!(
+        f.request(
+            "unknown",
+            "POST",
+            "/api/materials/extract",
+            json!({"pdf_base64":"JVBERi0="})
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+    for body in [
+        json!({"pdf_base64":"not base64"}),
+        json!({"pdf_base64":"aGVsbG8="}),
+        json!({"pdf_base64":"JVBERi0=","owner":"bob"}),
+    ] {
+        assert!(f
+            .request("alice", "POST", "/api/materials/extract", body)
+            .await
+            .0
+            .is_client_error());
+    }
+    assert_eq!(
+        f.db()
+            .query_row("SELECT COUNT(*) FROM task_details", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        f.db()
+            .query_row("SELECT COUNT(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn adopted_draft_provenance_is_validated_and_private_after_manual_edit() {
+    let f = Fixture::new();
+    let p = f.proposal("adoption").await;
+    let (_, p) = f
+        .act(&p, json!({"action":"confirm","expected_revision":0}))
+        .await;
+    let task = p["task_id"].as_str().unwrap();
+    let path = format!("/api/tasks/{task}/actions");
+    assert_eq!(
+        f.request(
+            "bob",
+            "POST",
+            &path,
+            json!({"action":"accept","expected_revision":0,"source_draft_id":"forged"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.request(
+            "bob",
+            "POST",
+            &path,
+            json!({"action":"accept","expected_revision":0})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, draft) = f
+        .request(
+            "bob",
+            "POST",
+            &format!("/api/tasks/{task}/drafts"),
+            json!({"request_id":"draft-adoption","expected_revision":1}),
+        )
+        .await;
+    let source = draft["response"]["draft"]["id"].as_str().unwrap();
+    assert_eq!(f.request("bob", "POST", &path, json!({"action":"deliver","expected_revision":1,"result":"Edited by human","source_draft_id":"forged"})).await.0, StatusCode::BAD_REQUEST);
+    assert_eq!(f.request("bob", "POST", &path, json!({"action":"deliver","expected_revision":1,"result":"Edited by human","source_draft_id":source})).await.0, StatusCode::OK);
+    assert_eq!(
+        f.db()
+            .query_row(
+                "SELECT source_draft_id FROM deliveries WHERE task_id=?1 AND status='submitted'",
+                [task],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        source
+    );
+    let (_, public) = f
+        .request("alice", "GET", &format!("/api/tasks/{task}"), Value::Null)
+        .await;
+    assert!(public.to_string().contains("Edited by human"));
+    assert!(
+        !public.to_string().contains(source),
+        "private source draft IDs must not be included in public timeline"
     );
 }

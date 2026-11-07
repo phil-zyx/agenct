@@ -125,10 +125,7 @@ pub(super) async fn chat(
         return Ok(Json(response));
     }
     let guard = h
-        .gates
-        .get(&id)
-        .unwrap()
-        .clone()
+        .gate(&id)?
         .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, "a turn is already running"))?;
     if let Some(response) = replay(&*h.db()?, &id, &input)? {
@@ -207,7 +204,7 @@ pub(super) async fn status(
         return Err(denied());
     }
     // A dropped handler releases the gate. Its reserved dispatch remains uncertain.
-    if let Ok(_guard) = h.gates.get(&id).unwrap().try_lock() {
+    if let Ok(_guard) = h.gate(&id)?.try_lock_owned() {
         mark_uncertain(&mut *h.db()?, &id, &key)?;
     }
     Ok(Json(receipt(&*h.db()?, &id, &key)?.ok_or_else(denied)?))

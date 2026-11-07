@@ -42,6 +42,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hub = hub.with_worker_scopes(serde_json::from_slice(&bytes)?)?;
         eprintln!("Worker queue admission configured; execution and publication remain disabled");
     }
+    if let Some(path) = std::env::var_os("AGENCT_PRIVATE_CONFIG") {
+        hub = hub.with_private_config(path.into())?;
+    }
+    if let Some(path) = std::env::var_os("AGENCT_REPOSITORIES_FILE") {
+        let gate = std::env::var_os("AGENCT_REPOSITORY_GATE_FILE")
+            .ok_or("AGENCT_REPOSITORY_GATE_FILE required for read-only repository access")?;
+        hub = hub.with_repositories(path.into(), gate.into())?;
+    }
+    if let Some(path) = std::env::var_os("AGENCT_TENANTS_FILE") {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)?
+            .take(131073)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > 131072 {
+            return Err("tenant mapping exceeds 128 KiB".into());
+        }
+        let assignments: agenct_hub::tenants::Config = serde_json::from_slice(&bytes)?;
+        hub = hub.with_tenants(assignments)?;
+        eprintln!("Organization isolation enabled; cross-organization delegation disabled");
+    }
+    hub.validate_startup()?;
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {

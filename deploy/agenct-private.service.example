@@ -20,6 +20,9 @@ KillSignal=SIGINT
 TimeoutStopSec=90
 Restart=on-failure
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agenct-private
 # No EnvironmentFile containing browser tokens. The launcher reads only token hashes.
 # DSH needs a separately operated loopback adapter and approved provider credentials.
 

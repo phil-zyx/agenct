@@ -4,19 +4,24 @@ mod audit;
 mod audit_migration;
 pub mod browser_auth;
 mod chat_turns;
+mod context_memory;
 mod directory;
 mod drafts;
 pub mod gitlab;
+mod materials;
 mod messages;
 pub mod oidc;
 mod policy;
+mod private_staging;
 mod profiles;
 mod proposals;
 pub mod publication;
+mod repo_context;
 mod runtime;
 mod schema;
 mod task_context;
 mod tasks;
+pub mod tenants;
 pub mod worker;
 pub mod worker_api;
 pub mod worker_consumer;
@@ -108,14 +113,28 @@ impl Config {
         })
     }
 }
+/// Token SHA-256 → user ID.
+type Roster = Arc<HashMap<String, String>>;
 #[derive(Clone)]
 pub struct Hub {
+    repositories: Option<Arc<repo_context::Repositories>>,
     worker_scopes: Arc<HashMap<String, worker_api::Scope>>,
     browser_auth: Option<browser_auth::BrowserAuth>,
     oidc: Option<oidc::Validator>,
     _lock: Option<Arc<std::fs::File>>,
     db: Arc<Mutex<Connection>>,
     users: Arc<HashMap<String, String>>,
+    private_config: Option<PathBuf>,
+    /// Last accepted private roster, keyed by the config file's SHA-256, so an
+    /// unchanged file is not re-parsed and re-applied on every request.
+    private_users: Arc<Mutex<Option<(String, Roster)>>>,
+    /// Startup tenant audit, fixed once the router is built (`app`). `None` means
+    /// a direct library caller: audit on every identity check, fail closed.
+    startup_ok: Option<bool>,
+    /// Summaries of large, append-only shared task material, so a turn that
+    /// references the same material does not re-summarize it every time.
+    material_summaries: Arc<Mutex<HashMap<String, String>>>,
+    extra_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     directory: Arc<directory::Directory>,
     // Arc per user so a turn can own its gate across a detached dispatch task.
     gates: Arc<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -204,12 +223,18 @@ impl Hub {
             )?;
         }
         Ok(Self {
+            repositories: None,
             worker_scopes: Arc::new(HashMap::new()),
             browser_auth: None,
             oidc: None,
             _lock: lock,
             db: Arc::new(Mutex::new(db)),
             users: Arc::new(users),
+            private_config: None,
+            private_users: Arc::new(Mutex::new(None)),
+            startup_ok: None,
+            material_summaries: Arc::new(Mutex::new(HashMap::new())),
+            extra_gates: Arc::new(Mutex::new(HashMap::new())),
             directory: Arc::new(directory),
             gates: Arc::new(gates),
             runtime: config.runtime,
@@ -223,12 +248,15 @@ impl Hub {
     /// Switches authentication exclusively to pinned external access tokens.
     /// Existing users remain the authorization roster; dev tokens no longer work.
     pub fn with_oidc(mut self, config: oidc::Config) -> std::result::Result<Self, &'static str> {
+        if self.private_config.is_some() {
+            return Err("OIDC cannot be combined with live private membership");
+        }
         if self.browser_auth.is_some() {
             return Err("choose browser sessions or API bearer validation, not both");
         }
         self.oidc = Some(oidc::Validator::new(
             config,
-            &self.directory.ids().cloned().collect(),
+            &self.directory.ids().collect(),
         )?);
         Ok(self)
     }
@@ -236,16 +264,29 @@ impl Hub {
         mut self,
         config: browser_auth::Config,
     ) -> std::result::Result<Self, &'static str> {
+        if self.private_config.is_some() {
+            return Err("browser sessions cannot be combined with live private membership");
+        }
         if self.oidc.is_some() {
             return Err("choose browser sessions or API bearer validation, not both");
         }
         self.browser_auth = Some(browser_auth::BrowserAuth::new(
             config,
-            &self.directory.ids().cloned().collect(),
+            &self.directory.ids().collect(),
         )?);
         Ok(self)
     }
     fn identity(&self, headers: &HeaderMap) -> Result<String> {
+        let startup = match self.startup_ok {
+            Some(ok) => ok,
+            None => self.validate_startup().is_ok(),
+        };
+        startup.then_some(()).ok_or(()).map_err(|_| {
+            Error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "tenant configuration required for this database",
+            )
+        })?;
         if let Some(auth) = &self.browser_auth {
             return auth.identity(headers);
         }
@@ -266,7 +307,10 @@ impl Hub {
             return Err(Error(StatusCode::UNAUTHORIZED, "invalid token"));
         }
         let hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-        self.users
+        let live_users = self.reload_private_users()?;
+        live_users
+            .as_deref()
+            .unwrap_or(&self.users)
             .get(&hash)
             .cloned()
             .ok_or(Error(StatusCode::UNAUTHORIZED, "invalid token"))
@@ -277,7 +321,10 @@ impl Hub {
             .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "storage unavailable"))
     }
 }
-pub fn app(hub: Hub) -> Router {
+pub fn app(mut hub: Hub) -> Router {
+    // Tenant membership is written only by builders, so the audit result cannot
+    // change once routing starts; record it instead of querying per request.
+    hub.startup_ok = Some(hub.validate_startup().is_ok());
     Router::new()
         .route("/auth/session", get(browser_auth::session))
         .route("/auth/login", get(browser_auth::login))
@@ -288,6 +335,12 @@ pub fn app(hub: Hub) -> Router {
             get(|| async { Json(serde_json::json!({"status":"ok","stage":"development"})) }),
         )
         .route("/api/me", get(me))
+        .route("/api/repositories", get(repo_context::list))
+        .route("/api/repositories/context", post(repo_context::read))
+        .route(
+            "/api/materials/extract",
+            post(materials::extract).layer(DefaultBodyLimit::max(3 * 1024 * 1024)),
+        )
         .route(
             "/api/profile",
             get(profiles::get_profile).put(profiles::update_profile),
@@ -305,7 +358,7 @@ pub fn app(hub: Hub) -> Router {
         )
         .route(
             "/api/proposals/{id}/actions",
-            post(proposals::proposal_action),
+            post(proposals::proposal_action).layer(DefaultBodyLimit::max(2 * 1024 * 1024)),
         )
         .route("/api/tasks", get(tasks::tasks))
         .route("/api/tasks/{id}", get(tasks::task_detail))
@@ -328,6 +381,7 @@ pub fn app(hub: Hub) -> Router {
         )
         .fallback_service(tower_http::services::ServeDir::new("hub/web"))
         .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(axum::middleware::from_fn(private_staging::event_log))
         .layer(axum::middleware::from_fn_with_state(
             hub.clone(),
             browser_auth::guard,
@@ -336,7 +390,9 @@ pub fn app(hub: Hub) -> Router {
 }
 async fn me(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<serde_json::Value>> {
     let id = h.identity(&headers)?;
-    Ok(Json(
-        serde_json::json!({"user":id,"runtime":h.runtime.label(),"production":false}),
-    ))
+    let mut value = serde_json::json!({"user":id,"runtime":h.runtime.label(),"production":false});
+    if let Some(tenant) = h.directory.tenant(&id) {
+        value["tenant"] = serde_json::json!(tenant);
+    }
+    Ok(Json(value))
 }

@@ -1,11 +1,15 @@
 //! Configured membership and delegation policy, independent of runtime locks.
 //!
-//! Membership is fixed at startup today. OIDC/tenant policy belongs here rather
+//! Private staging membership can be refreshed from an owner-only configuration. OIDC/tenant policy belongs here rather
 //! than in the presence, absence or current state of a per-user execution gate.
-use std::collections::HashSet;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::RwLock,
+};
 
 pub(crate) struct Directory {
-    members: HashSet<String>,
+    members: RwLock<HashSet<String>>,
+    tenants: Option<HashMap<String, String>>,
 }
 
 impl Directory {
@@ -25,19 +29,67 @@ impl Directory {
         if members.is_empty() {
             return Err("at least one configured user is required");
         }
-        Ok(Self { members })
+        Ok(Self {
+            members: RwLock::new(members),
+            tenants: None,
+        })
     }
 
     pub(crate) fn contains(&self, id: &str) -> bool {
-        self.members.contains(id)
+        self.members.read().expect("directory lock").contains(id)
     }
 
     pub(crate) fn can_delegate(&self, requester: &str, owner: &str) -> bool {
-        requester != owner && self.contains(requester) && self.contains(owner)
+        requester != owner
+            && self.contains(requester)
+            && self.contains(owner)
+            && self
+                .tenants
+                .as_ref()
+                .is_none_or(|mapping| mapping.get(requester) == mapping.get(owner))
     }
 
-    pub(crate) fn ids(&self) -> impl Iterator<Item = &String> {
-        self.members.iter()
+    pub(crate) fn with_tenants(
+        mut self,
+        mapping: HashMap<String, String>,
+    ) -> Result<Self, &'static str> {
+        if mapping.len() != self.members.read().expect("directory lock").len()
+            || mapping.iter().any(|(user, tenant)| {
+                !self.contains(user)
+                    || tenant.is_empty()
+                    || tenant.len() > 64
+                    || !tenant
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
+            })
+        {
+            return Err(
+                "tenant mapping must assign every configured user exactly once to a valid tenant",
+            );
+        }
+        self.tenants = Some(mapping);
+        Ok(self)
+    }
+
+    pub(crate) fn tenant(&self, user: &str) -> Option<&str> {
+        self.tenants.as_ref()?.get(user).map(String::as_str)
+    }
+
+    pub(crate) fn tenants_enabled(&self) -> bool {
+        self.tenants.is_some()
+    }
+
+    pub(crate) fn ids(&self) -> impl Iterator<Item = String> {
+        self.members
+            .read()
+            .expect("directory lock")
+            .clone()
+            .into_iter()
+    }
+
+    pub(crate) fn replace(&self, replacement: Self) {
+        *self.members.write().expect("directory lock") =
+            replacement.members.into_inner().expect("directory lock");
     }
 }
 

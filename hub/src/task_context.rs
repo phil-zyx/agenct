@@ -5,6 +5,8 @@ pub(super) const STALE: &str = "selected task changed; refresh and select it aga
 pub(super) const UNAVAILABLE: &str = "selected task is not available for discussion";
 /// Must match the adapter's MAX_TASK_CONTEXT_BYTES.
 pub(super) const MAX_CONTEXT_BYTES: usize = 20480;
+/// Bound on cached shared-material summaries; cleared wholesale when full.
+const MATERIAL_SUMMARY_CACHE: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -103,4 +105,97 @@ pub(super) fn capture(
         return Err(invalid("selected task context exceeds limit"));
     }
     Ok(Some(context))
+}
+
+/// Replace an excerpt of large shared material with a bounded semantic summary.
+/// Only explicitly shared task_details are read; no private conversations enter it.
+pub(super) async fn prepare_large_details(
+    h: &Hub,
+    user: &str,
+    profile: &profiles::RuntimeProfile,
+    mut context: serde_json::Value,
+) -> Result<serde_json::Value> {
+    if context["details_truncated"] != true {
+        return Ok(context);
+    }
+    let task = context["id"]
+        .as_str()
+        .ok_or_else(|| invalid("invalid selected task"))?
+        .to_owned();
+    let revision = context["revision"]
+        .as_i64()
+        .ok_or_else(|| invalid("invalid selected task revision"))?;
+    let selection = Selection {
+        task_id: task.clone(),
+        expected_revision: revision,
+    };
+    let material = {
+        let db = h.db()?;
+        capture(&db, user, Some(&selection))?;
+        db.query_row(
+            "SELECT content FROM task_details WHERE task_id=?1",
+            [&task],
+            |r| r.get::<_, String>(0),
+        )?
+    };
+    // Shared material is append-only, so (caller, task, backend, profile, content)
+    // fully determines the summary input. Reuse it rather than re-summarizing every
+    // chunk of the material on every turn. Keyed per caller: a profile is private.
+    let key = {
+        let mut hasher = Sha256::new();
+        for part in [
+            user,
+            task.as_str(),
+            h.runtime.label(),
+            &serde_json::to_string(profile).map_err(|_| invalid("invalid runtime profile"))?,
+            material.as_str(),
+        ] {
+            hasher.update(part.len().to_le_bytes());
+            hasher.update(part.as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    };
+    let cached = h
+        .material_summaries
+        .lock()
+        .map_err(|_| invalid("summary cache unavailable"))?
+        .get(&key)
+        .cloned();
+    let summary = match cached {
+        Some(summary) => summary,
+        None => {
+            let summary = crate::context_memory::summarize(
+                h,
+                profile,
+                "",
+                &[Message {
+                    role: "user".into(),
+                    content: material,
+                    status: "complete".into(),
+                    created_at: None,
+                }],
+            )
+            .await?;
+            let mut cache = h
+                .material_summaries
+                .lock()
+                .map_err(|_| invalid("summary cache unavailable"))?;
+            if cache.len() >= MATERIAL_SUMMARY_CACHE {
+                cache.clear();
+            }
+            cache.insert(key, summary.clone());
+            summary
+        }
+    };
+    context["details"] = serde_json::json!(format!(
+        "[共享材料摘要：已读取全部原文生成；摘要可能遗漏细节，核对时请查看原始材料。]\n{summary}"
+    ));
+    // Keep the existing incomplete/derived-data flag so old clients do not mistake
+    // model-generated prose for the full verbatim attachment.
+    if context["details"].to_string().len() > 12000 || context.to_string().len() > MAX_CONTEXT_BYTES
+    {
+        return Err(invalid("shared material summary exceeds context limit"));
+    }
+    capture(&*h.db()?, user, Some(&selection))?;
+    Ok(context)
 }

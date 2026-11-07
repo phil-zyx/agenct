@@ -1,0 +1,17 @@
+# Local TLS ingress for the OIDC/tenant test configuration. No public listener.
+# Set public_origin in browser OIDC config to https://agenct.localhost:8443.
+# Trust this Caddy instance's local CA only in the test client, never disable TLS
+# verification in the Hub's OIDC HTTP client. Hub continues to bind loopback HTTP.
+{
+	admin off
+	auto_https disable_redirects
+	skip_install_trust
+}
+https://agenct.localhost:8443 {
+	bind 127.0.0.1
+	tls internal
+	reverse_proxy 127.0.0.1:8080
+}
+# A real public deployment needs an authorized DNS name, publicly trusted TLS,
+# registered exact OIDC callback, tenant configuration and operational review.
+# This local template makes no claim that those deployment gates are complete.

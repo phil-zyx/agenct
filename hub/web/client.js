@@ -5,10 +5,12 @@ let turnStorageAvailable = true;
 let selectedAgent = null, roleGeneration = 0, roleRead = null, roleButtons = [];
 let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
 const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
+const actionEditors = new Map();
+let notificationTasks = null, notificationsEnabled = false;
 const detailDrafts = new Map(); // Unsent shared-material text survives poll re-renders.
 let lastActivity = [];
-let pollTimer = null, pollDelay = 5000, refreshFlight = null, snapshot = '', renderedBusy = '';
-const POLL_INTERVAL = 5000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000, CHAT_SEND_TIMEOUT = 90000;
+let pollTimer = null, pollDelay = 3000, refreshFlight = null, snapshot = '', renderedBusy = '';
+const POLL_INTERVAL = 3000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000, CHAT_SEND_TIMEOUT = 90000;
 const busy = new Set();
 const $ = id => document.getElementById(id);
 // Toast that fades on its own; longer messages stay a little longer. Pure CSS
@@ -87,7 +89,7 @@ function el(tag, className, text) {
   return element;
 }
 const TASK_STATUS = {
-  awaiting_owner: ['待接单', 'wait'], working: ['进行中', 'work'], ready_for_acceptance: ['待验收', 'review'],
+  awaiting_owner: ['待接手', 'wait'], working: ['进行中', 'work'], ready_for_acceptance: ['待验收', 'review'],
   completed: ['已完成', 'done'], canceled: ['已取消', 'muted']
 };
 const PROPOSAL_STATUS = { pending: ['待你确认', 'review'], confirmed: ['已确认', 'done'], rejected: ['已拒绝', 'muted'] };
@@ -97,97 +99,6 @@ function badge(table, value) {
   const [label, tone] = table[value] || [value, 'muted'];
   return el('span', 'badge badge-' + tone, label);
 }
-// Server times are UTC "YYYY-MM-DD HH:MM:SS"; anything else is treated as unknown.
-function parseUtc(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) return null;
-  const date = new Date(value.replace(' ', 'T') + 'Z');
-  return Number.isNaN(date.getTime()) ? null : date;
-}
-const pad = n => String(n).padStart(2, '0');
-function dayLabel(date) {
-  const today = new Date();
-  const start = d => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
-  const days = Math.round((start(today) - start(date)) / 86400000);
-  if (days === 0) return '今天';
-  if (days === 1) return '昨天';
-  return `${date.getMonth() + 1}月${date.getDate()}日`;
-}
-const clock = date => `${pad(date.getHours())}:${pad(date.getMinutes())}`;
-const formatWhen = date => (dayLabel(date) === '今天' ? '' : dayLabel(date) + ' ') + clock(date);
-
-const ACTIVITY_ICON = {
-  pending: '○', awaiting_owner: '○', working: '◔', ready_for_acceptance: '◑', completed: '✓', canceled: '✕', rejected: '✕'
-};
-function activityLine(item, me) {
-  const l = item.latest || {};
-  const who = l.actor === me ? '你' : l.actor + ' ';
-  switch (l.action) {
-    case 'proposal_pending': return `等你确认 · 委派给 ${item.counterpart}`;
-    case 'proposal_rejected': return '已拒绝，未共享';
-    case 'created': return item.role === 'owner' ? `${item.counterpart} 委派给你，待接单` : `已委派给 ${item.counterpart}，等对方接单`;
-    case 'accept': return `${who}已接单`;
-    case 'deliver': return `${who}提交了交付`;
-    case 'approve': return `${who}验收通过`;
-    case 'return': return `${who}退回了交付`;
-    case 'cancel': return `${who}取消了任务` + (l.reason ? `：${l.reason}` : '');
-    case 'draft_complete': return '你的 Agent 起草了交付草稿（仅你可见）';
-    case 'draft_uncertain': return '起草结果未知，可在草稿中核对';
-    case 'draft_pending': return '你的 Agent 正在起草…';
-    default: return String(l.action || '');
-  }
-}
-function flash(element) {
-  if (!element) return;
-  element.scrollIntoView?.({ block: 'center', behavior: 'smooth' });
-  element.classList.remove('flash');
-  void element.offsetWidth;
-  element.classList.add('flash');
-}
-function renderActivity(context, items) {
-  const groups = [];
-  for (const item of Array.isArray(items) ? items : []) {
-    if (!item || typeof item.id !== 'string') continue;
-    const at = parseUtc(item.latest?.at);
-    const label = at ? dayLabel(at) : '更早';
-    if (!groups.length || groups[groups.length - 1].label !== label) groups.push({ label, items: [] });
-    groups[groups.length - 1].items.push({ item, at });
-  }
-  const nodes = [];
-  for (const group of groups) {
-    nodes.push(el('h3', 'day', group.label));
-    for (const { item, at } of group.items) {
-      const row = el('button', 'activity-item status-' + item.status);
-      row.type = 'button';
-      const icon = el('span', 'activity-icon', ACTIVITY_ICON[item.status] || '•');
-      const body = el('span', 'activity-body');
-      body.append(el('span', 'activity-title', item.title), el('span', 'activity-line', activityLine(item, context.user)));
-      row.append(icon, body, el('span', 'activity-time', at ? clock(at) : ''));
-      row.onclick = () => {
-        if (!current(context)) return;
-        if (item.kind === 'task') {
-          setPaneTab('tasks');
-          panelTask = item.id;
-          flash([...$('tasks').children].find(card => card.taskId === item.id));
-        } else {
-          returnToChatOnNarrowScreen();
-          flash([...$('conversation').children].find(card => card.proposalId === item.id));
-        }
-      };
-      nodes.push(row);
-    }
-  }
-  $('activity').replaceChildren(...nodes);
-}
-function setPaneTab(tab) {
-  const tasks = tab === 'tasks';
-  $('tasks').classList[tasks ? 'remove' : 'add']('hide');
-  $('activity').classList[tasks ? 'add' : 'remove']('hide');
-  $('tab-tasks').classList[tasks ? 'add' : 'remove']('on');
-  $('tab-activity').classList[tasks ? 'remove' : 'add']('on');
-  $('tab-tasks').setAttribute('aria-selected', String(tasks));
-  $('tab-activity').setAttribute('aria-selected', String(!tasks));
-}
-
 // Panels open inside the task card they were launched from (see render).
 let panelTask = null, panelSlots = new Map();
 const taskPane = () => panelSlots.get(panelTask) || $('tasks');
@@ -222,7 +133,7 @@ function renderRoleSelection() {
   $('clear-role').disabled = roleLocked() || !selectedAgent;
   roleButtons.forEach(button => { button.disabled = roleLocked(); });
   $('role-details').textContent = agent
-    ? `本次角色：${agent.name || agent.id} · ${agent.role || '以原始回执为准'} · 配置版本 ${agent.revision}`
+    ? `本次角色：${agent.name || agent.id} · ${agent.role || '以原始回执为准'} · 角色版本 ${agent.revision}`
       + (pendingTurn ? '\n发送角色已锁定；核对结果前不能切换。'
         : agent.invalidated ? '\n所选配置已变更，选择已失效。请重新选择或明确恢复默认管家。'
           : '\n仅用于下一条普通聊天。')
@@ -255,7 +166,7 @@ $('choose-role').onclick = async () => {
           || !['coordinator', 'researcher', 'writer', 'reviewer'].includes(agent.role)
           || agent.model_ref !== 'server-default')
         || profile.agents.filter(agent => agent.enabled && agent.role === 'coordinator').length !== 1) {
-      throw Error('个人角色配置响应无效');
+      throw Error('个人角色设置响应无效');
     }
     if (selectedAgent && selectedAgent.revision !== profile.revision) selectedAgent.invalidated = true;
     $('role-options').replaceChildren();
@@ -298,7 +209,7 @@ const workerUI = createWorkerUI({ api, current, article, conversation: taskPane 
 const taskSignature = task => JSON.stringify([
   task.id, task.revision, task.requester, task.owner, task.status, task.summary, task.result, task.details ?? null
 ]);
-const MAX_DETAILS_BYTES = 12000;
+const MAX_DETAILS_BYTES = 256 * 1024;
 
 function renderTaskContext() {
   const task = pendingTurn?.selectedTask || selectedTask;
@@ -382,7 +293,7 @@ function restoreTurn(context) {
   catch { turnStorageAvailable = false; }
   if (saved && saved.user === context.user && saved.browserMode === context.browserMode
       && typeof saved.id === 'string' && /^[a-f0-9-]{36}$/.test(saved.id)) {
-    pendingTurn = { id: saved.id, status: 'uncertain', text: null,
+    pendingTurn = { id: saved.id, status: 'checking', text: null,
       selectedAgent: validAgentBinding(saved.agent) ? { id: saved.agent.id, revision: saved.agent.revision } : null };
     if (saved.agent && !validAgentBinding(saved.agent)) pendingTurn.invalidAgentBinding = true;
     renderTurn();
@@ -397,12 +308,13 @@ function renderTurn() {
   // A normal in-flight send is not a problem to resolve: show a typing bubble and
   // keep the recovery sheet visually quiet (its text stays available to tests and
   // assistive tech). It becomes prominent only once the outcome is unresolved.
-  const inFlight = waiting && busy.has('send');
+  const inFlight = waiting && (busy.has('send') || pendingTurn.status === 'checking');
   $('turn-recovery').classList[inFlight ? 'add' : 'remove']('quiet');
   $('typing').classList[inFlight ? 'remove' : 'add']('hide');
   if (inFlight) { const scroller = $('scroller'); scroller.scrollTop = scroller.scrollHeight; }
   $('turn-status').textContent = waiting
-    ? (pendingTurn.status === 'sending' ? '正在发送，尚未收到服务端回执。'
+    ? (pendingTurn.status === 'checking' ? '正在自动核对上次发送状态…'
+      : pendingTurn.status === 'sending' ? '正在发送，尚未收到服务端回执。'
       : pendingTurn.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。'
         : '上次发送的结果尚未确认，可能已经处理。')
       + '\n请求编号：' + pendingTurn.id
@@ -415,10 +327,12 @@ function renderTurn() {
   $('send').disabled = waiting || busy.has('send');
   renderTaskContext();
   renderRoleSelection();
+  renderRepositorySelection();
 }
 
 async function completeTurn(context, response) {
   const { text, selectedTask: expectedTask, selectedAgent: expectedAgent } = pendingTurn;
+  if (!repositoryReceiptMatches(pendingTurn.selectedRepository, response.repository_context)) throw Error('仓库回执与本次选择不符，保留恢复凭据');
   const profile = response.runtime_profile;
   if (pendingTurn.invalidAgentBinding || (expectedAgent && (!profile
       || profile.agent_id !== expectedAgent.id || profile.revision !== expectedAgent.revision
@@ -426,7 +340,7 @@ async function completeTurn(context, response) {
       || (expectedAgent.model_ref && profile.model_ref !== expectedAgent.model_ref)))) {
     throw Error('角色回执与本次选择不符，保留恢复凭据');
   }
-  const receiptRole = profile ? `\n本次角色：${profile.agent_id} · ${profile.role} · 配置版本 ${profile.revision}` : '';
+  const receiptRole = profile ? `\n本次角色：${profile.agent_id} · ${profile.role} · 角色版本 ${profile.revision}` : '';
   const task = response.task_context;
   if (text !== null && (expectedTask
     ? !task || task.id !== expectedTask.id || task.revision !== expectedTask.revision
@@ -472,6 +386,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   selectedTask = null;
   selectedAgent = null;
   closeRolePicker();
+  resetRepositoryUI();
   visibleTasks = new Map();
   discussionButtons = [];
   taskView++;
@@ -487,81 +402,30 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('task-count').textContent = '';
   $('rail-badge').textContent = '';
   detailDrafts.clear();
+  actionEditors.clear(); messagePanels.clear();
+  notificationTasks = null; notificationsEnabled = false;
+  taskFilter = 'active'; $('task-filter').value = 'active';
+  document.title = 'Agenct';
+  $('enable-notifications').textContent = '开启系统通知';
   $('identity').textContent = '';
   $('text').value = '';
   $('open-agents').disabled = false;
   $('send').disabled = false;
+  $('onboarding').classList.add('hide');
   $('room').classList.add('hide');
   $('login').classList.remove('hide');
-}
-
-function addActions(element, context, kind, item, actions) {
-  const key = kind + ':' + item.id;
-  const buttons = actions.map(([action, label]) => {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.textContent = label;
-    if (ACTION_STYLE[action]) button.className = ACTION_STYLE[action];
-    button.disabled = busy.has(key);
-    button.onclick = async () => {
-      if (!current(context) || busy.has(key)) return;
-      let result, reason, details;
-      if (kind === 'proposals' && action === 'confirm') {
-        const entered = element.detailsBox?.value ?? '';
-        if (entered.trim()) {
-          if (new TextEncoder().encode(entered).length > MAX_DETAILS_BYTES) {
-            status('共享材料最多 12000 字节（约 4000 个汉字）。尚未确认。'); return;
-          }
-          details = entered;
-        }
-      }
-      if (action === 'deliver') {
-        result = prompt('填写并确认人工交付结果（不会执行任何代码；确认后对方可见）', draftUI.reviewedText(item));
-        if (!result || !current(context)) return;
-      }
-      if (action === 'cancel') {
-        const entered = prompt('取消任务：请填写 1–500 字的简短原因，确认后双方可见。已有交付记录会保留；已发出的模型请求可能继续运行并产生费用。');
-        if (entered === null || !current(context)) return;
-        reason = entered.trim();
-        if (!reason || Array.from(reason).length > 500) { status('取消原因须为 1–500 字。尚未发送取消请求。'); return; }
-      }
-      busy.add(key);
-      buttons.forEach(control => { control.disabled = true; });
-      status('');
-      try {
-        await api(context, kind + '/' + encodeURIComponent(item.id) + '/actions', 'POST', {
-          action, result, ...(reason === undefined ? {} : { reason }),
-          ...(details === undefined ? {} : { details }), expected_revision: item.revision
-        });
-        if (!current(context)) return;
-        status(kind === 'proposals'
-          ? (action === 'confirm' ? (details ? '已确认共享摘要和共享材料，并创建任务。' : '已确认共享摘要并创建任务。') : '已拒绝提案，未创建任务。')
-          : '已更新。');
-      } catch (error) {
-        if (current(context)) status(error.message + '。请刷新核对服务端状态后再操作。');
-      } finally {
-        if (current(context)) {
-          busy.delete(key);
-          buttons.forEach(control => { control.disabled = false; });
-          await refresh(context).catch(error => { if (current(context)) status(error.message); });
-        }
-      }
-    };
-    element.append(button);
-    return button;
-  });
 }
 
 // Only read requests are repeated. Mutations still require an explicit user action.
 function schedulePoll(context = session()) {
   clearTimeout(pollTimer);
   pollTimer = null;
-  if (!current(context) || document.hidden) return;
+  if (!current(context)) return;
   pollTimer = setTimeout(() => poll(context), pollDelay);
 }
 
 async function poll(context) {
-  if (!current(context) || document.hidden) return;
+  if (!current(context)) return;
   try {
     await refresh(context, false);
     if (current(context)) pollDelay = POLL_INTERVAL;
@@ -582,7 +446,7 @@ async function poll(context) {
 document.addEventListener('visibilitychange', () => {
   clearTimeout(pollTimer);
   pollTimer = null;
-  if (!document.hidden && current(session()) && user) void poll(session());
+  if (current(session()) && user) void poll(session());
 });
 
 function refresh(context = session(), force = true) {
@@ -630,9 +494,10 @@ async function readSnapshot(context) {
   draftUI.update(context, tasks);
   timelineUI.update(context, tasks);
   updateTaskContext(context, tasks);
+  updateNotifications(context, tasks);
   if (!Array.isArray(activity)) activity = lastActivity;
   lastActivity = activity;
-  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity]);
+  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity, proposals.filter(isOldProposal).map(p => p.id)]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
   $('last-refresh').textContent = (changed ? '有新的更新 · ' : '')
@@ -644,160 +509,13 @@ async function readSnapshot(context) {
   renderedBusy = nextBusy;
   taskView++;
   discussionButtons = [];
+  const focused = document.activeElement;
+  const selection = focused && typeof focused.selectionStart === 'number' ? [focused.selectionStart, focused.selectionEnd] : null;
   const stream = $('conversation');
   const scroller = $('scroller');
   const stick = !(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 160);
-  const separators = new Map();
-  let previous = null;
-  messages.forEach((message, index) => {
-    const at = parseUtc(message.created_at);
-    if (!at) return;
-    if (!previous || at - previous >= 10 * 60 * 1000 || at.toDateString() !== previous.toDateString()) {
-      separators.set(index, el('div', 'time-sep', formatWhen(at)));
-    }
-    previous = at;
-  });
-  const entries = messages.map(message => {
-    const notice = message.role !== 'user' && /^\[(系统提示|MOCK)/.test(message.content);
-    const bubble = el('article', 'msg ' + (message.role === 'user' ? 'msg-user' : notice ? 'msg-notice' : 'msg-assistant')
-      + (message.status === 'failed' ? ' msg-failed' : ''));
-    bubble.append(el('div', 'msg-body', message.content));
-    if (message.status !== 'complete') bubble.append(el('div', 'msg-status', MESSAGE_STATUS[message.status] || message.status));
-    return bubble;
-  });
-  // Place each proposal right after the exchange that produced it. A proposal's
-  // summary is an exact excerpt of its source user message; unmatched proposals
-  // (e.g. /delegate or test-double turns) stay at the end as before.
-  // Each proposal claims the latest unclaimed matching user message, so the
-  // result does not depend on the order the proposals API returns.
-  const after = new Map();
-  const claimed = new Set();
-  const trailing = [];
-  for (const proposal of proposals) {
-    let at = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (!claimed.has(i) && messages[i].role === 'user' && typeof proposal.summary === 'string' && proposal.summary
-          && String(messages[i].content).includes(proposal.summary)) { at = i; break; }
-    }
-    if (at === -1) { trailing.push(proposal); continue; }
-    claimed.add(at);
-    const anchor = messages[at + 1] && messages[at + 1].role !== 'user' ? at + 1 : at;
-    if (!after.has(anchor)) after.set(anchor, []);
-    after.get(anchor).push(proposal);
-  }
-  // Unmatched proposals (e.g. /delegate, or a source message outside the loaded
-  // window) are placed by their own timestamp; undated legacy ones predate the
-  // window and go first. Nothing piles up at the bottom of the conversation.
-  const leading = [];
-  for (const proposal of trailing) {
-    const at = parseUtc(proposal.created_at);
-    let anchor = -1, anyDated = false;
-    if (at) messages.forEach((message, index) => {
-      const when = parseUtc(message.created_at);
-      if (when) { anyDated = true; if (when <= at) anchor = index; }
-    });
-    if (anchor >= 0) {
-      if (!after.has(anchor)) after.set(anchor, []);
-      after.get(anchor).push(proposal);
-    } else if (at && !anyDated && messages.length) {
-      if (!after.has(messages.length - 1)) after.set(messages.length - 1, []);
-      after.get(messages.length - 1).push(proposal);
-    } else leading.push(proposal);
-  }
-  const ordered = leading.map(proposal => ({ proposal }));
-  entries.forEach((bubble, index) => {
-    if (separators.has(index)) ordered.push({ bubble: separators.get(index) });
-    ordered.push({ bubble });
-    for (const proposal of after.get(index) || []) ordered.push({ proposal });
-  });
-  entries.length = 0;
-  for (const item of ordered) {
-    if (item.bubble) { entries.push(item.bubble); continue; }
-    const proposal = item.proposal;
-    const element = el('article', 'card proposal' + (proposal.status === 'pending' ? '' : ' settled'));
-    element.proposalId = proposal.id;
-    const head = el('header', 'card-head');
-    head.append(el('span', 'card-kicker', '委派提案'), badge(PROPOSAL_STATUS, proposal.status));
-    element.append(head, el('div', 'field', '接收人：' + proposal.owner), el('blockquote', 'summary-quote', proposal.summary));
-    if (proposal.task_id) element.append(el('div', 'meta', '已创建任务 #' + String(proposal.task_id).slice(0, 8)));
-    if (proposal.status === 'pending') {
-      element.append(el('p', 'note', '尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材料，不会收到你的私聊。'));
-      const label = el('label', null, '附带共享材料（可选）· 会原样发给接收人，对方的 Agent 起草时也会读取；请勿粘贴密钥或私密信息。');
-      const box = el('textarea');
-      box.rows = 3;
-      box.maxLength = MAX_DETAILS_BYTES;
-      box.placeholder = '粘贴对方完成任务需要的内容，例如文档正文或需求说明…';
-      const key = 'proposals:' + proposal.id;
-      box.value = detailDrafts.get(key) ?? '';
-      box.oninput = () => detailDrafts.set(key, box.value);
-      label.append(box);
-      // Collapsed until asked for, unless the user already typed something.
-      const reveal = el('button', 'text-btn add-material', '＋ 附带共享材料（可选）');
-      reveal.type = 'button';
-      if (!box.value) label.classList.add('hide');
-      else reveal.classList.add('hide');
-      reveal.onclick = () => { label.classList.remove('hide'); reveal.classList.add('hide'); box.focus?.(); };
-      const actions = el('div', 'actions');
-      actions.detailsBox = box;
-      element.detailsBox = box;
-      element.append(reveal, label, actions);
-      addActions(actions, context, 'proposals', proposal, [['confirm', '确认共享并委派'], ['reject', '拒绝，不共享']]);
-    }
-    entries.push(element);
-  }
-  const taskCards = [];
-  const slots = new Map();
-  for (const task of tasks) {
-    const element = el('article', 'card task task-' + task.status);
-    element.taskId = task.id;
-    // Remember which card a tool was used from, so its panel opens inside it.
-    element.addEventListener?.('click', () => { panelTask = task.id; }, true);
-    const head = el('header', 'card-head');
-    const mine = task.owner === context.user ? '我负责' : task.requester === context.user ? '我发起' : '';
-    head.append(badge(TASK_STATUS, task.status));
-    if (mine) head.append(el('span', 'badge badge-mine', mine));
-    const id = el('span', 'card-id', '#' + String(task.id).slice(0, 8));
-    id.title = '任务编号：' + task.id + ' · 版本：' + task.revision;
-    head.append(id);
-    element.append(head, el('h3', 'task-title', task.summary),
-      el('div', 'meta', `${task.requester} → ${task.owner}`));
-    if (task.details) {
-      const material = el('details', 'material');
-      material.append(el('summary', null, '共享材料'), el('pre', null, task.details));
-      element.append(material);
-    }
-    if (task.result) {
-      // Finished tasks keep the delivery one click away instead of filling the list.
-      const finished = ['completed', 'canceled'].includes(task.status);
-      const delivery = el(finished ? 'details' : 'div', 'delivery');
-      delivery.append(el(finished ? 'summary' : 'span', 'delivery-label', '最新交付'), el('pre', null, task.result));
-      element.append(delivery);
-    }
-    const primary = [];
-    if (task.owner === context.user && task.status === 'awaiting_owner') primary.push(['accept', '接单']);
-    if (task.owner === context.user && task.status === 'working') primary.push(['deliver', '提交人工交付']);
-    if (task.requester === context.user && task.status === 'ready_for_acceptance') primary.push(['approve', '验收'], ['return', '退回']);
-    const canCancel = (task.requester === context.user && ['awaiting_owner', 'working', 'ready_for_acceptance'].includes(task.status))
-      || (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status));
-    const foot = el('div', 'card-foot');
-    const actionRow = el('div', 'actions');
-    const tools = el('div', 'tools');
-    const more = el('details', 'more');
-    const menu = el('div', 'more-menu');
-    more.append(el('summary', null, '更多'), menu);
-    foot.append(actionRow, tools);
-    addActions(actionRow, context, 'tasks', task, primary);
-    addDiscussion(tools, context, task);
-    draftUI.attach(tools, context, task);
-    timelineUI.attach(menu, context, task);
-    workerUI.attach(menu, context, task);
-    if (canCancel) addActions(menu, context, 'tasks', task, [['cancel', '取消任务']]);
-    if (menu.children.length) tools.append(more);
-    const slot = el('div', 'card-panels');
-    slots.set(task.id, slot);
-    element.append(foot, slot);
-    taskCards.push(element);
-  }
+  const entries = renderConversation(context, messages, proposals);
+  const { taskCards, slots } = renderTaskCards(context, tasks);
   profileUI.append(entries);
   // Open panels (draft / timeline / queue) live inside the card they were opened
   // from; if that card is gone they fall back to the end of the list.
@@ -809,6 +527,7 @@ async function readSnapshot(context) {
   panelSlots = slots;
   stream.replaceChildren(...entries);
   $('tasks').replaceChildren(...taskCards);
+  applyTaskFilter();
   renderActivity(context, activity);
   $('task-count').textContent = tasks.length ? String(tasks.length) : '';
   // The rail badge counts tasks waiting on *this* user, not all tasks.
@@ -817,6 +536,7 @@ async function readSnapshot(context) {
   $('rail-badge').textContent = waiting ? String(waiting) : '';
   if (stick) scroller.scrollTop = scroller.scrollHeight;
   renderTaskContext();
+  if (focused?.isConnected) { focused.focus?.({ preventScroll: true }); if (selection) focused.setSelectionRange?.(...selection); }
 
 }
 
@@ -827,12 +547,13 @@ async function enterRoom(context) {
   user = me.user;
   context.user = user;
   restoreTurn(context);
-  const mode = me.runtime === 'dsh' ? '真实模型' : me.runtime === 'mock' ? '离线演示' : '运行时 ' + me.runtime;
+  const mode = me.runtime === 'dsh' ? '真实模型' : me.runtime === 'mock' ? '离线演示' : '服务模式 ' + me.runtime;
   $('identity').replaceChildren(el('b', null, `${user} 的管家`), el('span', 'muted', ` · ${mode}`), el('span', 'sr-only', ' · 已验证身份'));
   $('login').classList.add('hide');
   $('room').classList.remove('hide');
   await refresh(context);
-  if (current(context)) schedulePoll(context);
+  if (current(context) && pendingTurn) await $('check-turn').onclick();
+  if (current(context)) { schedulePoll(context); showOnboarding(context); }
 }
 
 async function checkSession() {
@@ -961,6 +682,7 @@ $('check-turn').onclick = async () => {
     }
   } catch (error) {
     if (!current(context) || pendingTurn !== turn) return;
+    turn.status = 'uncertain';
     status(error.httpStatus === 404
       ? '当前账号未找到这条发送记录，仍无法确认上次结果。未重发消息。'
       : error.message + '。暂时无法核对上次结果，未重发消息。');
@@ -1030,13 +752,16 @@ $('form').onsubmit = async event => {
         status('任务上下文已失效，未发送消息。请重新选择任务，或清除任务上下文后再发送。');
         return;
       }
-      chatTurn = { text, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent };
+      const message = repositoryChatMessage(text, selectedRepository);
+      closeRepositoryPicker();
+      chatTurn = { text, message, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent, selectedRepository };
+      selectedRepository = null;
       selectedAgent = null;
       selectedTask = null;
       pendingTurn = chatTurn;
       rememberTurn(context);
       renderTurn();
-      const response = await postChat(context, { message: text, request_id: chatTurn.id,
+      const response = await postChat(context, { message: chatTurn.message, request_id: chatTurn.id,
         ...(chatTurn.selectedAgent ? { agent_id: chatTurn.selectedAgent.id,
           expected_profile_revision: chatTurn.selectedAgent.revision } : {}),
         ...(chatTurn.selectedTask ? { selected_task: {
@@ -1065,6 +790,7 @@ $('form').onsubmit = async event => {
         && ((error.httpStatus === 409 && error.code === 'selected_agent_stale_before_dispatch')
           || (error.httpStatus === 400 && error.code === 'selected_agent_unavailable_before_dispatch'));
       if (rejectedAgent || rejectedSelection) {
+        selectedRepository = chatTurn.selectedRepository;
         selectedAgent = chatTurn.selectedAgent ? { ...chatTurn.selectedAgent,
           invalidated: rejectedAgent || chatTurn.selectedAgent.invalidated } : null;
         // These two server codes guarantee rejection before receipt reservation
@@ -1092,63 +818,35 @@ $('form').onsubmit = async event => {
   }
 };
 
-void checkSession();
+function isOldProposal(proposal) {
+  const date = parseUtc(proposal.created_at);
+  return proposal.status === 'pending' && date && Date.now() - date.getTime() >= 86400000;
+}
 
-// Enter sends, Shift+Enter inserts a newline. Never send while an IME is composing
-// (Chinese input confirms candidates with Enter).
-$('text').onkeydown = event => {
-  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
-  event.preventDefault();
-  if (!$('send').disabled) $('form').requestSubmit?.();
-};
-
-// Presentational chrome only: drawer, composer menu, help, toast, autogrow.
-// Never stores conversation content; the drawer preference is a per-viewer nicety.
-const preference = {
-  get(key) { try { return localStorage.getItem(key); } catch { return null; } },
-  set(key, value) { try { localStorage.setItem(key, value); } catch { /* storage unavailable */ } }
-};
-function setTasksOpen(open) {
-  $('room').classList[open ? 'add' : 'remove']('tasks-open');
-  $('toggle-tasks').setAttribute('aria-pressed', String(open));
-  preference.set('agenct.tasksOpen', open ? '1' : '0');
-}
-$('toggle-tasks').onclick = () => setTasksOpen(!$('room').classList.contains('tasks-open'));
-$('close-tasks').onclick = () => setTasksOpen(false);
-function returnToChatOnNarrowScreen() {
-  if (globalThis.innerWidth <= 900) setTasksOpen(false);
-}
-$('open-chat').onclick = () => { setTasksOpen(false); $('text').focus?.(); };
-// Default: docked open on wide screens, closed on phones where it would cover the chat.
-const savedTasksOpen = preference.get('agenct.tasksOpen');
-setTasksOpen(savedTasksOpen === null ? !(globalThis.innerWidth <= 900) : savedTasksOpen === '1');
-function setMenuOpen(open) {
-  $('composer-menu').classList[open ? 'remove' : 'add']('hide');
-  $('composer-menu-toggle').setAttribute('aria-expanded', String(open));
-}
-$('composer-menu-toggle').onclick = () => setMenuOpen($('composer-menu').classList.contains('hide'));
-$('open-help').onclick = () => { returnToChatOnNarrowScreen(); setMenuOpen(true); $('help').open = true; $('help').focus?.(); };
-// Same path as typing /agents: handled locally by the profile UI, never sent to a model.
-$('open-agents').onclick = async () => {
-  const context = session();
-  if (!current(context) || $('send').disabled || $('open-agents').disabled) return;
-  returnToChatOnNarrowScreen();
-  $('open-agents').disabled = true;
-  try {
-    // Open the local editor directly. Never replace or submit an unsent message.
-    await profileUI.handle(context, '/agents');
-    if (current(context)) $('conversation').lastElementChild?.scrollIntoView?.({ block: 'nearest' });
-  } finally {
-    if (current(context)) $('open-agents').disabled = false;
+function updateNotifications(context, tasks) {
+  const waiting = tasks.filter(task => (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+    || (task.requester === context.user && task.status === 'ready_for_acceptance'));
+  document.title = waiting.length ? `(${waiting.length}) Agenct` : 'Agenct';
+  const incoming = new Set(waiting.map(task => task.id + ':' + task.status));
+  if (notificationTasks && notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    const count = [...incoming].filter(key => !notificationTasks.has(key)).length;
+    if (count) {
+      try { new Notification('Agenct 有新的待办', { body: `${count} 项工作需要你处理，请打开 Agenct 查看。`, tag: 'agenct-tasks' }); } catch { /* Title remains available when OS notifications are unsupported. */ }
+    }
   }
+  notificationTasks = incoming;
+}
+
+$('enable-notifications').onclick = async () => {
+  if (!current(session())) return;
+  if (typeof Notification === 'undefined') { status('当前浏览器不支持系统通知；标签页标题仍会显示待办数。'); return; }
+  const context = session();
+  if (notificationsEnabled) { notificationsEnabled = false; $('enable-notifications').textContent = '开启系统通知'; return; }
+  try {
+    const permission = await Notification.requestPermission();
+    if (!current(context)) return;
+    notificationsEnabled = permission === 'granted';
+    $('enable-notifications').textContent = notificationsEnabled ? '关闭系统通知' : '开启系统通知';
+    if (!notificationsEnabled) status('系统通知未开启；标签页标题仍会显示待办数。');
+  } catch { if (current(context)) status('无法开启系统通知；标签页标题仍会显示待办数。'); }
 };
-$('status').onclick = () => { $('status').textContent = ''; };
-$('text').oninput = () => {
-  const box = $('text');
-  if (!box.style) return;
-  box.style.height = 'auto';
-  box.style.height = Math.min(box.scrollHeight, 200) + 'px';
-};
-$('tab-activity').onclick = () => setPaneTab('activity');
-$('tab-tasks').onclick = () => setPaneTab('tasks');
-setPaneTab('activity');
