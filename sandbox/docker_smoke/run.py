@@ -6,6 +6,8 @@ source enter the container. The runtime's unconditional disablement is unchanged
 Requires a disposable Linux host with Docker, Python 3 and static C toolchain.
 """
 import argparse
+import hashlib
+import time
 from contextlib import ExitStack
 import json
 import os
@@ -67,7 +69,7 @@ def cleanup(docker, names, tag, image_id):
     require(not failures, 'cleanup incomplete: ' + ', '.join(failures))
 
 
-def run(journal_directory=None):
+def run(journal_directory=None, report_file=None):
     names = []
     tag = 'agenct-benign-smoke:' + uuid.uuid4().hex
     with ExitStack() as stack:
@@ -107,7 +109,13 @@ def run(journal_directory=None):
                        *plan.argv[1:], timeout=timeout)
 
             def inspect(self, name, timeout):
-                return json.loads(self.call('inspect', name, timeout=timeout).stdout)[0]
+                observed = json.loads(self.call('inspect', name, timeout=timeout).stdout)[0]
+                state = observed.get('State', {})
+                if state.get('Status') == 'exited' and state.get('ExitCode') != 0 and not state.get('OOMKilled'):
+                    print('benign fixture exit: ' + str(state.get('ExitCode')), file=sys.stderr)
+                    diagnostic = docker('logs', name, timeout=timeout, check=False).stderr[:4096]
+                    print('fixed probe diagnostic: ' + json.dumps(diagnostic.decode('utf-8', errors='replace')), file=sys.stderr)
+                return observed
 
             def lookup(self, identity, timeout):
                 result = docker('inspect', identity, timeout=timeout, check=False)
@@ -143,8 +151,10 @@ def run(journal_directory=None):
             (directory / 'fixture.txt').write_bytes(snapshot.files[0].content)
             (directory / 'Dockerfile').write_text(
                 'FROM scratch\n'
+                'WORKDIR /candidate\n'
                 'COPY --chmod=0555 probe /opt/agenct-checks/probe\n'
                 'COPY --chmod=0555 probe /opt/agenct-checks/hang\n'
+                'COPY --chmod=0555 probe /opt/agenct-checks/memory\n'
                 'COPY --chmod=0444 fixture.txt /candidate/fixture.txt\n'
                 'USER 65534:65534\nWORKDIR /candidate\n')
             docker('build', '--network=none', '--pull=false', '--no-cache',
@@ -159,6 +169,12 @@ def run(journal_directory=None):
             require(observed.snapshot_digest == snapshot.digest,
                     'host-side snapshot binding changed')
             print('PASS: staged supervisor inspected immutable source and exact container/image before and after check')
+            print('PASS: fixed probe observed outbound route/raw-socket denial, root/source write denial and tmp noexec')
+            print('PASS: fixed probe enforced tmpfs/PID quotas and observed CPU throttling; cgroup memory/swap limits pinned')
+
+            limited = supervisor.observe_benign(BenignEngine(), image_id, 'memory', journal=journal)
+            require(not limited.production_eligible and limited.cleanup_confirmed, 'memory probe cleanup required')
+            print('PASS: fixed allocation hit real cgroup memory limit (daemon exit 137 + OOMKilled), cleanup confirmed')
 
             timed = BenignEngine()
             try:
@@ -184,9 +200,23 @@ def run(journal_directory=None):
             cleanup(docker, names, tag, image_id)
         print('PASS: named fixture containers and image removed')
         print('LIMIT: benign Docker smoke only; production executor remains disabled')
+        if report_file is not None:
+            report = {'version': 1, 'scope': 'fixed-readonly-context-boundary',
+                      'production_execution_enabled': False, 'checked_at': int(time.time()),
+                      'probe_sha256': hashlib.sha256(Path(__file__).with_name('probe.c').read_bytes()).hexdigest(),
+                      'checks': ['network', 'filesystem', 'pid', 'cpu', 'memory', 'timeout', 'revocation', 'cleanup']}
+            fd = os.open(report_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(report, stream, sort_keys=True)
+                stream.write('\n')
+                stream.flush()
+                os.fsync(stream.fileno())
+
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--journal-directory', help='private durable host directory for fixture cleanup')
-    run(parser.parse_args().journal_directory)
+    parser.add_argument('--report-file', help='new owner-only local evidence file; never authorizes worker execution')
+    args = parser.parse_args()
+    run(args.journal_directory, args.report_file)
