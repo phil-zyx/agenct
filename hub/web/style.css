@@ -498,3 +498,4 @@ textarea, input { caret-color: var(--brand); }
 .task-hint { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
 .task-confirm { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
 .task-confirm .note { margin: 0 0 8px; }
+.msg-sending { opacity: .72; }

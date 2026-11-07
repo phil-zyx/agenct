@@ -132,15 +132,58 @@ const ACTION_TEXT = {
   return: task => ['确认退回', `退回给 ${task.owner} 修改，可以在聊天里说明原因。`]
 };
 
+/** Carry out the confirmed step. Deliver without a draft opens the editor instead. */
+async function runPendingAction(context, task) {
+  const pending = pendingActions.get(task.id), key = 'tasks:' + task.id;
+  if (!pending || pending.revision !== task.revision || !current(context) || busy.has(key)) return;
+  const draft = latestDraft(task);
+  if (pending.action === 'deliver' && !draft) {
+    deliveryEditors.set(task.id, { text: '', source: null, revision: task.revision });
+    pendingActions.delete(task.id);
+    return refresh(context).catch(() => {});
+  }
+  busy.add(key);
+  try {
+    await api(context, 'tasks/' + encodeURIComponent(task.id) + '/actions', 'POST', {
+      action: pending.action, expected_revision: task.revision,
+      ...(pending.action === 'deliver' ? { result: draft.content, source_draft_id: draft.id } : {})
+    });
+    if (!current(context)) return;
+    pendingActions.delete(task.id);
+    status({ accept: '已接手，Agent 正在起草。', deliver: `已交付给 ${task.requester}。`, approve: '已验收。', return: `已退回给 ${task.owner}。` }[pending.action]);
+  } catch (error) {
+    if (current(context)) status(error.message + '。请刷新核对任务状态。');
+  } finally {
+    if (current(context)) { busy.delete(key); await refresh(context).catch(error => status(error.message)); }
+  }
+}
+
+const YES = /^(确认|确定)(接手|交付|验收|退回)?[。.!！~～]*$|^(好的?|好啊|好嘞|可以|行|是的?|对|嗯+|没问题|ok|okay|yes|y)[。.!！~～]*$/i;
+const NO = /^(算了|取消|不了|先不|不要|不用了?|cancel|no|n)[。.!！~～]*$/i;
+
+/** A short yes or no typed while a step waits on the card answers it directly,
+    without another model turn. Returns true when the text was used that way. */
+async function replyToPendingAction(context, text) {
+  const waiting = [...pendingActions.keys()].filter(id => visibleTasks.get(id)?.revision === pendingActions.get(id).revision);
+  const id = selectedTask && pendingActions.has(selectedTask.id) ? selectedTask.id : waiting.length === 1 ? waiting[0] : null;
+  const task = id && visibleTasks.get(id);
+  if (!task || !(YES.test(text) || NO.test(text))) return false;
+  $('text').value = ''; $('text').oninput?.();
+  if (NO.test(text)) { pendingActions.delete(id); status('好的，没有执行。'); await refresh(context).catch(() => {}); return true; }
+  await runPendingAction(context, task);
+  return true;
+}
+
 /** The one confirmation a plain-language request leads to. */
 function confirmation(context, task, card) {
   const pending = pendingActions.get(task.id);
   if (!pending) return;
   if (pending.revision !== task.revision) { pendingActions.delete(task.id); return; }
   const [label, note] = ACTION_TEXT[pending.action](task);
+  // Answerable by typing as well as by the button.
   const draft = latestDraft(task);
   const box = el('div', 'task-confirm');
-  box.append(el('p', 'note', note));
+  box.append(el('p', 'note', note + ' 可以直接回复「确认」或「算了」。'))
   const actions = el('div', 'actions');
   const key = 'tasks:' + task.id;
   if (pending.action === 'deliver' && !draft) {
@@ -156,23 +199,7 @@ function confirmation(context, task, card) {
   }
   const confirm = el('button', 'primary', label); confirm.type = 'button';
   confirm.disabled = busy.has(key);
-  confirm.onclick = async () => {
-    if (!current(context) || busy.has(key)) return;
-    busy.add(key); confirm.disabled = true;
-    try {
-      await api(context, 'tasks/' + encodeURIComponent(task.id) + '/actions', 'POST', {
-        action: pending.action, expected_revision: task.revision,
-        ...(pending.action === 'deliver' ? { result: draft.content, source_draft_id: draft.id } : {})
-      });
-      if (!current(context)) return;
-      pendingActions.delete(task.id);
-      status({ accept: '已接手，Agent 正在起草。', deliver: `已交付给 ${task.requester}。`, approve: '已验收。', return: `已退回给 ${task.owner}。` }[pending.action]);
-    } catch (error) {
-      if (current(context)) status(error.message + '。请刷新核对任务状态。');
-    } finally {
-      if (current(context)) { busy.delete(key); await refresh(context).catch(error => status(error.message)); }
-    }
-  };
+  confirm.onclick = () => runPendingAction(context, task);
   if (pending.action !== 'deliver' || draft) actions.append(confirm);
   if (pending.action === 'deliver' && draft) {
     const edit = el('button', 'text-btn', '先改一下再交付'); edit.type = 'button';
