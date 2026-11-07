@@ -495,3 +495,6 @@ textarea, input { caret-color: var(--brand); }
 .agent-draft-meta { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .agent-draft-ask { font-size: 13px; color: var(--text); margin-bottom: 8px; padding-left: 8px; border-left: 2px solid var(--line-strong); }
 .agent-draft .markdown { font-size: 14.5px; }
+.task-hint { margin: 10px 0 0; font-size: 13px; color: var(--muted); }
+.task-confirm { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.task-confirm .note { margin: 0 0 8px; }

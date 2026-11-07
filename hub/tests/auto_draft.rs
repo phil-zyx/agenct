@@ -236,3 +236,88 @@ async fn disabled_hub_never_drafts_on_its_own() {
     assert_eq!(f.draft_turns(), 0);
     assert!(f.task("bob", &task).await["my_draft"].is_null());
 }
+
+impl Fixture {
+    async fn say(&self, who: &str, task: &Value, message: &str, key: &str) -> Value {
+        let (status, out) = self
+            .call(
+                who,
+                "POST",
+                "/api/messages",
+                json!({"message":message,"request_id":key,
+                    "selected_task":{"task_id":task["id"],"expected_revision":task["revision"]}}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{out}");
+        out
+    }
+}
+
+#[tokio::test]
+async fn plain_language_suggests_only_the_steps_the_caller_may_take() {
+    let f = Fixture::new(false);
+    let id = f.delegated().await;
+
+    // Owner, awaiting: "接手" reads as accept; nothing changes until confirmed.
+    let task = f.task("bob", &id).await;
+    let out = f.say("bob", &task, "好的，我接手", "m1").await;
+    assert_eq!(out["task_action"]["action"], "accept");
+    assert_eq!(out["task_action"]["task_id"], id.as_str());
+    assert_eq!(out["task_action"]["expected_revision"], 0);
+    assert_eq!(f.task("bob", &id).await["status"], "awaiting_owner");
+    // The requester cannot be offered the owner's step.
+    let out = f.say("alice", &task, "我接手", "m2").await;
+    assert!(out["task_action"].is_null());
+
+    f.act("bob", &id, json!({"action":"accept","expected_revision":0}))
+        .await;
+    let task = f.task("bob", &id).await;
+    let out = f
+        .say("bob", &task, "我是 bob，用于面试，语气正式", "m3")
+        .await;
+    assert_eq!(out["task_action"]["action"], "revise");
+    assert_eq!(
+        out["task_action"]["instruction"],
+        "我是 bob，用于面试，语气正式"
+    );
+    let out = f.say("bob", &task, "可以了，交付吧", "m4").await;
+    assert_eq!(out["task_action"]["action"], "deliver");
+    assert!(out["task_action"]["instruction"].is_null());
+    assert_eq!(f.task("alice", &id).await["status"], "working");
+    // The same receipt replays the same suggestion.
+    let replay = f.say("bob", &task, "可以了，交付吧", "m4").await;
+    assert_eq!(replay["task_action"], out["task_action"]);
+    // The conversation itself is ordinary private history.
+    let (_, messages) = f.call("bob", "GET", "/api/messages", Value::Null).await;
+    assert!(messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["content"] == "可以了，交付吧"));
+
+    f.act(
+        "bob",
+        &id,
+        json!({"action":"deliver","expected_revision":1,"result":"交付内容"}),
+    )
+    .await;
+    let task = f.task("alice", &id).await;
+    assert_eq!(
+        f.say("alice", &task, "验收通过", "m5").await["task_action"]["action"],
+        "approve"
+    );
+    assert_eq!(
+        f.say("alice", &task, "退回，再补充一段经历", "m6").await["task_action"]["action"],
+        "return"
+    );
+    // Without a selected task there is never a task action.
+    let (_, out) = f
+        .call(
+            "alice",
+            "POST",
+            "/api/messages",
+            json!({"message":"验收通过","request_id":"m7"}),
+        )
+        .await;
+    assert!(out["task_action"].is_null());
+}

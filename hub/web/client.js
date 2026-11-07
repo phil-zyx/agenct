@@ -216,6 +216,7 @@ function renderTaskContext() {
   const locked = !!pendingTurn || busy.has('send') || busy.has('turn-check');
   $('task-context').classList[task ? 'remove' : 'add']('hide');
   $('task-context-title').textContent = task ? (task.invalidated ? '（已失效）' : '') + task.summary : '';
+  $('task-context-label').textContent = task?.auto ? '回复给任务' : '讨论';
   $('task-context-details').textContent = task
     ? (pendingTurn ? '本次发送的任务上下文已锁定，核对结果前不能更换。'
       : task.invalidated ? '所选任务已变更或不再可见，此选择已失效。请重新选择任务，或清除后再发送。'
@@ -265,6 +266,7 @@ function addDiscussion(element, context, task) {
 
 $('clear-task-context').onclick = () => {
   if (!current(session()) || pendingTurn || busy.has('send') || busy.has('turn-check')) return;
+  dismissFocus();
   selectedTask = null;
   renderTaskContext();
   status('已清除讨论的任务。');
@@ -352,6 +354,7 @@ async function completeTurn(context, response) {
       + (task.details_truncated ? '共享材料已截断。' : '')
     : '';
   forgetTurn();
+  if (current(context)) handleTaskAction(context, response.task_action);
   if (text !== null && $('text').value.trim() === text) $('text').value = '';
   status('已核实消息处理完成。' + receiptContext + receiptRole);
   try { await refresh(context); }
@@ -495,6 +498,7 @@ async function readSnapshot(context) {
   draftUI.update(context, tasks);
   timelineUI.update(context, tasks);
   updateTaskContext(context, tasks);
+  focusTask(context, tasks, activity);
   updateNotifications(context, tasks);
   if (!Array.isArray(activity)) activity = lastActivity;
   lastActivity = activity;
@@ -712,8 +716,6 @@ $('form').onsubmit = async event => {
   const context = session();
   const text = $('text').value.trim();
   if (!text || !current(context) || busy.has('send')) return;
-  // Bound to a task's draft: the text is the owner's supplement for a new version.
-  if (sendDraftReply(context, text)) return;
   if (pendingTurn) {
     status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
     return;
