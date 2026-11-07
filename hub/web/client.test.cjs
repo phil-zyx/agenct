@@ -1732,6 +1732,21 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(posts(again,'/actions').length,0);
     assert.match(again.$('status').textContent,/草稿版本已变更/);
   });
+
+  await test('successful confirmed action advances an empty composer but never retargets in-flight input', async () => {
+    for (const typed of [false,true]) {
+      const f=fixture(undefined,{tasks:[task({status:'awaiting_owner',revision:0})],
+        taskAction:()=>({action:'accept',task_id:'task-one',expected_revision:0})});
+      await f.login('bob');await settle();await f.send('接手');await settle();
+      f.tasks([task({status:'working',revision:1})]);
+      f.hold();
+      const action = findButton(f.$('conversation'),'确认接手').onclick(); await f.ready();
+      if(typed)f.$('text').value='Written against old version';
+      f.release(); await action; await settle();
+      assert.match(f.$('task-context-details').textContent,typed?/失效/:/版本：1/);
+      if(typed)assert.equal(f.$('text').value,'Written against old version');
+    }
+  });
   console.log('Client regression tests passed');
 
 })().catch(error => {

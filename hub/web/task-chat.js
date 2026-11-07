@@ -195,6 +195,11 @@ async function runPendingAction(context, task, pending) {
     });
     if (!current(context)) return;
     forgetAction(task.id);
+    // This explicit action consumed the selected snapshot. Only advance an empty
+    // composer; text typed while the request was in flight keeps its old fence.
+    if (selectedTask?.id === task.id && selectedTask.revision === task.revision && !$('text').value.trim()) {
+      selectedTask = null;
+    }
     status({ accept: '已接手，Agent 正在起草。', deliver: `已交付给 ${task.requester}。`, approve: '已验收。', return: `已退回给 ${task.owner}。` }[pending.action]);
   } catch (error) {
     if (current(context)) status(error.message + '。请刷新核对任务状态。');
