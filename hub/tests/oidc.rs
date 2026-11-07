@@ -684,3 +684,99 @@ fn orphaned_private_history_cannot_be_silently_adopted_at_first_tenant_startup()
     drop(db);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn departed_member_history_remains_bound_without_new_delegation_authority() {
+    let root = std::env::temp_dir().join(format!("agenct-departed-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let database = root.join("hub.sqlite3");
+    let path = database.to_str().unwrap();
+    {
+        let h = organization_hub(path, Runtime::Mock)
+            .with_tenants(organizations())
+            .unwrap();
+        let db = rusqlite::Connection::open(&database).unwrap();
+        db.execute("INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('departed-task','alice','bob','Historical work','completed',2)", []).unwrap();
+        db.execute("INSERT INTO proposals(id,requester,owner,summary,status,revision,source,request_id) VALUES ('departed-proposal','alice','bob','Historical proposal','pending',0,'manual','departed')", []).unwrap();
+        drop(db);
+        drop(h);
+    }
+    let reopen = || {
+        let mut config = organization_config(path, Runtime::Mock);
+        config.users.retain(|user| user.id != "bob");
+        let mut oidc = policy();
+        oidc["subjects"] =
+            json!({"subject-alice":"alice","subject-carol":"carol","subject-dave":"dave"});
+        let mut tenants = organizations();
+        tenants.0.remove("bob");
+        Hub::open(config)
+            .unwrap()
+            .with_oidc(serde_json::from_value(oidc).unwrap())
+            .unwrap()
+            .with_tenants(tenants)
+    };
+    {
+        let a = app(reopen().unwrap());
+        assert_eq!(
+            organization_request(&a, "alice", "GET", "/api/tasks/departed-task", Value::Null)
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            organization_request(&a, "bob", "GET", "/api/tasks/departed-task", Value::Null)
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            organization_request(
+                &a,
+                "alice",
+                "POST",
+                "/api/proposals",
+                json!({"owner":"bob","summary":"New work"})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            organization_request(
+                &a,
+                "alice",
+                "POST",
+                "/api/proposals/departed-proposal/actions",
+                json!({"action":"confirm","expected_revision":0})
+            )
+            .await
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    {
+        let db = rusqlite::Connection::open(&database).unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT tenant FROM tenant_memberships WHERE owner='bob'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "north"
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT status FROM proposals WHERE id='departed-proposal'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "pending"
+        );
+        // Retained membership must not excuse historical cross-tenant records.
+        db.execute("INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('cross-tenant','carol','bob','Invalid history','completed',2)", []).unwrap();
+    }
+    assert!(reopen().is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
