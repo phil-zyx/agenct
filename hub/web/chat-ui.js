@@ -137,10 +137,11 @@ function renderConversation(context, messages, proposals, moments = []) {
   const entries = messages.map(message => {
     const notice = message.role !== 'user' && /^\[(系统提示|MOCK)/.test(message.content);
     const bubble = el('article', 'msg ' + (message.role === 'user' ? 'msg-user' : notice ? 'msg-notice' : 'msg-assistant')
-      + (message.status === 'failed' ? ' msg-failed' : ''));
+      + (message.status === 'failed' ? ' msg-failed' : message.status === 'pending' ? ' msg-sending' : ''));
     bubble.append(message.role === 'assistant' && !notice ? renderMarkdown(message.content) : el('div', 'msg-body', message.content));
     addMessageActions(bubble, context, message);
-    if (message.status !== 'complete') bubble.append(el('div', 'msg-status', MESSAGE_STATUS[message.status] || message.status));
+    // In flight is shown by the typing dots; only outcomes needing attention get words.
+    if (!['complete', 'pending'].includes(message.status)) bubble.append(el('div', 'msg-status', MESSAGE_STATUS[message.status] || message.status));
     return bubble;
   });
   // Place each proposal right after the exchange that produced it. A proposal's

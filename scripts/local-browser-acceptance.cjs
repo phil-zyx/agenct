@@ -153,19 +153,24 @@ async function freePort() {
     await proposal.getByRole('button', { name: '确认共享并委派', exact: true }).click();
     await bob.bringToFront();
     await bob.locator('#refresh').click();
-    // Incoming work is handled in the conversation; the pane is an overview.
+    // Incoming work is handled by talking; the card itself has no action buttons.
+    const say = async (page, text) => { await page.locator('#text').fill(text); await page.locator('#text').press('Enter'); };
     const work = bob.locator('.task-chat').last();
-    await work.getByRole('button', { name: '接手', exact: true }).click();
+    await work.waitFor();
+    assert.equal(await work.getByRole('button').count(), 0, 'no action buttons on the task card');
+    await say(bob, '好的，我接手');
+    await work.getByRole('button', { name: '确认接手', exact: true }).click();
     // Accepting starts the owner's private draft, shown in the same conversation card.
     await work.locator('.agent-draft').waitFor({ timeout: 20000 });
     assert.equal((await (await api('alice', 'tasks')).json())[0].my_draft, undefined, 'Requester never sees draft state');
-    await work.getByRole('button', { name: '补充信息 / 让 Agent 修改', exact: true }).click();
-    await bob.locator('#text').fill('请缩短并保留验收清单'); await bob.locator('#text').press('Enter');
-    await bob.waitForFunction(() => document.querySelector('.task-chat .agent-draft-ask')?.textContent.includes('请缩短'));
+    await bob.waitForFunction(() => !document.getElementById('task-context').classList.contains('hide'));
+    await say(bob, '请缩短并保留验收清单');
+    await bob.waitForFunction(() => document.querySelector('.task-chat .agent-draft-ask')?.textContent.includes('请缩短'), null, { timeout: 20000 });
     const privateDraft = await (await api('alice', 'tasks')).json();
     assert.equal(privateDraft[0].result, null, 'Private drafting must not publish a delivery');
-    assert.equal((await (await api('bob', 'messages')).json()).some(m => m.content.includes('请缩短')), false, 'a supplement is not chat history');
-    await work.getByRole('button', { name: '交付给 alice', exact: true }).click();
+    await bob.waitForFunction(() => !document.getElementById('task-context').classList.contains('hide'));
+    await say(bob, '可以了，交付');
+    await work.getByRole('button', { name: '先改一下再交付', exact: true }).click();
     await work.getByLabel('交付内容', { exact: true }).fill('人工审阅后的交付：已检查共享文档，建议补充操作步骤。');
     await work.getByRole('button', { name: '确认交付', exact: true }).click();
     await bob.locator('.task-line', { hasText: '等待验收' }).waitFor();
@@ -174,7 +179,11 @@ async function freePort() {
     const result = alice.locator('.task-chat', { hasText: '交付了结果' });
     await result.waitFor();
     assert((await result.textContent()).includes('人工审阅后的交付'));
-    await result.getByRole('button', { name: '验收通过', exact: true }).click();
+    await alice.waitForFunction(() => !document.getElementById('task-context').classList.contains('hide'));
+    await say(alice, '验收通过');
+    await result.getByRole('button', { name: '确认验收', exact: true }).waitFor();
+    // A typed yes is the confirmation itself.
+    await say(alice, '确认');
     await alice.locator('.task-line', { hasText: '已验收完成' }).waitFor();
     await tasks(alice);
     await alice.locator('.task-completed').waitFor({ state: 'attached' });

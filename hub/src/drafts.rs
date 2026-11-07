@@ -264,6 +264,7 @@ pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> 
         profile: &profile,
         task_context: Some(&snapshot),
         draft_revision: revision_context.as_ref(),
+        task_role: None,
     };
     let answer = match &h.runtime {
         Runtime::Mock => runtime::MockRuntime.turn(request).await,

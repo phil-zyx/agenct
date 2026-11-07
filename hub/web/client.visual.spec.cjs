@@ -31,10 +31,10 @@ for (const width of [1330, 1440, 400]) {
         await expect(f.page.getByRole('button', { name: '在对话中处理', exact: true })).toBeInViewport();
         await expect(f.page).toHaveScreenshot(`tasks-${width}-${colorScheme}.png`, { mask: masks });
         await f.page.screenshot({ path: testInfo.outputPath('tasks.png'), mask: masks });
-        // The delivery is accepted inside the conversation.
+        // The delivery is accepted by replying in the conversation; the card only explains how.
         await f.page.getByRole('button', { name: '在对话中处理', exact: true }).click();
-        const accept = f.page.locator('#task-chat-task-alpha').getByRole('button', { name: '验收通过', exact: true });
-        await expect(accept).toBeInViewport();
+        await expect(f.page.locator('#task-chat-task-alpha .task-hint')).toBeInViewport();
+        await expect(f.page.locator('#task-context-label')).toHaveText('回复给任务');
         await f.page.waitForTimeout(1800); // let the arrival highlight fade
         expect(await f.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
         await expect(f.page).toHaveScreenshot(`task-chat-${width}-${colorScheme}.png`, { mask: masks });

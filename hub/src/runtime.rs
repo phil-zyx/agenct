@@ -19,6 +19,8 @@ pub(super) struct TurnRequest<'a> {
     pub profile: &'a RuntimeProfile,
     pub task_context: Option<&'a serde_json::Value>,
     pub draft_revision: Option<&'a serde_json::Value>,
+    /// The caller's role in task_context ("owner" | "requester"), for task actions.
+    pub task_role: Option<&'a str>,
 }
 
 /// Static dispatch keeps the transport replaceable without exposing Hub/DB authority.
@@ -26,6 +28,16 @@ pub(super) trait Runtime {
     fn turn(&self, request: TurnRequest<'_>) -> impl Future<Output = Result<AdapterReply>> + Send;
 }
 
+/// A model's reading of what the user asked to do with the selected task. Only a
+/// suggestion: the Hub re-checks it against the caller's role and the task state,
+/// and nothing changes until the user confirms (a private draft revision excepted).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TaskAction {
+    pub action: String,
+    #[serde(default)]
+    pub instruction: Option<String>,
+}
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AdapterProposal {
@@ -40,6 +52,8 @@ pub(super) struct AdapterReply {
     // Explicit null is required; an omitted proposal is a protocol error.
     #[serde(deserialize_with = "Option::deserialize")]
     pub proposal: Option<AdapterProposal>,
+    #[serde(default)]
+    pub task_action: Option<TaskAction>,
 }
 impl AdapterReply {
     /// The same boundary checks every runtime's output before Hub persistence.
@@ -127,22 +141,60 @@ impl Runtime for MockRuntime {
                 reply: crate::context_memory::mock_summary(request.history),
                 backend: "mock".into(),
                 proposal: None,
+                task_action: None,
             });
         }
         if request.kind == TurnKind::DraftDelivery {
-            return Ok(AdapterReply { reply: "[MOCK · draft only] 请根据任务共享摘要核对、编辑并明确提交交付。这不是执行或完成证据。".into(), backend: "mock".into(), proposal: None });
+            return Ok(AdapterReply { reply: "[MOCK · draft only] 请根据任务共享摘要核对、编辑并明确提交交付。这不是执行或完成证据。".into(), backend: "mock".into(), proposal: None, task_action: None });
+        }
+        if let Some(context) = request.task_context {
+            if let Some(task_action) = mock_task_action(request.message, context, request.task_role)
+            {
+                return Ok(AdapterReply {
+                    reply: format!(
+                        "[MOCK · deterministic test double] 理解为：{}。",
+                        task_action.action
+                    ),
+                    backend: "mock".into(),
+                    proposal: None,
+                    task_action: Some(task_action),
+                });
+            }
         }
         if let Some((owner, summary)) = mock_delegation(request.message) {
             return Ok(AdapterReply {
                 reply: "[MOCK · deterministic test double] 请检查接收人和将共享的任务内容，再明确确认。确认前对方不会收到任务。".into(),
-                backend: "mock".into(), proposal: Some(AdapterProposal { owner, summary }),
+                backend: "mock".into(), proposal: Some(AdapterProposal { owner, summary }), task_action: None,
             });
         }
         Ok(AdapterReply {
             reply: format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。", request.history.len()),
-            backend: "mock".into(), proposal: None,
+            backend: "mock".into(), proposal: None, task_action: None,
         })
     }
+}
+
+/// Offline keyword reading of a task instruction; real language understanding is the model's.
+fn mock_task_action(
+    message: &str,
+    context: &serde_json::Value,
+    role: Option<&str>,
+) -> Option<TaskAction> {
+    let has = |words: &[&str]| words.iter().any(|w| message.contains(w));
+    // Like a model, it reads intent from words regardless of the task's state;
+    // whether the step is possible now is the Hub's decision.
+    let action = match (role?, context["status"].as_str()?) {
+        ("owner", _) if has(&["接手", "接了", "accept"]) => "accept",
+        ("owner", _) if has(&["交付", "发给", "deliver"]) => "deliver",
+        ("requester", _) if has(&["退回", "重做", "修改", "return"]) => "return",
+        ("requester", _) if has(&["验收", "通过", "可以", "approve"]) => "approve",
+        ("owner", "working") => "revise",
+        _ => return None,
+    };
+    Some(TaskAction {
+        action: action.into(),
+        instruction: (action == "revise").then(|| message.to_owned()),
+    })
 }
 
 pub(super) struct DshRuntime<'a> {
@@ -168,6 +220,9 @@ impl Runtime for DshRuntime<'_> {
         }
         if request.kind == TurnKind::ContextSummary {
             payload["kind"] = serde_json::json!("context_summary");
+        }
+        if let (Some(role), Some(_)) = (request.task_role, request.task_context) {
+            payload["task_role"] = serde_json::json!(role);
         }
         if let Some(revision) = request.draft_revision {
             payload["draft_revision"] = revision.clone();
@@ -236,6 +291,7 @@ mod tests {
                 profile: &profile(),
                 task_context: None,
                 draft_revision: None,
+                task_role: None,
             })
             .await
             .unwrap()
