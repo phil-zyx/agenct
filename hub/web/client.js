@@ -406,7 +406,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('rail-badge').textContent = '';
   detailDrafts.clear();
   actionEditors.clear(); messagePanels.clear();
-  resetTaskChat();
+  resetTaskChat({ preserveRecovery });
   notificationTasks = null; notificationsEnabled = false;
   taskFilter = 'active'; $('task-filter').value = 'active';
   document.title = 'Agenct';

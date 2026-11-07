@@ -181,16 +181,14 @@ fn mock_task_action(
     role: Option<&str>,
 ) -> Option<TaskAction> {
     let has = |words: &[&str]| words.iter().any(|w| message.contains(w));
+    // Like a model, it reads intent from words regardless of the task's state;
+    // whether the step is possible now is the Hub's decision.
     let action = match (role?, context["status"].as_str()?) {
-        ("owner", "awaiting_owner") if has(&["接手", "接了", "accept"]) => "accept",
-        ("owner", "working") if has(&["交付", "发给", "deliver"]) => "deliver",
+        ("owner", _) if has(&["接手", "接了", "accept"]) => "accept",
+        ("owner", _) if has(&["交付", "发给", "deliver"]) => "deliver",
+        ("requester", _) if has(&["退回", "重做", "修改", "return"]) => "return",
+        ("requester", _) if has(&["验收", "通过", "可以", "approve"]) => "approve",
         ("owner", "working") => "revise",
-        ("requester", "ready_for_acceptance") if has(&["退回", "重做", "修改", "return"]) => {
-            "return"
-        }
-        ("requester", "ready_for_acceptance") if has(&["验收", "通过", "可以", "approve"]) => {
-            "approve"
-        }
         _ => return None,
     };
     Some(TaskAction {

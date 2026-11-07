@@ -9,14 +9,38 @@ const draftReads = new Set();      // request_ids being fetched
 const deliveryEditors = new Map(); // task id -> { text, source, revision } kept across polls
 const pendingActions = new Map();  // task id -> { action, revision } read from the user's words
 const dismissedFocus = new Set();  // "id:revision" the user detached from the composer
+const ACTIONS_KEY = 'agenct.task-actions.v1';
+let actionsOwner = null;           // whose saved steps are loaded in this tab
+
+// A waiting step survives a reload of this tab (never credentials or content).
+function saveActions() {
+  try { sessionStorage.setItem(ACTIONS_KEY, JSON.stringify({ user: actionsOwner, items: [...pendingActions] })); } catch {}
+}
+function loadActions(context) {
+  if (actionsOwner === context.user) return;
+  pendingActions.clear(); actionsOwner = context.user;
+  try {
+    const saved = JSON.parse(sessionStorage.getItem(ACTIONS_KEY));
+    if (saved?.user === context.user && Array.isArray(saved.items)) {
+      for (const [id, step] of saved.items) {
+        if (typeof id === 'string' && ACTION_TEXT[step?.action] && Number.isSafeInteger(step.revision)) pendingActions.set(id, step);
+      }
+    }
+  } catch {}
+}
+function rememberAction(id, step) { pendingActions.set(id, step); saveActions(); }
+function forgetAction(id) { if (pendingActions.delete(id)) saveActions(); }
 
 function taskChatVersion() {
   // Re-render when a fetched draft or an open editor changes, not only on API data.
   return JSON.stringify([[...draftReceipts.keys()], [...deliveryEditors.keys()], [...pendingActions]]);
 }
 
-function resetTaskChat() {
+function resetTaskChat({ preserveRecovery = false } = {}) {
   draftReceipts.clear(); draftReads.clear(); deliveryEditors.clear(); pendingActions.clear(); dismissedFocus.clear();
+  actionsOwner = null;
+  // Kept across a reload of the same login; dropped on logout or identity change.
+  if (!preserveRecovery) { try { sessionStorage.removeItem(ACTIONS_KEY); } catch {} }
 }
 
 function latestStep(activity, id) {
@@ -107,7 +131,7 @@ function deliveryEditor(context, task, card, draft) {
         ...(editor.source ? { source_draft_id: editor.source } : {})
       });
       if (!current(context)) return;
-      deliveryEditors.delete(task.id); pendingActions.delete(task.id);
+      deliveryEditors.delete(task.id); forgetAction(task.id);
       status(`已交付给 ${task.requester}。`);
     } catch (error) {
       if (current(context)) note.textContent = error.message + '。内容已保留，刷新核对后再试。';
@@ -139,7 +163,7 @@ async function runPendingAction(context, task) {
   const draft = latestDraft(task);
   if (pending.action === 'deliver' && !draft) {
     deliveryEditors.set(task.id, { text: '', source: null, revision: task.revision });
-    pendingActions.delete(task.id);
+    forgetAction(task.id);
     return refresh(context).catch(() => {});
   }
   busy.add(key);
@@ -149,7 +173,7 @@ async function runPendingAction(context, task) {
       ...(pending.action === 'deliver' ? { result: draft.content, source_draft_id: draft.id } : {})
     });
     if (!current(context)) return;
-    pendingActions.delete(task.id);
+    forgetAction(task.id);
     status({ accept: '已接手，Agent 正在起草。', deliver: `已交付给 ${task.requester}。`, approve: '已验收。', return: `已退回给 ${task.owner}。` }[pending.action]);
   } catch (error) {
     if (current(context)) status(error.message + '。请刷新核对任务状态。');
@@ -169,7 +193,7 @@ async function replyToPendingAction(context, text) {
   const task = id && visibleTasks.get(id);
   if (!task || !(YES.test(text) || NO.test(text))) return false;
   $('text').value = ''; $('text').oninput?.();
-  if (NO.test(text)) { pendingActions.delete(id); status('好的，没有执行。'); await refresh(context).catch(() => {}); return true; }
+  if (NO.test(text)) { forgetAction(id); status('好的，没有执行。'); await refresh(context).catch(() => {}); return true; }
   await runPendingAction(context, task);
   return true;
 }
@@ -178,7 +202,7 @@ async function replyToPendingAction(context, text) {
 function confirmation(context, task, card) {
   const pending = pendingActions.get(task.id);
   if (!pending) return;
-  if (pending.revision !== task.revision) { pendingActions.delete(task.id); return; }
+  if (pending.revision !== task.revision) { forgetAction(task.id); return; }
   const [label, note] = ACTION_TEXT[pending.action](task);
   // Answerable by typing as well as by the button.
   const draft = latestDraft(task);
@@ -192,7 +216,7 @@ function confirmation(context, task, card) {
     write.onclick = () => {
       if (!current(context)) return;
       deliveryEditors.set(task.id, { text: '', source: null, revision: task.revision });
-      pendingActions.delete(task.id);
+      forgetAction(task.id);
       return refresh(context).catch(() => {});
     };
     actions.append(write);
@@ -206,13 +230,13 @@ function confirmation(context, task, card) {
     edit.onclick = () => {
       if (!current(context)) return;
       deliveryEditors.set(task.id, { text: draft?.content || '', source: draft?.id || null, revision: task.revision });
-      pendingActions.delete(task.id);
+      forgetAction(task.id);
       return refresh(context).catch(() => {});
     };
     actions.append(edit);
   }
   const cancel = el('button', 'text-btn', '算了'); cancel.type = 'button';
-  cancel.onclick = () => { pendingActions.delete(task.id); return refresh(context).catch(() => {}); };
+  cancel.onclick = () => { forgetAction(task.id); return refresh(context).catch(() => {}); };
   actions.append(cancel);
   box.append(actions);
   card.append(box);
@@ -280,12 +304,15 @@ function taskMoment(context, task) {
 
 /** One conversation entry per task, with the time of its latest visible step. */
 function taskMoments(context, tasks, activity) {
+  loadActions(context);
   const moments = [];
   for (const task of tasks) {
     if (task.owner !== context.user && task.requester !== context.user) continue;
     const element = taskMoment(context, task);
     if (!element) continue;
-    moments.push({ at: parseUtc(latestStep(activity, task.id)?.at), element, task });
+    // A card waiting for an answer sits at the end, right under the reply that asked.
+    const asking = pendingActions.has(task.id) || deliveryEditors.has(task.id);
+    moments.push({ at: asking ? null : parseUtc(latestStep(activity, task.id)?.at), element, task });
   }
   return moments;
 }
@@ -300,7 +327,7 @@ function handleTaskAction(context, action) {
     const draft = latestDraft(task);
     startDraft(context, task, draft?.id ? { base_draft_id: draft.id, instruction: action.instruction } : null);
   } else if (ACTION_TEXT[action.action]) {
-    pendingActions.set(task.id, { action: action.action, revision: task.revision });
+    rememberAction(task.id, { action: action.action, revision: task.revision });
   }
 }
 

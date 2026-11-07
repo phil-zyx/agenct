@@ -210,14 +210,6 @@ pub(super) async fn execute_chat(
                     return Err(error);
                 }
             };
-            let reply = answer.reply.clone();
-            tx.execute(
-                "UPDATE messages SET status='complete' WHERE id=?1",
-                [message_id],
-            )?;
-            if message_id.is_some() {
-                tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
-            }
             // A proposal and a task action never travel together; a delegation wins.
             let task_action = match (&proposal, &answer.task_action, &task_context) {
                 (None, Some(action), Some(context)) => {
@@ -225,6 +217,21 @@ pub(super) async fn execute_chat(
                 }
                 _ => None,
             };
+            // The model offered a step the Hub will not allow: never leave its
+            // "confirm below" standing with nothing to confirm.
+            let reply = match (&answer.task_action, &task_action, &task_context) {
+                (Some(_), None, Some(context)) if proposal.is_none() => {
+                    step_unavailable_notice(context, task_role)
+                }
+                _ => answer.reply.clone(),
+            };
+            tx.execute(
+                "UPDATE messages SET status='complete' WHERE id=?1",
+                [message_id],
+            )?;
+            if message_id.is_some() {
+                tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
+            }
             let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context,"task_action":task_action});
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
@@ -273,6 +280,32 @@ fn checked_task_action(
         "expected_revision": context["revision"],
         "instruction": instruction,
     }))
+}
+
+/// Hub-authored explanation when a suggested task step is not available now.
+fn step_unavailable_notice(context: &serde_json::Value, role: Option<&str>) -> String {
+    let status = match context["status"].as_str().unwrap_or("") {
+        "awaiting_owner" => "待接手",
+        "working" => "进行中",
+        "ready_for_acceptance" => "待验收",
+        "completed" => "已完成",
+        "canceled" => "已取消",
+        _ => "未知",
+    };
+    let next = match (role, context["status"].as_str()) {
+        (Some("owner"), Some("awaiting_owner")) => "现在可以做的是接手。",
+        (Some("owner"), Some("working")) => "现在可以补充信息让 Agent 修改草稿，或交付。",
+        (Some("requester"), Some("ready_for_acceptance")) => "现在可以验收或退回。",
+        (Some("requester"), Some("awaiting_owner" | "working")) => "现在需要等对方处理。",
+        (Some("owner"), Some("ready_for_acceptance")) => "现在需要等对方验收。",
+        _ => "这个任务已经结束，不能再变更。",
+    };
+    format!(
+        "[系统提示] 这一步现在做不了：任务「{}」当前状态是「{}」。{}",
+        context["summary"].as_str().unwrap_or(""),
+        status,
+        next
+    )
 }
 
 /// Hub-authored, deterministic text. The model-supplied name is shown only when it
