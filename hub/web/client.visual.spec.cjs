@@ -28,9 +28,16 @@ for (const width of [1330, 1440, 400]) {
         await expect(f.page).toHaveScreenshot(`chat-${width}-${colorScheme}.png`, { mask: masks });
         await f.page.screenshot({ path: testInfo.outputPath('chat.png'), mask: masks });
         await showTasks(f, [taskFixture()]);
-        await expect(f.page.getByRole('button', { name: '验收', exact: true })).toBeInViewport();
+        await expect(f.page.getByRole('button', { name: '在对话中处理', exact: true })).toBeInViewport();
         await expect(f.page).toHaveScreenshot(`tasks-${width}-${colorScheme}.png`, { mask: masks });
         await f.page.screenshot({ path: testInfo.outputPath('tasks.png'), mask: masks });
+        // The delivery is accepted inside the conversation.
+        await f.page.getByRole('button', { name: '在对话中处理', exact: true }).click();
+        const accept = f.page.locator('#task-chat-task-alpha').getByRole('button', { name: '验收通过', exact: true });
+        await expect(accept).toBeInViewport();
+        await f.page.waitForTimeout(1800); // let the arrival highlight fade
+        expect(await f.page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+        await expect(f.page).toHaveScreenshot(`task-chat-${width}-${colorScheme}.png`, { mask: masks });
       } finally { await f.close(); }
     });
   }
