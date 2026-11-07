@@ -66,6 +66,10 @@
         <details class="chip-more"><summary>附带内容</summary><p id="task-context-details" role="status" aria-live="polite"></p></details>
         <button type="button" id="clear-task-context" class="icon-btn small" title="清除讨论的任务" aria-label="清除讨论的任务"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </section>
+      <section id="draft-reply" class="chip-bar hide" aria-label="补充给 Agent 的草稿要求">
+        <span class="chip-label">补充给 Agent</span><span id="draft-reply-title" class="chip-title"></span>
+        <button type="button" id="clear-draft-reply" class="icon-btn small" title="不再补充，恢复普通聊天" aria-label="不再补充，恢复普通聊天"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      </section>
       <section id="repository-context" class="chip-bar hide" aria-label="下一条聊天的仓库内容"><span id="repository-context-text"></span><button type="button" id="clear-repository" class="text-btn">清除仓库选择</button></section>
       <section id="repository-picker" class="sheet hide" aria-label="只读仓库选择"><div id="repository-options"></div><button type="button" id="close-repository-picker" class="text-btn">关闭仓库选择</button></section>
       <section id="role-picker" class="sheet hide" aria-label="启用的个人角色">
@@ -122,6 +126,7 @@
 <script src="task-ui.js"></script>
 <script src="repo-ui.js"></script>
 <script src="client.js"></script>
+<script src="task-chat.js"></script>
 <script src="client-chrome.js"></script>
 </body>
 </html>

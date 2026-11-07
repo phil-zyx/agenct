@@ -403,6 +403,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('rail-badge').textContent = '';
   detailDrafts.clear();
   actionEditors.clear(); messagePanels.clear();
+  resetTaskChat();
   notificationTasks = null; notificationsEnabled = false;
   taskFilter = 'active'; $('task-filter').value = 'active';
   document.title = 'Agenct';
@@ -497,7 +498,7 @@ async function readSnapshot(context) {
   updateNotifications(context, tasks);
   if (!Array.isArray(activity)) activity = lastActivity;
   lastActivity = activity;
-  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity, proposals.filter(isOldProposal).map(p => p.id)]);
+  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity, proposals.filter(isOldProposal).map(p => p.id), taskChatVersion()]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
   $('last-refresh').textContent = (changed ? '有新的更新 · ' : '')
@@ -514,7 +515,7 @@ async function readSnapshot(context) {
   const stream = $('conversation');
   const scroller = $('scroller');
   const stick = !(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 160);
-  const entries = renderConversation(context, messages, proposals);
+  const entries = renderConversation(context, messages, proposals, taskMoments(context, tasks, activity));
   const { taskCards, slots } = renderTaskCards(context, tasks);
   profileUI.append(entries);
   // Open panels (draft / timeline / queue) live inside the card they were opened
@@ -711,6 +712,8 @@ $('form').onsubmit = async event => {
   const context = session();
   const text = $('text').value.trim();
   if (!text || !current(context) || busy.has('send')) return;
+  // Bound to a task's draft: the text is the owner's supplement for a new version.
+  if (sendDraftReply(context, text)) return;
   if (pendingTurn) {
     status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
     return;
