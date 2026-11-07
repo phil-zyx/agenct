@@ -181,7 +181,9 @@ async function freePort() {
     assert((await result.textContent()).includes('人工审阅后的交付'));
     await alice.waitForFunction(() => !document.getElementById('task-context').classList.contains('hide'));
     await say(alice, '验收通过');
-    await result.getByRole('button', { name: '确认验收', exact: true }).click();
+    await result.getByRole('button', { name: '确认验收', exact: true }).waitFor();
+    // A typed yes is the confirmation itself.
+    await say(alice, '确认');
     await alice.locator('.task-line', { hasText: '已验收完成' }).waitFor();
     await tasks(alice);
     await alice.locator('.task-completed').waitFor({ state: 'attached' });

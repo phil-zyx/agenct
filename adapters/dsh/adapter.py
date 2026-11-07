@@ -236,7 +236,7 @@ def run_sdk(turn, home, workspace, factory=None, *, resume=False):
         'status. A suggestion does nothing by itself: revise only produces a new private draft, and accept, deliver, '
         'approve and return each wait for the user to confirm with one click. In reply, say in one or two short '
         'sentences what you understood (for revise: that a new draft version is being prepared; otherwise: that they '
-        'can confirm below). If the intent is unclear, ask a short question and set task_action to null. '
+        'can reply 确认 or 算了, or use the button below). If the intent is unclear, ask a short question and set task_action to null. '
         'Never set both proposal and task_action. ') if "task_role" in turn else '')
         + 
         'Do not add fields, Markdown fences, tool calls, or authorization flags. '

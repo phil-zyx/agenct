@@ -716,6 +716,8 @@ $('form').onsubmit = async event => {
   const context = session();
   const text = $('text').value.trim();
   if (!text || !current(context) || busy.has('send')) return;
+  // A short yes/no to a step waiting on the card is that confirmation itself.
+  if (await replyToPendingAction(context, text)) return;
   if (pendingTurn) {
     status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
     return;
@@ -766,6 +768,8 @@ $('form').onsubmit = async event => {
       pendingTurn = chatTurn;
       rememberTurn(context);
       renderTurn();
+      // The message now lives in the conversation; the composer is free again.
+      if ($('text').value.trim() === text) { $('text').value = ''; $('text').oninput?.(); }
       const response = await postChat(context, { message: chatTurn.message, request_id: chatTurn.id,
         ...(chatTurn.selectedAgent ? { agent_id: chatTurn.selectedAgent.id,
           expected_profile_revision: chatTurn.selectedAgent.revision } : {}),
@@ -803,6 +807,8 @@ $('form').onsubmit = async event => {
         selectedTask = chatTurn.selectedTask ? { ...chatTurn.selectedTask,
           invalidated: rejectedSelection || chatTurn.selectedTask.invalidated } : null;
         forgetTurn();
+        // Not sent: give the words back.
+        if (!$('text').value.trim()) $('text').value = chatTurn.text;
         status(error.message + (rejectedAgent
           ? '。服务端尚未处理本次消息，所选角色已失效。请重新选择角色或明确恢复默认管家。未自动重发。'
           : '。服务端尚未处理本次消息，任务上下文已失效。请重新选择任务，或清除后再发送。未自动重发。'));

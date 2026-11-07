@@ -1556,6 +1556,32 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const body = JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body);
     assert.deepEqual([body.action, body.source_draft_id, body.expected_revision, body.result], ['deliver', 'auto-draft-id', 3, 'Auto draft 需要补充的信息']);
   });
+  await test('a typed yes carries out the waiting step and a typed no drops it, without a model turn', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance', result: 'done' })],
+      taskAction: body => /退回/.test(body.message) ? { action: 'return', task_id: 'task-one', expected_revision: 3 } : null });
+    await f.login('alice'); await settle();
+    await f.send('退回，改一下开头'); await settle();
+    assert.match(f.$('conversation').textContent, /可以直接回复「确认」或「算了」/);
+    const turns = chatPosts(f).length;
+    await f.send('算了'); await settle();
+    assert.equal(chatPosts(f).length, turns, 'no model turn for a plain no');
+    assert.equal(posts(f, '/actions').length, 0);
+    assert(!findButton(f.$('conversation'), '确认退回'), 'the step is withdrawn');
+    await f.send('退回，改一下开头'); await settle();
+    await f.send('确认'); await settle();
+    assert.equal(chatPosts(f).length, turns + 1, 'only the request itself reached the model');
+    assert.equal(JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body).action, 'return');
+    assert.equal(f.$('text').value, '');
+    // Without a waiting step, the same word is an ordinary message.
+    const g = fixture(); await g.login('alice'); await g.send('确认'); await settle();
+    assert.equal(chatPosts(g).length, 1);
+  });
+  await test('the composer clears as soon as a message is sent', async () => {
+    const f = fixture(); await f.login('alice'); f.stallPosts();
+    const send = f.send('long question'); await f.ready();
+    assert.equal(f.$('text').value, '', 'the words now sit in the conversation');
+    f.release?.(); void send;
+  });
   await test('requester accepts a delivery by saying so and never reads drafts', async () => {
     const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance', result: '**交付**内容' })],
       taskAction: () => ({ action: 'approve', task_id: 'task-one', expected_revision: 3 }) });
