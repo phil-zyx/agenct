@@ -211,6 +211,16 @@ pub(super) async fn summarize(
     previous: &str,
     messages: &[Message],
 ) -> Result<String> {
+    summarize_with_guard(h, profile, previous, messages, &|| Ok(())).await
+}
+
+pub(super) async fn summarize_with_guard(
+    h: &Hub,
+    profile: &RuntimeProfile,
+    previous: &str,
+    messages: &[Message],
+    authorized: &(impl Fn() -> Result<()> + Sync),
+) -> Result<String> {
     let mut next_summary = previous.to_owned();
     for mut group in chunks(messages) {
         if !next_summary.is_empty() {
@@ -226,6 +236,7 @@ pub(super) async fn summarize(
             task_context: None,
             draft_revision: None,
         };
+        authorized()?;
         let answer = match &h.runtime {
             Runtime::Mock => MockRuntime.turn(request).await,
             Runtime::Dsh { url, token } => {
