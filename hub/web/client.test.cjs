@@ -230,6 +230,97 @@ const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'ali
 const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
+
+  await test('work index reveals filtered tasks without changing composer, selection or task state', async () => {
+    for (const [filter, status, requester, expected] of [
+      ['active', 'completed', 'alice', 'completed'], ['active', 'canceled', 'alice', 'completed'],
+      ['completed', 'working', 'alice', 'active'], ['mine', 'working', 'carol', 'active'],
+      ['waiting', 'working', 'alice', 'active']
+    ]) {
+      const t = task({ id: 'target', status, requester, owner: requester === 'carol' ? 'alice' : 'bob' });
+      const f = fixture(undefined, { tasks: [t], activity: [{ kind: 'task', id: 'target', title: 'Target', status, latest: {} }] });
+      await f.login('alice'); f.$('text').value = 'Unsent private question'; f.discussion('target').onclick();
+      const context = f.$('task-context-details').textContent;
+      f.$('task-filter').value = filter; f.$('task-filter').onchange();
+      const card = f.$('tasks').children.find(e => e.taskId === 'target'); assert(card.classList.contains('hide'));
+      const row = f.$('activity').children.find(e => e.className.startsWith('activity-item'));
+      row.onclick(); row.onclick();
+      assert(!card.classList.contains('hide')); assert(card.classList.contains('flash')); assert(card.focused);
+      assert.equal(f.$('task-filter').value, expected);
+      assert.equal(f.$('text').value, 'Unsent private question'); assert.equal(f.$('task-context-details').textContent, context);
+      assert.equal(f.calls.filter(c => c.options?.method === 'POST').length, 0);
+      await f.$('logout').onclick(); await f.login('bob'); f.$('tab-activity').onclick();
+      row.onclick(); assert(f.$('tasks').classList.contains('hide'), 'old identity callback cannot navigate');
+    }
+  });
+  await test('work index expands old proposal ancestors and preserves unsent input without dispatch', async () => {
+    const f = fixture(undefined, { width: 400,
+      proposals: [{ id: 'old', owner: 'bob', summary: 'Old', status: 'pending', revision: 0, created_at: '2020-01-01 00:00:00' }],
+      activity: [{ kind: 'proposal', id: 'old', title: 'Old', status: 'pending', latest: {} }] });
+    await f.login('alice'); f.$('text').value = 'Keep this draft'; f.$('toggle-tasks').onclick();
+    const group = f.$('conversation').children.find(e => e.className === 'old-proposals');
+    const target = group.children.find(e => e.proposalId === 'old'); assert.equal(group.open, false);
+    const row = f.$('activity').children.find(e => e.className.startsWith('activity-item'));
+    row.onclick(); row.onclick();
+    assert.equal(group.open, true); assert(target.classList.contains('flash')); assert(target.focused);
+    assert(!f.$('room').classList.contains('tasks-open')); assert.equal(f.$('text').value, 'Keep this draft');
+    assert.equal(f.calls.filter(c => c.options?.method === 'POST').length, 0);
+    await f.$('logout').onclick(); await f.login('bob'); f.$('toggle-tasks').onclick();
+    row.onclick(); assert(f.$('room').classList.contains('tasks-open'));
+  });
+
+  await test('only routine feedback expires; errors and saved-reply fallback remain keyboard dismissible', async () => {
+    const f = fixture(undefined, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick(); assert(f.$('status').classList.contains('show'));
+    f.failReads(500); await f.$('refresh').onclick();
+    assert.match(f.$('status').textContent, /Read unavailable/);
+    assert(!f.$('status').classList.contains('show'), 'critical status must not receive fading animation');
+    f.$('status').onkeydown({ key: 'Escape', preventDefault() {} });
+    assert.equal(f.$('status').textContent, '');
+    await f.send('Reply must stay readable');
+    assert.match(f.$('status').textContent, /已保存的回复：Saved chat reply/);
+    assert(!f.$('status').classList.contains('show'));
+    assert.equal(f.storage.size, 0, 'no private reply text retained in storage');
+  });
+  await test('task invalidation is announced outside collapsed context details', async () => {
+    const f = fixture(undefined, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick();
+    assert.match(f.$('task-context-status').textContent, /已选择讨论任务/);
+    f.tasks([task({ revision: 4 })]); await f.$('refresh').onclick();
+    assert.match(f.$('task-context-status').textContent, /已失效/);
+    f.$('clear-task-context').onclick(); assert.equal(f.$('task-context-status').textContent, '');
+    const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+    assert.match(html, /id="task-context-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert(html.indexOf('id="task-context-status"') < html.indexOf('<section id="task-context"'));
+    f.discussion('task-one').onclick();
+    let writes = 0, content = f.$('task-context-status').textContent;
+    Object.defineProperty(f.$('task-context-status'), 'textContent', {get: () => content, set: value => { writes++; content = value; }});
+    await f.$('refresh').onclick(); assert.equal(writes, 0, 'unchanged polls do not repeat live announcements');
+  });
+  await test('each task panel retains its owner across other tool clicks and snapshot rerenders', async () => {
+    const all = ['A', 'B', 'C'].map(id => task({ id, summary: 'Task ' + id }));
+    const f = fixture(undefined, { tasks: all }); await f.login('bob');
+    const card = id => f.$('tasks').children.find(e => e.taskId === id);
+    const slot = id => card(id).children.find(e => e.className === 'card-panels');
+    await findButton(card('A'), '我的私密交付草稿').onclick();
+    const draft = slot('A').children[0]; assert(draft);
+    await findButton(draft, '让我的 Agent 起草（不交付）').onclick();
+    const walk = e => [e, ...e.children.flatMap(walk)];
+    const editor = walk(draft).find(e => e.value === 'Generated draft'); editor.value = 'Private edited A';
+    await findButton(card('B'), '查看共享时间线').onclick();
+    const timeline = slot('B').children[0]; assert(timeline);
+    await findButton(card('C'), '查看待办队列（不执行）').onclick();
+    const queue = slot('C').children[0]; assert(queue);
+    f.discussion('B').onclick(); f.change(); await f.$('refresh').onclick();
+    assert.deepEqual(slot('A').children, [draft]);
+    assert.deepEqual(slot('B').children, [timeline]);
+    assert.deepEqual(slot('C').children, [queue]);
+    assert.equal(editor.value, 'Private edited A');
+    assert(!slot('B').textContent.includes('Private edited A'));
+    assert.equal(f.calls.filter(c => c.url?.endsWith('/actions')).length, 0);
+    await f.$('logout').onclick(); await f.login('alice');
+    assert(!f.$('tasks').textContent.includes('私密文本草稿'));
+  });
   await test('narrow task discussion and navigation return to chat without dispatch', async () => {
     const f = fixture({ enabled: false }, { width: 400, tasks: [task()] });
     await f.login('alice');
@@ -1746,6 +1837,20 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
       assert.match(f.$('task-context-details').textContent,typed?/失效/:/版本：1/);
       if(typed)assert.equal(f.$('text').value,'Written against old version');
     }
+  });
+
+  await test('integrated task confirmation errors stay readable and stale automatic context is announced', async () => {
+    const f=fixture(undefined,{tasks:[task({status:'ready_for_acceptance'})],
+      taskAction:()=>({action:'approve',task_id:'task-one',expected_revision:3})});
+    await f.login('alice');await settle();await f.send('验收');await settle();
+    await f.send('确认退回');await settle();
+    assert.match(f.$('status').textContent,/动作与当前/);
+    assert(!f.$('status').classList.contains('show'));
+    assert.equal(posts(f,'/actions').length,0);
+    f.tasks([task({status:'ready_for_acceptance',revision:4})]);await f.$('refresh').onclick();await settle();
+    assert.match(f.$('task-context-status').textContent,/失效/);
+    assert.equal(f.$('text').value,'确认退回');
+    f.$('status').onkeydown({key:'Escape',preventDefault(){}});assert.equal(f.$('status').textContent,'');
   });
   console.log('Client regression tests passed');
 

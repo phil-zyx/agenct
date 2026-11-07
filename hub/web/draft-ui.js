@@ -67,7 +67,7 @@ function createDraftUI({ api, current, article, conversation }) {
     edit = null;
     const panel = article('私密文本草稿：不会执行、交付或验收。只发送本任务的共享摘要、委派人确认附带的共享材料、交付结果及所选角色，不发送任何私聊；长文本可能截断。');
     if (card) card.replaceChildren(article('已关闭旧草稿视图。'));
-    card = panel; conversation().append(panel); panel.scrollIntoView?.({ block: 'nearest' });
+    card = panel; conversation(taskId).append(panel); panel.scrollIntoView?.({ block: 'nearest' });
     const openedRevision = tasks.get(taskId)?.revision;
     let working = false, view = 0, unresolved = saved(context), role = null, roleInvalid = false;
     if (unresolved && unresolved.task !== taskId) {

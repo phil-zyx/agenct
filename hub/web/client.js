@@ -13,14 +13,14 @@ let pollTimer = null, pollDelay = 3000, refreshFlight = null, snapshot = '', ren
 const POLL_INTERVAL = 3000, MAX_POLL_DELAY = 60000, READ_TIMEOUT = 15000, CHAT_SEND_TIMEOUT = 90000;
 const busy = new Set();
 const $ = id => document.getElementById(id);
-// Toast that fades on its own; longer messages stay a little longer. Pure CSS
-// animation (no timers), restarted on every new message; click dismisses.
-const status = text => {
+// Critical feedback and reply fallbacks stay readable until dismissed.
+// Only explicitly marked routine feedback expires; no text is persisted.
+const status = (text, { transient = false } = {}) => {
   const toast = $('status');
   toast.textContent = text;
   toast.classList.remove('show');
   void toast.offsetWidth;
-  if (!text) return;
+  if (!text || !transient) return;
   toast.style?.setProperty('--life', Math.min(9, 3 + text.length / 25).toFixed(1) + 's');
   toast.classList.add('show');
 };
@@ -100,8 +100,11 @@ function badge(table, value) {
   return el('span', 'badge badge-' + tone, label);
 }
 // Panels open inside the task card they were launched from (see render).
-let panelTask = null, panelSlots = new Map();
-const taskPane = () => panelSlots.get(panelTask) || $('tasks');
+let panelOwners = new WeakMap(), panelSlots = new Map();
+const taskPane = taskId => ({ append(panel) {
+  panelOwners.set(panel, taskId);
+  (panelSlots.get(taskId) || $('tasks')).append(panel);
+} });
 
 const timelineUI = createTaskTimelineUI({ api, current, article, conversation: taskPane });
 
@@ -201,7 +204,7 @@ $('clear-role').onclick = () => {
   selectedAgent = null;
   closeRolePicker();
   renderRoleSelection();
-  status('已明确恢复默认管家；下一条普通聊天不指定其他角色。');
+  status('已明确恢复默认管家；下一条普通聊天不指定其他角色。', { transient: true });
 };
 
 const workerUI = createWorkerUI({ api, current, article, conversation: taskPane });
@@ -215,6 +218,12 @@ function renderTaskContext() {
   const task = pendingTurn?.selectedTask || selectedTask;
   const locked = !!pendingTurn || busy.has('send') || busy.has('turn-check');
   $('task-context').classList[task ? 'remove' : 'add']('hide');
+  const contextNotice = !task ? '' : task.invalidated
+    ? '讨论任务已失效，请重新选择或清除后发送。'
+    : pendingTurn ? '本次发送的讨论任务已锁定，核对结果前不能更换。'
+      : '已选择讨论任务：' + task.summary;
+  // Unchanged polling must not repeat live announcements.
+  if ($('task-context-status').textContent !== contextNotice) $('task-context-status').textContent = contextNotice;
   $('task-context-title').textContent = task ? (task.invalidated ? '（已失效）' : '') + task.summary : '';
   $('task-context-label').textContent = task?.auto ? '回复给任务' : '讨论';
   $('task-context-details').textContent = task
@@ -258,7 +267,7 @@ function addDiscussion(element, context, task) {
     renderTaskContext();
     returnToChatOnNarrowScreen();
     $('text').focus?.();
-    status('已选择任务，下一条消息会附带它。');
+    status('已选择任务，下一条消息会附带它。', { transient: true });
   };
   discussionButtons.push(button);
   element.append(button);
@@ -269,7 +278,7 @@ $('clear-task-context').onclick = () => {
   dismissFocus();
   selectedTask = null;
   renderTaskContext();
-  status('已清除讨论的任务。');
+  status('已清除讨论的任务。', { transient: true });
 };
 
 // Only a recovery receipt is kept for this tab. Never persist credentials or chat text.
@@ -399,7 +408,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('conversation').replaceChildren();
   $('tasks').replaceChildren();
   $('activity').replaceChildren();
-  panelTask = null;
+  panelOwners = new WeakMap();
   panelSlots = new Map();
   lastActivity = [];
   $('task-count').textContent = '';
@@ -528,7 +537,7 @@ async function readSnapshot(context) {
   workerUI.append(panels);
   draftUI.append(panels);
   timelineUI.append(panels);
-  for (const panel of panels) (slots.get(panelTask) || { append: node => taskCards.push(node) }).append(panel);
+  for (const panel of panels) (slots.get(panelOwners.get(panel)) || { append: node => taskCards.push(node) }).append(panel);
   panelSlots = slots;
   stream.replaceChildren(...entries);
   $('tasks').replaceChildren(...taskCards);
