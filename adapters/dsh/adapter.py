@@ -140,6 +140,18 @@ def load_unique_json(raw):
 TASK_ACTIONS = {"accept", "revise", "deliver", "approve", "return"}
 
 
+def normalized_task_action(action, proposal):
+    if (proposal is not None or not isinstance(action, dict) or not {"action"} <= set(action) <= {"action", "instruction"}
+            or action["action"] not in TASK_ACTIONS):
+        return None
+    if action["action"] != "revise":
+        return {"action": action["action"]}
+    instruction = action.get("instruction")
+    if not isinstance(instruction, str) or not instruction.strip() or len(instruction.encode()) > 4000:
+        return None
+    return {"action": "revise", "instruction": instruction}
+
+
 def parse_model_response(raw, message, kind="chat", task_actions=False):
     """Strict kind-specific protocol. Never execute or repair model output.
     task_actions: the turn carried a selected task, so a task_action may be suggested."""
@@ -149,19 +161,10 @@ def parse_model_response(raw, message, kind="chat", task_actions=False):
     keys = {"reply", "proposal", "task_action"} if task_actions and kind == "chat" else {"reply", "proposal"}
     if not isinstance(value, dict) or not {"reply", "proposal"} <= set(value) <= keys:
         raise ValueError("invalid_model_response")
-    action = value.get("task_action")
-    if action is not None:
-        if (not isinstance(action, dict) or not {"action"} <= set(action) <= {"action", "instruction"}
-                or action["action"] not in TASK_ACTIONS):
-            raise ValueError("invalid_task_action")
-        instruction = action.get("instruction")
-        if action["action"] == "revise":
-            if not isinstance(instruction, str) or not instruction.strip() or len(instruction.encode()) > 4000:
-                raise ValueError("invalid_task_action")
-        elif instruction is not None:
-            raise ValueError("invalid_task_action")
-        if value["proposal"] is not None:
-            raise ValueError("proposal_and_task_action")
+    if "task_action" in value:
+        # A suggestion only. One that does not fit the protocol is dropped, never
+        # repaired; the reply itself stays valid and the Hub re-checks any action.
+        value["task_action"] = normalized_task_action(value["task_action"], value["proposal"])
     if not isinstance(value["reply"], str) or not value["reply"].strip() or len(value["reply"].encode()) > (8000 if kind in ("draft_delivery", "context_summary") else 32000):
         raise ValueError("invalid_reply")
     proposal = value["proposal"]

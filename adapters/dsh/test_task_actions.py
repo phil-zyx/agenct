@@ -20,19 +20,25 @@ class TaskActionProtocolTests(unittest.TestCase):
         self.assertIsNone(parse_model_response(reply(task_action=None), "hi", "chat", True)["task_action"])
         self.assertNotIn("task_action", parse_model_response(reply(), "hi", "chat", True))
 
-    def test_shapes_are_strict(self):
+    def test_unfit_suggestions_are_dropped_not_repaired(self):
         for action in ({"action": "execute"}, {"action": "revise"}, {"action": "revise", "instruction": "  "},
-                       {"action": "revise", "instruction": "x" * 4001}, {"action": "approve", "instruction": "x"},
-                       {"action": "deliver", "extra": 1}, ["deliver"], "deliver"):
-            with self.subTest(action=action), self.assertRaises(ValueError):
-                parse_model_response(reply(task_action=action), "m", "chat", True)
+                       {"action": "revise", "instruction": "x" * 4001}, {"action": "deliver", "extra": 1},
+                       ["deliver"], "deliver"):
+            with self.subTest(action=action):
+                result = parse_model_response(reply(task_action=action), "m", "chat", True)
+                self.assertIsNone(result["task_action"])
+                self.assertEqual(result["reply"], "ok")
+        # An irrelevant instruction on a non-revise step is ignored.
+        self.assertEqual(parse_model_response(reply(task_action={"action": "deliver", "instruction": ""}), "m", "chat", True)["task_action"],
+                         {"action": "deliver"})
         ok = parse_model_response(reply(task_action={"action": "revise", "instruction": "我是 bob"}), "m", "chat", True)
         self.assertEqual(ok["task_action"]["instruction"], "我是 bob")
 
     def test_never_with_a_delegation_proposal(self):
         raw = json.dumps({"reply": "ok", "proposal": {"owner": "bob", "summary": "review"}, "task_action": {"action": "deliver"}})
-        with self.assertRaises(ValueError):
-            parse_model_response(raw, "bob review", "chat", True)
+        result = parse_model_response(raw, "bob review", "chat", True)
+        self.assertIsNone(result["task_action"])
+        self.assertEqual(result["proposal"]["owner"], "bob")
 
     def test_task_role_requires_task_context_and_chat(self):
         context = {"id": "t", "revision": 1, "requester": "alice", "owner": "bob", "status": "working",
