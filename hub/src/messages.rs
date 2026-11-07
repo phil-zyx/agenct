@@ -80,6 +80,15 @@ pub(super) async fn execute_chat(
         repository_message,
     )
     .await?;
+    let task_role = task_context.as_ref().and_then(|context| {
+        if context["owner"] == id {
+            Some("owner")
+        } else if context["requester"] == id {
+            Some("requester")
+        } else {
+            None
+        }
+    });
     // Generate the test double's reply without DB access. Preserve its established
     // proposal-only history behavior, but never bypass shared output validation.
     let mock_answer = if matches!(h.runtime, Runtime::Mock) {
@@ -93,6 +102,7 @@ pub(super) async fn execute_chat(
                     profile: &runtime_profile,
                     task_context: task_context.as_ref(),
                     draft_revision: None,
+                    task_role,
                 })
                 .await?,
         )
@@ -139,6 +149,7 @@ pub(super) async fn execute_chat(
                 profile: &runtime_profile,
                 task_context: task_context.as_ref(),
                 draft_revision: None,
+                task_role,
             })
             .await
         }
@@ -158,6 +169,7 @@ pub(super) async fn execute_chat(
                 reply: recipient_notice(h, id, owner),
                 backend: answer.backend.clone(),
                 proposal: None,
+                task_action: None,
             })
         } else if matches!(h.runtime, Runtime::Mock) {
             Err(invalid(
@@ -198,7 +210,21 @@ pub(super) async fn execute_chat(
                     return Err(error);
                 }
             };
-            let reply = answer.reply;
+            // A proposal and a task action never travel together; a delegation wins.
+            let task_action = match (&proposal, &answer.task_action, &task_context) {
+                (None, Some(action), Some(context)) => {
+                    checked_task_action(action, context, task_role)
+                }
+                _ => None,
+            };
+            // The model offered a step the Hub will not allow: never leave its
+            // "confirm below" standing with nothing to confirm.
+            let reply = match (&answer.task_action, &task_action, &task_context) {
+                (Some(_), None, Some(context)) if proposal.is_none() => {
+                    step_unavailable_notice(context, task_role)
+                }
+                _ => answer.reply.clone(),
+            };
             tx.execute(
                 "UPDATE messages SET status='complete' WHERE id=?1",
                 [message_id],
@@ -206,7 +232,7 @@ pub(super) async fn execute_chat(
             if message_id.is_some() {
                 tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
             }
-            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context});
+            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context,"task_action":task_action});
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
             Ok(Json(response))
@@ -220,6 +246,66 @@ pub(super) async fn execute_chat(
             Err(error)
         }
     }
+}
+
+/// The model's suggested task step, kept only if the caller may take it in the
+/// task's state as snapshotted for this turn. It is returned for the client to
+/// confirm (or, for a private draft revision, to request); nothing runs here.
+fn checked_task_action(
+    action: &crate::runtime::TaskAction,
+    context: &serde_json::Value,
+    role: Option<&str>,
+) -> Option<serde_json::Value> {
+    let allowed: &[&str] = match (role?, context["status"].as_str()?) {
+        ("owner", "awaiting_owner") => &["accept"],
+        ("owner", "working") => &["revise", "deliver"],
+        ("requester", "ready_for_acceptance") => &["approve", "return"],
+        _ => &[],
+    };
+    if !allowed.contains(&action.action.as_str()) {
+        return None;
+    }
+    let instruction = if action.action == "revise" {
+        let text = action.instruction.as_deref()?.trim();
+        if text.is_empty() || text.len() > 4000 {
+            return None;
+        }
+        Some(text.to_owned())
+    } else {
+        None
+    };
+    Some(serde_json::json!({
+        "action": action.action,
+        "task_id": context["id"],
+        "expected_revision": context["revision"],
+        "instruction": instruction,
+    }))
+}
+
+/// Hub-authored explanation when a suggested task step is not available now.
+fn step_unavailable_notice(context: &serde_json::Value, role: Option<&str>) -> String {
+    let status = match context["status"].as_str().unwrap_or("") {
+        "awaiting_owner" => "待接手",
+        "working" => "进行中",
+        "ready_for_acceptance" => "待验收",
+        "completed" => "已完成",
+        "canceled" => "已取消",
+        _ => "未知",
+    };
+    let next = match (role, context["status"].as_str()) {
+        (Some("owner"), Some("awaiting_owner")) => "现在可以做的是接手。",
+        (Some("owner"), Some("working")) => "现在可以补充信息让 Agent 修改草稿，或交付。",
+        (Some("requester"), Some("ready_for_acceptance")) => "现在可以验收或退回。",
+        (Some("requester"), Some("awaiting_owner" | "working")) => "现在需要等对方处理。",
+        (Some("owner"), Some("ready_for_acceptance")) => "现在需要等对方验收。",
+        _ => "这个任务已经结束，不能再变更。",
+    };
+    format!(
+        "[系统提示] 这一步现在做不了：任务「{}」当前状态是「{}」。{}",
+        context["summary"].as_str().unwrap_or(""),
+        status,
+        next
+    )
 }
 
 /// Hub-authored, deterministic text. The model-supplied name is shown only when it

@@ -134,6 +134,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
         data = { repository_context: settings.repositoryMismatch ? null : repositoryTurns.get(requestId), reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null,
           runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
           task_context: responseContextOverride === undefined ? turnContexts.get(requestId) : responseContextOverride,
+          task_action: settings.taskAction ? settings.taskAction(JSON.parse(options.body)) : null,
           turn: { request_id: requestId, status: postTurnStatus } };
       }
       if (url.startsWith('/api/turns/')) {
@@ -361,8 +362,9 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(JSON.parse(chatPosts(f)[1].options.body).message,'Fresh ordinary question');
   });
   await test('handwritten delivery never claims a private draft source', async () => {
-    const f=fixture(undefined,{tasks:[task()]}); await f.login('bob');
-    await findButton(f.$('conversation'),'手写交付').onclick();
+    const f=fixture(undefined,{tasks:[task()],taskAction:()=>({action:'deliver',task_id:'task-one',expected_revision:3})}); await f.login('bob');
+    await f.send('直接交付吧'); await new Promise(r=>setImmediate(r));
+    await findButton(f.$('conversation'),'填写交付内容').onclick();
     const box = walk(f.$('conversation')).find(node => node.className === 'action-editor');
     walk(box).find(node => node.tagName === 'textarea').value = 'Handwritten delivery';
     await findButton(box,'确认交付').onclick();
@@ -1160,7 +1162,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
   });
   await test('logout, relogin and auth expiry clear task selection and stale cards cannot restore it', async () => {
     for (const transition of ['logout', 'login', 'expiry']) {
-      const f = fixture({ enabled: false }, { tasks: [task()] }); await f.login('alice');
+      // A finished task waits on nobody, so no automatic binding masks the check.
+      const f = fixture({ enabled: false }, { tasks: [task({ status: 'completed' })] }); await f.login('alice');
       const old = f.discussion('task-one'); old.onclick();
       if (transition === 'logout') await f.$('logout').onclick();
       else if (transition === 'login') await f.login('bob');
@@ -1517,42 +1520,92 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
   });
   const settle = async () => { for (let i = 0; i < 6; i++) await new Promise(resolve => setImmediate(resolve)); };
   const posts = (f, suffix) => f.calls.filter(c => c.options?.method === 'POST' && c.url.endsWith(suffix));
-  await test('incoming work is accepted in the conversation; the task pane is an overview', async () => {
-    const f = fixture(undefined, { tasks: [task({ status: 'awaiting_owner', revision: 0 })] }); await f.login('bob');
+  const said = f => JSON.parse(chatPosts(f).at(-1).options.body);
+  await test('plain replies go to the task waiting on me; accepting takes one confirmation', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'awaiting_owner', revision: 0 })],
+      taskAction: body => body.selected_task && /接手/.test(body.message) ? { action: 'accept', task_id: 'task-one', expected_revision: 0 } : null });
+    await f.login('bob'); await settle();
     const walk = e => [e, ...e.children.flatMap(walk)];
-    assert(findButton(f.$('conversation'), '接手'), 'accept lives in the conversation');
-    assert(!walk(f.$('tasks')).some(e => e.textContent === '接手'), 'no duplicate accept in the pane');
-    assert(walk(f.$('tasks')).some(e => e.textContent === '在对话中处理'));
-    await findButton(f.$('conversation'), '接手').onclick();
+    assert(!walk(f.$('conversation')).some(e => e.tagName === 'button' && /接手/.test(e.textContent)), 'no action buttons before asked');
+    assert.equal(f.$('task-context').classList.contains('hide'), false, 'composer is bound to the waiting task');
+    await f.send('好的我接手'); await settle();
+    assert.deepEqual(said(f).selected_task, { task_id: 'task-one', expected_revision: 0 });
+    assert.equal(posts(f, '/actions').length, 0, 'understanding alone changes nothing');
+    await findButton(f.$('conversation'), '确认接手').onclick();
     assert.deepEqual(JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body), { action: 'accept', expected_revision: 0 });
+    // × detaches the composer from that task version.
+    const g = fixture(undefined, { tasks: [task({ status: 'awaiting_owner', revision: 0 })] }); await g.login('bob'); await settle();
+    g.$('clear-task-context').onclick(); await g.send('随便聊聊'); await settle();
+    assert.equal(said(g).selected_task, undefined);
   });
-  await test('agent draft is supplemented and delivered from the conversation', async () => {
+  await test('agent draft is supplemented and delivered by talking to it', async () => {
     const draft = { status: 'complete', automatic: true, request_id: 'auto-task-one-r3' };
-    const f = fixture(undefined, { tasks: [task({ result: null, my_draft: draft })] }); await f.login('bob'); await settle();
+    const f = fixture(undefined, { tasks: [task({ result: null, my_draft: draft })],
+      taskAction: body => /交付/.test(body.message) ? { action: 'deliver', task_id: 'task-one', expected_revision: 3 }
+        : { action: 'revise', task_id: 'task-one', expected_revision: 3, instruction: body.message } });
+    await f.login('bob'); await settle();
     assert.match(f.$('conversation').textContent, /Auto draft 需要补充的信息/);
     assert.match(f.$('conversation').textContent, /仅你可见/);
-    await findButton(f.$('conversation'), '补充信息 / 让 Agent 修改').onclick();
-    assert.equal(f.$('draft-reply').classList.contains('hide'), false);
     await f.send('我是 bob，用于面试，语气正式'); await settle();
-    assert.equal(chatPosts(f).length, 0, 'a supplement is not a chat message');
     const revision = JSON.parse(posts(f, '/tasks/task-one/drafts')[0].options.body);
     assert.deepEqual(revision.revision, { base_draft_id: 'auto-draft-id', instruction: '我是 bob，用于面试，语气正式' });
-    assert.equal(revision.expected_revision, 3);
-    assert.equal(f.$('draft-reply').classList.contains('hide'), true);
     assert.equal(posts(f, '/actions').length, 0, 'drafting never delivers');
-    await findButton(f.$('conversation'), '交付给 alice').onclick();
-    const walk = e => [e, ...e.children.flatMap(walk)];
-    const box = walk(f.$('conversation')).find(node => node.className === 'action-editor');
-    assert.equal(walk(box).find(node => node.tagName === 'textarea').value, 'Auto draft 需要补充的信息');
-    await findButton(box, '确认交付').onclick();
+    await f.send('可以，交付吧'); await settle();
+    assert.equal(posts(f, '/actions').length, 0, 'delivery waits for one confirmation');
+    await findButton(f.$('conversation'), '确认交付').onclick();
     const body = JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body);
-    assert.deepEqual([body.action, body.source_draft_id, body.expected_revision], ['deliver', 'auto-draft-id', 3]);
+    assert.deepEqual([body.action, body.source_draft_id, body.expected_revision, body.result], ['deliver', 'auto-draft-id', 3, 'Auto draft 需要补充的信息']);
   });
-  await test('requester accepts or returns a delivery in the conversation and never reads drafts', async () => {
-    const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance', result: '**交付**内容' })] }); await f.login('alice'); await settle();
+  await test('a typed yes carries out the waiting step and a typed no drops it, without a model turn', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance', result: 'done' })],
+      taskAction: body => /退回/.test(body.message) ? { action: 'return', task_id: 'task-one', expected_revision: 3 } : null });
+    await f.login('alice'); await settle();
+    await f.send('退回，改一下开头'); await settle();
+    assert.match(f.$('conversation').textContent, /可以直接回复「确认」或「算了」/);
+    const turns = chatPosts(f).length;
+    await f.send('算了'); await settle();
+    assert.equal(chatPosts(f).length, turns, 'no model turn for a plain no');
+    assert.equal(posts(f, '/actions').length, 0);
+    assert(!findButton(f.$('conversation'), '确认退回'), 'the step is withdrawn');
+    await f.send('退回，改一下开头'); await settle();
+    await f.send('确认'); await settle();
+    assert.equal(chatPosts(f).length, turns + 1, 'only the request itself reached the model');
+    assert.equal(JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body).action, 'return');
+    assert.equal(f.$('text').value, '');
+    // Without a waiting step, the same word is an ordinary message.
+    const g = fixture(); await g.login('alice'); await g.send('确认'); await settle();
+    assert.equal(chatPosts(g).length, 1);
+  });
+  await test('a waiting step sits at the end of the conversation and survives a reload, not a logout', async () => {
+    const storage = new Map();
+    const settings = { storage, tasks: [task({ status: 'ready_for_acceptance', result: 'done' })],
+      messages: [{ role: 'user', content: 'later question', status: 'complete', created_at: '2099-01-01 00:00:00' }],
+      activity: [{ kind: 'task', id: 'task-one', latest: { action: 'deliver', actor: 'bob', at: '2000-01-01 00:00:00' } }],
+      taskAction: body => /退回/.test(body.message) ? { action: 'return', task_id: 'task-one', expected_revision: 3 } : null };
+    const f = fixture(undefined, settings); await f.login('alice'); await settle();
+    const cardIndex = g => g.$('conversation').children.findIndex(node => node.taskId === 'task-one');
+    assert(cardIndex(f) < f.$('conversation').children.length - 1, 'an older step stays in place');
+    await f.send('退回'); await settle();
+    assert.equal(cardIndex(f), f.$('conversation').children.length - 1, 'the card asking for an answer is last');
+    const again = fixture(undefined, settings); await again.login('alice'); await settle();
+    assert(findButton(again.$('conversation'), '确认退回'), 'the waiting step survives a reload');
+    await again.$('logout').onclick();
+    const after = fixture(undefined, settings); await after.login('alice'); await settle();
+    assert(!findButton(after.$('conversation'), '确认退回'), 'logout drops it');
+  });
+  await test('the composer clears as soon as a message is sent', async () => {
+    const f = fixture(); await f.login('alice'); f.stallPosts();
+    const send = f.send('long question'); await f.ready();
+    assert.equal(f.$('text').value, '', 'the words now sit in the conversation');
+    f.release?.(); void send;
+  });
+  await test('requester accepts a delivery by saying so and never reads drafts', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance', result: '**交付**内容' })],
+      taskAction: () => ({ action: 'approve', task_id: 'task-one', expected_revision: 3 }) });
+    await f.login('alice'); await settle();
     assert.match(f.$('conversation').textContent, /bob 交付了结果/);
-    assert(findButton(f.$('conversation'), '退回修改'));
-    await findButton(f.$('conversation'), '验收通过').onclick();
+    await f.send('验收通过'); await settle();
+    await findButton(f.$('conversation'), '确认验收').onclick();
     assert.equal(JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body).action, 'approve');
     const g = fixture(undefined, { tasks: [task({ my_draft: undefined })] }); await g.login('alice'); await settle();
     assert.match(g.$('conversation').textContent, /bob 已接手/);
