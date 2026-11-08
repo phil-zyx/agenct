@@ -542,7 +542,7 @@ async function nextStepsInteractions(browser, origin) {
     assert.equal(f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').length, 0,
       'missing base must not discard the instruction and dispatch an uninstructed draft');
     task.my_draft = { status: 'complete', automatic: true, request_id: 'existing-base' };
-    await f.page.locator('#refresh').click();
+    await f.page.locator('#refresh').evaluate(button => button.click());
     await f.page.waitForFunction(() => [...document.querySelectorAll('.deferred-revision button')].some(b => !b.disabled));
     await retry.click();
     await f.page.waitForFunction(() => !document.querySelector('.deferred-revision'));
