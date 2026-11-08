@@ -314,7 +314,7 @@ mod tests {
             0,
             json!({"public":{"team":"支付团队"},"private":{"work_context":"内部背景"},"permissions":{"auto_reply_public":true}}),
         );
-        let current = crate::collaboration::read(&*h.db().unwrap(), "alice").unwrap();
+        let current = crate::collaboration::read(&h.db().unwrap(), "alice").unwrap();
         assert_eq!(current.revision, 0);
         assert!(!current.permissions.auto_reply_public);
         assert!(current.public.team.is_empty());
@@ -344,7 +344,7 @@ mod tests {
             act(&a, "alice", &suggestion, "confirm").await.1["status"],
             "confirmed"
         );
-        let current = crate::collaboration::read(&*h.db().unwrap(), "alice").unwrap();
+        let current = crate::collaboration::read(&h.db().unwrap(), "alice").unwrap();
         assert_eq!(current.revision, 1);
         assert_eq!(current.public.team, "支付团队");
         assert_eq!(current.private.work_context, "内部背景");
@@ -365,7 +365,7 @@ mod tests {
         let first = act(&a, "alice", &suggestion, "confirm").await.1;
         assert_eq!(act(&a, "alice", &suggestion, "confirm").await.1, first);
         assert_eq!(
-            crate::collaboration::read(&*h.db().unwrap(), "alice")
+            crate::collaboration::read(&h.db().unwrap(), "alice")
                 .unwrap()
                 .revision,
             1
@@ -383,13 +383,13 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(
-            crate::collaboration::read(&*h.db().unwrap(), "alice")
+            crate::collaboration::read(&h.db().unwrap(), "alice")
                 .unwrap()
                 .public
                 .team,
             "one"
         );
-        assert!(context(&*h.db().unwrap(), "alice").unwrap()["pending"].is_null());
+        assert!(context(&h.db().unwrap(), "alice").unwrap()["pending"].is_null());
     }
     #[tokio::test]
     async fn stale_confirmation_preserves_pending_and_rejection_still_works() {
@@ -401,17 +401,17 @@ mod tests {
             ..Default::default()
         };
         current.public.team = "newer".into();
-        crate::collaboration::write(&*h.db().unwrap(), "alice", &current).unwrap();
+        crate::collaboration::write(&h.db().unwrap(), "alice", &current).unwrap();
         assert_eq!(
             act(&a, "alice", &suggestion, "confirm").await.0,
             StatusCode::CONFLICT
         );
         assert_eq!(
-            context(&*h.db().unwrap(), "alice").unwrap()["pending"]["status"],
+            context(&h.db().unwrap(), "alice").unwrap()["pending"]["status"],
             "pending"
         );
         assert_eq!(
-            crate::collaboration::read(&*h.db().unwrap(), "alice")
+            crate::collaboration::read(&h.db().unwrap(), "alice")
                 .unwrap()
                 .public
                 .team,
@@ -437,9 +437,9 @@ mod tests {
             act(&a, "alice", &first, "confirm").await.0,
             StatusCode::CONFLICT
         );
-        assert_eq!(context(&*h.db().unwrap(), "bob").unwrap()["pending"], bob);
+        assert_eq!(context(&h.db().unwrap(), "bob").unwrap()["pending"], bob);
         assert_eq!(
-            context(&*h.db().unwrap(), "alice").unwrap()["pending"],
+            context(&h.db().unwrap(), "alice").unwrap()["pending"],
             second
         );
         assert_eq!(
@@ -503,11 +503,11 @@ mod tests {
             tx.commit().unwrap();
         }
         assert_eq!(
-            context(&*h.db().unwrap(), "alice").unwrap()["pending"],
+            context(&h.db().unwrap(), "alice").unwrap()["pending"],
             prior
         );
         assert_eq!(
-            crate::collaboration::read(&*h.db().unwrap(), "alice")
+            crate::collaboration::read(&h.db().unwrap(), "alice")
                 .unwrap()
                 .revision,
             0
@@ -567,7 +567,7 @@ mod tests {
             StatusCode::METHOD_NOT_ALLOWED
         );
         assert_eq!(
-            crate::collaboration::read(&*h.db().unwrap(), "alice")
+            crate::collaboration::read(&h.db().unwrap(), "alice")
                 .unwrap()
                 .revision,
             0
@@ -600,7 +600,7 @@ mod tests {
             act(&a, "alice", &suggestion, "confirm").await.1["status"],
             "confirmed"
         );
-        let current = crate::collaboration::read(&*h.db().unwrap(), "alice").unwrap();
+        let current = crate::collaboration::read(&h.db().unwrap(), "alice").unwrap();
         assert_eq!(current.revision, 1);
         assert_eq!(current.private.response_preferences, "先给结论");
         drop(a);
