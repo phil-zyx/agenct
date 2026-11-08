@@ -19,6 +19,26 @@ pub(super) struct TurnRequest<'a> {
     pub profile: &'a RuntimeProfile,
     pub task_context: Option<&'a serde_json::Value>,
     pub draft_revision: Option<&'a serde_json::Value>,
+    /// Current owner's explicit work context, never permissions or shared task data.
+    pub owner_context: Option<&'a serde_json::Value>,
+    /// Chat-only editable profile snapshot and pending suggestion; never authority.
+    pub profile_context: Option<&'a serde_json::Value>,
+}
+
+pub(super) fn owner_context(
+    db: &rusqlite::Connection,
+    owner: &str,
+) -> Result<Option<serde_json::Value>> {
+    let profile = crate::collaboration::read(db, owner)?;
+    let context = serde_json::json!({"public":profile.public,"private":profile.private});
+    let populated = ["public", "private"].iter().any(|group| {
+        context[*group].as_object().is_some_and(|fields| {
+            fields
+                .values()
+                .any(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+        })
+    });
+    Ok(populated.then_some(context))
 }
 
 /// Static dispatch keeps the transport replaceable without exposing Hub/DB authority.
@@ -40,6 +60,8 @@ pub(super) struct AdapterReply {
     // Explicit null is required; an omitted proposal is a protocol error.
     #[serde(deserialize_with = "Option::deserialize")]
     pub proposal: Option<AdapterProposal>,
+    #[serde(default)]
+    pub profile_update: Option<serde_json::Value>,
 }
 impl AdapterReply {
     /// The same boundary checks every runtime's output before Hub persistence.
@@ -53,6 +75,11 @@ impl AdapterReply {
         self.backend == backend
             && !self.reply.trim().is_empty()
             && self.reply.len() <= 32000
+            && !(self.proposal.is_some() && self.profile_update.is_some())
+            && self
+                .profile_update
+                .as_ref()
+                .is_none_or(|changes| crate::profile_suggestions::validate_changes(changes).is_ok())
             && self.proposal.as_ref().is_none_or(|p| {
                 p.owner != requester
                     && participant(&p.owner)
@@ -93,12 +120,15 @@ fn validate_request(request: &TurnRequest<'_>) -> Result<()> {
             || request.history.is_empty()
             || request.task_context.is_some()
             || request.draft_revision.is_some()
+            || request.owner_context.is_some()
+            || request.profile_context.is_some()
             || uuid::Uuid::parse_str(request.session_id).is_err())
     {
         return Err(invalid("invalid summary runtime context"));
     }
     if request.kind == TurnKind::DraftDelivery
         && (request.message != DRAFT_MESSAGE
+            || request.profile_context.is_some()
             || !request.history.is_empty()
             || uuid::Uuid::parse_str(request.session_id).is_err()
             || request
@@ -115,6 +145,7 @@ impl AdapterReply {
             && !self.reply.trim().is_empty()
             && self.reply.len() <= 8000
             && self.proposal.is_none()
+            && self.profile_update.is_none()
     }
 }
 
@@ -127,20 +158,31 @@ impl Runtime for MockRuntime {
                 reply: crate::context_memory::mock_summary(request.history),
                 backend: "mock".into(),
                 proposal: None,
+                profile_update: None,
             });
         }
         if request.kind == TurnKind::DraftDelivery {
-            return Ok(AdapterReply { reply: "[MOCK · draft only] 请根据任务共享摘要核对、编辑并明确提交交付。这不是执行或完成证据。".into(), backend: "mock".into(), proposal: None });
+            return Ok(AdapterReply { reply: "[MOCK · draft only] 请根据任务共享摘要核对、编辑并明确提交交付。这不是执行或完成证据。".into(), backend: "mock".into(), proposal: None, profile_update: None });
+        }
+        if let Some(changes) = mock_profile_update(request.message, request.profile_context) {
+            return Ok(AdapterReply {
+                reply: "准备记住这些内容，请检查后确认。".into(),
+                backend: "mock".into(),
+                proposal: None,
+                profile_update: Some(changes),
+            });
         }
         if let Some((owner, summary)) = mock_delegation(request.message) {
             return Ok(AdapterReply {
                 reply: "[MOCK · deterministic test double] 请检查接收人和将共享的任务内容，再明确确认。确认前对方不会收到任务。".into(),
                 backend: "mock".into(), proposal: Some(AdapterProposal { owner, summary }),
+                profile_update: None,
             });
         }
         Ok(AdapterReply {
             reply: format!("[MOCK · no model] 收到你的消息。当前已保存 {} 条已完成上下文消息。真实任务请使用对话中的委派操作；本回复不会执行工具。", request.history.len()),
             backend: "mock".into(), proposal: None,
+            profile_update: None,
         })
     }
 }
@@ -175,6 +217,12 @@ impl Runtime for DshRuntime<'_> {
         if let Some(context) = request.task_context {
             payload["task_context"] = context.clone();
         }
+        if let Some(context) = request.owner_context {
+            payload["owner_context"] = context.clone();
+        }
+        if let Some(context) = request.profile_context {
+            payload["profile_context"] = context.clone();
+        }
         if payload["history"].as_array().unwrap().len() > 100
             || serde_json::to_vec(&payload).unwrap().len() > 60000
         {
@@ -182,7 +230,7 @@ impl Runtime for DshRuntime<'_> {
                 "chat context exceeds adapter limit; summarize before dispatch",
             ));
         }
-        let response = self
+        let mut response = self
             .client
             .post(self.url)
             .bearer_auth(self.token)
@@ -191,6 +239,33 @@ impl Runtime for DshRuntime<'_> {
             .await
             .map_err(|_| adapter_failed())?;
         if !response.status().is_success() {
+            let status = response.status();
+            let is_json = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| {
+                    value
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .eq_ignore_ascii_case("application/json")
+                });
+            if is_json && matches!(status.as_u16(), 400 | 502 | 503 | 504) {
+                // Error responses are tiny fixed-code objects. Cap reads rather
+                // than accepting arbitrary gateway HTML or provider diagnostics.
+                let mut body = Vec::new();
+                while let Some(chunk) = response.chunk().await.map_err(|_| adapter_failed())? {
+                    if body.len() + chunk.len() > 1024 {
+                        return Err(adapter_failed());
+                    }
+                    body.extend_from_slice(&chunk);
+                }
+                if let Some(failure) = crate::chat_failures::adapter_error(status, &body) {
+                    return Err(failure);
+                }
+            }
             return Err(adapter_failed());
         }
         response
@@ -201,6 +276,68 @@ impl Runtime for DshRuntime<'_> {
 }
 
 // Bounded recognition lives only in the offline test double.
+fn mock_profile_update(
+    message: &str,
+    context: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let message = message.trim().trim_end_matches(['。', '！']);
+    let mut updates = json!({});
+    if let Some(value) = message.strip_prefix("把我的职责公开为") {
+        if !value.trim().is_empty() {
+            updates["public"] = json!({"responsibilities":value.trim()});
+        }
+    } else if message == "允许助手用公开资料答复" {
+        updates["permissions"] = json!({"auto_reply_public":true});
+    } else if message == "关闭公开自动答复" {
+        updates["permissions"] = json!({"auto_reply_public":false});
+    } else if message == "关闭自动起草" {
+        updates["permissions"] = json!({"auto_prepare_drafts":false});
+    } else if message == "开启自动起草" {
+        updates["permissions"] = json!({"auto_prepare_drafts":true});
+    } else if let Some(value) = message
+        .strip_prefix("记住：")
+        .or_else(|| message.strip_prefix("记住:"))
+    {
+        let mut private = json!({});
+        for part in value.split(['，', ',', '。', '；', ';']).map(str::trim) {
+            if part.starts_with("我负责") {
+                private["work_context"] = json!(part);
+            }
+            if let Some(preference) = part.strip_prefix("回复") {
+                if !preference.trim().is_empty() {
+                    private["response_preferences"] = json!(preference.trim());
+                }
+            }
+        }
+        if !private.as_object().unwrap().is_empty() {
+            updates["private"] = private;
+        }
+    } else if let Some(preference) = message.strip_prefix("回复改为") {
+        if !preference.trim().is_empty() {
+            updates["private"] = json!({"response_preferences":preference.trim()});
+        }
+    }
+    if updates.as_object().unwrap().is_empty() {
+        return None;
+    }
+    let mut merged = context
+        .and_then(|ctx| ctx.get("pending"))
+        .and_then(|pending| pending.get("changes"))
+        .filter(|changes| changes.is_object())
+        .cloned()
+        .unwrap_or(json!({}));
+    for (group, fields) in updates.as_object().unwrap() {
+        if !merged[group].is_object() {
+            merged[group] = json!({});
+        }
+        for (key, value) in fields.as_object().unwrap() {
+            merged[group][key] = value.clone();
+        }
+    }
+    Some(merged)
+}
+
 fn mock_delegation(message: &str) -> Option<(String, String)> {
     let rest = message
         .trim()
@@ -236,6 +373,8 @@ mod tests {
                 profile: &profile(),
                 task_context: None,
                 draft_revision: None,
+                owner_context: None,
+                profile_context: None,
             })
             .await
             .unwrap()

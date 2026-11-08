@@ -236,3 +236,53 @@ async fn disabled_hub_never_drafts_on_its_own() {
     assert_eq!(f.draft_turns(), 0);
     assert!(f.task("bob", &task).await["my_draft"].is_null());
 }
+
+#[tokio::test]
+async fn owner_can_disable_automatic_preparation_without_disabling_manual_drafts() {
+    let f = Fixture::new(true);
+    let body = json!({"expected_revision":0,
+        "public":{"team":"","responsibilities":"","help_with":"","request_requirements":""},
+        "private":{"work_context":"","response_preferences":""},
+        "permissions":{"auto_reply_public":false,"auto_prepare_drafts":false}});
+    assert_eq!(
+        f.call("bob", "PUT", "/api/collaboration-profile", body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let task = f.delegated().await;
+    f.act(
+        "bob",
+        &task,
+        json!({"action":"accept","expected_revision":0}),
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(f.draft_turns(), 0);
+    let path = format!("/api/tasks/{task}/drafts");
+    let (status, _) = f
+        .call(
+            "bob",
+            "POST",
+            &path,
+            json!({"request_id":format!("auto-{task}-r1"),"expected_revision":1}),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "auto-prefixed dispatch respects current preference too"
+    );
+    assert_eq!(f.draft_turns(), 0);
+    let (status, draft) = f
+        .call(
+            "bob",
+            "POST",
+            &path,
+            json!({"request_id":"manual-after-opt-out","expected_revision":1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(draft["status"], "complete");
+    assert_eq!(f.draft_turns(), 1);
+}

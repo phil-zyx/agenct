@@ -57,6 +57,12 @@ pub(super) async fn execute_chat(
     runtime_profile: profiles::RuntimeProfile,
     task_context: Option<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>> {
+    if let Some(response) =
+        crate::colleague_lookup::answer(h, id, input, &runtime_profile, task_context.as_ref())?
+    {
+        return Ok(response);
+    }
+    let profile_context = crate::profile_suggestions::context(&*h.db()?, id)?;
     // Reservation already exists: summary model calls cannot be repeated by a
     // replay of this request. Preserve the original snapshot in the reservation.
     let task_context = match task_context {
@@ -78,6 +84,7 @@ pub(super) async fn execute_chat(
         &runtime_profile,
         task_context.as_ref(),
         repository_message,
+        Some(&profile_context),
     )
     .await?;
     // Generate the test double's reply without DB access. Preserve its established
@@ -93,6 +100,8 @@ pub(super) async fn execute_chat(
                     profile: &runtime_profile,
                     task_context: task_context.as_ref(),
                     draft_revision: None,
+                    owner_context: None,
+                    profile_context: Some(&profile_context),
                 })
                 .await?,
         )
@@ -139,12 +148,21 @@ pub(super) async fn execute_chat(
                 profile: &runtime_profile,
                 task_context: task_context.as_ref(),
                 draft_revision: None,
+                owner_context: None,
+                profile_context: Some(&profile_context),
             })
             .await
         }
         _ => unreachable!("mock reply is generated above"),
     }
     .and_then(|answer| {
+        if answer.profile_update.is_some()
+            && (task_context.is_some() || repository_context.is_some())
+        {
+            return Err(invalid(
+                "discuss personal settings without a selected task or repository",
+            ));
+        }
         let participant = |owner: &str| h.directory.can_delegate(id, owner);
         if answer.valid(h.runtime.label(), id, &input.message, participant) {
             Ok(answer)
@@ -158,6 +176,7 @@ pub(super) async fn execute_chat(
                 reply: recipient_notice(h, id, owner),
                 backend: answer.backend.clone(),
                 proposal: None,
+                profile_update: None,
             })
         } else if matches!(h.runtime, Runtime::Mock) {
             Err(invalid(
@@ -198,7 +217,30 @@ pub(super) async fn execute_chat(
                     return Err(error);
                 }
             };
-            let reply = answer.reply;
+            let suggestion = answer
+                .profile_update
+                .as_ref()
+                .map(|changes| {
+                    let key = input
+                        .request_id
+                        .clone()
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    crate::profile_suggestions::save(
+                        &tx,
+                        id,
+                        &key,
+                        profile_context["profile"]["revision"]
+                            .as_u64()
+                            .ok_or_else(|| invalid("invalid profile revision"))?,
+                        changes,
+                    )
+                })
+                .transpose()?;
+            let reply = if suggestion.is_some() {
+                "准备记住以下内容。请检查后确认；确认前不会修改你的资料或助手权限。".to_string()
+            } else {
+                answer.reply
+            };
             tx.execute(
                 "UPDATE messages SET status='complete' WHERE id=?1",
                 [message_id],
@@ -207,6 +249,9 @@ pub(super) async fn execute_chat(
                 tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
             }
             let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context});
+            if let Some(suggestion) = suggestion {
+                response["profile_suggestion"] = suggestion;
+            }
             chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
             tx.commit()?;
             Ok(Json(response))

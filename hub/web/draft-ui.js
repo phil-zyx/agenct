@@ -47,9 +47,9 @@ function createDraftUI({ api, current, article, conversation }) {
   function status(task) {
     const d = draftState(task);
     if (!d) return '';
-    if (d.status === 'pending') return d.automatic ? 'Agent 正在自动起草，完成后在这里审阅。' : '起草中…';
-    if (d.status === 'complete') return d.automatic ? 'Agent 已自动起草，仅你可见。审阅、修改后再交付。' : '草稿已就绪，仅你可见。';
-    return '起草结果未知，打开草稿可核对；不会自动重发。';
+    if (d.status === 'pending') return d.automatic ? '正在自动起草，完成后请在这里审阅。' : '起草中…';
+    if (d.status === 'complete') return d.automatic ? '草稿已写好，仅你可见。请先审阅、修改，再确认交付。' : '草稿已写好，仅你可见。';
+    return '暂时无法确认是否已生成草稿。打开草稿查看，系统不会自动重新起草。';
   }
   function attach(element, context, task) {
     if (task.owner !== context.user) return;
@@ -66,7 +66,7 @@ function createDraftUI({ api, current, article, conversation }) {
     editors = [];
     const version = ++generation;
     edit = null;
-    const panel = article('私密文本草稿：不会执行、交付或验收。只发送本任务的共享摘要、委派人确认附带的共享材料、交付结果及所选角色，不发送任何私聊；长文本可能截断。');
+    const panel = article('草稿仅你可见，审阅并确认后才会交付。起草不会执行任务或自动验收。起草时只使用本任务的共享摘要、任务发起人确认共享的材料、交付结果和所选角色，不发送私聊。过长的内容可能只使用其中一部分。');
     if (card) card.replaceChildren(article('已关闭旧草稿视图。'));
     card = panel; conversation().append(panel); panel.scrollIntoView?.({ block: 'nearest' });
     const openedRevision = tasks.get(taskId)?.revision;
@@ -120,7 +120,7 @@ function createDraftUI({ api, current, article, conversation }) {
       editors.push({ input, original: draft.content });
       if (!stale) button('使用此草稿填入人工交付', () => {
         edit = { task: taskId, revision: draft.task_revision, source: draft.id, input };
-        panel.append(article('已选择编辑稿；尚未交付。请点击任务上的人工交付按钮审阅并确认。'));
+        panel.append(article('已选用这份草稿，还没有交付。请回到任务卡，点击「提交人工交付」，检查内容后再确认。'));
       });
       if (!stale && key(draft.id)) {
         const label = document.createElement('label'); label.className = 'draft-revision-field'; label.textContent = '修改这版草稿的要求（基于保存版本，当前手改内容不会自动发送）';

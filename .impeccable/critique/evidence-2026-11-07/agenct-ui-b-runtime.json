@@ -1,0 +1,1834 @@
+{
+  "origin": "http://127.0.0.1:46291",
+  "engine": "145.0.7632.6",
+  "screenshots": [
+    "/tmp/agenct-b-desktop-tasks.png",
+    "/tmp/agenct-b-desktop-contacts.png",
+    "/tmp/agenct-b-desktop-settings.png",
+    "/tmp/agenct-b-mobile-chat.png",
+    "/tmp/agenct-b-mobile-tasks.png",
+    "/tmp/agenct-b-mobile-delivery-preview.png",
+    "/tmp/agenct-b-mobile-delegation.png",
+    "/tmp/agenct-b-mobile-settings.png",
+    "/tmp/agenct-b-mobile-settings-dark.png"
+  ],
+  "states": {
+    "desktop-tasks": {
+      "width": 1440,
+      "height": 900,
+      "scrollWidth": 1440,
+      "focused": "tab-tasks",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 0,
+          "w": 72,
+          "h": 900,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 72,
+          "y": 0,
+          "w": 988,
+          "h": 900,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 1060,
+          "y": 0,
+          "w": 380,
+          "h": 900,
+          "display": "block"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#text": {
+          "x": 192,
+          "y": 832,
+          "w": 750,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 948,
+          "y": 832,
+          "w": 40,
+          "h": 40,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "refresh",
+          "label": "刷新本账号会话与任务",
+          "w": 36,
+          "h": 36
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "composer-menu-toggle",
+          "label": "角色与说明",
+          "w": 40,
+          "h": 40
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 40
+        },
+        {
+          "id": "tab-activity",
+          "label": "工作",
+          "w": 58,
+          "h": 32.390625
+        },
+        {
+          "id": "tab-tasks",
+          "label": "任务2",
+          "w": 72.359375,
+          "h": 32.390625
+        },
+        {
+          "id": "close-tasks",
+          "label": "收起",
+          "w": 36,
+          "h": 36
+        },
+        {
+          "id": "task-filter",
+          "label": "进行中的任务待我处理我发起的已完成 / 已取消",
+          "w": 150,
+          "h": 39
+        },
+        {
+          "id": "",
+          "label": "验收",
+          "w": 62,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "退回",
+          "w": 62,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "讨论此任务",
+          "w": 81,
+          "h": 25.59375
+        },
+        {
+          "id": "",
+          "label": "更多",
+          "w": 51.03125,
+          "h": 31.4375
+        },
+        {
+          "id": "",
+          "label": "查看共享时间线",
+          "w": 156,
+          "h": 32.1875
+        },
+        {
+          "id": "",
+          "label": "取消任务",
+          "w": 156,
+          "h": 32.1875
+        },
+        {
+          "id": "",
+          "label": "提交人工交付",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "讨论此任务",
+          "w": 81,
+          "h": 25.59375
+        },
+        {
+          "id": "",
+          "label": "我的私密交付草稿",
+          "w": 120,
+          "h": 25.59375
+        },
+        {
+          "id": "",
+          "label": "更多",
+          "w": 51.03125,
+          "h": 31.4375
+        },
+        {
+          "id": "",
+          "label": "查看共享时间线",
+          "w": 163,
+          "h": 32.1875
+        },
+        {
+          "id": "",
+          "label": "查看待办队列（不执行）",
+          "w": 163,
+          "h": 32.1875
+        },
+        {
+          "id": "",
+          "label": "取消任务",
+          "w": 163,
+          "h": 32.1875
+        }
+      ],
+      "contrast": [
+        {
+          "text": "2",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": " · 离线演示",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "待验收",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "我发起",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(239, 239, 241)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "alice → bob",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(246, 246, 247)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "进行中",
+          "color": "rgb(58, 95, 168)",
+          "background": "rgb(233, 238, 248)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "我负责",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(239, 239, 241)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "bob → alice",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(246, 246, 247)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "desktop-contacts": {
+      "width": 1440,
+      "height": 900,
+      "scrollWidth": 1440,
+      "focused": "<button class=\"icon-btn\" type=\"button\" aria-label=\"关闭联系人\">×</button>",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 0,
+          "w": 72,
+          "h": 900,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 72,
+          "y": 0,
+          "w": 948,
+          "h": 900,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#contacts-view": {
+          "x": 1020,
+          "y": 0,
+          "w": 420,
+          "h": 900,
+          "display": "block"
+        },
+        "#text": {
+          "x": 172,
+          "y": 832,
+          "w": 750,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 928,
+          "y": 832,
+          "w": 40,
+          "h": 40,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "refresh",
+          "label": "刷新本账号会话与任务",
+          "w": 36,
+          "h": 36
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "composer-menu-toggle",
+          "label": "角色与说明",
+          "w": 40,
+          "h": 40
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 40
+        },
+        {
+          "id": "",
+          "label": "关闭联系人",
+          "w": 36,
+          "h": 36
+        }
+      ],
+      "contrast": [
+        {
+          "text": "2",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": " · 离线演示",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "选择联系人，准备一份待确认的委派提案。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "委派 ›",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "委派 ›",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "desktop-settings": {
+      "width": 1440,
+      "height": 900,
+      "scrollWidth": 1440,
+      "focused": "<button type=\"button\" class=\"icon-btn profile-close\" aria-label=\"关闭设置\" title=\"关闭设置\">×</button>",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 0,
+          "w": 72,
+          "h": 900,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 72,
+          "y": 0,
+          "w": 948,
+          "h": 900,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#profile-view": {
+          "x": 1020,
+          "y": 0,
+          "w": 420,
+          "h": 900,
+          "display": "block"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#text": {
+          "x": 172,
+          "y": 832,
+          "w": 750,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 928,
+          "y": 832,
+          "w": 40,
+          "h": 40,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "refresh",
+          "label": "刷新本账号会话与任务",
+          "w": 36,
+          "h": 36
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "composer-menu-toggle",
+          "label": "角色与说明",
+          "w": 40,
+          "h": 40
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 40
+        },
+        {
+          "id": "",
+          "label": "关闭设置",
+          "w": 36,
+          "h": 36
+        },
+        {
+          "id": "",
+          "label": "角色如何使用",
+          "w": 91.765625,
+          "h": 29.4375
+        },
+        {
+          "id": "",
+          "label": "",
+          "w": 269,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "管家研究写作审阅",
+          "w": 269,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "默认模型",
+          "w": 269,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "启用 我的管家",
+          "w": 36,
+          "h": 22
+        },
+        {
+          "id": "",
+          "label": "移除",
+          "w": 42,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "添加角色",
+          "w": 379,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "取消，不保存",
+          "w": 118,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "检查更改",
+          "w": 90,
+          "h": 42
+        }
+      ],
+      "contrast": [
+        {
+          "text": "2",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": " · 离线演示",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "设置你的默认管家，也可添加其他角色。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "管家负责理解需求与组织协作。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "mobile-chat": {
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 390,
+      "focused": "text",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 784,
+          "w": 390,
+          "h": 60,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#text": {
+          "x": 72,
+          "y": 724,
+          "w": 252,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 330,
+          "y": 720,
+          "w": 40,
+          "h": 44,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 44
+        }
+      ],
+      "contrast": [
+        {
+          "text": "2",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "mobile-tasks": {
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 390,
+      "focused": "tab-tasks",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 784,
+          "w": 390,
+          "h": 60,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "block"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#text": {
+          "x": 72,
+          "y": 724,
+          "w": 252,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 330,
+          "y": 720,
+          "w": 40,
+          "h": 44,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 44
+        },
+        {
+          "id": "task-filter",
+          "label": "进行中的任务待我处理我发起的已完成 / 已取消",
+          "w": 150,
+          "h": 39
+        },
+        {
+          "id": "",
+          "label": "更多",
+          "w": 51.03125,
+          "h": 31.4375
+        },
+        {
+          "id": "",
+          "label": "更多",
+          "w": 51.03125,
+          "h": 31.4375
+        }
+      ],
+      "contrast": [
+        {
+          "text": "2",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "待验收",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "我发起",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(239, 239, 241)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "alice → bob",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(246, 246, 247)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "进行中",
+          "color": "rgb(58, 95, 168)",
+          "background": "rgb(233, 238, 248)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "我负责",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(239, 239, 241)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "bob → alice",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(246, 246, 247)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "mobile-delivery-preview": {
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 390,
+      "focused": "<button type=\"button\">预览</button>",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 784,
+          "w": 390,
+          "h": 60,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "block"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#text": {
+          "x": 72,
+          "y": 724,
+          "w": 252,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 330,
+          "y": 720,
+          "w": 40,
+          "h": 44,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 44
+        },
+        {
+          "id": "",
+          "label": "更多",
+          "w": 51.03125,
+          "h": 31.4375
+        },
+        {
+          "id": "",
+          "label": "更多",
+          "w": 51.03125,
+          "h": 31.4375
+        }
+      ],
+      "contrast": [
+        {
+          "text": "2",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "待验收",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "我发起",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(239, 239, 241)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "alice → bob",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(246, 246, 247)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "进行中",
+          "color": "rgb(58, 95, 168)",
+          "background": "rgb(233, 238, 248)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "我负责",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(239, 239, 241)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "bob → alice",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(246, 246, 247)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "请审阅交付内容。预览并确认后，对方可见。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(246, 246, 247)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "mobile-delegation": {
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 390,
+      "focused": "<textarea rows=\"4\" placeholder=\"希望对方帮你完成什么？\" aria-label=\"委派摘要\" style=\"\"></textarea>",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 784,
+          "w": 390,
+          "h": 60,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "block"
+        },
+        "#text": {
+          "x": 72,
+          "y": 724,
+          "w": 252,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 330,
+          "y": 720,
+          "w": 40,
+          "h": 44,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 44
+        },
+        {
+          "id": "",
+          "label": "生成委派提案",
+          "w": 349,
+          "h": 36.796875
+        }
+      ],
+      "contrast": [
+        {
+          "text": "1",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "选择联系人，准备一份待确认的委派提案。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "委派 ›",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "委派 ›",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "先生成提案，核对并确认后才会共享摘要。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "mobile-settings": {
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 390,
+      "focused": "<button type=\"button\" class=\"icon-btn profile-close\" aria-label=\"关闭设置\" title=\"关闭设置\">×</button>",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 784,
+          "w": 390,
+          "h": 60,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "block"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#text": {
+          "x": 72,
+          "y": 724,
+          "w": 252,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 330,
+          "y": 720,
+          "w": 40,
+          "h": 44,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 44
+        },
+        {
+          "id": "",
+          "label": "角色如何使用",
+          "w": 91.765625,
+          "h": 29.4375
+        },
+        {
+          "id": "",
+          "label": "管家研究写作审阅",
+          "w": 239,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "默认模型",
+          "w": 239,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "启用 我的管家",
+          "w": 36,
+          "h": 22
+        },
+        {
+          "id": "",
+          "label": "移除",
+          "w": 42,
+          "h": 44
+        },
+        {
+          "id": "",
+          "label": "取消，不保存",
+          "w": 118,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "检查更改",
+          "w": 90,
+          "h": 42
+        }
+      ],
+      "contrast": [
+        {
+          "text": "1",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(29, 29, 31)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(31, 122, 92)",
+          "background": "rgb(229, 242, 236)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "设置你的默认管家，也可添加其他角色。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "管家负责理解需求与组织协作。",
+          "color": "rgb(110, 110, 118)",
+          "background": "rgb(255, 255, 255)",
+          "fontSize": "13px"
+        }
+      ]
+    },
+    "mobile-settings-dark": {
+      "width": 390,
+      "height": 844,
+      "scrollWidth": 390,
+      "focused": "composer-menu-toggle",
+      "boxes": {
+        ".rail": {
+          "x": 0,
+          "y": 784,
+          "w": 390,
+          "h": 60,
+          "display": "flex"
+        },
+        ".chat-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "flex"
+        },
+        ".task-pane": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#profile-view": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 784,
+          "display": "block"
+        },
+        "#contacts-view": {
+          "x": 0,
+          "y": 0,
+          "w": 0,
+          "h": 0,
+          "display": "none"
+        },
+        "#text": {
+          "x": 72,
+          "y": 724,
+          "w": 252,
+          "h": 40,
+          "display": "block"
+        },
+        "#send": {
+          "x": 330,
+          "y": 720,
+          "w": 40,
+          "h": 44,
+          "display": "grid"
+        }
+      },
+      "smallTargets": [
+        {
+          "id": "enable-notifications",
+          "label": "开启系统通知",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "＋ 附带共享材料（可选）",
+          "w": 163.140625,
+          "h": 23.59375
+        },
+        {
+          "id": "",
+          "label": "确认共享并委派",
+          "w": 132,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "修改后确认",
+          "w": 104,
+          "h": 36.796875
+        },
+        {
+          "id": "",
+          "label": "拒绝，不共享",
+          "w": 118,
+          "h": 36.796875
+        },
+        {
+          "id": "send",
+          "label": "发送",
+          "w": 40,
+          "h": 44
+        },
+        {
+          "id": "",
+          "label": "角色如何使用",
+          "w": 91.765625,
+          "h": 29.4375
+        },
+        {
+          "id": "",
+          "label": "管家研究写作审阅",
+          "w": 239,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "默认模型",
+          "w": 239,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "启用 我的管家",
+          "w": 36,
+          "h": 22
+        },
+        {
+          "id": "",
+          "label": "移除",
+          "w": 42,
+          "h": 44
+        },
+        {
+          "id": "",
+          "label": "取消，不保存",
+          "w": 118,
+          "h": 42
+        },
+        {
+          "id": "",
+          "label": "检查更改",
+          "w": 90,
+          "h": 42
+        }
+      ],
+      "contrast": [
+        {
+          "text": "1",
+          "color": "rgb(255, 255, 255)",
+          "background": "rgb(229, 72, 77)",
+          "fontSize": "11px"
+        },
+        {
+          "text": "alice 的管家 · 离线演示 · 已验证身份",
+          "color": "rgb(236, 236, 239)",
+          "background": "rgb(32, 32, 35)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "待你确认",
+          "color": "rgb(76, 191, 148)",
+          "background": "rgb(27, 50, 41)",
+          "fontSize": "12px"
+        },
+        {
+          "text": "尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材",
+          "color": "rgb(162, 162, 171)",
+          "background": "rgb(32, 32, 35)",
+          "fontSize": "13px"
+        },
+        {
+          "text": "设置你的默认管家，也可添加其他角色。",
+          "color": "rgb(162, 162, 171)",
+          "background": "rgb(32, 32, 35)",
+          "fontSize": "14px"
+        },
+        {
+          "text": "管家负责理解需求与组织协作。",
+          "color": "rgb(162, 162, 171)",
+          "background": "rgb(32, 32, 35)",
+          "fontSize": "13px"
+        }
+      ]
+    }
+  },
+  "contactsEscapeFocus": "open-contacts",
+  "settingsEscapeFocus": "open-agents",
+  "taskTabSequence": [
+    {
+      "id": "task-filter",
+      "label": "进行中的任务待我处理我发起的已完成 / 已取消",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "验收",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "退回",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "讨论此任务",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "更多",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "提交人工交付",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "讨论此任务",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "我的私密交付草稿",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "更多",
+      "covered": false
+    },
+    {
+      "id": "",
+      "label": "\n\n  \n  \n    \n  \n  \n    \n    2\n",
+      "covered": false
+    },
+    {
+      "id": "open-chat",
+      "label": "聊天",
+      "covered": false
+    },
+    {
+      "id": "toggle-tasks",
+      "label": "工作与任务",
+      "covered": false
+    },
+    {
+      "id": "open-contacts",
+      "label": "联系人",
+      "covered": false
+    },
+    {
+      "id": "open-agents",
+      "label": "个人角色设置",
+      "covered": false
+    },
+    {
+      "id": "open-account",
+      "label": "账号与成员",
+      "covered": false
+    },
+    {
+      "id": "logout",
+      "label": "退出",
+      "covered": false
+    },
+    {
+      "id": "enable-notifications",
+      "label": "开启系统通知",
+      "covered": true
+    },
+    {
+      "id": "refresh",
+      "label": "刷新本账号会话与任务",
+      "covered": true
+    }
+  ],
+  "deliveryWrites": [
+    {
+      "pathname": "/api/tasks/own-task/actions",
+      "method": "POST",
+      "body": {
+        "action": "deliver",
+        "expected_revision": 1,
+        "result": "已完成接口审核，待确认这份人工结果。"
+      }
+    }
+  ],
+  "proposalWrites": [
+    {
+      "pathname": "/api/proposals",
+      "method": "POST",
+      "body": {
+        "owner": "bob",
+        "summary": "请审阅当前接口文档。",
+        "request_id": "d966ed3e-9fe2-40ce-8812-a0cd073bd9c4"
+      }
+    }
+  ],
+  "settingsTabSequence": [
+    {
+      "id": "",
+      "label": "\n\n  \n  \n    \n  \n  \n    \n    1\n",
+      "covered": false
+    },
+    {
+      "id": "open-chat",
+      "label": "聊天",
+      "covered": false
+    },
+    {
+      "id": "toggle-tasks",
+      "label": "工作与任务",
+      "covered": false
+    },
+    {
+      "id": "open-contacts",
+      "label": "联系人",
+      "covered": false
+    },
+    {
+      "id": "open-agents",
+      "label": "个人角色设置",
+      "covered": false
+    },
+    {
+      "id": "open-account",
+      "label": "账号与成员",
+      "covered": false
+    },
+    {
+      "id": "logout",
+      "label": "退出",
+      "covered": false
+    },
+    {
+      "id": "enable-notifications",
+      "label": "开启系统通知",
+      "covered": true
+    },
+    {
+      "id": "refresh",
+      "label": "刷新本账号会话与任务",
+      "covered": true
+    },
+    {
+      "id": "",
+      "label": "＋ 附带共享材料（可选）",
+      "covered": true
+    },
+    {
+      "id": "",
+      "label": "确认共享并委派",
+      "covered": true
+    },
+    {
+      "id": "",
+      "label": "修改后确认",
+      "covered": true
+    },
+    {
+      "id": "",
+      "label": "拒绝，不共享",
+      "covered": true
+    },
+    {
+      "id": "composer-menu-toggle",
+      "label": "角色与说明",
+      "covered": true
+    }
+  ],
+  "mutable": true,
+  "overlayInjected": true,
+  "overlayLogs": [
+    "%c[impeccable] 8 anti-patterns found color: oklch(84% 0.19 80.46); font-weight: bold"
+  ],
+  "pageErrors": []
+}

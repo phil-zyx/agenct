@@ -5,12 +5,14 @@
   "description": "Chat-first, browser-local demonstration of cross-person agent delegation",
   "license": "MIT",
   "scripts": {
-    "test": "node test.cjs && node test-chat.cjs && node hub/web/client.test.cjs && node hub/web/profiles-ui.test.cjs && node hub/web/worker-ui.test.cjs && node hub/web/draft-ui.test.cjs && node hub/web/task-timeline-model.test.cjs && node hub/web/task-timeline-ui.test.cjs",
-    "check": "node --check dist/chat.js && node --check dist/chat-engine.js && node --check dist/engine.js && node --check dist/dashboard-app.js && node --check hub/web/client.js && node --check hub/web/profiles-ui.js && node --check hub/web/worker-ui.js && node --check hub/web/draft-ui.js && node --check hub/web/task-timeline-model.js && node --check hub/web/task-timeline-ui.js && node --check hub/web/activity-ui.js && node --check hub/web/chat-ui.js && node --check hub/web/task-ui.js && node --check hub/web/client-chrome.js && node --check hub/web/repo-ui.js",
-    "test:browser": "node hub/web/client.browser.test.cjs",
+    "test": "node test.cjs && node test-chat.cjs && node hub/web/client.test.cjs && node hub/web/profiles-ui.test.cjs && node hub/web/worker-ui.test.cjs && node hub/web/draft-ui.test.cjs && node hub/web/task-timeline-model.test.cjs && node hub/web/task-timeline-ui.test.cjs && node hub/web/collaboration-profile-ui.test.cjs",
+    "check": "node --check dist/chat.js && node --check dist/chat-engine.js && node --check dist/engine.js && node --check dist/dashboard-app.js && node --check hub/web/client.js && node --check hub/web/profiles-ui.js && node --check hub/web/worker-ui.js && node --check hub/web/draft-ui.js && node --check hub/web/task-timeline-model.js && node --check hub/web/task-timeline-ui.js && node --check hub/web/activity-ui.js && node --check hub/web/chat-ui.js && node --check hub/web/task-ui.js && node --check hub/web/account-ui.js && node --check hub/web/client-chrome.js && node --check hub/web/repo-ui.js && node --check hub/web/contacts-ui.js && node --check hub/web/collaboration-profile-ui.js && node --check hub/web/profile-suggestions-ui.js",
+    "test:browser": "node hub/web/client.browser.test.cjs && node hub/web/reliability.browser.test.cjs && node hub/web/contact-recovery.browser.test.cjs && node hub/web/chat-failure.browser.test.cjs",
     "test:visual": "playwright test",
     "test:visual:update": "playwright test --update-snapshots",
-    "test:local": "node scripts/local-browser-acceptance.cjs"
+    "test:local": "node scripts/local-browser-acceptance.cjs",
+    "test:collaboration": "node hub/web/collaboration.browser.test.cjs",
+    "test:profile-chat": "node hub/web/profile-chat.browser.test.cjs"
   },
   "engines": {
     "node": ">=22"

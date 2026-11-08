@@ -122,6 +122,69 @@ impl Adapter {
 fn success() -> Value {
     json!({"reply":"fixture reply","backend":"dsh","proposal":null})
 }
+
+async fn save_work_context(app: &Router, owner: &str, secret: &str) {
+    let body = json!({
+        "expected_revision":0,
+        "public":{"team":"研发","responsibilities":"接口设计","help_with":"审阅","request_requirements":"文档"},
+        "private":{"work_context":secret,"response_preferences":"先写结论"},
+        "permissions":{"auto_reply_public":false,"auto_prepare_drafts":true}
+    });
+    assert_eq!(
+        request(app, owner, "PUT", "/api/collaboration-profile", body)
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn saved_owner_context_reaches_only_own_chat_and_private_draft_separate_from_history() {
+    let adapter = Adapter::new(success(), false).await;
+    let a = adapter.app(":memory:");
+    save_work_context(&a, "alice", "ALICE_ONLY_BACKGROUND").await;
+    save_work_context(&a, "bob", "BOB_ONLY_BACKGROUND").await;
+    for who in ["alice", "bob"] {
+        assert_eq!(
+            request(
+                &a,
+                who,
+                "POST",
+                "/api/messages",
+                json!({"message":"hello","request_id":"context-chat"})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let task = working(&a).await;
+    let (status, receipt) = request(&a, "bob", "POST", &route(&task), input("owner-profile")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!receipt.to_string().contains("BOB_ONLY_BACKGROUND"));
+    assert!(!receipt.to_string().contains("owner_context"));
+    let payloads = adapter.payloads.lock().unwrap();
+    assert_eq!(payloads.len(), 3);
+    assert_eq!(
+        payloads[0]["profile_context"]["profile"]["private"]["work_context"],
+        "ALICE_ONLY_BACKGROUND"
+    );
+    assert_eq!(
+        payloads[1]["profile_context"]["profile"]["private"]["work_context"],
+        "BOB_ONLY_BACKGROUND"
+    );
+    assert_eq!(
+        payloads[2]["owner_context"]["private"]["work_context"],
+        "BOB_ONLY_BACKGROUND"
+    );
+    for payload in payloads.iter() {
+        assert!(payload["owner_context"].get("permissions").is_none());
+        assert!(!payload["history"].to_string().contains("BACKGROUND"));
+        assert!(!payload["task_context"].to_string().contains("BACKGROUND"));
+    }
+    assert!(!payloads[2].to_string().contains("ALICE_ONLY_BACKGROUND"));
+    assert!(payloads[2].get("profile_context").is_none());
+}
 struct Database(std::path::PathBuf);
 impl Database {
     fn new() -> Self {
