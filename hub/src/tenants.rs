@@ -21,6 +21,29 @@ BEGIN SELECT RAISE(ABORT,'tenant assignments are immutable'); END;";
 /// JSON object mapping every configured user ID to one organization ID.
 /// Duplicate keys are rejected instead of silently choosing one organization.
 pub struct Config(pub HashMap<String, String>);
+
+fn audit_contact_partitions(
+    db: &rusqlite::Connection,
+    directory: &Directory,
+) -> Result<(), &'static str> {
+    let mut query = db
+        .prepare("SELECT DISTINCT sender,recipient FROM contact_messages")
+        .map_err(|_| "contact tenant startup audit failed")?;
+    let rows = query
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|_| "contact tenant startup audit failed")?;
+    for row in rows {
+        let (sender, recipient) = row.map_err(|_| "contact tenant startup audit failed")?;
+        if !directory.can_delegate(&sender, &recipient) {
+            return Err(
+                "existing contact messages cross tenant boundaries or reference unmapped users",
+            );
+        }
+    }
+    Ok(())
+}
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct Mapping;
@@ -63,6 +86,15 @@ impl Hub {
     /// Enable only with an already-configured OIDC identity mode and a fixed
     /// complete roster. Old cross-organization work fails startup, never leaks.
     pub fn with_tenants(mut self, config: Config) -> Result<Self, &'static str> {
+        if self
+            .browser_auth
+            .as_ref()
+            .is_some_and(|auth| auth.gitlab_auto_signup)
+        {
+            return Err(
+                "automatic GitLab signup uses an isolated single workspace, not static tenants",
+            );
+        }
         if self.private_config.is_some() {
             return Err("tenant isolation cannot use live private membership");
         }
@@ -95,6 +127,7 @@ impl Hub {
                     }
                 }
             }
+            audit_contact_partitions(&tx, &directory)?;
             // Bind all current identities, including those with only private chat.
             // Historical assignments remain after a user leaves the active roster.
             {
@@ -132,6 +165,38 @@ impl Hub {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn historical_contact_messages_cannot_be_repartitioned_across_tenants() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE contact_messages(sender TEXT,recipient TEXT); INSERT INTO contact_messages VALUES ('alice','bob'),('bob','alice')").unwrap();
+        let directory = |bob_tenant: &str| {
+            Directory::new(["alice".into(), "bob".into()])
+                .unwrap()
+                .with_tenants(
+                    [
+                        ("alice".into(), "one".into()),
+                        ("bob".into(), bob_tenant.into()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                )
+                .unwrap()
+        };
+        assert!(audit_contact_partitions(&db, &directory("one")).is_ok());
+        assert!(audit_contact_partitions(&db, &directory("two")).is_err());
+        db.execute(
+            "INSERT INTO contact_messages VALUES ('unknown','alice')",
+            [],
+        )
+        .unwrap();
+        assert!(audit_contact_partitions(&db, &directory("one")).is_err());
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM contact_messages", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
     #[test]
     fn duplicate_unknown_missing_and_invalid_memberships_are_rejected() {
         assert!(serde_json::from_str::<Config>(r#"{"alice":"one","alice":"two"}"#).is_err());

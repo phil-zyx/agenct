@@ -26,7 +26,7 @@ function fixture() {
     },
     current: ctx => ctx.user === identity,
     article: text => { const e = new Element(); e.textContent = text; return e; },
-    conversation: () => conversation, status: () => {}
+    host: () => conversation, status: () => {}
   });
   return { ui, calls, conversation,
     button: text => walk(conversation).find(e => e.textContent === text),
@@ -53,7 +53,7 @@ function fixture() {
   assert.deepEqual(Object.keys(put.body).sort(),['agents','expected_revision']);
   f.release(); await saving;
   assert(walk(f.conversation).some(e => e.textContent.includes('已保存个人配置')));
-  const entries=[]; f.ui.append(entries); assert.equal(entries.length,1);
+  assert(f.button('×'));
 
   const canceled = fixture(); await canceled.open(); await canceled.button('检查更改').onclick();
   const oldConfirm = canceled.button('确认保存个人配置'); await canceled.button('取消，不保存').onclick();

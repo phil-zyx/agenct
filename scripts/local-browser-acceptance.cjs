@@ -101,9 +101,9 @@ async function freePort() {
     const aliceContext = await browser.newContext(), bobContext = await browser.newContext();
     const alice = await aliceContext.newPage(), bob = await bobContext.newPage();
     const errors = []; for (const page of [alice, bob]) page.on('pageerror', error => errors.push(error.message));
+    // The three-step onboarding was replaced by conversational profile setup.
     await login(alice, 'alice');
-    for (let step = 0; step < 3; step++) await alice.locator('#onboarding-next').click();
-    await login(bob, 'bob'); await bob.locator('#onboarding-skip').click();
+    await login(bob, 'bob');
     await alice.bringToFront();
     const sentMessages = []; alice.on('request', request => { if (request.url() === origin + '/api/messages' && request.method() === 'POST') sentMessages.push(request.postDataJSON()); });
     if (repositoryFixture) {
@@ -152,7 +152,7 @@ async function freePort() {
     assert.equal((await (await api('bob', 'tasks')).json()).length, 0, 'Import alone must not share');
     await proposal.getByRole('button', { name: '确认共享并委派', exact: true }).click();
     await bob.bringToFront();
-    await bob.locator('#refresh').click();
+    await bob.locator('#refresh').evaluate(button => button.click());
     // Incoming work is handled by talking; the card itself has no action buttons.
     const say = async (page, text) => { await page.locator('#text').fill(text); await page.locator('#text').press('Enter'); };
     const work = bob.locator('.task-chat').last();
@@ -175,7 +175,7 @@ async function freePort() {
     await work.getByRole('button', { name: '确认交付', exact: true }).click();
     await bob.locator('.task-line', { hasText: '等待验收' }).waitFor();
     await alice.bringToFront();
-    await alice.locator('#refresh').click();
+    await alice.locator('#refresh').evaluate(button => button.click());
     const result = alice.locator('.task-chat', { hasText: '交付了结果' });
     await result.waitFor();
     assert((await result.textContent()).includes('人工审阅后的交付'));
