@@ -410,9 +410,11 @@ const needsMe = (context, task) => (task.owner === context.user && ['awaiting_ow
 function focusTask(context, tasks, activity) {
   // An unresolved send keeps its own locked context until it is checked.
   if (pendingTurn || busy.has('turn-check')) return;
-  // A selected snapshot stays fixed, including invalidation. Polling may not
-  // reinterpret text already being composed, even if another task becomes newer.
-  if (selectedTask || $('text').value.trim()) return;
+  // Polling never reinterprets text already being composed, and an explicit
+  // choice stays fixed (including its invalidation). Only an automatic binding
+  // with an empty composer follows the task to its current version.
+  if ($('text').value.trim()) return;
+  if (selectedTask && !selectedTask.auto) return;
   const time = task => parseUtc(latestStep(activity, task.id)?.at)?.getTime() ?? 0;
   const next = tasks.filter(task => needsMe(context, task) && !dismissedFocus.has(task.id + ':' + task.revision))
     .sort((a, b) => time(b) - time(a))[0];

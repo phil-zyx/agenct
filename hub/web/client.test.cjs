@@ -1881,6 +1881,21 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(f.$('text').value,'确认退回');
     f.$('status').onkeydown({key:'Escape',preventDefault(){}});assert.equal(f.$('status').textContent,'');
   });
+  await test('an automatic binding follows the task to a new version only while nothing is being typed', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'awaiting_owner', revision: 0 })] });
+    await f.login('bob'); await f.$('refresh').onclick();
+    assert.equal(f.$('task-context').classList.contains('hide'), false);
+    // Returned and back with the owner at a new version; the composer is empty.
+    f.tasks([task({ status: 'awaiting_owner', revision: 2 })]); await f.$('refresh').onclick();
+    assert(!f.$('task-context-title').textContent.includes('已失效'));
+    await f.send('我接手');
+    assert.deepEqual(JSON.parse(chatPosts(f).at(-1).options.body).selected_task, { task_id: 'task-one', expected_revision: 2 });
+    // While typing, the version under the user's words is never swapped.
+    await f.$('refresh').onclick();
+    f.$('text').value = '写到一半';
+    f.tasks([task({ status: 'awaiting_owner', revision: 4 })]); await f.$('refresh').onclick();
+    assert(f.$('task-context-title').textContent.includes('已失效'));
+  });
   console.log('Client regression tests passed');
 
 })().catch(error => {
