@@ -275,9 +275,13 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
   await test('only routine feedback expires; errors and saved-reply fallback remain keyboard dismissible', async () => {
     const f = fixture(undefined, { tasks: [task()] }); await f.login('alice');
     f.discussion('task-one').onclick(); assert(f.$('status').classList.contains('show'));
+    // A failed sync is shown in the persistent sync-error bar (with retry), not a fading toast.
     f.failReads(500); await f.$('refresh').onclick();
-    assert.match(f.$('status').textContent, /Read unavailable/);
-    assert(!f.$('status').classList.contains('show'), 'critical status must not receive fading animation');
+    assert.equal(f.$('sync-error').classList.contains('hide'), false);
+    assert.match(f.$('sync-error-text').textContent, /暂时无法同步/);
+    f.failReads(0); await f.$('retry-sync').onclick();
+    assert.equal(f.$('sync-error').classList.contains('hide'), true, 'a successful retry clears the bar');
+    f.failReads(500);
     f.$('status').onkeydown({ key: 'Escape', preventDefault() {} });
     assert.equal(f.$('status').textContent, '');
     await f.send('Reply must stay readable');
