@@ -11,10 +11,10 @@ const { chromium } = require('playwright');
 const STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 const server = http.createServer((request, response) => {
   const name = request.url === '/' ? 'index.html' : request.url.slice(1);
-  if (!/^[a-z][a-z0-9-]*\.(?:html|css|js)$/.test(name) || !fs.existsSync(path.join(__dirname, name))) {
+  if (!/^[a-z][a-z0-9-]*\.(?:html|css|js|png)$/.test(name) || !fs.existsSync(path.join(__dirname, name))) {
     response.writeHead(404).end(); return;
   }
-  response.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
+  response.setHeader('Content-Type', name.endsWith('.png') ? 'image/png' : name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
   response.end(fs.readFileSync(path.join(__dirname, name)));
 });
 
@@ -90,6 +90,11 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
   });
   await page.goto(origin);
   async function login(user = 'alice') {
+    await page.waitForFunction(() => !document.getElementById('room').classList.contains('hide') || !document.getElementById('dev-login').classList.contains('hide'));
+    if (await page.locator('#room').isVisible()) {
+      if ((await page.locator('#identity').textContent()).startsWith(user + ' ')) return;
+      await page.locator('#logout').click();
+    }
     await page.locator('#token').fill(user); await page.locator('#enter').click();
     await page.waitForFunction(user => document.getElementById('identity').textContent.startsWith(user), user);
   }
@@ -115,7 +120,7 @@ function taskFixture(id = 'task-alpha', revision = 7) {
 async function showTasks(f, tasks) {
   f.state.tasks = tasks;
   await f.page.locator('#open-chat').click();
-  await f.page.locator('#refresh').click();
+  await f.page.locator('#refresh').evaluate(button => button.click());
   await f.page.waitForFunction(count => [...document.querySelectorAll('#tasks button')]
     .filter(button => button.textContent === '讨论此任务').length === count, tasks.length);
   await f.page.locator('#toggle-tasks').click();
@@ -136,6 +141,74 @@ if (require.main === module) (async () => {
   try {
     {
       const f = await fixture(browser, origin);
+      const own = { id: 'alice', display_name: 'Alice', color: 'green', status: 'active', revision: 0, admin: true };
+      const other = { id: 'bob', display_name: 'Bob', color: 'blue', status: 'active', revision: 0, admin: false };
+      await f.page.route('**/api/me', route => route.fulfill({ json: { user: 'alice', runtime: 'mock', member: own } }));
+      await f.page.route('**/api/members', route => route.fulfill({ json: [own, other] }));
+      const writes = [];
+      await f.page.route('**/api/members/*', route => {
+        const data = route.request().postDataJSON(); writes.push(data);
+        Object.assign(own, data, { revision: own.revision + 1 }); return route.fulfill({ json: own });
+      });
+      await f.page.locator('#open-account').click();
+      await f.page.getByRole('textbox', { name: 'alice 显示姓名', exact: true }).fill('Alice Chen');
+      await f.page.getByRole('button', { name: '保存资料', exact: true }).first().click();
+      await f.page.waitForFunction(() => document.querySelector('input[aria-label="alice 显示姓名"]')?.value === 'Alice Chen');
+      assert.equal(writes[0].expected_revision, 0); assert.equal(writes[0].display_name, 'Alice Chen');
+      assert.equal(await f.page.getByRole('button', { name: '停用账号', exact: true }).count(), 1);
+      await f.page.keyboard.press('Escape');
+      assert.equal(await f.page.locator('#contacts-view').isVisible(), false);
+      await f.close(); console.log('PASS Chromium account profile editing and admin member controls');
+    }
+    {
+      const f = await fixture(browser, origin);
+      await f.page.route('**/api/contacts', route => route.fulfill({ status: 404, body: '' }));
+      await f.page.locator('#open-contacts').click();
+      await f.page.getByText('无法读取联系人：服务端未提供此接口，请更新并重启本地服务', { exact: true }).waitFor();
+      await f.page.route('**/api/contacts', route => route.fulfill({ json: ['bob', 'carol'] }));
+      await f.page.route('**/api/contacts/*/profile', route => route.fulfill({ json: { public: {} } }));
+      await f.page.getByRole('button', { name: '重新读取', exact: true }).click();
+      await f.page.locator('#text').fill('My unsent draft');
+      await f.page.locator('#open-contacts').click();
+      await f.page.locator('.contact-row').first().waitFor();
+      await f.page.getByRole('searchbox', { name: '搜索联系人' }).fill('bob');
+      assert.equal(await f.page.locator('.contact-row').count(), 1);
+      await f.page.locator('.contact-row').click();
+      assert.equal(f.calls.filter(c => c.method === 'POST').length, 0);
+      await f.page.getByRole('button', { name: '请他帮忙', exact: true }).click();
+      await f.page.getByRole('textbox', { name: '委派摘要', exact: true }).fill('Review the document');
+      await f.page.getByRole('button', { name: '生成委派提案', exact: true }).click();
+      await f.page.waitForSelector('#contacts-view.hide', { state: 'attached' });
+      const proposal = f.calls.find(c => c.pathname === '/api/proposals' && c.method === 'POST');
+      assert.equal(proposal.body.owner, 'bob'); assert.equal(proposal.body.summary, 'Review the document');
+      assert.equal(await f.page.locator('#text').inputValue(), 'My unsent draft');
+      assert(!f.calls.some(c => c.pathname.endsWith('/actions')));
+      await f.page.locator('#open-contacts').click();
+      await f.page.locator('#logout').click();
+      assert.equal(await f.page.locator('#contacts-view').textContent(), '');
+      await f.close(); console.log('PASS Chromium contacts search, explicit proposal, preserved draft and logout cleanup');
+    }
+    {
+      const f = await fixture(browser, origin);
+      await f.page.reload();
+      await f.page.waitForSelector('#room:not(.hide)');
+      assert((await f.page.locator('#identity').textContent()).startsWith('alice'));
+      assert.equal(await f.page.locator('#token').inputValue(), '');
+      assert.equal(f.posts().length, 0);
+      await f.page.locator('#logout').click();
+      await f.page.reload();
+      await f.page.waitForSelector('#dev-login:not(.hide)');
+      assert.equal(await f.page.locator('#room').isVisible(), false);
+      await f.login();
+      await f.page.route('**/api/me', route => route.fulfill({ status: 401, json: { error: 'expired token' } }));
+      await f.page.reload();
+      await f.page.waitForSelector('#dev-login:not(.hide)');
+      assert.equal(await f.page.evaluate(() => sessionStorage.getItem('agenct.dev-auth.v1')), null);
+      assert.equal(await f.page.locator('#room').isVisible(), false);
+      await f.close(); console.log('PASS Chromium development login refresh, logout and invalid-token cleanup');
+    }
+    {
+      const f = await fixture(browser, origin);
       await f.page.setViewportSize({ width: 400, height: 760 });
       await showTasks(f, [taskFixture()]);
       await f.page.locator('#toggle-tasks').evaluate(b => { if (b.getAttribute('aria-pressed') !== 'true') b.click(); });
@@ -152,12 +225,25 @@ if (require.main === module) (async () => {
       assert.equal(await f.page.locator('#text').evaluate(el => el === document.activeElement), true);
       await f.page.locator('#toggle-tasks').click(); await f.page.locator('#open-chat').click();
       assert.equal(await f.page.locator('.task-pane').isVisible(), false);
-      await f.page.locator('#toggle-tasks').click(); await f.page.locator('#open-help').click();
-      assert.equal(await f.page.locator('.task-pane').isVisible(), false);
+      await f.page.locator('#composer-menu-toggle').click();
+      await f.page.locator('#help > summary').click();
+      assert.equal(await f.page.locator('#help').getAttribute('open'), '');
       await f.page.locator('#composer-menu-toggle').click();
       await f.page.locator('#text').fill('Keep my unsent private text');
       await f.page.locator('#toggle-tasks').click(); await f.page.locator('#open-agents').click();
       await f.page.waitForFunction(() => !document.getElementById('open-agents').disabled);
+      assert.equal(await f.page.locator('#profile-view').isVisible(), true);
+      assert.equal(await f.page.locator('#conversation .profile-settings').count(), 0);
+      assert.equal(await f.page.locator('.chat-pane').isVisible(), true);
+      await f.page.setViewportSize({ width: 1280, height: 900 });
+      const chatBounds = await f.page.locator('.chat-pane').boundingBox();
+      const settingsBounds = await f.page.locator('#profile-view').boundingBox();
+      assert(settingsBounds.x >= chatBounds.x + chatBounds.width - 1, 'Settings occupy the right column alongside chat');
+      assert.equal(settingsBounds.width, 420);
+      await f.page.setViewportSize({ width: 400, height: 800 });
+      await f.page.keyboard.press('Escape');
+      assert.equal(await f.page.locator('#profile-view').isVisible(), false);
+      assert.equal(await f.page.locator('.chat-pane').isVisible(), true);
       assert.equal(await f.page.locator('#text').inputValue(), 'Keep my unsent private text');
       assert.equal(await f.page.locator('.task-pane').isVisible(), false);
       assert.equal(f.posts().length, 0);
@@ -167,6 +253,9 @@ if (require.main === module) (async () => {
       const f = await fixture(browser, origin, false, true);
       f.state.post = 'stall'; await f.send('Wait for a response');
       await f.page.waitForSelector('#turn-recovery.quiet');
+      assert.equal(await f.page.locator('#text').inputValue(), '');
+      assert.equal(await f.page.locator('#outgoing-message .msg-body').textContent(), 'Wait for a response');
+      assert.equal(await f.page.locator('#outgoing-message').isVisible(), true);
       const snapshot = await f.page.locator('#turn-status').ariaSnapshot();
       assert.match(snapshot, /正在发送/);
       assert.equal(await f.page.locator('#turn-recovery').evaluate(el => getComputedStyle(el).display === 'none'), false);
@@ -182,7 +271,7 @@ if (require.main === module) (async () => {
       assert.deepEqual(JSON.parse(await f.stored()), { id, user: 'alice', browserMode: false });
       await f.page.locator('#text').fill('changed unsent draft');
       await f.page.locator('#text').evaluate(element => element.form.requestSubmit());
-      await f.page.locator('#refresh').click();
+      await f.page.locator('#refresh').evaluate(button => button.click());
       assert.equal(f.posts().length, 1);
       for (const state of ['pending', 'uncertain']) {
         f.state.receipt = state; await f.page.locator('#check-turn').click();
@@ -267,6 +356,7 @@ if (require.main === module) (async () => {
       await discussButtons(f).nth(1).click();
       assert((await f.page.locator('#task-context-details').textContent()).includes(beta.id));
       await f.send('/agents'); await settled(f);
+      await f.page.getByRole('button', { name: '关闭设置', exact: true }).click();
       await f.send('/delegate bob only this explicit summary'); await settled(f);
       assert.equal(f.posts().length, 0, 'Profile and delegation commands do not send ordinary chat');
       assert.equal(await f.page.locator('#task-context').isVisible(), true);
@@ -285,7 +375,7 @@ if (require.main === module) (async () => {
       const alpha = taskFixture(); await showTasks(f, [alpha]);
       await discussButtons(f).click();
       f.state.tasks = change === 'revision' ? [{ ...alpha, revision: 8, summary: 'Updated public summary' }] : [];
-      await f.page.locator('#refresh').click();
+      await f.page.locator('#refresh').evaluate(button => button.click());
       if (change === 'revision') await f.page.waitForFunction(() => document.getElementById('room').textContent.includes('Updated public summary'));
       else await f.page.waitForFunction(() => ![...document.querySelectorAll('#tasks button')].some(button => button.textContent === '讨论此任务'));
       await f.page.locator('#text').fill('Do not silently drop my selected context');
@@ -322,7 +412,7 @@ if (require.main === module) (async () => {
       assert.equal(await discussButtons(f).isDisabled(), true);
       assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
       f.state.tasks = [{ ...alpha, revision: 8, summary: 'Changed while previous turn unresolved' }];
-      await f.page.locator('#refresh').click();
+      await f.page.locator('#refresh').evaluate(button => button.click());
       await f.page.waitForFunction(() => document.getElementById('room').textContent.includes('Changed while previous turn unresolved'));
       assert.equal(await discussButtons(f).isDisabled(), true);
       assert.equal(await f.page.locator('#clear-task-context').isDisabled(), true);
@@ -356,11 +446,8 @@ if (require.main === module) (async () => {
       const f = await fixture(browser, origin, browserMode); await f.uncertain();
       f.state.receipt = 'pending';
       const receipt = await f.stored(); await f.page.reload();
-      if (!browserMode) {
-        assert.equal(await f.page.locator('#room').isVisible(), false);
-        assert.equal(await f.page.locator('#token').inputValue(), '');
-        await f.login();
-      } else await f.page.waitForSelector('#room:not(.hide)');
+      await f.page.waitForSelector('#room:not(.hide)');
+      assert.equal(await f.page.locator('#token').inputValue(), '');
       assert.equal(await f.stored(), receipt);
       assert.equal(await f.page.locator('#send').isDisabled(), true);
       assert.equal(await f.page.locator('#text').inputValue(), '');
@@ -415,7 +502,7 @@ async function nextStepsInteractions(browser, origin) {
     assert.equal(action.body.action, 'confirm');
     assert.equal(action.body.owner, 'carol'); assert.equal(action.body.summary, 'My manually rewritten summary');
     f.state.proposals = [2, 3].map(id => ({ id, owner: 'bob', summary: 'Old pending ' + id, status: 'pending', revision: 0, created_at: '2020-01-01 00:00:00' }));
-    await f.page.locator('#refresh').click();
+    await f.page.locator('#refresh').evaluate(button => button.click());
     const group = f.page.locator('details').filter({ has: f.page.locator('summary', { hasText: '2 个未处理的提案' }) });
     await group.waitFor(); assert.equal(await group.getAttribute('open'), null);
     await group.locator('summary').click();

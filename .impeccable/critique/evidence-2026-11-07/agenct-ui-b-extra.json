@@ -1,0 +1,101 @@
+{
+  "nav": [
+    {
+      "id": "open-chat",
+      "active": true,
+      "current": "page",
+      "pressed": null
+    },
+    {
+      "id": "toggle-tasks",
+      "active": false,
+      "current": null,
+      "pressed": "true"
+    },
+    {
+      "id": "open-contacts",
+      "active": false,
+      "current": null,
+      "pressed": null
+    },
+    {
+      "id": "open-agents",
+      "active": false,
+      "current": null,
+      "pressed": null
+    },
+    {
+      "id": "open-account",
+      "active": false,
+      "current": null,
+      "pressed": null
+    },
+    {
+      "id": "logout",
+      "active": false,
+      "current": null,
+      "pressed": null
+    }
+  ],
+  "focus": {
+    "id": "refresh",
+    "covered": "<button type=\"button\" id=\"close-tasks\" class=\"icon-btn\" title=\"收起\" aria-label=\"收起\"><svg viewBox=\"0 0 24 24\" aria-hidden=\"true\"><path d=\"M6 6l12 12M18 6 6 18\"></path></svg></button>"
+  },
+  "mobileOffline": {
+    "text": "暂时无法同步，保留上次快照；将自动重试，也可手动刷新。",
+    "visible": false,
+    "liveNotice": false,
+    "toast": ""
+  },
+  "desktopOffline": true,
+  "overlay": [
+    {
+      "mode": "chat",
+      "text": "alice 的管家 · 离线演示\n· 已验证身份\n暂时无法同步，保留上次快照；将自动重试，也可手动刷新。\n开启系统通知\n管家\n委派提案\n待你确认\n接收人：bob\nShare only this exact summary\n\n尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材料，不会收到你的私聊。\n\n＋ 附带共享材料（可选）\n确认共享并委派\n修改后确认\n拒绝，不共享\n\n直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。Enter 发送，Shift+Enter 换行。",
+      "globals": [
+        "impeccableDetect",
+        "impeccableDetectAsync",
+        "impeccableScan",
+        "impeccableScanAsync",
+        "impeccableMeasureHiddenText",
+        "impeccableCollectVisualContrastCandidates",
+        "impeccableAnalyzeVisualContrast",
+        "impeccableGetLastVisualContrastAnalyses",
+        "impeccableSnapshotCapture",
+        "impeccableDetectFromSnapshot"
+      ]
+    },
+    {
+      "mode": "tasks",
+      "text": "alice 的管家 · 离线演示\n· 已验证身份\n暂时无法同步，保留上次快照；将自动重试，也可手动刷新。\n开启系统通知\n管家\n委派提案\n待你确认\n接收人：bob\nShare only this exact summary\n\n尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材料，不会收到你的私聊。\n\n＋ 附带共享材料（可选）\n确认共享并委派\n修改后确认\n拒绝，不共享\n\n直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。Enter 发送，Shift+Enter 换行。\n\n工作\n任务\nLOW CONTRAST TEXT",
+      "globals": [
+        "impeccableDetect",
+        "impeccableDetectAsync",
+        "impeccableScan",
+        "impeccableScanAsync",
+        "impeccableMeasureHiddenText",
+        "impeccableCollectVisualContrastCandidates",
+        "impeccableAnalyzeVisualContrast",
+        "impeccableGetLastVisualContrastAnalyses",
+        "impeccableSnapshotCapture",
+        "impeccableDetectFromSnapshot"
+      ]
+    },
+    {
+      "mode": "settings",
+      "text": "alice 的管家 · 离线演示\n· 已验证身份\n暂时无法同步，保留上次快照；将自动重试，也可手动刷新。\n开启系统通知\n管家\n委派提案\n待你确认\n接收人：bob\nShare only this exact summary\n\n尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材料，不会收到你的私聊。\n\n＋ 附带共享材料（可选）\n确认共享并委派\n修改后确认\n拒绝，不共享\n\n直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。Enter 发送，Shift+Enter 换行。\n\n个人角色设置\n×\n\n设置你的默认管家，也可添加其他角色。\n\n角色如何使用\n添加角色\n取消，不保存\n检查更改",
+      "globals": [
+        "impeccableDetect",
+        "impeccableDetectAsync",
+        "impeccableScan",
+        "impeccableScanAsync",
+        "impeccableMeasureHiddenText",
+        "impeccableCollectVisualContrastCandidates",
+        "impeccableAnalyzeVisualContrast",
+        "impeccableGetLastVisualContrastAnalyses",
+        "impeccableSnapshotCapture",
+        "impeccableDetectFromSnapshot"
+      ]
+    }
+  ]
+}

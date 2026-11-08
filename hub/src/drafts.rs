@@ -18,6 +18,7 @@ pub(super) const STALE: &str = "draft task revision changed before reservation";
 pub(super) const STATE: &str = "draft task must be working before reservation";
 pub(super) const ROLE: &str = "draft role unavailable or changed before reservation";
 pub(super) const BUSY: &str = "draft runtime busy before reservation";
+pub(super) const AUTO_DISABLED: &str = "automatic private drafts disabled by owner";
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -130,10 +131,22 @@ pub(super) fn auto_request_id(task: &str, revision: i64) -> String {
 /// shared, delivered or approved without the owner. Skipped silently if the
 /// task moves on first; waits briefly while the owner's own turn is running.
 pub(super) fn spawn_auto(h: Hub, owner: String, task: String, revision: i64) {
+    let allowed = h
+        .db()
+        .and_then(|db| crate::collaboration::read(&db, &owner))
+        .is_ok_and(|profile| profile.permissions.auto_prepare_drafts);
+    if !allowed {
+        return;
+    }
     tokio::spawn(async move {
         for _ in 0..40 {
             let profile = {
                 let Ok(db) = h.db() else { return };
+                if !crate::collaboration::read(&db, &owner)
+                    .is_ok_and(|profile| profile.permissions.auto_prepare_drafts)
+                {
+                    return;
+                }
                 let summary: Option<String> = db
                     .query_row(
                         "SELECT summary FROM tasks WHERE id=?1 AND owner=?2 AND status='working' AND revision=?3",
@@ -194,12 +207,19 @@ pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> 
         .gate(&owner)?
         .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, BUSY))?;
-    let (profile, snapshot, session, revision_context) = {
+    let (profile, snapshot, session, revision_context, owner_context) = {
         let mut db = h.db()?;
         let tx = db.transaction()?;
         owner_task(&tx, &owner, &task)?;
         if let Some(value) = replay(&tx, &owner, &task, &input)? {
             return Ok(value);
+        }
+        if input.request_id.starts_with(AUTO_PREFIX)
+            && !crate::collaboration::read(&tx, &owner)?
+                .permissions
+                .auto_prepare_drafts
+        {
+            return Err(Error(StatusCode::CONFLICT, AUTO_DISABLED));
         }
         let (status, revision) = owner_task(&tx, &owner, &task)?;
         if revision != input.expected_revision {
@@ -242,10 +262,11 @@ pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> 
             Ok(json!({"base_draft_id":change.base_draft_id,"content":content,"instruction":change.instruction}))
         }).transpose()?;
         let session = Uuid::new_v4().to_string();
+        let owner_context = runtime::owner_context(&tx, &owner)?;
         tx.execute("INSERT INTO draft_turns(owner,request_id,task_id,binding,status,task_context,runtime_profile,session_id) VALUES (?1,?2,?3,?4,'pending',?5,?6,?7)",
             params![owner,input.request_id,task,serde_json::to_string(&input).map_err(|_|invalid("invalid draft input"))?,snapshot.to_string(),serde_json::to_string(&profile).map_err(|_|invalid("invalid runtime profile"))?,session])?;
         tx.commit()?;
-        (profile, snapshot, session, revision_context)
+        (profile, snapshot, session, revision_context, owner_context)
     };
     let _reservation = Reservation {
         h,
@@ -264,6 +285,8 @@ pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> 
         profile: &profile,
         task_context: Some(&snapshot),
         draft_revision: revision_context.as_ref(),
+        owner_context: owner_context.as_ref(),
+        profile_context: None,
     };
     let answer = match &h.runtime {
         Runtime::Mock => runtime::MockRuntime.turn(request).await,

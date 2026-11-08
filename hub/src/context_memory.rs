@@ -34,11 +34,15 @@ fn payload_bytes(
     input: &ChatInput,
     profile: &RuntimeProfile,
     task: Option<&Value>,
+    profile_context: Option<&Value>,
 ) -> usize {
     let mut value = json!({"session_id":"00000000-0000-0000-0000-000000000000", "runtime_profile":profile,
         "history":history.iter().map(|m|json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(), "message":input.message});
     if let Some(task) = task {
         value["task_context"] = task.clone();
+    }
+    if let Some(context) = profile_context {
+        value["profile_context"] = context.clone();
     }
     serde_json::to_vec(&value)
         .expect("context serializable")
@@ -49,8 +53,10 @@ fn fits(
     input: &ChatInput,
     profile: &RuntimeProfile,
     task: Option<&Value>,
+    profile_context: Option<&Value>,
 ) -> bool {
-    history.len() <= 40 && payload_bytes(history, input, profile, task) <= LIMIT_BYTES
+    history.len() <= 40
+        && payload_bytes(history, input, profile, task, profile_context) <= LIMIT_BYTES
 }
 fn failed() -> Error {
     Error(
@@ -110,7 +116,7 @@ pub(super) async fn prepare(
     profile: &RuntimeProfile,
     task: Option<&Value>,
 ) -> Result<Vec<Message>> {
-    prepare_with_extra(h, owner, input, profile, task, None).await
+    prepare_with_extra(h, owner, input, profile, task, None, None).await
 }
 
 pub(super) async fn prepare_with_extra(
@@ -120,6 +126,7 @@ pub(super) async fn prepare_with_extra(
     profile: &RuntimeProfile,
     task: Option<&Value>,
     extra: Option<Message>,
+    profile_context: Option<&Value>,
 ) -> Result<Vec<Message>> {
     let (mut summary, mut through, mut recent) = {
         let db = h.db()?;
@@ -159,6 +166,7 @@ pub(super) async fn prepare_with_extra(
         input,
         profile,
         task,
+        profile_context,
     ) {
         if recent.is_empty() {
             return Err(failed());
@@ -225,6 +233,8 @@ pub(super) async fn summarize(
             profile,
             task_context: None,
             draft_revision: None,
+            owner_context: None,
+            profile_context: None,
         };
         let answer = match &h.runtime {
             Runtime::Mock => MockRuntime.turn(request).await,
@@ -241,6 +251,7 @@ pub(super) async fn summarize(
         .map_err(|_| failed())?;
         if answer.backend != h.runtime.label()
             || answer.proposal.is_some()
+            || answer.profile_update.is_some()
             || answer.reply.trim().is_empty()
             || answer.reply.len() > MAX_SUMMARY_BYTES
         {
@@ -671,12 +682,19 @@ mod tests {
             status: "complete".into(),
             created_at: None,
         };
-        let history =
-            prepare_with_extra(&h, "alice", &input(), &profile(), None, Some(extra.clone()))
-                .await
-                .unwrap();
+        let history = prepare_with_extra(
+            &h,
+            "alice",
+            &input(),
+            &profile(),
+            None,
+            Some(extra.clone()),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(history.len() <= 40);
-        assert!(fits(&history, &input(), &profile(), None));
+        assert!(fits(&history, &input(), &profile(), None, None));
         assert_eq!(history.last().unwrap().content, extra.content);
         let summary: String = h
             .db()
@@ -694,6 +712,39 @@ mod tests {
         assert!(next
             .iter()
             .all(|m| !m.content.contains("SELECTED_REPOSITORY_CONTENT")));
+    }
+
+    #[tokio::test]
+    async fn profile_context_counts_toward_chat_budget_but_never_enters_summary() {
+        let fake = adapter().await;
+        let h = Hub::open(config(
+            ":memory:".into(),
+            Runtime::Dsh {
+                url: fake.url.clone(),
+                token: "t".repeat(40),
+            },
+        ))
+        .unwrap();
+        seed(&h, "alice", 20, &"a".repeat(1800));
+        let owner = json!({
+            "public":{"team":"🟢".repeat(120),"responsibilities":"🟢".repeat(1000),"help_with":"🟢".repeat(1000),"request_requirements":"🟢".repeat(1000)},
+            "private":{"work_context":"🟢".repeat(2000),"response_preferences":"🟢".repeat(1000)}
+        });
+        let history =
+            prepare_with_extra(&h, "alice", &input(), &profile(), None, None, Some(&owner))
+                .await
+                .unwrap();
+        assert!(fits(&history, &input(), &profile(), None, Some(&owner)));
+        let calls = fake.calls.lock().unwrap();
+        assert!(
+            !calls.is_empty(),
+            "owner context should trigger compaction before dispatch"
+        );
+        for call in calls.iter() {
+            assert_eq!(call["kind"], "context_summary");
+            assert!(call.get("profile_context").is_none());
+            assert!(!call.to_string().contains('🟢'));
+        }
     }
 
     #[tokio::test]

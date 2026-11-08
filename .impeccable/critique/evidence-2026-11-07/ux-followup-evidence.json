@@ -1,0 +1,15 @@
+{
+  "roleReopened": "我的管家",
+  "dialogs": [],
+  "ctaStyle": {
+    "background": "rgba(0, 0, 0, 0)",
+    "color": "rgb(110, 110, 118)",
+    "fontSize": "13px"
+  },
+  "deliveryEditorOpened": 0,
+  "sync": {
+    "text": "暂时无法同步，保留上次快照；将自动重试，也可手动刷新。",
+    "visible": false
+  },
+  "errors": []
+}

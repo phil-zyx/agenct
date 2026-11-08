@@ -1,6 +1,23 @@
+// Private-network HTTP does not expose randomUUID, but getRandomValues remains
+// available. Keep request IDs cryptographically random in the local deployment.
+if (typeof crypto.randomUUID !== 'function') {
+  crypto.randomUUID = () => {
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  };
+}
+const DEV_AUTH_KEY = 'agenct.dev-auth.v1';
+function savedDevToken() { try { return sessionStorage.getItem(DEV_AUTH_KEY) || ''; } catch { return ''; } }
+function rememberDevToken(value) {
+  try { if (value) sessionStorage.setItem(DEV_AUTH_KEY, value); else sessionStorage.removeItem(DEV_AUTH_KEY); } catch { /* Login still works when storage is unavailable. */ }
+}
 let token = '', user = '', epoch = 0, refreshVersion = 0;
 let browserMode = null, csrfToken = '', logoutPending = false;
 let controller = new AbortController(), pendingSend = null, pendingTurn = null;
+let displayedMessages = [];
 let turnStorageAvailable = true;
 let selectedAgent = null, roleGeneration = 0, roleRead = null, roleButtons = [];
 let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
@@ -46,12 +63,22 @@ async function api(context, path, method = 'GET', body) {
     headers,
     body: body ? JSON.stringify(body) : undefined
   });
-  const data = await response.json();
+  let data;
+  try { data = await response.json(); }
+  catch {
+    if (!current(context)) throw Error('身份已变更，请重新操作');
+    const error = Error(response.status === 404
+      ? '服务端未提供此接口，请更新并重启本地服务'
+      : response.ok ? '服务端返回了空响应或无效数据，请重试'
+        : '请求失败（HTTP ' + response.status + '），请重试');
+    error.httpStatus = response.status;
+    throw error;
+  }
   if (!current(context)) throw Error('身份已变更，请重新操作');
   if (!response.ok) {
-    const error = Error(data.error || response.status);
+    const error = Error(data?.error || response.status);
     error.httpStatus = response.status;
-    error.code = data.code;
+    error.code = data?.code;
     throw error;
   }
   return data;
@@ -93,7 +120,7 @@ const TASK_STATUS = {
   completed: ['已完成', 'done'], canceled: ['已取消', 'muted']
 };
 const PROPOSAL_STATUS = { pending: ['待你确认', 'review'], confirmed: ['已确认', 'done'], rejected: ['已拒绝', 'muted'] };
-const MESSAGE_STATUS = { pending: '发送中…', failed: '未发送成功', interrupted: '已中断', uncertain: '未确认' };
+const MESSAGE_STATUS = { pending: '发送中…', failed: '这次没有取得回复，可以重新提问', interrupted: '已中断', uncertain: '未确认' };
 const ACTION_STYLE = { confirm: 'primary', accept: 'primary', deliver: 'primary', approve: 'primary', cancel: 'danger' };
 function badge(table, value) {
   const [label, tone] = table[value] || [value, 'muted'];
@@ -107,13 +134,34 @@ const timelineUI = createTaskTimelineUI({ api, current, article, conversation: t
 
 const draftUI = createDraftUI({ api, current, article, conversation: taskPane });
 
-const profileUI = createProfileUI({ api, current, article, conversation: () => $('conversation'), status,
+const profileUI = createProfileUI({ api, current, article, host: () => $('profile-view'), status,
+  onVisibility: open => {
+    if (open) { closeContacts(); collaborationProfileUI.close(); }
+    $('room').classList[open ? 'add' : 'remove']('settings-open');
+    $('profile-view').classList[open ? 'remove' : 'add']('hide');
+    $('open-agents').classList[open ? 'add' : 'remove']('active');
+    $('open-chat').classList.add('active');
+    $('open-agents').setAttribute('aria-expanded', String(open));
+    $('toggle-tasks').setAttribute('aria-pressed', String(!open && $('room').classList.contains('tasks-open')));
+    $('open-chat').setAttribute('aria-current', 'page');
+  },
   onSaved: revision => {
     if (selectedAgent && selectedAgent.revision !== revision) selectedAgent.invalidated = true;
     closeRolePicker();
     renderRoleSelection();
   }
 });
+
+const collaborationProfileUI = createCollaborationProfileUI({ api: (context, ...args) => contactApi(context, ...args), current, host: () => $('collaboration-profile-view'), status, onEdit: () => editPersonalInfo(),
+  onVisibilityChange: open => {
+    if (open) { closeContacts(); profileUI.reset(); }
+    $('room').classList[open ? 'add' : 'remove']('collaboration-settings-open');
+    $('collaboration-profile-view').classList[open ? 'remove' : 'add']('hide');
+    $('open-collaboration').classList[open ? 'add' : 'remove']('active');
+    $('open-collaboration').setAttribute('aria-expanded', String(open));
+  }
+});
+$('open-collaboration').onclick = () => collaborationProfileUI.open(session());
 
 const validAgentBinding = agent => agent && typeof agent.id === 'string'
   && /^[A-Za-z0-9_-]{1,32}$/.test(agent.id)
@@ -138,7 +186,7 @@ function renderRoleSelection() {
         : agent.invalidated ? '\n所选配置已变更，选择已失效。请重新选择或明确恢复默认管家。'
           : '\n仅用于下一条普通聊天。')
     : pendingTurn ? '发送角色待原始回执核对，不能重新选择或自动重发。'
-      : '下一条普通聊天默认使用你的管家。';
+      : '提问时，默认由管家回复。';
 }
 $('choose-role').onclick = async () => {
   const context = session();
@@ -255,6 +303,7 @@ function addDiscussion(element, context, task) {
     if (!visible || taskSignature(visible) !== taskSignature(task)) return;
     selectedTask = { ...visible, invalidated: false };
     renderTaskContext();
+    closeContacts(); closePeerConversation();
     returnToChatOnNarrowScreen();
     $('text').focus?.();
     status('已选择任务，下一条消息会附带它。');
@@ -272,6 +321,7 @@ $('clear-task-context').onclick = () => {
 
 // Only a recovery receipt is kept for this tab. Never persist credentials or chat text.
 function forgetTurn() {
+  snapshot = '';
   pendingTurn = null;
   try { sessionStorage.removeItem(TURN_STORAGE_KEY); } catch { turnStorageAvailable = false; }
   renderTurn();
@@ -303,6 +353,15 @@ function restoreTurn(context) {
 }
 
 function renderTurn() {
+  const outgoing = $('outgoing-message');
+  outgoing.replaceChildren();
+  outgoing.classList[pendingTurn?.text ? 'remove' : 'add']('hide');
+  if (pendingTurn?.text) {
+    const bubble = el('article', 'msg msg-user');
+    bubble.append(el('div', 'msg-body', pendingTurn.text));
+    bubble.append(el('div', 'msg-status', pendingTurn.status === 'sending' ? '发送中…' : '等待确认发送结果'));
+    outgoing.append(bubble);
+  }
   const waiting = !!pendingTurn;
   $('turn-recovery').classList[waiting ? 'remove' : 'add']('hide');
   // A normal in-flight send is not a problem to resolve: show a typing bubble and
@@ -330,6 +389,27 @@ function renderTurn() {
   renderRepositorySelection();
 }
 
+const CHAT_FAILURE_CODES = new Set(['runtime_failed', 'runtime_timeout', 'invalid_turn', 'busy',
+  'provider_not_configured', 'sdk_version_mismatch', 'sdk_unavailable', 'model_protocol_error', 'runtime_incomplete']);
+async function failTurn(context, failure) {
+  if (!pendingTurn || !failure || !CHAT_FAILURE_CODES.has(failure.code) || typeof failure.message !== 'string') {
+    throw Error('失败回执无效，保留发送记录供核对');
+  }
+  const turn = pendingTurn;
+  // A confirmed server failure is terminal. Never repeat the provider call by
+  // polling, and never discard text the user typed while waiting.
+  if (!$('text').value.trim() && turn.text) $('text').value = turn.text;
+  if (turn.selectedTask) selectedTask = { ...turn.selectedTask, invalidated: true };
+  if (turn.selectedAgent) selectedAgent = { ...turn.selectedAgent, invalidated: true };
+  selectedRepository = turn.selectedRepository || null;
+  forgetTurn();
+  try { await refresh(context); } catch { /* The error notice remains usable offline. */ }
+  if (current(context)) {
+    status(failure.message.replace(/[。.!！]+$/, '') + '。可以修改问题后再发送。' + (turn.selectedTask || turn.selectedAgent ? '原任务或角色需重新选择。' : ''));
+    $('text').focus?.();
+  }
+}
+
 async function completeTurn(context, response) {
   const { text, selectedTask: expectedTask, selectedAgent: expectedAgent } = pendingTurn;
   if (!repositoryReceiptMatches(pendingTurn.selectedRepository, response.repository_context)) throw Error('仓库回执与本次选择不符，保留恢复凭据');
@@ -352,7 +432,6 @@ async function completeTurn(context, response) {
       + (task.details_truncated ? '共享材料已截断。' : '')
     : '';
   forgetTurn();
-  if (text !== null && $('text').value.trim() === text) $('text').value = '';
   status('已核实消息处理完成。' + receiptContext + receiptRole);
   try { await refresh(context); }
   catch (error) {
@@ -362,15 +441,23 @@ async function completeTurn(context, response) {
 }
 
 function resetIdentity({ preserveRecovery = false } = {}) {
+  collaborationProfileUI.reset({ discard: true });
+  clearPeerSession();
+  resetProfileSuggestions();
+  closeContacts();
+  clearContactDrafts();
+  setSyncError(false);
+  if (!preserveRecovery) { rememberDevToken(''); try { sessionStorage.removeItem('agenct.invitation'); } catch { /* unavailable */ } }
   clearTimeout(pollTimer);
   pollTimer = null;
   refreshFlight = null;
   snapshot = '';
+  displayedMessages = [];
   renderedBusy = '';
   pollDelay = POLL_INTERVAL;
   $('last-refresh').textContent = '';
   $('sync-notice').textContent = '';
-  profileUI.reset();
+  profileUI.reset({ discard: true });
   workerUI.reset();
   draftUI.reset({ preserveRecovery });
   timelineUI.reset();
@@ -411,7 +498,6 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('text').value = '';
   $('open-agents').disabled = false;
   $('send').disabled = false;
-  $('onboarding').classList.add('hide');
   $('room').classList.add('hide');
   $('login').classList.remove('hide');
 }
@@ -432,12 +518,14 @@ async function poll(context) {
   } catch (error) {
     if (!current(context)) return;
     if (error.httpStatus === 401) {
+      rememberDevToken('');
       resetIdentity({ preserveRecovery: true });
       status(browserMode ? '登录已失效，请重新登录。' : '登录已失效，请重新输入访问令牌。');
       return;
     }
     pollDelay = Math.min(pollDelay * 2, MAX_POLL_DELAY);
-    $('last-refresh').textContent = '暂时无法同步，保留上次快照；将自动重试，也可手动刷新。';
+    $('last-refresh').textContent = '暂时无法同步，当前仍显示上次更新的内容。系统会自动重试，你也可以手动刷新。';
+    setSyncError(true);
   } finally {
     if (current(context)) schedulePoll(context);
   }
@@ -449,6 +537,11 @@ document.addEventListener('visibilitychange', () => {
   if (current(session()) && user) void poll(session());
 });
 
+function setSyncError(failed) {
+  $('sync-error').classList[failed ? 'remove' : 'add']('hide');
+  $('room').classList[failed ? 'add' : 'remove']('has-sync-error');
+  $('sync-error-text').textContent = failed ? '暂时无法同步，显示的仍是上次更新的内容。正在自动重试。' : '';
+}
 function refresh(context = session(), force = true) {
   if (!current(context)) return Promise.resolve();
   if (refreshFlight && refreshFlight.epoch === context.epoch) {
@@ -475,14 +568,15 @@ async function readSnapshot(context) {
   const abort = () => reads.abort();
   context.signal.addEventListener('abort', abort, { once: true });
   const timeout = setTimeout(abort, READ_TIMEOUT);
-  let messages, proposals, tasks, activity;
+  let messages, proposals, tasks, activity, profileSuggestions;
   try {
-    [messages, proposals, tasks, activity] = await Promise.all([
+    [messages, proposals, tasks, activity, profileSuggestions] = await Promise.all([
       api({ ...context, signal: reads.signal }, 'messages'),
       api({ ...context, signal: reads.signal }, 'proposals'),
       api({ ...context, signal: reads.signal }, 'tasks'),
       // Index is derived and optional: a failure must not block the conversation.
-      api({ ...context, signal: reads.signal }, 'activity').catch(() => null)
+      api({ ...context, signal: reads.signal }, 'activity').catch(() => null),
+      api({ ...context, signal: reads.signal }, 'profile-suggestions')
     ]);
   } finally {
     clearTimeout(timeout);
@@ -490,6 +584,7 @@ async function readSnapshot(context) {
     reads.abort();
   }
   if (!current(context) || version !== refreshVersion) return;
+  void refreshPeerContacts(context);
   workerUI.update(context, tasks);
   draftUI.update(context, tasks);
   timelineUI.update(context, tasks);
@@ -497,8 +592,9 @@ async function readSnapshot(context) {
   updateNotifications(context, tasks);
   if (!Array.isArray(activity)) activity = lastActivity;
   lastActivity = activity;
-  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity, proposals.filter(isOldProposal).map(p => p.id)]);
+  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity, profileSuggestions, proposals.filter(isOldProposal).map(p => p.id)]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
+  setSyncError(false);
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
   $('last-refresh').textContent = (changed ? '有新的更新 · ' : '')
     + '已同步 ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -514,9 +610,13 @@ async function readSnapshot(context) {
   const stream = $('conversation');
   const scroller = $('scroller');
   const stick = !(scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight > 160);
-  const entries = renderConversation(context, messages, proposals);
+  // Keep the pre-send history until the receipt resolves: polling may already
+  // contain this user message, while the local sending bubble is still visible.
+  displayedMessages = pendingTurn?.history || messages;
+  const entries = renderConversation(context, displayedMessages, proposals);
+  entries.push(...renderProfileSuggestions(context, profileSuggestions));
   const { taskCards, slots } = renderTaskCards(context, tasks);
-  profileUI.append(entries);
+
   // Open panels (draft / timeline / queue) live inside the card they were opened
   // from; if that card is gone they fall back to the end of the list.
   const panels = [];
@@ -546,21 +646,46 @@ async function enterRoom(context) {
   if (context.browserMode && me.user !== context.user) throw Error('登录身份已变更，请重新加载页面');
   user = me.user;
   context.user = user;
+  if (!context.browserMode) rememberDevToken(context.token);
   restoreTurn(context);
   const mode = me.runtime === 'dsh' ? '真实模型' : me.runtime === 'mock' ? '离线演示' : '服务模式 ' + me.runtime;
-  $('identity').replaceChildren(el('b', null, `${user} 的管家`), el('span', 'muted', ` · ${mode}`), el('span', 'sr-only', ' · 已验证身份'));
+  $('identity').replaceChildren(el('b', null, `${me.member?.display_name || user} 的管家`), el('span', 'muted', ` · ${mode}`), el('span', 'sr-only', ' · 已验证身份'));
   $('login').classList.add('hide');
   $('room').classList.remove('hide');
   await refresh(context);
   if (current(context) && pendingTurn) await $('check-turn').onclick();
-  if (current(context)) { schedulePoll(context); showOnboarding(context); }
+  if (current(context)) schedulePoll(context);
 }
 
+function pendingInvitation() {
+  try {
+    const match = /^#invite=([a-f0-9]{64})$/.exec(window.location.hash || '');
+    if (match) { sessionStorage.setItem('agenct.invitation', match[1]); window.history?.replaceState(null, '', window.location.pathname); }
+    return sessionStorage.getItem('agenct.invitation');
+  } catch { return null; }
+}
+// A failed GitLab/OIDC callback returns here with a coarse reason; show it once.
+const LOGIN_ERRORS = {
+  expired: '登录已过期（超过 5 分钟，或服务在登录过程中重启了）。请重新点击登录。',
+  provider: '服务器暂时连不上 GitLab，登录没有完成。请稍后重试；一直失败请让管理员检查服务器到 GitLab 的网络或代理。',
+  account: '这个 GitLab 账号未启用，或没有使用本系统的权限。',
+  failed: '登录没有完成，请重试。'
+};
+const loginError = (() => {
+  try {
+    const params = new URLSearchParams(location.search), reason = params.get('login_error');
+    if (reason) history.replaceState?.(null, '', location.pathname);
+    return reason;
+  } catch { return null; }
+})();
+
 async function checkSession() {
+  pendingInvitation();
   resetIdentity({ preserveRecovery: true });
   const checkEpoch = epoch;
   browserMode = null;
   $('dev-login').classList.add('hide');
+  $('switch-account').classList.add('hide');
   $('oidc-login').classList.add('hide');
   $('auth-retry').classList.add('hide');
   status('正在检查登录状态…');
@@ -574,19 +699,34 @@ async function checkSession() {
     if (epoch !== checkEpoch) return;
     if (typeof data.enabled !== 'boolean') throw Error('登录配置响应无效');
     browserMode = data.enabled;
+    $('dev-login-hint').classList[browserMode ? 'add' : 'remove']('hide');
     clearTimeout(timeout);
     status('');
     if (!browserMode) {
-      $('dev-login').classList.remove('hide');
+      const saved = savedDevToken();
+      if (saved) await loginWithDevToken(saved);
+      if (browserMode === false) $('dev-login').classList.remove('hide');
       return;
     }
+    rememberDevToken('');
     $('oidc-login').classList.remove('hide');
+    if (!data.authenticated && loginError) status(LOGIN_ERRORS[loginError] || LOGIN_ERRORS.failed);
     if (data.authenticated) {
       if (typeof data.user !== 'string' || !data.user || typeof data.csrf_token !== 'string' || !data.csrf_token) {
         throw Error('登录会话响应无效');
       }
       user = data.user;
       csrfToken = data.csrf_token;
+      $('switch-account').classList.remove('hide');
+      const invitation = pendingInvitation();
+      if (invitation) {
+        await api(session(), 'invitations/accept', 'POST', { token: invitation });
+        try { sessionStorage.removeItem('agenct.invitation'); } catch { /* unavailable */ }
+      } else if (data.member_status && data.member_status !== 'active') {
+        $('oidc-login').classList.add('hide');
+        status(data.member_status === 'invited' ? '请使用管理员提供的邀请链接加入。' : '账号已停用，请联系管理员。');
+        return;
+      }
       await enterRoom(session());
     }
     // An expired/unknown login does not establish a different receipt owner.
@@ -600,14 +740,14 @@ async function checkSession() {
   }
 }
 
+$('switch-account').onclick = () => $('logout').onclick();
 $('auth-retry').onclick = () => { if (!logoutPending) return checkSession(); };
 $('oidc-login').onclick = () => {
   if (browserMode === true && !logoutPending) window.location.assign('/auth/login');
 };
-$('enter').onclick = async () => {
+async function loginWithDevToken(enteredToken) {
   if (browserMode !== false) return;
-  const enteredToken = $('token').value;
-  $('token').value = '';
+  rememberDevToken('');
   resetIdentity({ preserveRecovery: true });
   token = enteredToken;
   const context = session();
@@ -616,9 +756,15 @@ $('enter').onclick = async () => {
     await enterRoom(context);
   } catch (error) {
     if (context.epoch !== epoch) return;
+    rememberDevToken('');
     resetIdentity({ preserveRecovery: true });
     status(error.message);
   }
+}
+$('enter').onclick = async () => {
+  const enteredToken = $('token').value;
+  $('token').value = '';
+  await loginWithDevToken(enteredToken);
 };
 $('logout').onclick = async () => {
   if (logoutPending) return;
@@ -655,7 +801,11 @@ $('logout').onclick = async () => {
 $('refresh').onclick = async () => {
   const context = session();
   try { await refresh(context); }
-  catch (error) { if (current(context)) status(error.message); }
+  catch (error) { if (current(context)) setSyncError(true); }
+};
+$('retry-sync').onclick = async () => {
+  $('retry-sync').disabled = true;
+  try { await $('refresh').onclick(); } finally { $('retry-sync').disabled = false; }
 };
 $('check-turn').onclick = async () => {
   const context = session(), turn = pendingTurn;
@@ -670,12 +820,14 @@ $('check-turn').onclick = async () => {
   try {
     const receipt = await api({ ...context, signal: reads.signal }, 'turns/' + encodeURIComponent(turn.id));
     if (!current(context) || pendingTurn !== turn) return;
-    if (receipt.request_id !== turn.id || !['complete', 'pending', 'uncertain'].includes(receipt.status)
+    if (receipt.request_id !== turn.id || !['complete', 'pending', 'uncertain', 'failed'].includes(receipt.status)
         || (receipt.status === 'complete' && (!receipt.response || typeof receipt.response !== 'object'))) {
       throw Error('发送状态响应无效');
     }
     if (receipt.status === 'complete') {
       await completeTurn(context, receipt.response);
+    } else if (receipt.status === 'failed') {
+      await failTurn(context, receipt.failure);
     } else {
       turn.status = receipt.status;
       status(receipt.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。稍后可再次核对，未重发消息。' : '服务端无法确认上次处理结果。未重发消息。');
@@ -702,6 +854,7 @@ $('new-turn').onclick = () => {
   if (!current(context) || !turn || busy.has('send') || busy.has('turn-check')) return;
   if (!confirm('上一次发送的结果仍未知，消息可能已经处理。开始新尝试后再次发送可能重复处理。是否放弃此恢复凭据并开始新尝试？')) return;
   if (!current(context) || pendingTurn !== turn) return;
+  if (!$('text').value && turn.text) $('text').value = turn.text;
   forgetTurn();
   status('已开始新尝试。请核对输入内容，如需角色或任务上下文请重新选择，再点击发送；将使用新的请求编号。上次操作不会被撤销。');
 };
@@ -754,11 +907,13 @@ $('form').onsubmit = async event => {
       }
       const message = repositoryChatMessage(text, selectedRepository);
       closeRepositoryPicker();
-      chatTurn = { text, message, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent, selectedRepository };
+      chatTurn = { text, message, history: displayedMessages, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent, selectedRepository };
       selectedRepository = null;
       selectedAgent = null;
       selectedTask = null;
       pendingTurn = chatTurn;
+      $('text').value = '';
+      if ($('text').style) $('text').style.height = 'auto';
       rememberTurn(context);
       renderTurn();
       const response = await postChat(context, { message: chatTurn.message, request_id: chatTurn.id,
@@ -770,11 +925,13 @@ $('form').onsubmit = async event => {
       });
       if (!current(context) || pendingTurn !== chatTurn) return;
       const receipt = response.turn;
-      if (!receipt || receipt.request_id !== chatTurn.id || !['complete', 'pending', 'uncertain'].includes(receipt.status)) {
+      if (!receipt || receipt.request_id !== chatTurn.id || !['complete', 'pending', 'uncertain', 'failed'].includes(receipt.status)) {
         throw Error('发送状态响应无效');
       }
       if (receipt.status === 'complete') {
         await completeTurn(context, response);
+      } else if (receipt.status === 'failed') {
+        await failTurn(context, response.failure);
       } else {
         chatTurn.status = receipt.status;
         status('尚未确认消息处理完成。请核对发送状态；不会自动重发。');
@@ -790,6 +947,7 @@ $('form').onsubmit = async event => {
         && ((error.httpStatus === 409 && error.code === 'selected_agent_stale_before_dispatch')
           || (error.httpStatus === 400 && error.code === 'selected_agent_unavailable_before_dispatch'));
       if (rejectedAgent || rejectedSelection) {
+        if (!$('text').value) $('text').value = chatTurn.text;
         selectedRepository = chatTurn.selectedRepository;
         selectedAgent = chatTurn.selectedAgent ? { ...chatTurn.selectedAgent,
           invalidated: rejectedAgent || chatTurn.selectedAgent.invalidated } : null;

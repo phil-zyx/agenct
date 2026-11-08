@@ -35,8 +35,26 @@ impl Directory {
         })
     }
 
+    pub(crate) fn gitlab_workspace(ids: Vec<String>) -> Self {
+        Self {
+            members: RwLock::new(ids.into_iter().collect()),
+            tenants: None,
+        }
+    }
+    pub(crate) fn add_gitlab_user(&self, id: String) {
+        self.members.write().expect("directory lock").insert(id);
+    }
     pub(crate) fn contains(&self, id: &str) -> bool {
         self.members.read().expect("directory lock").contains(id)
+    }
+
+    pub(crate) fn contacts(&self, requester: &str) -> Vec<String> {
+        let mut contacts: Vec<_> = self
+            .ids()
+            .filter(|id| self.can_delegate(requester, id))
+            .collect();
+        contacts.sort();
+        contacts
     }
 
     pub(crate) fn can_delegate(&self, requester: &str, owner: &str) -> bool {
@@ -96,6 +114,22 @@ impl Directory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contacts_exclude_self_unknown_users_and_other_tenants() {
+        let directory = Directory::new(["alice", "bob", "carol"].map(String::from))
+            .unwrap()
+            .with_tenants(
+                [("alice", "one"), ("bob", "one"), ("carol", "two")]
+                    .into_iter()
+                    .map(|(id, tenant)| (id.into(), tenant.into()))
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(directory.contacts("alice"), vec!["bob"]);
+        assert!(directory.contacts("carol").is_empty());
+        assert!(directory.contacts("unknown").is_empty());
+    }
 
     #[test]
     fn delegation_requires_two_distinct_configured_members() {

@@ -1,0 +1,12 @@
+[
+  {
+    "antipattern": "pulsing-dot",
+    "name": "Pulsing status dot",
+    "description": "Small pulsing status dots simulate liveness decoratively. Reserve pulse animation for indicators tied to genuinely live, changing data; a static indicator with clear labeling is honest and calmer.",
+    "severity": "warning",
+    "category": "slop",
+    "file": "/home/lee/projects/qivators/agenct/hub/web/index.html",
+    "line": 0,
+    "snippet": ".typing span — 8x8px dot with infinite \"typing\" animation"
+  }
+]

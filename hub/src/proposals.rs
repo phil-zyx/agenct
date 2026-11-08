@@ -42,7 +42,7 @@ fn save_proposal(
     request_id: Option<&str>,
     source: &str,
 ) -> Result<Proposal> {
-    if !h.directory.can_delegate(requester, owner) {
+    if !h.directory.can_delegate(requester, owner) || !h.member_active(owner)? {
         return Err(invalid("select another configured participant"));
     }
     if summary.trim().is_empty() || summary.len() > 4000 {
@@ -202,7 +202,8 @@ pub(super) async fn proposal_action(
             status: &p.status,
             revision: p.revision,
             expected_revision: a.expected_revision,
-            recipient_available: h.directory.can_delegate(&user, owner),
+            recipient_available: h.directory.can_delegate(&user, owner) && tx.query_row(
+                "SELECT COALESCE((SELECT status='active' FROM member_profiles WHERE owner=?1),1)", [owner], |row| row.get::<_, bool>(0))?,
         },
     )
     .map_err(Error::from)?
