@@ -261,12 +261,16 @@ class BridgeSmoke:
         check(len(self.calls()) == count, "unexpected extra runner dispatch")
 
     def dispatch(self, owner, payload, expected_route, *, failure=False):
+        # failure: False, "failed" (adapter explicitly reported runtime_failed: a
+        # durable failed receipt, HTTP 200) or "uncertain" (malformed output: 502).
         before = len(self.calls())
-        result = self.api(owner, "/api/messages", payload, status=502 if failure else 200)
+        result = self.api(owner, "/api/messages", payload, status=502 if failure == "uncertain" else 200)
         calls = self.calls()
         check(len(calls) == before + 1, "turn must dispatch exactly once")
         turn = calls[-1]
-        check(set(turn) == {"session_id", "history", "message", "runtime_profile"},
+        # profile_context: the caller's own editable profile snapshot and pending
+        # suggestion (collaboration); never another person's data.
+        check(set(turn) == {"session_id", "history", "message", "runtime_profile", "profile_context"},
               "Hub forwarded unexpected fields to adapter")
         check(turn["message"] == payload["message"], "wrong message crossed HTTP boundary")
         check(turn["history"] == self.histories[owner], "history is not completed-only owner history")
@@ -281,6 +285,10 @@ class BridgeSmoke:
         encoded = json.dumps(turn)
         check(all(token not in encoded for token in [self.adapter_token, *self.tokens.values()]),
               "a credential entered the adapter payload")
+        if failure == "failed":
+            check(result == {"reply": None, "turn": {"request_id": payload["request_id"], "status": "failed"},
+                             "failure": {"code": "runtime_failed", "message": "这次没有取得回复，可重新提问。"}},
+                  "explicit adapter failure did not produce a failed receipt")
         if not failure:
             check(result["backend"] == "dsh" and result["runtime_profile"] == expected_route,
                   "Hub changed the adapter response route or fell back to mock")
@@ -298,6 +306,23 @@ class BridgeSmoke:
         check(result.get("code") == code, "selection failure lost its pre-dispatch error code")
         self.api(owner, "/api/turns/" + payload["request_id"], status=404)
         self.unchanged(before)
+
+    def failed(self, payload):
+        key = payload["request_id"]
+        before = len(self.calls())
+        failure = {"code": "runtime_failed", "message": "这次没有取得回复，可重新提问。"}
+        receipt = self.api("alice", "/api/turns/" + key)
+        check(receipt == {"request_id": key, "status": "failed", "response": None, "failure": failure},
+              "explicit failure lost its durable failed receipt")
+        replay = self.api("alice", "/api/messages", payload)
+        check(replay == {"reply": None, "turn": {"request_id": key, "status": "failed"}, "failure": failure},
+              "failed turn was redispatched or replayed as an answer")
+        self.api("bob", "/api/turns/" + key, status=404)
+        self.unchanged(before)
+
+    def settled(self, payload):
+        (self.failed if payload["outcome"] == "failed" else self.uncertain)(
+            {k: v for k, v in payload.items() if k != "outcome"})
 
     def uncertain(self, payload):
         key = payload["request_id"]
@@ -320,7 +345,7 @@ class BridgeSmoke:
             check(all(isinstance(m.get("created_at"), str) for m in messages), "message timestamps missing")
             uncertain = [{k: m[k] for k in ("role", "content", "status")}
                          for m in messages if m["status"] != "complete"]
-            expected = [{"role": "user", "content": p["message"], "status": "uncertain"}
+            expected = [{"role": "user", "content": p["message"], "status": p["outcome"]}
                         for p in failures] if owner == "alice" else []
             check(uncertain == expected, "failed turn message status or owner isolation changed")
 
@@ -393,11 +418,14 @@ class BridgeSmoke:
         }, "recipient saw more than the confirmed shared task")
         self.unchanged(before)
 
-        failures = [{"request_id": "failure", "message": FAILURE_MESSAGE},
-                    {"request_id": "malformed", "message": MALFORMED_MESSAGE}]
+        # An explicit runtime failure is a durable "failed" outcome (retry is the
+        # user's choice); malformed output stays an unknown, uncertain outcome.
+        failures = [{"request_id": "failure", "message": FAILURE_MESSAGE, "outcome": "failed"},
+                    {"request_id": "malformed", "message": MALFORMED_MESSAGE, "outcome": "uncertain"}]
         for payload in failures:
-            self.dispatch("alice", payload, route(2), failure=True)
-            self.uncertain(payload)
+            sent = {k: v for k, v in payload.items() if k != "outcome"}
+            self.dispatch("alice", sent, route(2), failure=payload["outcome"])
+            self.settled(payload)
         check(self.api("bob", "/api/tasks") == tasks, "failed output created a task")
         check(self.api("alice", "/api/proposals") == [confirmed], "failed output created a proposal")
         self.check_messages(failures)
@@ -408,7 +436,7 @@ class BridgeSmoke:
         check(self.api("alice", "/api/messages", selected) == selected_response,
               "restart rerouted a completed selected-role receipt")
         for payload in failures:
-            self.uncertain(payload)
+            self.settled(payload)
         check(self.api("alice", "/api/profile")["revision"] == 2, "restart lost profile revision")
         check(self.api("bob", "/api/tasks") == tasks, "restart changed confirmed task")
         check(self.api("alice", "/api/proposals") == [confirmed], "restart changed proposal")
