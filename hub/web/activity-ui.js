@@ -77,12 +77,23 @@ function renderActivity(context, items) {
         if (!current(context)) return;
         if (item.kind === 'task') {
           setPaneTab('tasks');
-          panelTask = item.id;
-          flash([...$('tasks').children].find(card => card.taskId === item.id));
+          revealTask(item.id);
         } else {
           closeContacts(); closePeerConversation();
           returnToChatOnNarrowScreen();
-          flash([...$('conversation').children].find(card => card.proposalId === item.id));
+          // Old pending proposals live in a collapsed group, not at stream root.
+          const reveal = node => {
+            if (node.proposalId === item.id) return node;
+            for (const child of node.children) {
+              const target = reveal(child);
+              if (target) {
+                if (node.tagName?.toLowerCase() === 'details') node.open = true;
+                return target;
+              }
+            }
+          };
+          const target = reveal($('conversation'));
+          if (target) { target.tabIndex = -1; target.focus?.(); flash(target); }
         }
       };
       nodes.push(row);
