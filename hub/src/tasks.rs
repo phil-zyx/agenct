@@ -215,10 +215,15 @@ pub(super) async fn action(
     }
     // Task revision changes revoke queued work and lease capabilities atomically.
     worker::revoke_task(&tx, &id)?;
+    let auto_prepare = h.auto_draft
+        && next == "working"
+        && crate::collaboration::read(&tx, &t.owner)?
+            .permissions
+            .auto_prepare_drafts;
     tx.commit()?;
     drop(db);
     let mut out = serde_json::json!({"id":id,"status":next,"revision":t.revision+1});
-    if h.auto_draft && next == "working" {
+    if auto_prepare {
         out["auto_draft"] = serde_json::json!({
             "request_id": crate::drafts::auto_request_id(&id, t.revision + 1)
         });

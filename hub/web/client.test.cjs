@@ -43,6 +43,8 @@ function fixture(auth = { enabled: false }, settings = {}) {
   let confirmation = false;
   const confirmations = [];
   const storage = settings.storage || new Map();
+  const authStorage = settings.authStorage || new Map();
+  const storageFor = key => key === 'agenct.dev-auth.v1' ? authStorage : storage;
   const timers = new Map();
   const listeners = new Map();
   let timerId = 0;
@@ -69,9 +71,9 @@ function fixture(auth = { enabled: false }, settings = {}) {
     prompt: (label, value) => settings.prompt ? settings.prompt(label, value) : '',
     confirm: text => { confirmations.push(text); return confirmation; },
     sessionStorage: {
-      getItem: key => { if (settings.storageFailure) throw Error('Storage unavailable'); return storage.get(key) || null; },
-      setItem: (key, value) => { if (settings.storageFailure) throw Error('Storage unavailable'); storage.set(key, value); },
-      removeItem: key => { if (settings.storageFailure) throw Error('Storage unavailable'); storage.delete(key); }
+      getItem: key => { if (settings.storageFailure) throw Error('Storage unavailable'); return storageFor(key).get(key) || null; },
+      setItem: (key, value) => { if (settings.storageFailure) throw Error('Storage unavailable'); storageFor(key).set(key, value); },
+      removeItem: key => { if (settings.storageFailure) throw Error('Storage unavailable'); storageFor(key).delete(key); }
     },
     localStorage: { getItem: key => settings.preferences?.get(key) || null, setItem: (key, value) => settings.preferences?.set(key, value) },
     window: { location: { assign: url => calls.push({ redirect: url }) } },
@@ -166,11 +168,12 @@ function fixture(auth = { enabled: false }, settings = {}) {
     }
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'profiles-ui.js'), 'utf8'), context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, 'collaboration-profile-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'worker-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'draft-ui.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-model.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-ui.js'), 'utf8'), context);
-  for (const name of ['activity-ui.js', 'chat-ui.js', 'task-ui.js', 'repo-ui.js', 'client.js', 'task-chat.js', 'client-chrome.js']) vm.runInContext(fs.readFileSync(path.join(__dirname, name), 'utf8'), context);
+  for (const name of ['activity-ui.js', 'chat-ui.js', 'profile-suggestions-ui.js', 'task-ui.js', 'repo-ui.js', 'client.js', 'task-chat.js', 'account-ui.js', 'contacts-ui.js', 'client-chrome.js']) vm.runInContext(fs.readFileSync(path.join(__dirname, name), 'utf8'), context);
   return {
     $, calls, timers, storage, confirmations, turnContexts, turnProfiles, document,
     key(event) { listeners.get('keydown')?.({ preventDefault() {}, ...event }); },
@@ -240,9 +243,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.match(f.$('task-context-details').textContent, /task-one/);
     f.$('toggle-tasks').onclick(); f.$('open-chat').onclick();
     assert(!f.$('room').classList.contains('tasks-open'));
-    f.$('toggle-tasks').onclick(); f.$('open-help').onclick();
-    assert(!f.$('room').classList.contains('tasks-open'));
-    assert.equal(f.$('help').open, true);
+    f.$('composer-menu-toggle').onclick();
+    assert(!f.$('composer-menu').classList.contains('hide'));
     assert.equal(chatPosts(f).length, 0);
   });
   await test('role shortcut preserves unsent text and task selection without model or mutation', async () => {
@@ -254,7 +256,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(f.$('text').value, 'Unsent private message');
     assert.match(f.$('task-context-details').textContent, /task-one/);
     assert(!f.$('room').classList.contains('tasks-open'));
-    assert.match(f.$('conversation').textContent, /个人角色设置/);
+    assert.match(f.$('profile-view').textContent, /个人角色设置/);
+    assert.doesNotMatch(f.$('conversation').textContent, /个人角色设置/);
     assert.equal(f.calls.filter(call => call.options?.method === 'POST' || call.options?.method === 'PUT').length, 0);
   });
   await test('desktop discussion keeps optional task dock and role shortcut respects unresolved send', async () => {
@@ -403,16 +406,13 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     await findButton(proposal,'确认共享并委派').onclick();
     assert.equal(JSON.parse(f.calls.find(call=>call.url.endsWith('/actions')).options.body).details, '# 文档\n可共享正文');
   });
-  await test('first-login guide is per user and example selection fills without sending', async () => {
-    const preferences = new Map(); const f = fixture(undefined,{preferences,proposals:[]}); await f.login('alice');
-    assert(!f.$('onboarding').classList.contains('hide')); f.$('onboarding-next').onclick(); assert(f.$('onboarding-step').textContent.startsWith('2 / 3'));
-    f.$('onboarding-next').onclick(); f.$('onboarding-next').onclick(); assert.equal(preferences.get('agenct.onboarding.v1:alice'),'done');
-    await f.login('alice'); assert(f.$('onboarding').classList.contains('hide'));
-    const example = findButton(f.$('conversation'),'帮我梳理今天的工作重点'); assert(example); example.onclick(); assert.equal(f.$('text').value,'帮我梳理今天的工作重点'); assert.equal(chatPosts(f).length,0);
-    await f.login('bob'); assert(!f.$('onboarding').classList.contains('hide'));
+  await test('empty chat examples fill the input without sending', async () => {
+    const f = fixture(undefined,{proposals:[]}); await f.login('alice');
+    const example = findButton(f.$('conversation'),'帮我梳理今天的工作重点'); assert(example);
+    example.onclick(); assert.equal(f.$('text').value,'帮我梳理今天的工作重点'); assert.equal(chatPosts(f).length,0);
   });
   await test('keyboard shortcut toggles drawer and Escape returns focus', async () => {
-    const f = fixture(undefined,{width:400}); await f.login('alice'); f.$('onboarding-skip').onclick();
+    const f = fixture(undefined,{width:400}); await f.login('alice');
     f.key({key:'K',ctrlKey:true,shiftKey:true}); assert(f.$('room').classList.contains('tasks-open')); assert(f.$('tab-activity').focused);
     f.key({key:'Escape'}); assert(!f.$('room').classList.contains('tasks-open')); assert(f.$('toggle-tasks').focused);
     assert.equal(f.calls.filter(call=>call.options.method==='POST').length,0);
@@ -707,12 +707,13 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     await f.login('alice');
     f.hold();
     const poll = f.tick();
-    const count = f.calls.length;
+    const snapshotCalls = () => f.calls.filter(call => ['/api/messages', '/api/proposals', '/api/tasks', '/api/activity', '/api/profile-suggestions'].includes(call.url)).length;
+    const count = snapshotCalls();
     const manual = f.$('refresh').onclick();
-    assert.equal(f.calls.length, count, 'Only one read batch in flight');
+    assert.equal(snapshotCalls(), count, 'Only one read batch in flight');
     f.release();
     await Promise.all([poll, manual]);
-    assert.equal(f.calls.length, count + 4, 'Manual request receives a fresh batch (messages, proposals, tasks, activity) after in-flight read');
+    assert.equal(snapshotCalls(), count + 5, 'Manual request receives a fresh batch (messages, proposals, tasks, activity) after in-flight read');
   });
   await test('stalled read times out and schedules recovery instead of overlapping requests', async () => {
     const f = fixture();
@@ -727,19 +728,30 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.match(f.$('last-refresh').textContent, /无法同步/);
     assert([...f.timers.values()].some(value => value.delay === 6000));
   });
-  await test('profile command stays in single chat and survives refresh without sending to model', async () => {
+  await test('profile command opens separate settings and survives refresh without sending to model', async () => {
     const f = fixture(); await f.login('alice'); await f.send('/agents');
     assert.equal(f.calls.filter(call => call.options.method === 'POST' || call.options.method === 'PUT').length, 0);
-    const panel = f.$('conversation').children.at(-1);
-    assert.match(panel.textContent, /个人角色设置/);
+    const panel = f.$('profile-view').children.at(-1);
+    assert.match(f.$('profile-view').textContent, /个人角色设置/);
     await f.$('refresh').onclick();
-    assert.equal(f.$('conversation').children.at(-1), panel);
+    assert.equal(f.$('profile-view').children.at(-1), panel);
     const controls = panel.children[0];
     f.change(); await f.tick();
-    assert.equal(f.$('conversation').children.at(-1), panel, 'Changed polling snapshot keeps the same profile card');
+    assert.equal(f.$('profile-view').children.at(-1), panel, 'Changed polling snapshot keeps the same profile card');
     assert.equal(panel.children[0], controls, 'Polling preserves in-progress profile fields');
     f.$('logout').onclick(); await f.login('bob');
-    assert(!f.$('conversation').children.includes(panel));
+    assert(!f.$('profile-view').children.includes(panel));
+  });
+  await test('development token survives refresh and logout clears it', async () => {
+    const authStorage = new Map();
+    const f = fixture({ enabled: false }, { authStorage }); await f.login('alice');
+    assert.equal(authStorage.get('agenct.dev-auth.v1'), 'alice');
+    const reloaded = fixture({ enabled: false }, { authStorage }); await reloaded.ready();
+    assert.match(reloaded.$('identity').textContent, /^alice/);
+    assert.equal(reloaded.$('token').value, '');
+    await reloaded.$('logout').onclick(); assert.equal(authStorage.size, 0);
+    const loggedOut = fixture({ enabled: false }, { authStorage }); await loggedOut.ready();
+    assert(!loggedOut.calls.some(call => call.url === '/api/me'));
   });
   await test('browser startup restores cookie session without bearer credentials', async () => {
     const f = fixture({ enabled: true, authenticated: true, user: 'alice', csrf_token: 'csrf-only' });
@@ -847,9 +859,22 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
   await test('first-use guidance keeps direct chat primary and details optional', async () => {
     const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
     assert.match(html, /直接说你想解决的问题，无需先配置角色/);
-    assert.match(html, /aria-describedby="chat-help" placeholder="说说你想解决的问题…"/);
-    assert.match(html, /<details[^>]*><summary>能力边界、委派示例与恢复说明<\/summary>/);
+    assert.match(html, /aria-describedby="chat-help" placeholder="输入问题，或说说你的想法…"/);
+    assert.match(html, /<details[^>]*><summary>使用说明<\/summary>/);
     assert.match(html, /Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行/);
+  });
+  await test('send immediately shows a local bubble, survives polling and preserves the next draft', async () => {
+    const f = fixture(); await f.login('alice'); f.hold();
+    const sending = f.send('question'); await f.ready();
+    assert.equal(f.$('text').value, '');
+    assert.match(f.$('outgoing-message').textContent, /question.*发送中/s);
+    f.unhold(); f.change(); await f.$('refresh').onclick();
+    assert.match(f.$('outgoing-message').textContent, /question/);
+    f.$('text').value = 'question'; // A new draft can even match the sent text.
+    f.release(); await sending;
+    assert.equal(f.$('text').value, 'question');
+    assert.equal(f.$('outgoing-message').children.length, 0);
+    assert.equal(chatPosts(f).length, 1);
   });
   await test('pending and uncertain receipts only use GET until complete', async () => {
     for (const initialStatus of ['pending', 'uncertain']) {
@@ -1452,7 +1477,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
     await f.send('/agents');
     const descendants = element => [element, ...element.children.flatMap(descendants)];
-    const button = text => descendants(f.$('conversation')).find(element => element.textContent === text);
+    const button = text => descendants(f.$('profile-view')).find(element => element.textContent === text);
     await button('检查更改').onclick();
     f.profile(roles(4)); await button('确认保存个人配置').onclick();
     assert(f.calls.some(call => call.url === '/api/profile' && call.options.method === 'PUT'));

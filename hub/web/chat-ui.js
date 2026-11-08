@@ -73,16 +73,16 @@ function addMessageActions(bubble, context, message) {
   delegate.onclick = () => {
     if (!current(context) || messagePanels.has(messageKey)) return;
     const panel = el('section', 'message-delegation'); messagePanels.set(messageKey, panel);
-    const recipient = el('input'); recipient.setAttribute('aria-label', '消息委派接收人'); recipient.placeholder = '接收人账号，例如 bob';
+    const recipient = el('input'); recipient.setAttribute('aria-label', '消息委派接收人'); recipient.placeholder = '接收人账号，可从联系人列表查看';
     const summary = el('textarea'); summary.value = message.content; summary.rows = 4; summary.setAttribute('aria-label', '消息委派摘要');
-    const note = el('p', 'note', '先生成只有你可见的提案；再次确认提案后，才会共享这段摘要。');
+    const note = el('p', 'note', '先整理成提案，只有你能看到。核对并确认后，才会把摘要发给对方。');
     const create = el('button', 'primary', '生成委派提案'); create.type = 'button';
     const cancel = el('button', 'text-btn', '关闭'); cancel.type = 'button';
     let requestId = crypto.randomUUID(), requestValue = null;
     create.onclick = async () => {
       if (!current(context) || create.disabled) return;
       const owner = recipient.value.trim(), text = summary.value.trim();
-      if (!/^[A-Za-z0-9_-]{1,64}$/.test(owner) || !text || new TextEncoder().encode(text).length > 4000) { note.textContent = '请填写接收人和 1–4000 字节的摘要；长消息可手动缩短。'; return; }
+      if (!/^[A-Za-z0-9_-]{1,64}$/.test(owner) || !text || new TextEncoder().encode(text).length > 4000) { note.textContent = '请填写接收人和任务摘要。摘要过长时，请删减后再试。'; return; }
       const value = JSON.stringify([owner, text]); if (requestValue !== value) { requestId = crypto.randomUUID(); requestValue = value; }
       create.disabled = true; cancel.disabled = true;
       try {
@@ -90,7 +90,7 @@ function addMessageActions(bubble, context, message) {
         if (!current(context)) return;
         panel.remove?.(); messagePanels.delete(messageKey);
         status('已生成提案，尚未共享。请核对后确认。'); await refresh(context);
-      } catch (error) { if (current(context)) note.textContent = error.message + '。输入保留，重试沿用同一请求编号。'; }
+      } catch (error) { if (current(context)) note.textContent = error.message + '。已保留你填写的内容，可以重试。'; }
       finally { if (current(context)) { create.disabled = false; cancel.disabled = false; } }
     };
     cancel.onclick = () => { if (create.disabled) return; panel.remove?.(); messagePanels.delete(messageKey); delegate.focus?.(); };
@@ -111,11 +111,11 @@ function addMessageActions(bubble, context, message) {
 
 function renderChatExamples() {
   const box = el('section', 'chat-examples');
-  box.append(el('h2', null, '今天想先解决什么？'), el('p', 'muted', '先聊清楚需求；涉及他人的任务，会先让你确认。'));
-  for (const text of ['帮我梳理今天的工作重点', '请让 bob 帮我 检查这份文档', '帮我把下面的想法整理成行动清单']) {
+  box.append(el('h2', null, '有什么需要帮忙的？'), el('p', 'muted', '直接告诉我就好。需要请同事帮忙时，会先由你确认。'));
+  for (const text of ['帮我梳理今天的工作重点', '帮我检查这份文档', '把我的想法整理成待办事项']) {
     const button = el('button', 'example-prompt', text); button.type = 'button';
     button.onclick = () => {
-      if ($('text').value.trim()) { status('输入框中已有未发送内容，请先处理或清空后再选择示例。'); return; }
+      if ($('text').value.trim()) { status('输入框里还有没发送的内容，请先发送或清空，再选择示例。'); return; }
       $('text').value = text; $('text').oninput?.(); $('text').focus?.();
     };
     box.append(button);
@@ -219,8 +219,8 @@ function renderConversation(context, messages, proposals, moments = []) {
     element.append(head, el('div', 'field', '接收人：' + proposal.owner), el('blockquote', 'summary-quote', proposal.summary));
     if (proposal.task_id) element.append(el('div', 'meta', '已创建任务 #' + String(proposal.task_id).slice(0, 8)));
     if (proposal.status === 'pending') {
-      element.append(el('p', 'note', '尚未发送给对方，也未创建任务。确认后，对方只会看到接收人、上面的摘要和你附带的材料，不会收到你的私聊。'));
-      const label = el('label', null, '附带共享材料（可选）· 会原样发给接收人，对方的 Agent 起草时也会读取；请勿粘贴密钥或私密信息。');
+      element.append(el('p', 'note', '确认后才会创建任务，并将接收人、这份摘要和附带材料共享给对方。你的私聊不会发送。'));
+      const label = el('label', null, '共享材料（可选）：会原样发给对方，并用于生成草稿。请勿填写密钥或私密信息。');
       const box = el('textarea');
       box.rows = 3;
       box.maxLength = MAX_DETAILS_BYTES;

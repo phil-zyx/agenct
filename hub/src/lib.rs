@@ -3,16 +3,21 @@ mod activity;
 mod audit;
 mod audit_migration;
 pub mod browser_auth;
+mod chat_failures;
 mod chat_turns;
+mod collaboration;
+mod colleague_lookup;
 mod context_memory;
 mod directory;
 mod drafts;
 pub mod gitlab;
 mod materials;
+mod members;
 mod messages;
 pub mod oidc;
 mod policy;
 mod private_staging;
+mod profile_suggestions;
 mod profiles;
 mod proposals;
 pub mod publication;
@@ -77,7 +82,14 @@ impl Config {
             .unwrap_or("127.0.0.1:8080".into())
             .parse()?;
         if !bind.ip().is_loopback() {
-            return Err("This development service must bind to loopback".into());
+            let explicitly_allowed =
+                std::env::var("AGENCT_PRIVATE_BIND_IP").ok() == Some(bind.ip().to_string());
+            if !explicitly_allowed
+                || !browser_auth::private_http(&format!("http://{bind}"))
+                || std::env::var_os("AGENCT_BROWSER_OIDC_CONFIG_FILE").is_none()
+            {
+                return Err("Non-loopback development bind requires an explicit private IP and browser authentication".into());
+            }
         }
         let users = serde_json::from_str(&std::env::var("AGENCT_USERS_JSON")?)?;
         let runtime = match std::env::var("AGENCT_RUNTIME")?.as_str() {
@@ -117,6 +129,7 @@ impl Config {
 type Roster = Arc<HashMap<String, String>>;
 #[derive(Clone)]
 pub struct Hub {
+    member_admins: Arc<std::collections::HashSet<String>>,
     repositories: Option<Arc<repo_context::Repositories>>,
     worker_scopes: Arc<HashMap<String, worker_api::Scope>>,
     browser_auth: Option<browser_auth::BrowserAuth>,
@@ -148,8 +161,9 @@ pub struct Error(StatusCode, &'static str);
 type Result<T> = std::result::Result<T, Error>;
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
-        // Only these selection checks run before receipt reservation/dispatch.
-        // Generic conflicts and transport failures must remain uncertain to clients.
+        // Selection codes describe rejection before reservation. Explicit adapter
+        // failure codes describe an ended dispatch, never proof it did no work.
+        // Generic conflicts and transport failures remain unknown to clients.
         let code = match self.1 {
             drafts::STALE => Some("draft_task_stale_before_reservation"),
             drafts::STATE => Some("draft_task_state_before_reservation"),
@@ -159,7 +173,7 @@ impl IntoResponse for Error {
             profiles::UNAVAILABLE => Some("selected_agent_unavailable_before_dispatch"),
             task_context::STALE => Some("selected_task_stale_before_dispatch"),
             task_context::UNAVAILABLE => Some("selected_task_unavailable_before_dispatch"),
-            _ => None,
+            _ => chat_failures::code(&self),
         };
         let mut body = serde_json::json!({"error": self.1});
         if let Some(code) = code {
@@ -225,6 +239,7 @@ impl Hub {
             )?;
         }
         Ok(Self {
+            member_admins: Arc::new(Default::default()),
             repositories: None,
             worker_scopes: Arc::new(HashMap::new()),
             browser_auth: None,
@@ -279,13 +294,31 @@ impl Hub {
         if self.oidc.is_some() {
             return Err("choose browser sessions or API bearer validation, not both");
         }
+        let auto_signup = config.gitlab_auto_signup;
+        let issuer = config.issuer.clone();
+        let subjects = config.subjects.clone();
         self.browser_auth = Some(browser_auth::BrowserAuth::new(
             config,
             &self.directory.ids().collect(),
         )?);
+        if auto_signup {
+            self.restore_gitlab_workspace(&issuer)?;
+        } else {
+            self.bind_subjects(&issuer, &subjects)?;
+        }
         Ok(self)
     }
     fn identity(&self, headers: &HeaderMap) -> Result<String> {
+        let id = self.raw_identity(headers)?;
+        if !self.member_active(&id)? {
+            return Err(Error(
+                StatusCode::UNAUTHORIZED,
+                "account disabled or invitation pending",
+            ));
+        }
+        Ok(id)
+    }
+    fn raw_identity(&self, headers: &HeaderMap) -> Result<String> {
         let startup = match self.startup_ok {
             Some(ok) => ok,
             None => self.validate_startup().is_ok(),
@@ -338,12 +371,45 @@ pub fn app(mut hub: Hub) -> Router {
         .route("/auth/session", get(browser_auth::session))
         .route("/auth/login", get(browser_auth::login))
         .route("/auth/callback", get(browser_auth::callback))
+        .route(
+            "/identity/v1/auth/oidc/gitlab/callback",
+            get(browser_auth::callback),
+        )
         .route("/auth/logout", post(browser_auth::logout))
         .route(
             "/health",
             get(|| async { Json(serde_json::json!({"status":"ok","stage":"development"})) }),
         )
         .route("/api/me", get(me))
+        .route("/api/contacts", get(contacts))
+        .route(
+            "/api/collaboration-profile",
+            get(collaboration::get_profile)
+                .put(collaboration::update_profile)
+                .layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/api/contacts/{id}/profile",
+            get(collaboration::public_profile),
+        )
+        .route(
+            "/api/contacts/{id}/messages",
+            get(collaboration::messages)
+                .post(collaboration::send)
+                .layer(DefaultBodyLimit::max(32 * 1024)),
+        )
+        .route("/api/contacts/{id}/read", post(collaboration::mark_read))
+        .route("/api/conversations", get(collaboration::conversations))
+        .route("/api/profile-suggestions", get(profile_suggestions::list))
+        .route(
+            "/api/profile-suggestions/{id}/actions",
+            post(profile_suggestions::action),
+        )
+        .route("/api/people", get(members::people))
+        .route("/api/members", get(members::list))
+        .route("/api/members/{id}", axum::routing::put(members::update))
+        .route("/api/invitations", post(members::invite))
+        .route("/api/invitations/accept", post(members::accept))
         .route("/api/repositories", get(repo_context::list))
         .route("/api/repositories/context", post(repo_context::read))
         .route(
@@ -403,5 +469,22 @@ async fn me(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<serde_json:
     if let Some(tenant) = h.directory.tenant(&id) {
         value["tenant"] = serde_json::json!(tenant);
     }
+    value["member"] = serde_json::to_value(h.member(&id)?).map_err(|_| {
+        Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "member serialization failed",
+        )
+    })?;
     Ok(Json(value))
+}
+
+async fn contacts(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<String>>> {
+    let id = h.identity(&headers)?;
+    let mut ids = Vec::new();
+    for other in h.directory.contacts(&id) {
+        if h.member_active(&other)? {
+            ids.push(other);
+        }
+    }
+    Ok(Json(ids))
 }

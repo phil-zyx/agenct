@@ -37,13 +37,13 @@ function activityLine(item, me) {
     case 'proposal_rejected': return '已拒绝，未共享';
     case 'created': return item.role === 'owner' ? `${item.counterpart} 委派给你，待接手` : `已委派给 ${item.counterpart}，等对方接手`;
     case 'accept': return `${who}已接手`;
-    case 'deliver': return `${who}提交了交付`;
+    case 'deliver': return `${who}提交了交付内容`;
     case 'approve': return `${who}验收通过`;
-    case 'return': return `${who}退回了交付`;
+    case 'return': return `${who}退回了交付内容`;
     case 'cancel': return `${who}取消了任务` + (l.reason ? `：${l.reason}` : '');
-    case 'draft_complete': return '你的 Agent 起草了交付草稿（仅你可见）';
-    case 'draft_uncertain': return '起草结果未知，可在草稿中核对';
-    case 'draft_pending': return '你的 Agent 正在起草…';
+    case 'draft_complete': return '草稿已写好，等你审阅（仅你可见）';
+    case 'draft_uncertain': return '暂时无法确认起草结果，请打开草稿查看';
+    case 'draft_pending': return '正在为你起草…';
     default: return String(l.action || '');
   }
 }
@@ -80,6 +80,7 @@ function renderActivity(context, items) {
           panelTask = item.id;
           flash([...$('tasks').children].find(card => card.taskId === item.id));
         } else {
+          closeContacts(); closePeerConversation();
           returnToChatOnNarrowScreen();
           flash([...$('conversation').children].find(card => card.proposalId === item.id));
         }
