@@ -36,7 +36,7 @@ function fixture() {
      const check=fixture();check.truncated(flags);
      if(source==='list')check.listed();
      await check.open();
-     assert(walk(check.conversation).some(e=>e.textContent.includes('委派人确认附带的共享材料')));
+     assert(walk(check.conversation).some(e=>e.textContent.includes('任务发起人确认共享的材料')));
      if(source==='post')await check.click('让我的 Agent 起草（不交付）');
      if(source==='recovery'){
        check.error(Error('lost response'));await check.click('让我的 Agent 起草（不交付）');

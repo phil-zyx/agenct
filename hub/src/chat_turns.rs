@@ -29,6 +29,11 @@ fn receipt(db: &Connection, owner: &str, key: &str) -> Result<Option<serde_json:
             .map(|raw| serde_json::from_str::<serde_json::Value>(&raw))
             .transpose()
             .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "invalid stored turn"))?;
+        if status == "uncertain" {
+            if let Some(failure) = crate::chat_failures::read(db, owner, key)? {
+                return Ok(serde_json::json!({"request_id":key,"status":"failed","response":null,"failure":failure}));
+            }
+        }
         Ok(serde_json::json!({"request_id":key,"status":status,"response":response}))
     })
     .transpose()
@@ -64,6 +69,12 @@ fn replay(db: &Connection, owner: &str, input: &ChatInput) -> Result<Option<serd
     let found = receipt(db, owner, key)?.ok_or_else(denied)?;
     if found["status"] == "complete" {
         return Ok(Some(found["response"].clone()));
+    }
+    if found["status"] == "failed" {
+        return Ok(Some(crate::chat_failures::response(
+            key,
+            found["failure"].clone(),
+        )));
     }
     Ok(Some(
         serde_json::json!({"reply":null,"turn":{"request_id":key,"status":found["status"]}}),
@@ -172,9 +183,21 @@ pub(super) async fn chat(
     let dispatch = tokio::spawn(async move {
         let _guard = guard;
         let result = execute_chat(&task_hub, &task_id, &input, runtime_profile, task_context).await;
-        if result.is_err() {
-            // A timeout/error cannot prove the provider never acted. Never retry dispatch.
+        if let Err(error) = &result {
             if let Some(key) = input.request_id.as_deref() {
+                if let Some(code) = crate::chat_failures::code(error) {
+                    // Only a strict adapter error receipt proves this dispatch
+                    // ended without a usable reply. It does not prove no model
+                    // work happened, and this reservation is never dispatched again.
+                    let mut db = task_hub.db()?;
+                    crate::chat_failures::record(&mut db, &task_id, key, code)?;
+                    if let Some(failure) = crate::chat_failures::read(&db, &task_id, key)? {
+                        return Ok(Json(crate::chat_failures::response(key, failure)));
+                    }
+                    return result;
+                }
+                // Transport timeout, invalid response or process interruption
+                // cannot establish the outcome. Keep the conservative receipt.
                 mark_uncertain(&mut *task_hub.db()?, &task_id, key)?;
             }
         }
@@ -206,6 +229,15 @@ pub(super) async fn status(
     // A dropped handler releases the gate. Its reserved dispatch remains uncertain.
     if let Ok(_guard) = h.gate(&id)?.try_lock_owned() {
         mark_uncertain(&mut *h.db()?, &id, &key)?;
+        let saved = receipt(&*h.db()?, &id, &key)?;
+        if saved
+            .as_ref()
+            .is_some_and(|saved| saved["status"] == "uncertain")
+        {
+            if let Some(recovered) = crate::colleague_lookup::recover(&h, &id, &key)? {
+                return Ok(Json(recovered));
+            }
+        }
     }
     Ok(Json(receipt(&*h.db()?, &id, &key)?.ok_or_else(denied)?))
 }
@@ -215,6 +247,212 @@ mod tests {
     use super::*;
     use crate::messages::history;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn failure_config(path: &str, runtime: Runtime) -> Config {
+        Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            database: path.into(),
+            users: vec![UserConfig {
+                id: "alice".into(),
+                token_sha256: format!("{:x}", Sha256::digest("a".repeat(40).as_bytes())),
+            }],
+            runtime,
+        }
+    }
+
+    fn failed_input() -> ChatInput {
+        ChatInput {
+            message: "hello".into(),
+            agent_id: None,
+            expected_profile_revision: None,
+            request_id: Some("failure-fixture".into()),
+            selected_task: None,
+        }
+    }
+
+    async fn failure_adapter(
+        response_status: u16,
+        content_type: &'static str,
+        body: String,
+        path: &str,
+    ) -> (
+        Hub,
+        HeaderMap,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let adapter = Router::new().route(
+            "/v1/turn",
+            post(move || {
+                let (counter, body) = (counter.clone(), body.clone());
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    axum::response::Response::builder()
+                        .status(response_status)
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/turn", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+        let hub = Hub::open(failure_config(
+            path,
+            Runtime::Dsh {
+                url,
+                token: "fixture-adapter-token".into(),
+            },
+        ))
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            format!("Bearer {}", "a".repeat(40)).parse().unwrap(),
+        );
+        (hub, headers, calls, server)
+    }
+
+    #[tokio::test]
+    async fn explicit_adapter_errors_are_durable_failed_receipts_without_redispatch() {
+        for (response_status, code) in [
+            (502, "runtime_failed"),
+            (504, "runtime_timeout"),
+            (400, "invalid_turn"),
+            (503, "busy"),
+            (502, "provider_not_configured"),
+            (502, "sdk_version_mismatch"),
+            (502, "sdk_unavailable"),
+            (502, "model_protocol_error"),
+            (502, "runtime_incomplete"),
+        ] {
+            let path =
+                std::env::temp_dir().join(format!("agenct-chat-failure-{}.db", Uuid::new_v4()));
+            let (h, headers, calls, server) = failure_adapter(
+                response_status,
+                "application/json; charset=utf-8",
+                serde_json::json!({"error":code}).to_string(),
+                path.to_str().unwrap(),
+            )
+            .await;
+            let runtime = h.runtime.clone();
+            let result = chat(State(h.clone()), headers.clone(), Json(failed_input()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(result["turn"]["status"], "failed");
+            assert_eq!(result["failure"]["code"], code);
+            assert_eq!(
+                result["failure"]["message"],
+                "这次没有取得回复，可重新提问。"
+            );
+            assert_eq!(history(&h, "alice").unwrap()[0].status, "failed");
+            let observed = status(
+                State(h.clone()),
+                headers.clone(),
+                Path("failure-fixture".into()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(observed["status"], "failed");
+            assert_eq!(observed["failure"], result["failure"]);
+            assert!(observed["response"].is_null());
+            let replay = chat(State(h.clone()), headers.clone(), Json(failed_input()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(replay, result);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            drop(h);
+            let reopened = Hub::open(failure_config(path.to_str().unwrap(), runtime)).unwrap();
+            let observed = status(
+                State(reopened.clone()),
+                headers.clone(),
+                Path("failure-fixture".into()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(observed["status"], "failed");
+            assert_eq!(history(&reopened, "alice").unwrap()[0].status, "failed");
+            assert_eq!(
+                chat(State(reopened), headers, Json(failed_input()))
+                    .await
+                    .unwrap()
+                    .0,
+                result
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("lock"));
+        }
+    }
+
+    #[tokio::test]
+    async fn non_contract_http_failures_remain_unknown_and_never_redispatch() {
+        for (response_status, content_type, body) in [
+            (
+                501,
+                "application/json",
+                "{\"error\":\"runtime_failed\"}".into(),
+            ),
+            (
+                502,
+                "text/html",
+                "<html>upstream gateway failed</html>".into(),
+            ),
+            (502, "application/json", String::new()),
+            (
+                502,
+                "application/json",
+                "{\"error\":\"runtime_timeout\"}".into(),
+            ),
+            (
+                502,
+                "application/json",
+                "{\"error\":\"unknown_failure\"}".into(),
+            ),
+            (502, "text/html", "{\"error\":\"runtime_failed\"}".into()),
+            (
+                502,
+                "application/json",
+                format!(
+                    "{{\"error\":\"runtime_failed\",\"details\":\"{}\"}}",
+                    "x".repeat(1500)
+                ),
+            ),
+        ] {
+            let (h, headers, calls, server) =
+                failure_adapter(response_status, content_type, body, ":memory:").await;
+            let result = chat(State(h.clone()), headers.clone(), Json(failed_input())).await;
+            assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);
+            let observed = status(
+                State(h.clone()),
+                headers.clone(),
+                Path("failure-fixture".into()),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(observed["status"], "uncertain");
+            assert!(observed.get("failure").is_none());
+            assert_eq!(history(&h, "alice").unwrap()[0].status, "uncertain");
+            assert_eq!(
+                chat(State(h), headers, Json(failed_input()))
+                    .await
+                    .unwrap()
+                    .0["turn"]["status"],
+                "uncertain"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
 
     #[tokio::test]
     async fn actual_transport_timeout_marks_message_and_receipt_uncertain_without_retry() {

@@ -30,6 +30,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hub = hub.with_browser_auth(serde_json::from_slice(&bytes)?)?;
         eprintln!("Authentication: opt-in OIDC browser sessions; bearer tokens disabled");
     }
+    if let Ok(value) = std::env::var("AGENCT_MEMBER_ADMINS_JSON") {
+        hub = hub.with_member_admins(serde_json::from_str(&value)?)?;
+    }
     if let Some(path) = std::env::var_os("AGENCT_WORKER_SCOPES_FILE") {
         use std::io::Read;
         let mut bytes = Vec::new();
@@ -82,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(error) => return Err(error.into()),
     };
-    eprintln!("Agenct Hub listening at http://{bind}; runtime={mode}; loopback development only");
+    eprintln!("Agenct Hub listening at http://{bind}; runtime={mode}; development service");
     axum::serve(listener, app(hub))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
