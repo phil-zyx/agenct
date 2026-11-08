@@ -143,7 +143,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
         if (turnFailure) return { ok: false, status: turnFailure, json: async () => ({ error: 'Receipt unavailable' }) };
         const requestId = decodeURIComponent(url.split('/').at(-1));
         data = { request_id: requestId, status: checkTurnStatus,
-          response: checkTurnStatus === 'complete' ? { repository_context: settings.repositoryMismatch ? null : repositoryTurns.get(requestId), reply: 'Saved chat reply',
+          response: checkTurnStatus === 'complete' ? { task_action: settings.recoveredTaskAction || null, repository_context: settings.repositoryMismatch ? null : repositoryTurns.get(requestId), reply: 'Saved chat reply',
             runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
             task_context: responseContextOverride === undefined ? turnContexts.get(requestId) ?? null : responseContextOverride,
             turn: { request_id: requestId, status: 'complete' } } : null };
@@ -152,14 +152,15 @@ function fixture(auth = { enabled: false }, settings = {}) {
         const task = tasks.find(t => url === '/api/tasks/' + t.id);
         if (task) data = { task, timeline: {events: [], deliveries: [], audit: {schema_version:1,legacy_history_incomplete:true,legacy_notice:'Earlier history unknown'}} };
       }
+      if (settings.draftPostFailure && url.endsWith('/drafts') && options.method === 'POST') throw Error('Draft outcome unknown');
       if (url.includes('/drafts/turns/') && options.method === 'GET') {
         const task = tasks[0], requestId = decodeURIComponent(url.split('/').pop());
         data = {kind:'draft_delivery',task_id:task.id,request_id:requestId,status:'complete',current_stale:false,
-          response:{draft:{id:'auto-draft-id',seq:1,content:'Auto draft 需要补充的信息',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}};
+          response:{draft:{id:settings.draftId || 'auto-draft-id',seq:1,content:'Auto draft 需要补充的信息',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}};
       } else if (url.includes('/drafts')) {
         const task = tasks[0];
         data = options.method === 'POST'
-          ? {kind:'draft_delivery',task_id:task.id,request_id:JSON.parse(options.body).request_id,status:'complete',current_stale:false,response:{draft:{id:'fixture-generated-draft',content:'Generated draft',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}}
+          ? {kind:'draft_delivery',task_id:task.id,request_id:JSON.parse(options.body).request_id,status:settings.draftPostStatus || 'complete',current_stale:false,response:{draft:{id:'fixture-generated-draft',content:'Generated draft',task_revision:task.revision},task_context:{id:task.id},runtime_profile:{revision:0}}}
           : {kind:'draft_delivery',task_id:task.id,items:[],next_cursor:null};
       }
       if (url.endsWith('/profile/catalog')) data = { roles: ['coordinator', 'researcher'], models: [{ id: 'server-default' }], max_agents: 8 };
@@ -232,6 +233,101 @@ const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'ali
 const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
+
+  await test('work index reveals filtered tasks without changing composer, selection or task state', async () => {
+    for (const [filter, status, requester, expected] of [
+      ['active', 'completed', 'alice', 'completed'], ['active', 'canceled', 'alice', 'completed'],
+      ['completed', 'working', 'alice', 'active'], ['mine', 'working', 'carol', 'active'],
+      ['waiting', 'working', 'alice', 'active']
+    ]) {
+      const t = task({ id: 'target', status, requester, owner: requester === 'carol' ? 'alice' : 'bob' });
+      const f = fixture(undefined, { tasks: [t], activity: [{ kind: 'task', id: 'target', title: 'Target', status, latest: {} }] });
+      await f.login('alice'); f.$('text').value = 'Unsent private question'; f.discussion('target').onclick();
+      const context = f.$('task-context-details').textContent;
+      f.$('task-filter').value = filter; f.$('task-filter').onchange();
+      const card = f.$('tasks').children.find(e => e.taskId === 'target'); assert(card.classList.contains('hide'));
+      const row = f.$('activity').children.find(e => e.className.startsWith('activity-item'));
+      row.onclick(); row.onclick();
+      assert(!card.classList.contains('hide')); assert(card.classList.contains('flash')); assert(card.focused);
+      assert.equal(f.$('task-filter').value, expected);
+      assert.equal(f.$('text').value, 'Unsent private question'); assert.equal(f.$('task-context-details').textContent, context);
+      assert.equal(f.calls.filter(c => c.options?.method === 'POST').length, 0);
+      await f.$('logout').onclick(); await f.login('bob'); f.$('tab-activity').onclick();
+      row.onclick(); assert(f.$('tasks').classList.contains('hide'), 'old identity callback cannot navigate');
+    }
+  });
+  await test('work index expands old proposal ancestors and preserves unsent input without dispatch', async () => {
+    const f = fixture(undefined, { width: 400,
+      proposals: [{ id: 'old', owner: 'bob', summary: 'Old', status: 'pending', revision: 0, created_at: '2020-01-01 00:00:00' }],
+      activity: [{ kind: 'proposal', id: 'old', title: 'Old', status: 'pending', latest: {} }] });
+    await f.login('alice'); f.$('text').value = 'Keep this draft'; f.$('toggle-tasks').onclick();
+    const group = f.$('conversation').children.find(e => e.className === 'old-proposals');
+    const target = group.children.find(e => e.proposalId === 'old'); assert.equal(group.open, false);
+    const row = f.$('activity').children.find(e => e.className.startsWith('activity-item'));
+    row.onclick(); row.onclick();
+    assert.equal(group.open, true); assert(target.classList.contains('flash')); assert(target.focused);
+    assert(!f.$('room').classList.contains('tasks-open')); assert.equal(f.$('text').value, 'Keep this draft');
+    assert.equal(f.calls.filter(c => c.options?.method === 'POST').length, 0);
+    await f.$('logout').onclick(); await f.login('bob'); f.$('toggle-tasks').onclick();
+    row.onclick(); assert(f.$('room').classList.contains('tasks-open'));
+  });
+
+  await test('only routine feedback expires; errors and saved-reply fallback remain keyboard dismissible', async () => {
+    const f = fixture(undefined, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick(); assert(f.$('status').classList.contains('show'));
+    // A failed sync is shown in the persistent sync-error bar (with retry), not a fading toast.
+    f.failReads(500); await f.$('refresh').onclick();
+    assert.equal(f.$('sync-error').classList.contains('hide'), false);
+    assert.match(f.$('sync-error-text').textContent, /暂时无法同步/);
+    f.failReads(0); await f.$('retry-sync').onclick();
+    assert.equal(f.$('sync-error').classList.contains('hide'), true, 'a successful retry clears the bar');
+    f.failReads(500);
+    f.$('status').onkeydown({ key: 'Escape', preventDefault() {} });
+    assert.equal(f.$('status').textContent, '');
+    await f.send('Reply must stay readable');
+    assert.match(f.$('status').textContent, /已保存的回复：Saved chat reply/);
+    assert(!f.$('status').classList.contains('show'));
+    assert.equal(f.storage.size, 0, 'no private reply text retained in storage');
+  });
+  await test('task invalidation is announced outside collapsed context details', async () => {
+    const f = fixture(undefined, { tasks: [task()] }); await f.login('alice');
+    f.discussion('task-one').onclick();
+    assert.match(f.$('task-context-status').textContent, /已选择讨论任务/);
+    f.tasks([task({ revision: 4 })]); await f.$('refresh').onclick();
+    assert.match(f.$('task-context-status').textContent, /已失效/);
+    f.$('clear-task-context').onclick(); assert.equal(f.$('task-context-status').textContent, '');
+    const html = fs.readFileSync(path.join(__dirname, 'index.html'), 'utf8');
+    assert.match(html, /id="task-context-status"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert(html.indexOf('id="task-context-status"') < html.indexOf('<section id="task-context"'));
+    f.discussion('task-one').onclick();
+    let writes = 0, content = f.$('task-context-status').textContent;
+    Object.defineProperty(f.$('task-context-status'), 'textContent', {get: () => content, set: value => { writes++; content = value; }});
+    await f.$('refresh').onclick(); assert.equal(writes, 0, 'unchanged polls do not repeat live announcements');
+  });
+  await test('each task panel retains its owner across other tool clicks and snapshot rerenders', async () => {
+    const all = ['A', 'B', 'C'].map(id => task({ id, summary: 'Task ' + id }));
+    const f = fixture(undefined, { tasks: all }); await f.login('bob');
+    const card = id => f.$('tasks').children.find(e => e.taskId === id);
+    const slot = id => card(id).children.find(e => e.className === 'card-panels');
+    await findButton(card('A'), '我的私密交付草稿').onclick();
+    const draft = slot('A').children[0]; assert(draft);
+    await findButton(draft, '让我的 Agent 起草（不交付）').onclick();
+    const walk = e => [e, ...e.children.flatMap(walk)];
+    const editor = walk(draft).find(e => e.value === 'Generated draft'); editor.value = 'Private edited A';
+    await findButton(card('B'), '查看共享时间线').onclick();
+    const timeline = slot('B').children[0]; assert(timeline);
+    await findButton(card('C'), '查看待办队列（不执行）').onclick();
+    const queue = slot('C').children[0]; assert(queue);
+    f.discussion('B').onclick(); f.change(); await f.$('refresh').onclick();
+    assert.deepEqual(slot('A').children, [draft]);
+    assert.deepEqual(slot('B').children, [timeline]);
+    assert.deepEqual(slot('C').children, [queue]);
+    assert.equal(editor.value, 'Private edited A');
+    assert(!slot('B').textContent.includes('Private edited A'));
+    assert.equal(f.calls.filter(c => c.url?.endsWith('/actions')).length, 0);
+    await f.$('logout').onclick(); await f.login('alice');
+    assert(!f.$('tasks').textContent.includes('私密文本草稿'));
+  });
   await test('narrow task discussion and navigation return to chat without dispatch', async () => {
     const f = fixture({ enabled: false }, { width: 400, tasks: [task()] });
     await f.login('alice');
@@ -1635,6 +1731,170 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const g = fixture(undefined, { tasks: [task({ my_draft: undefined })] }); await g.login('alice'); await settle();
     assert.match(g.$('conversation').textContent, /bob 已接手/);
     assert.equal(g.calls.filter(c => c.url.includes('/drafts')).length, 0);
+  });
+
+  await test('typed confirmation binds only selected task and matching action; detached replies stay ordinary', async () => {
+    for (const mode of ['detach', 'other', 'wrong-action']) {
+      const f = fixture(undefined, { tasks: [task({status:'ready_for_acceptance'}), task({id:'other',status:'working'})],
+        taskAction: () => ({action:'approve',task_id:'task-one',expected_revision:3}) });
+      await f.login('alice'); await settle(); await f.send('验收'); await settle();
+      if (mode === 'detach') f.$('clear-task-context').onclick();
+      if (mode === 'other') f.discussion('other').onclick();
+      await f.send(mode === 'wrong-action' ? '确认退回' : '好的'); await settle();
+      assert.equal(posts(f,'/actions').length,0);
+      if (mode === 'wrong-action') assert.equal(f.$('text').value,'确认退回');
+    }
+  });
+  await test('polling keeps typed input bound to its snapshot and preserves stale invalidation', async () => {
+    const f=fixture(undefined,{tasks:[task({id:'A'})]}); await f.login('bob'); await settle();
+    f.$('text').value='Private reply intended for A';
+    f.tasks([task({id:'B'}),task({id:'A'})]); await f.$('refresh').onclick(); await settle();
+    assert.match(f.$('task-context-details').textContent,/任务编号：A/);
+    assert.equal(f.$('text').value,'Private reply intended for A');
+    f.tasks([task({id:'B'}),task({id:'A',revision:4})]); await f.$('refresh').onclick(); await settle();
+    assert.match(f.$('task-context-details').textContent,/失效/);
+    await f.$('form').onsubmit({preventDefault(){}}); assert.equal(chatPosts(f).length,0);
+    const g=fixture(undefined,{tasks:[]});await g.login('bob');g.$('text').value='Ordinary private chat';
+    g.tasks([task()]);await g.$('refresh').onclick();assert(g.$('task-context').classList.contains('hide'));
+  });
+  await test('unavailable draft retains revision instruction until explicit retry with loaded base', async () => {
+    const instruction='Use formal tone';
+    const f=fixture(undefined,{tasks:[task()],taskAction:()=>({action:'revise',task_id:'task-one',expected_revision:3,instruction})});
+    await f.login('bob');await settle();await f.send(instruction);await settle();
+    assert.equal(posts(f,'/tasks/task-one/drafts').length,0);
+    assert.match(f.$('conversation').textContent,/Use formal tone/);
+    assert(findButton(f.$('conversation'),'用保留的要求修改草稿').disabled);
+    f.tasks([task({my_draft:{status:'complete',request_id:'auto-existing'}})]);await f.$('refresh').onclick();await settle();
+    assert.equal(posts(f,'/tasks/task-one/drafts').length,0,'no automatic retry');
+    await findButton(f.$('conversation'),'用保留的要求修改草稿').onclick();await settle();
+    const body=JSON.parse(posts(f,'/tasks/task-one/drafts')[0].options.body);
+    assert.equal(body.revision.instruction,instruction);
+    assert.equal(body.request_id,said(f).request_id);
+    await f.$('logout').onclick();await f.login('alice');assert(!f.$('conversation').textContent.includes(instruction));
+  });
+  await test('the same recovered chat turn uses one draft receipt key across tabs and changing base drafts', async () => {
+    const id='12345678-1234-4234-8234-123456789abc';
+    const saved=JSON.stringify({id,user:'bob',browserMode:false});
+    const action={action:'revise',task_id:'task-one',expected_revision:3,instruction:'Formal tone'};
+    const run=async(draftId)=>{
+      const storage=new Map([['agenct.pending-chat-turn.v1',saved]]);
+      const f=fixture(undefined,{draftId,storage,tasks:[task({my_draft:{status:'complete',request_id:'auto-existing'}})],recoveredTaskAction:action});
+      await f.login('bob');await settle();
+      const retry=findButton(f.$('conversation'),'用保留的要求修改草稿');if(retry&&!retry.disabled)await retry.onclick();
+      await settle();return f;
+    };
+    const a=await run('base-one'),b=await run('base-two');
+    const bodies=[a,b].map(f=>JSON.parse(posts(f,'/tasks/task-one/drafts')[0].options.body));
+    assert.equal(bodies[0].request_id,id);assert.equal(bodies[1].request_id,id);
+    assert.equal(bodies[0].revision.instruction,'Formal tone');
+    assert.notEqual(bodies[0].revision.base_draft_id,bodies[1].revision.base_draft_id);
+    // The server's owner/request-id binding rejects a changed base, never dispatches a second turn.
+    assert.equal(a.storage.size,0);assert.equal(b.storage.size,0);
+  });
+  await test('retained confirmation callback cannot execute a replacement action', async () => {
+    const f=fixture(undefined,{tasks:[task({status:'ready_for_acceptance'})],
+      taskAction:body=>({action:body.message.includes('退回')?'return':'approve',task_id:'task-one',expected_revision:3})});
+    await f.login('alice');await settle();await f.send('验收');await settle();
+    const old=findButton(f.$('conversation'),'确认验收');await f.send('退回修改');await settle();
+    await old.onclick();assert.equal(posts(f,'/actions').length,0);
+  });
+
+  await test('failed or uncertain deferred revision retains instruction and checks original key without resending', async () => {
+    for (const uncertain of [false,true]) {
+      const f=fixture(undefined,{tasks:[task()],draftPostStatus:uncertain?'uncertain':'complete',
+        taskAction:()=>({action:'revise',task_id:'task-one',expected_revision:3,instruction:'Keep this exact instruction'})});
+      await f.login('bob');await settle();await f.send('Keep this exact instruction');await settle();
+      f.tasks([task({my_draft:{status:'complete',request_id:'base'}})]);await f.$('refresh').onclick();await settle();
+      if(!uncertain)f.failNextPost();
+      await findButton(f.$('conversation'),'用保留的要求修改草稿').onclick();await settle();
+      assert.match(f.$('conversation').textContent,/Keep this exact instruction/);
+      const request=JSON.parse(posts(f,'/tasks/task-one/drafts')[0].options.body);
+      await findButton(f.$('conversation'),'核对这次修订').onclick();await settle();
+      assert.equal(posts(f,'/tasks/task-one/drafts').length,1);
+      assert(f.calls.some(c=>c.url==='/api/tasks/task-one/drafts/turns/'+request.request_id));
+      assert.equal(f.storage.size,0,'private instructions remain memory only');
+    }
+  });
+
+  await test('direct revision failure keeps same-key read-only recovery', async () => {
+    const f=fixture(undefined,{tasks:[task({my_draft:{status:'complete',request_id:'base'}})],draftPostFailure:true,
+      taskAction:()=>({action:'revise',task_id:'task-one',expected_revision:3,instruction:'Retain direct instruction'})});
+    await f.login('bob');await settle();await f.send('Retain direct instruction');await settle();
+    assert.match(f.$('conversation').textContent,/Retain direct instruction/);
+    await findButton(f.$('conversation'),'核对这次修订').onclick();await settle();
+    assert.equal(posts(f,'/tasks/task-one/drafts').length,1);
+  });
+
+  await test('later revision instructions cannot replace an uncertain receipt or silently dispatch', async () => {
+    const f=fixture(undefined,{tasks:[task({my_draft:{status:'complete',request_id:'base'}})],draftPostFailure:true,
+      taskAction:body=>({action:'revise',task_id:'task-one',expected_revision:3,instruction:body.message})});
+    await f.login('bob');await settle();await f.send('First instruction');await settle();
+    const first=JSON.parse(posts(f,'/tasks/task-one/drafts')[0].options.body);
+    await f.send('Second instruction');await settle();
+    assert.equal(posts(f,'/tasks/task-one/drafts').length,1);
+    assert.match(f.$('conversation').textContent,/First instruction/);assert.match(f.$('conversation').textContent,/Second instruction/);
+    await findButton(f.$('conversation'),'核对这次修订').onclick();await settle();
+    assert(f.calls.some(c=>c.url==='/api/tasks/task-one/drafts/turns/'+first.request_id));
+    assert.equal(posts(f,'/tasks/task-one/drafts').length,1);
+    assert.match(f.$('conversation').textContent,/Second instruction/);
+    assert(findButton(f.$('conversation'),'用保留的要求修改草稿'));
+  });
+
+  await test('restored delivery confirmation stays bound to the reviewed draft version', async () => {
+    const storage=new Map(),tasks=[task({my_draft:{status:'complete',request_id:'base'}})];
+    const f=fixture(undefined,{storage,tasks,draftId:'reviewed',
+      taskAction:()=>({action:'deliver',task_id:'task-one',expected_revision:3})});
+    await f.login('bob');await settle();await f.send('交付');await settle();
+    assert.equal(JSON.parse(storage.get('agenct.task-actions.v1')).items[0][1].draftId,'reviewed');
+    assert(!storage.get('agenct.task-actions.v1').includes('Auto draft'));
+    const again=fixture(undefined,{storage,tasks,draftId:'newer'});await again.login('bob');await settle();
+    await findButton(again.$('conversation'),'确认交付').onclick();await settle();
+    assert.equal(posts(again,'/actions').length,0);
+    assert.match(again.$('status').textContent,/草稿版本已变更/);
+  });
+
+  await test('successful confirmed action advances an empty composer but never retargets in-flight input', async () => {
+    for (const typed of [false,true]) {
+      const f=fixture(undefined,{tasks:[task({status:'awaiting_owner',revision:0})],
+        taskAction:()=>({action:'accept',task_id:'task-one',expected_revision:0})});
+      await f.login('bob');await settle();await f.send('接手');await settle();
+      f.tasks([task({status:'working',revision:1})]);
+      f.hold();
+      const action = findButton(f.$('conversation'),'确认接手').onclick(); await f.ready();
+      if(typed)f.$('text').value='Written against old version';
+      f.release(); await action; await settle();
+      assert.match(f.$('task-context-details').textContent,typed?/失效/:/版本：1/);
+      if(typed)assert.equal(f.$('text').value,'Written against old version');
+    }
+  });
+
+  await test('integrated task confirmation errors stay readable and stale automatic context is announced', async () => {
+    const f=fixture(undefined,{tasks:[task({status:'ready_for_acceptance'})],
+      taskAction:()=>({action:'approve',task_id:'task-one',expected_revision:3})});
+    await f.login('alice');await settle();await f.send('验收');await settle();
+    await f.send('确认退回');await settle();
+    assert.match(f.$('status').textContent,/动作与当前/);
+    assert(!f.$('status').classList.contains('show'));
+    assert.equal(posts(f,'/actions').length,0);
+    f.tasks([task({status:'ready_for_acceptance',revision:4})]);await f.$('refresh').onclick();await settle();
+    assert.match(f.$('task-context-status').textContent,/失效/);
+    assert.equal(f.$('text').value,'确认退回');
+    f.$('status').onkeydown({key:'Escape',preventDefault(){}});assert.equal(f.$('status').textContent,'');
+  });
+  await test('an automatic binding follows the task to a new version only while nothing is being typed', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'awaiting_owner', revision: 0 })] });
+    await f.login('bob'); await f.$('refresh').onclick();
+    assert.equal(f.$('task-context').classList.contains('hide'), false);
+    // Returned and back with the owner at a new version; the composer is empty.
+    f.tasks([task({ status: 'awaiting_owner', revision: 2 })]); await f.$('refresh').onclick();
+    assert(!f.$('task-context-title').textContent.includes('已失效'));
+    await f.send('我接手');
+    assert.deepEqual(JSON.parse(chatPosts(f).at(-1).options.body).selected_task, { task_id: 'task-one', expected_revision: 2 });
+    // While typing, the version under the user's words is never swapped.
+    await f.$('refresh').onclick();
+    f.$('text').value = '写到一半';
+    f.tasks([task({ status: 'awaiting_owner', revision: 4 })]); await f.$('refresh').onclick();
+    assert(f.$('task-context-title').textContent.includes('已失效'));
   });
   console.log('Client regression tests passed');
 

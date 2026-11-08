@@ -226,7 +226,9 @@ if (require.main === module) (async () => {
       assert(await f.page.locator('#status').evaluate(el => {
         const r = el.getBoundingClientRect(); return el.contains(document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2));
       }), 'Task error toast must not be covered by the mobile drawer');
-      await f.page.locator('#status').click();
+      assert.equal(await f.page.locator('#status').evaluate(el => getComputedStyle(el).animationName), 'none', 'critical error must not expire');
+      await f.page.locator('#status').focus(); await f.page.keyboard.press('Escape');
+      assert.equal(await f.page.locator('#status').textContent(), '');
       await discussButtons(f).click();
       assert.equal(await f.page.locator('.task-pane').isVisible(), false);
       assert.equal(await f.page.locator('#text').evaluate(el => el === document.activeElement), true);
@@ -391,6 +393,8 @@ if (require.main === module) (async () => {
       assert.equal(f.posts().length, 0, 'Invalid selection must block even direct form submission');
       assert.equal(await f.page.locator('#task-context').isVisible(), true);
       assert((await f.page.locator('#task-context-details').textContent()).includes('失效'));
+      assert.match(await f.page.locator('#task-context-status').ariaSnapshot(), /已失效/);
+      assert.equal(await f.page.locator('.chip-more').getAttribute('open'), null, 'announcement does not depend on expanded details');
       if (change === 'revision') {
         await discussButtons(f).click();
         await f.send('Discuss the new revision'); await settled(f);
@@ -532,16 +536,26 @@ async function nextStepsInteractions(browser, origin) {
     assert.equal(await card.getByRole('button').count(), 0, 'no action buttons on the card');
     assert((await f.page.locator('#task-context-label').textContent()).includes('回复给任务'));
     await f.page.locator('#text').fill('帮我写一版，语气正式'); await f.page.locator('#text').press('Enter');
+    const retry = card.getByRole('button', { name: '用保留的要求修改草稿', exact: true });
+    await retry.waitFor(); assert(await retry.isDisabled());
+    assert((await card.textContent()).includes('帮我写一版，语气正式'));
+    assert.equal(f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').length, 0,
+      'missing base must not discard the instruction and dispatch an uninstructed draft');
+    task.my_draft = { status: 'complete', automatic: true, request_id: 'existing-base' };
+    await f.page.locator('#refresh').evaluate(button => button.click());
+    await f.page.waitForFunction(() => [...document.querySelectorAll('.deferred-revision button')].some(b => !b.disabled));
+    await retry.click();
+    await f.page.waitForFunction(() => !document.querySelector('.deferred-revision'));
     await card.locator('.agent-draft').waitFor();
     assert((await card.textContent()).includes('Private generated draft'));
     const asked = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').at(-1).body;
-    assert.equal(asked.revision, undefined, 'no earlier draft: a fresh one');
+    assert.deepEqual(asked.revision, { base_draft_id: 'draft-existing-base', instruction: '帮我写一版，语气正式' });
     assert(!f.calls.some(c => c.pathname.endsWith('/actions')), 'drafting never delivers');
     await f.page.locator('#text').fill('更正式一些'); await f.page.locator('#text').press('Enter');
     await f.page.waitForFunction(() => document.querySelectorAll('.task-chat .agent-draft').length >= 1);
     const supplement = await (async () => { for (let i = 0; i < 50; i++) {
       const last = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').at(-1).body;
-      if (last.revision) return last; await f.page.waitForTimeout(100); } })();
+      if (last.revision?.instruction === '更正式一些') return last; await f.page.waitForTimeout(100); } })();
     assert.equal(supplement.revision.instruction, '更正式一些');
     await f.page.locator('#text').fill('可以，交付'); await f.page.locator('#text').press('Enter');
     await card.getByRole('button', { name: '先改一下再交付', exact: true }).click();

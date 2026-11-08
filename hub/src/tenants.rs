@@ -110,23 +110,6 @@ impl Hub {
             let tx = db
                 .transaction()
                 .map_err(|_| "tenant startup audit failed")?;
-            for table in ["tasks", "proposals"] {
-                let sql = format!("SELECT requester,owner FROM {table}");
-                let mut query = tx
-                    .prepare(&sql)
-                    .map_err(|_| "tenant startup audit failed")?;
-                let rows = query
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })
-                    .map_err(|_| "tenant startup audit failed")?;
-                for row in rows {
-                    let (requester, owner) = row.map_err(|_| "tenant startup audit failed")?;
-                    if !directory.can_delegate(&requester, &owner) {
-                        return Err("existing tasks or proposals cross tenant boundaries or reference unmapped users");
-                    }
-                }
-            }
             audit_contact_partitions(&tx, &directory)?;
             // Bind all current identities, including those with only private chat.
             // Historical assignments remain after a user leaves the active roster.
@@ -152,6 +135,34 @@ impl Hub {
                         (None, Some(tenant)) => { tx.execute("INSERT INTO tenant_memberships(owner,tenant) VALUES (?1,?2)",params![owner,tenant]).map_err(|_| "tenant startup audit failed")?; },
                         (None, None) => return Err("historical user data requires an explicit tenant assignment"),
                         _ => {},
+                    }
+                }
+            }
+            // Historical work belongs to immutable persisted memberships, even
+            // after departure. New actions still require the active directory.
+            for table in ["tasks", "proposals"] {
+                let sql = format!("SELECT r.requester,r.owner,a.tenant,b.tenant FROM {table} r LEFT JOIN tenant_memberships a ON a.owner=r.requester LEFT JOIN tenant_memberships b ON b.owner=r.owner");
+                let mut query = tx
+                    .prepare(&sql)
+                    .map_err(|_| "tenant startup audit failed")?;
+                let rows = query
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    })
+                    .map_err(|_| "tenant startup audit failed")?;
+                for row in rows {
+                    let (requester, owner, requester_tenant, owner_tenant) =
+                        row.map_err(|_| "tenant startup audit failed")?;
+                    if requester == owner
+                        || requester_tenant.is_none()
+                        || requester_tenant != owner_tenant
+                    {
+                        return Err("existing tasks or proposals cross tenant boundaries or reference unmapped users");
                     }
                 }
             }
