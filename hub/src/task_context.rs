@@ -113,7 +113,17 @@ pub(super) async fn prepare_large_details(
     h: &Hub,
     user: &str,
     profile: &profiles::RuntimeProfile,
+    context: serde_json::Value,
+) -> Result<serde_json::Value> {
+    prepare_large_details_with_guard(h, user, profile, context, &|| Ok(())).await
+}
+
+pub(super) async fn prepare_large_details_with_guard(
+    h: &Hub,
+    user: &str,
+    profile: &profiles::RuntimeProfile,
     mut context: serde_json::Value,
+    authorized: &(impl Fn() -> Result<()> + Sync),
 ) -> Result<serde_json::Value> {
     if context["details_truncated"] != true {
         return Ok(context);
@@ -164,7 +174,7 @@ pub(super) async fn prepare_large_details(
     let summary = match cached {
         Some(summary) => summary,
         None => {
-            let summary = crate::context_memory::summarize(
+            let summary = crate::context_memory::summarize_with_guard(
                 h,
                 profile,
                 "",
@@ -174,6 +184,7 @@ pub(super) async fn prepare_large_details(
                     status: "complete".into(),
                     created_at: None,
                 }],
+                authorized,
             )
             .await?;
             let mut cache = h

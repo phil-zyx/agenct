@@ -53,7 +53,8 @@ $('open-agents').onclick = async () => {
     if (current(context)) $('open-agents').disabled = false;
   }
 };
-$('status').onclick = () => { $('status').textContent = ''; };
+$('status').onclick = () => status('');
+$('status').onkeydown = event => { if (event.key === 'Escape') { event.preventDefault(); status(''); } };
 $('text').oninput = () => {
   const box = $('text');
   if (!box.style) return;

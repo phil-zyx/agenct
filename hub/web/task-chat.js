@@ -8,6 +8,7 @@ const draftReceipts = new Map();   // owner's draft request_id -> receipt
 const draftReads = new Set();      // request_ids being fetched
 const deliveryEditors = new Map(); // task id -> { text, source, revision } kept across polls
 const pendingActions = new Map();  // task id -> { action, revision } read from the user's words
+const deferredRevisions = new Map(); // instructions retained in memory until a base draft is available
 const dismissedFocus = new Set();  // "id:revision" the user detached from the composer
 const ACTIONS_KEY = 'agenct.task-actions.v1';
 let actionsOwner = null;           // whose saved steps are loaded in this tab
@@ -23,7 +24,10 @@ function loadActions(context) {
     const saved = JSON.parse(sessionStorage.getItem(ACTIONS_KEY));
     if (saved?.user === context.user && Array.isArray(saved.items)) {
       for (const [id, step] of saved.items) {
-        if (typeof id === 'string' && ACTION_TEXT[step?.action] && Number.isSafeInteger(step.revision)) pendingActions.set(id, step);
+        if (typeof id === 'string' && ['accept', 'deliver', 'approve', 'return'].includes(step?.action)
+            && Number.isSafeInteger(step.revision) && (step.action !== 'deliver' || step.draftId === null || typeof step.draftId === 'string')) {
+          pendingActions.set(id, { action: step.action, revision: step.revision, draftId: step.draftId ?? null });
+        }
       }
     }
   } catch {}
@@ -33,14 +37,20 @@ function forgetAction(id) { if (pendingActions.delete(id)) saveActions(); }
 
 function taskChatVersion() {
   // Re-render when a fetched draft or an open editor changes, not only on API data.
-  return JSON.stringify([[...draftReceipts.keys()], [...deliveryEditors.keys()], [...pendingActions]]);
+  return JSON.stringify([[...draftReceipts.keys()], [...deliveryEditors.keys()], [...pendingActions], [...deferredRevisions]]);
 }
 
 function resetTaskChat({ preserveRecovery = false } = {}) {
-  draftReceipts.clear(); draftReads.clear(); deliveryEditors.clear(); pendingActions.clear(); dismissedFocus.clear();
+  draftReceipts.clear(); draftReads.clear(); deliveryEditors.clear(); pendingActions.clear(); deferredRevisions.clear(); dismissedFocus.clear();
   actionsOwner = null;
-  // Kept across a reload of the same login; dropped on logout or identity change.
   if (!preserveRecovery) { try { sessionStorage.removeItem(ACTIONS_KEY); } catch {} }
+}
+
+function finishDeferred(taskId, saved) {
+  if (deferredRevisions.get(taskId) !== saved) return;
+  const [next, ...rest] = saved.queued || [];
+  if (next) deferredRevisions.set(taskId, { ...next, queued: rest });
+  else deferredRevisions.delete(taskId);
 }
 
 function latestStep(activity, id) {
@@ -84,17 +94,24 @@ function taskCard(task, kicker) {
   return card;
 }
 
-async function startDraft(context, task, revision) {
+async function startDraft(context, task, revision, requestId) {
   const key = 'draft:' + task.id;
-  if (!current(context) || busy.has(key)) return;
+  if (!current(context) || busy.has(key) || !requestId) return;
+  const saved = { instruction: revision.instruction, requestId, revision: task.revision,
+    baseDraftId: revision.base_draft_id, sent: true, queued: deferredRevisions.get(task.id)?.queued || [] };
+  deferredRevisions.set(task.id, saved);
   busy.add(key);
   status(revision ? '已发送补充要求，Agent 正在生成新版本…' : 'Agent 正在起草…');
   try {
     const receipt = await api(context, 'tasks/' + encodeURIComponent(task.id) + '/drafts', 'POST', {
-      request_id: crypto.randomUUID(), expected_revision: task.revision, ...(revision ? { revision } : {})
+      request_id: requestId, expected_revision: task.revision, ...(revision ? { revision } : {})
     });
     if (!current(context)) return;
-    if (receipt?.status === 'complete') { draftReceipts.set(receipt.request_id, receipt); status('新版本草稿已生成，仅你可见。'); }
+    if (receipt?.status === 'complete') {
+      draftReceipts.set(receipt.request_id, receipt);
+      finishDeferred(task.id, saved);
+      status('新版本草稿已生成，仅你可见。');
+    }
     else status('起草结果尚未确认；不会自动重发。');
   } catch (error) {
     if (current(context)) status('起草未完成：' + error.message);
@@ -157,10 +174,14 @@ const ACTION_TEXT = {
 };
 
 /** Carry out the confirmed step. Deliver without a draft opens the editor instead. */
-async function runPendingAction(context, task) {
-  const pending = pendingActions.get(task.id), key = 'tasks:' + task.id;
-  if (!pending || pending.revision !== task.revision || !current(context) || busy.has(key)) return;
+async function runPendingAction(context, task, pending) {
+  const key = 'tasks:' + task.id;
+  if (!pending || pendingActions.get(task.id) !== pending || pending.revision !== task.revision
+      || visibleTasks.get(task.id)?.revision !== task.revision || !current(context) || busy.has(key)) return;
   const draft = latestDraft(task);
+  if (pending.action === 'deliver' && (draft?.id || null) !== pending.draftId) {
+    status('草稿版本已变更，请重新核对后请求交付。'); return;
+  }
   if (pending.action === 'deliver' && !draft) {
     deliveryEditors.set(task.id, { text: '', source: null, revision: task.revision });
     forgetAction(task.id);
@@ -174,6 +195,11 @@ async function runPendingAction(context, task) {
     });
     if (!current(context)) return;
     forgetAction(task.id);
+    // This explicit action consumed the selected snapshot. Only advance an empty
+    // composer; text typed while the request was in flight keeps its old fence.
+    if (selectedTask?.id === task.id && selectedTask.revision === task.revision && !$('text').value.trim()) {
+      selectedTask = null;
+    }
     status({ accept: '已接手，Agent 正在起草。', deliver: `已交付给 ${task.requester}。`, approve: '已验收。', return: `已退回给 ${task.owner}。` }[pending.action]);
   } catch (error) {
     if (current(context)) status(error.message + '。请刷新核对任务状态。');
@@ -188,13 +214,18 @@ const NO = /^(算了|取消|不了|先不|不要|不用了?|cancel|no|n)[。.!�
 /** A short yes or no typed while a step waits on the card answers it directly,
     without another model turn. Returns true when the text was used that way. */
 async function replyToPendingAction(context, text) {
-  const waiting = [...pendingActions.keys()].filter(id => visibleTasks.get(id)?.revision === pendingActions.get(id).revision);
-  const id = selectedTask && pendingActions.has(selectedTask.id) ? selectedTask.id : waiting.length === 1 ? waiting[0] : null;
-  const task = id && visibleTasks.get(id);
-  if (!task || !(YES.test(text) || NO.test(text))) return false;
+  if (!selectedTask || selectedTask.invalidated || pendingTurn || busy.has('turn-check')) return false;
+  const task = visibleTasks.get(selectedTask.id), pending = pendingActions.get(selectedTask.id);
+  if (!task || !pending || task.revision !== selectedTask.revision || pending.revision !== task.revision
+      || !(YES.test(text) || NO.test(text))) return false;
+  const named = /^(确认|确定)(接手|交付|验收|退回)/.exec(text)?.[2];
+  if (named && named !== { accept: '接手', deliver: '交付', approve: '验收', return: '退回' }[pending.action]) {
+    status('确认的动作与当前待确认操作不同，请核对任务卡片。'); return true;
+  }
+  const id = task.id;
   $('text').value = ''; $('text').oninput?.();
   if (NO.test(text)) { forgetAction(id); status('好的，没有执行。'); await refresh(context).catch(() => {}); return true; }
-  await runPendingAction(context, task);
+  await runPendingAction(context, task, pending);
   return true;
 }
 
@@ -223,7 +254,7 @@ function confirmation(context, task, card) {
   }
   const confirm = el('button', 'primary', label); confirm.type = 'button';
   confirm.disabled = busy.has(key);
-  confirm.onclick = () => runPendingAction(context, task);
+  confirm.onclick = () => runPendingAction(context, task, pending);
   if (pending.action !== 'deliver' || draft) actions.append(confirm);
   if (pending.action === 'deliver' && draft) {
     const edit = el('button', 'text-btn', '先改一下再交付'); edit.type = 'button';
@@ -261,6 +292,37 @@ function ownerWorking(context, task, card) {
     card.append(el('p', 'task-hint', draft
       ? `直接在下面回复补充信息或修改意见；说「交付」就发给 ${task.requester}。`
       : '在下面告诉 Agent 怎么写，它会起草一版只有你可见的草稿。'));
+  }
+  const deferred = deferredRevisions.get(task.id);
+  if (deferred) {
+    const box = el('section', 'deferred-revision');
+    box.append(el('p', 'note', deferred.sent ? '修改要求已保留，结果尚未确认。仅核对原请求，不会重发。'
+      : '修改要求已保留，尚未发送。请等待基础草稿可用后重试。'), el('pre', null, deferred.instruction));
+    const retry = el('button', null, deferred.sent ? '核对这次修订' : '用保留的要求修改草稿'); retry.type = 'button';
+    retry.disabled = drafting || (!deferred.sent && (!draft || deferred.revision !== task.revision));
+    retry.onclick = async () => {
+      if (!current(context) || deferredRevisions.get(task.id) !== deferred
+          || busy.has('draft:' + task.id) || retry.disabled) return;
+      if (deferred.sent) {
+        retry.disabled = true;
+        try {
+          const receipt = await api(context, 'tasks/' + encodeURIComponent(task.id) + '/drafts/turns/' + encodeURIComponent(deferred.requestId));
+          if (!current(context) || deferredRevisions.get(task.id) !== deferred) return;
+          if (receipt?.status === 'complete') {
+            draftReceipts.set(deferred.requestId, receipt); finishDeferred(task.id, deferred);
+          } else status('修订结果仍未确认，保留原请求；不会重发。');
+        } catch (error) { if (current(context)) status('未能核对修订：' + error.message); }
+        finally { if (current(context)) { retry.disabled = false; await refresh(context).catch(() => {}); } }
+        return;
+      }
+      if (!draft || visibleTasks.get(task.id)?.revision !== deferred.revision) return;
+      return startDraft(context, task, { base_draft_id: draft.id, instruction: deferred.instruction }, deferred.requestId);
+    };
+    box.append(retry);
+    for (const queued of deferred.queued || []) {
+      box.append(el('p', 'note', '后续修改要求已保留，等待前一次核对完成后手动发送。'), el('pre', null, queued.instruction));
+    }
+    card.append(box);
   }
   confirmation(context, task, card);
   deliveryEditor(context, task, card, draft);
@@ -318,16 +380,25 @@ function taskMoments(context, tasks, activity) {
 }
 
 /** Act on the task step the Agent read from the user's message. */
-function handleTaskAction(context, action) {
+function handleTaskAction(context, action, requestId) {
   if (!action || typeof action.task_id !== 'string') return;
   const task = visibleTasks.get(action.task_id);
   if (!task || task.revision !== action.expected_revision) return;
   if (action.action === 'revise' && typeof action.instruction === 'string') {
     // Private and reversible: the new version is just another owner-only draft.
     const draft = latestDraft(task);
-    startDraft(context, task, draft?.id ? { base_draft_id: draft.id, instruction: action.instruction } : null);
+    if (typeof requestId !== 'string' || !/^[a-f0-9-]{36}$/.test(requestId)) return;
+    const existing = deferredRevisions.get(task.id);
+    if (existing) {
+      if (existing.requestId !== requestId && !(existing.queued || []).some(item => item.requestId === requestId)) {
+        (existing.queued ||= []).push({ instruction: action.instruction, requestId, revision: task.revision });
+      }
+      return; // Never overwrite or redispatch an unresolved instruction.
+    }
+    if (draft?.id) startDraft(context, task, { base_draft_id: draft.id, instruction: action.instruction }, requestId);
+    else deferredRevisions.set(task.id, { instruction: action.instruction, requestId, revision: task.revision });
   } else if (ACTION_TEXT[action.action]) {
-    rememberAction(task.id, { action: action.action, revision: task.revision });
+    rememberAction(task.id, { action: action.action, revision: task.revision, draftId: latestDraft(task)?.id || null });
   }
 }
 
@@ -339,7 +410,9 @@ const needsMe = (context, task) => (task.owner === context.user && ['awaiting_ow
 function focusTask(context, tasks, activity) {
   // An unresolved send keeps its own locked context until it is checked.
   if (pendingTurn || busy.has('turn-check')) return;
-  if (selectedTask && !selectedTask.auto) return;
+  // A selected snapshot stays fixed, including invalidation. Polling may not
+  // reinterpret text already being composed, even if another task becomes newer.
+  if (selectedTask || $('text').value.trim()) return;
   const time = task => parseUtc(latestStep(activity, task.id)?.at)?.getTime() ?? 0;
   const next = tasks.filter(task => needsMe(context, task) && !dismissedFocus.has(task.id + ':' + task.revision))
     .sort((a, b) => time(b) - time(a))[0];
