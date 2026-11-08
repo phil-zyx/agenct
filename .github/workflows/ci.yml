@@ -23,6 +23,8 @@ jobs:
       - run: rustup toolchain install stable --profile minimal
       - run: cargo +stable build --locked --manifest-path hub/Cargo.toml
       - run: npm run test:local
+      - name: Browser flows against a real Hub (contacts, collaboration, profile chat, chat failures)
+        run: npm run test:hub-browser
   browser:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
