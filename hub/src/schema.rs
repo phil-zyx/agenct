@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 13;
+pub(super) const VERSION: i64 = 17;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -74,6 +74,14 @@ const TABLES: &[&str] = &[
     "task_details",
     "context_summaries",
     "tenant_memberships",
+    "member_profiles",
+    "member_invitations",
+    "identity_bindings",
+    "collaboration_profiles",
+    "contact_messages",
+    "contact_reads",
+    "profile_suggestions",
+    "chat_failures",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -166,6 +174,10 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
         }
         12 => db.execute_batch(crate::context_memory::SCHEMA)?,
         13 => db.execute_batch(crate::tenants::SCHEMA)?,
+        14 => db.execute_batch(crate::members::SCHEMA)?,
+        15 => db.execute_batch(crate::collaboration::SCHEMA)?,
+        16 => db.execute_batch(crate::profile_suggestions::SCHEMA)?,
+        17 => db.execute_batch(crate::chat_failures::SCHEMA)?,
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -241,6 +253,10 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("task_details", _) => 10,
         ("context_summaries", _) => 12,
         ("tenant_memberships", _) => 13,
+        ("member_profiles" | "member_invitations" | "identity_bindings", _) => 14,
+        ("collaboration_profiles" | "contact_messages" | "contact_reads", _) => 15,
+        ("profile_suggestions", _) => 16,
+        ("chat_failures", _) => 17,
         ("messages" | "proposals", "created_at") => 11,
         ("events", "from_status" | "to_status" | "task_revision") => 6,
         ("events", "revision" | "delivery_seq") => 8,
@@ -316,6 +332,17 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 || (table == "task_details" && version < 10)
                 || (table == "context_summaries" && version < 12)
                 || (table == "tenant_memberships" && version < 13)
+                || (["member_profiles", "member_invitations", "identity_bindings"].contains(&table)
+                    && version < 14)
+                || ([
+                    "collaboration_profiles",
+                    "contact_messages",
+                    "contact_reads",
+                ]
+                .contains(&table)
+                    && version < 15)
+                || (table == "profile_suggestions" && version < 16)
+                || (table == "chat_failures" && version < 17)
             {
                 continue;
             }
@@ -353,7 +380,18 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         // Tables with foreign keys or table CHECKs are compared by their full owned definition.
         if matches!(
             table,
-            "draft_turns" | "task_details" | "context_summaries" | "tenant_memberships"
+            "draft_turns"
+                | "task_details"
+                | "context_summaries"
+                | "tenant_memberships"
+                | "member_profiles"
+                | "member_invitations"
+                | "identity_bindings"
+                | "collaboration_profiles"
+                | "contact_messages"
+                | "contact_reads"
+                | "profile_suggestions"
+                | "chat_failures"
         ) {
             let wanted_sql: String = expected.query_row(
                 "SELECT sql FROM sqlite_schema WHERE name=?1",
@@ -453,6 +491,10 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         ("tenant_memberships_no_replace", 13),
         ("tenant_memberships_no_update", 13),
         ("tenant_memberships_no_delete", 13),
+        ("chat_failures_valid_turn", 17),
+        ("chat_failures_no_replace", 17),
+        ("chat_failures_no_update", 17),
+        ("chat_failures_no_delete", 17),
     ] {
         let actual: Option<String> = db
             .query_row(

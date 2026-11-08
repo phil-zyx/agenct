@@ -1326,3 +1326,74 @@ async fn private_drafts_do_not_leak_or_consume_submitted_sequence() {
     drop(a);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[tokio::test]
+async fn contacts_are_authenticated_and_only_return_other_member_ids() {
+    let app = setup();
+    let (status, contacts) = request(&app, "alice", "GET", "/api/contacts", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(contacts, json!(["bob", "eve"]));
+    let (status, _) = request(&app, "unknown", "GET", "/api/contacts", Value::Null).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn member_profiles_permissions_revisions_and_disable() {
+    let hub = Hub::open(config(":memory:"))
+        .unwrap()
+        .with_member_admins(vec!["alice".into()])
+        .unwrap();
+    let app = app(hub);
+    assert_eq!(
+        request(&app, "bob", "GET", "/api/members", Value::Null)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let update =
+        json!({"expected_revision":0,"display_name":"Bob Chen","color":"blue","status":"active"});
+    assert_eq!(
+        request(&app, "bob", "PUT", "/api/members/eve", update.clone())
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        request(&app, "bob", "PUT", "/api/members/bob", update.clone())
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&app, "bob", "PUT", "/api/members/bob", update)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let (_, people) = request(&app, "alice", "GET", "/api/people", Value::Null).await;
+    assert_eq!(people[0]["display_name"], "Bob Chen");
+    assert_eq!(request(&app,"alice","PUT","/api/members/bob",json!({"expected_revision":1,"display_name":"Bob Chen","color":"blue","status":"disabled"})).await.0,StatusCode::OK);
+    assert_eq!(
+        request(&app, "bob", "GET", "/api/me", Value::Null).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        request(&app, "alice", "GET", "/api/contacts", Value::Null)
+            .await
+            .1,
+        json!(["eve"])
+    );
+    assert_eq!(
+        request(
+            &app,
+            "alice",
+            "POST",
+            "/api/proposals",
+            json!({"owner":"bob","summary":"not allowed"})
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(request(&app,"alice","PUT","/api/members/alice",json!({"expected_revision":0,"display_name":"Alice","color":"green","status":"disabled"})).await.0,StatusCode::FORBIDDEN);
+}

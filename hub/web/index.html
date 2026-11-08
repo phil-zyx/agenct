@@ -3,10 +3,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
 <title>Agenct</title>
+<link rel="icon" type="image/png" href="app-icon.png">
+<link rel="apple-touch-icon" href="app-icon.png">
 <link rel="stylesheet" href="style.css">
 <body>
 <nav class="rail" aria-label="主导航">
-  <div class="rail-logo" aria-hidden="true">A</div>
+  <img class="rail-logo" src="app-icon.png" alt="Agenct" width="38" height="38">
   <button type="button" id="open-chat" class="rail-btn active" title="聊天" aria-label="聊天" aria-current="page">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 1 3.4 6.5L4 20l1.3-3.6A7.9 7.9 0 0 1 4 12Z"/></svg>
   </button>
@@ -14,13 +16,18 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>
     <span id="rail-badge" class="rail-badge"></span>
   </button>
+  <button type="button" id="open-contacts" class="rail-btn" title="联系人" aria-label="联系人" aria-expanded="false" aria-controls="contact-sidebar">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="15" height="18" rx="3"/><path d="M3 7h4M3 12h4M3 17h4"/><circle cx="12.5" cy="9" r="2.2"/><path d="M9 17a3.5 3.5 0 0 1 7 0"/></svg>
+    <span id="contacts-badge" class="rail-badge"></span>
+  </button>
   <button type="button" id="open-agents" class="rail-btn" title="个人角色设置" aria-label="个人角色设置">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9" r="2.4"/><path d="M15.5 14.2A4.5 4.5 0 0 1 20.5 18.5"/></svg>
   </button>
-  <button type="button" id="open-help" class="rail-btn" title="能力边界与说明" aria-label="能力边界与说明">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6M10 21h4M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2V16h5v-.1c0-.8.4-1.5 1-2A6 6 0 0 0 12 3Z"/></svg>
+  <button type="button" id="open-collaboration" class="rail-btn" title="助手记住的我" aria-label="助手记住的我" aria-expanded="false" aria-controls="collaboration-profile-view">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="10" cy="18" r="2"/></svg>
   </button>
   <div class="rail-spacer"></div>
+  <button type="button" id="open-account" class="rail-btn" title="账号与成员" aria-label="账号与成员" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg></button>
   <button type="button" id="logout" class="rail-btn" title="退出" aria-label="退出">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"/></svg>
   </button>
@@ -30,33 +37,40 @@
 
 <section id="login" class="login">
   <div class="login-card">
-    <div class="avatar big" aria-hidden="true">A</div>
+    <img class="avatar big" src="app-icon.png" alt="" width="64" height="64">
     <h1>Agenct</h1>
-    <p class="lead">一个窗口，与你的管家协作。</p>
+    <p class="lead">和你的管家一起处理工作。</p>
     <p id="dev-login" class="hide login-form"><input type="password" id="token" placeholder="输入开发访问令牌" aria-label="开发访问令牌" autocomplete="off"><button id="enter" class="primary">进入</button></p>
-    <button id="oidc-login" class="hide primary wide">通过身份提供方登录</button>
+    <button id="oidc-login" class="hide primary wide">使用 GitLab 登录</button>
     <button id="auth-retry" class="hide">重试登录状态检查</button>
-    <small class="hint">开发令牌在状态目录的 <code>credentials.json</code> 中，只保留在本页内存里。验证版 · 无真实代码执行或 GitHub 发布。</small>
+    <button id="switch-account" class="hide">退出并切换账号</button>
+    <small id="dev-login-hint" class="hint">开发令牌在状态目录的 <code>credentials.json</code> 中，保留在当前标签页会话中，刷新自动登录，退出时清除。验证版 · 无真实代码执行或 GitHub 发布。</small>
   </div>
 </section>
 
-<main id="room" class="app hide">
-  <section class="chat-pane" aria-label="与管家的对话">
-    <div class="float-pill left"><span id="identity" class="identity"></span></div>
-    <div class="float-pill right">
-      <span class="sync"><small id="last-refresh"></small><span id="sync-notice" class="sync-notice" role="status" aria-live="polite"></span></span>
+<div id="account-tools-home" class="hide">
+  <section id="account-tools" class="account-tools" aria-label="会话与通知">
+    <h3>会话与通知</h3>
+    <p id="identity" class="identity"></p>
+    <p class="sync"><small id="last-refresh"></small><span id="sync-notice" class="sync-notice" role="status" aria-live="polite"></span></p>
+    <div class="actions">
+      <button type="button" id="refresh">刷新会话与任务</button>
       <button type="button" id="enable-notifications">开启系统通知</button>
-      <button type="button" id="refresh" class="icon-btn" title="刷新本账号会话与任务" aria-label="刷新本账号会话与任务">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/></svg>
-      </button>
     </div>
+  </section>
+</div>
+
+<main id="room" class="app hide">
+  <section id="sync-error" class="sync-error hide" aria-label="同步异常"><p id="sync-error-text" role="status" aria-live="polite"></p><button type="button" id="retry-sync">重试同步</button></section>
+  <aside id="contact-sidebar" class="contact-sidebar hide" aria-label="联系人与会话"></aside>
+  <section class="chat-pane" aria-label="与管家的对话">
     <div id="scroller" class="scroller">
-      <div class="stream-head" aria-hidden="true"><div class="avatar">A</div><span class="avatar-name">管家</span></div>
+      <div class="stream-head" aria-hidden="true"><img class="avatar" src="app-icon.png" alt="" width="56" height="56"><span class="avatar-name">管家</span></div>
       <div id="conversation" class="stream" aria-label="私聊与待确认提案"></div>
+      <div id="outgoing-message" class="stream hide" aria-label="本次发送的消息"></div>
       <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
     </div>
     <div class="composer">
-      <section id="onboarding" class="onboarding hide" aria-label="初次使用指引"><p id="onboarding-step" aria-live="polite"></p><div class="actions"><button type="button" id="onboarding-next">下一步</button><button type="button" id="onboarding-skip" class="text-btn">跳过引导</button></div></section>
       <section id="turn-recovery" class="sheet warn hide" aria-label="消息发送恢复">
         <p id="turn-status" role="status" aria-live="polite"></p>
         <div class="row"><button type="button" id="check-turn" class="primary">核对发送状态</button><button type="button" id="new-turn">开始新尝试</button></div>
@@ -69,36 +83,55 @@
       <section id="repository-context" class="chip-bar hide" aria-label="下一条聊天的仓库内容"><span id="repository-context-text"></span><button type="button" id="clear-repository" class="text-btn">清除仓库选择</button></section>
       <section id="repository-picker" class="sheet hide" aria-label="只读仓库选择"><div id="repository-options"></div><button type="button" id="close-repository-picker" class="text-btn">关闭仓库选择</button></section>
       <section id="role-picker" class="sheet hide" aria-label="启用的个人角色">
-        <p class="muted">每次只选一个角色，沿用本账号私聊历史。不创建团队、分离会话或增加工具权限。</p>
+        <p class="muted">为下一条消息选择一个角色。各角色使用同一段聊天记录，操作权限不变。</p>
         <div id="role-options" class="chips"></div>
         <button type="button" id="close-role-picker" class="text-btn">关闭角色选择</button>
       </section>
-      <section id="composer-menu" class="sheet menu hide" aria-label="更多选项">
+      <section id="composer-menu" class="sheet menu hide" aria-label="对话选项">
         <div class="menu-row" aria-label="下一条聊天的角色">
-          <span id="role-details" class="role-details" role="status" aria-live="polite">下一条普通聊天默认使用你的管家。</span>
+          <span id="role-details" class="role-details" role="status" aria-live="polite">提问时，默认由管家回复。</span>
           <button type="button" id="choose-role" class="text-btn">选择本次角色</button>
           <button type="button" id="clear-role" class="text-btn">恢复默认管家</button>
         </div>
         <button type="button" id="choose-repository" class="text-btn">选择只读仓库</button>
-        <details id="help" class="help"><summary>能力边界、委派示例与恢复说明</summary>
-        <button type="button" id="replay-onboarding" class="text-btn">重新查看使用指引</button>
-        <p>输入 /agents 可配置个人角色。Mock 委派示例：请让 bob 帮我 检查文档。也可输入 /delegate bob 任务摘要；确认前不会委派。</p>
+        <details id="help" class="help"><summary>使用说明</summary>
+        <p><strong>请同事帮忙：</strong>从「联系人」选择同事，填写任务摘要。核对接收人、摘要和材料后，点击「确认共享并委派」。私聊内容不会发送。</p>
+        <p><strong>审阅和交付：</strong>草稿仅你可见。检查并修改后，预览交付内容，再点击「确认交付」。最后由任务发起人验收。</p>
+        <p><strong>发送后没有回复：</strong>先点击「核对发送状态」。系统不会自动重发。若要再发一次，选择「开始新尝试」，核对内容后再点发送。上次消息可能已经处理，再次发送可能重复。</p>
+        <p>点击输入框下方的「对话选项」可选择下一条消息的角色；在「个人角色设置」中管理角色，也可输入 <code>/agents</code> 打开设置。按 Ctrl / ⌘ + Shift + K 可打开或收起任务面板。</p>
+        <details><summary>高级说明：仓库、数据与恢复</summary>
         <p>管理员启用只读仓库后，可输入 <code>/repo 仓库ID 完整提交ID 文件路径</code>，换行写问题；或 <code>/repo-search 仓库ID 完整提交ID 关键词</code>，换行写问题。仅限你的白名单仓库与固定提交，不执行代码。</p>
         <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，每 3 秒自动检查更新（后台标签页可能被浏览器延迟），离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号、所属账号及显式选择的角色 ID 和角色版本，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。验证版 · 无真实代码执行或 GitHub 发布。</small>
         </details>
+        </details>
       </section>
       <form id="form" class="composer-pill">
-        <button type="button" id="composer-menu-toggle" class="icon-btn plus" title="角色与说明" aria-label="角色与说明" aria-expanded="false">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
-        <textarea id="text" aria-label="给管家发消息" aria-describedby="chat-help" placeholder="说说你想解决的问题…" rows="1"></textarea>
+        <textarea id="text" aria-label="给管家发消息" aria-describedby="chat-help" placeholder="输入问题，或说说你的想法…" rows="1"></textarea>
         <button id="send" class="send-btn" title="发送" aria-label="发送">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
         </button>
       </form>
+      <div class="composer-options">
+        <button type="button" id="composer-menu-toggle" class="text-btn" aria-expanded="false" aria-controls="composer-menu">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h4m4 0h8M4 17h10m4 0h2"/><circle cx="10" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg>
+          对话选项
+        </button>
+      </div>
       <p id="chat-help" class="sr-only">直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。Enter 发送，Shift+Enter 换行。</p>
     </div>
   </section>
+  <section id="peer-view" class="peer-view hide" aria-label="联系人会话">
+    <header class="peer-header"><button type="button" id="peer-back">联系人</button><div><h2 id="peer-name"></h2><p id="peer-visibility" class="note"></p></div><button type="button" id="peer-details">协作资料</button></header>
+    <div id="peer-messages" class="peer-messages" aria-label="双方共享的消息"></div>
+    <form id="peer-form" class="peer-composer">
+      <label for="peer-message-input" id="peer-input-label">发送消息</label>
+      <textarea id="peer-message-input" rows="2" maxlength="4000" placeholder="输入消息…"></textarea>
+      <div class="peer-send-row"><p id="peer-send-status" class="note" role="status"></p><button type="submit" id="peer-send" class="primary">发送消息</button></div>
+    </form>
+  </section>
+  <section id="contacts-view" class="profile-view contacts-view hide" aria-label="联系人协作资料"></section>
+  <section id="collaboration-profile-view" class="profile-view hide" aria-label="助手记住的我"></section>
+  <section id="profile-view" class="profile-view hide" role="dialog" aria-modal="false" aria-label="个人角色设置"></section>
   <aside class="task-pane" aria-label="任务">
     <div class="pane-head">
       <div class="seg" role="tablist" aria-label="工作视图">
@@ -113,16 +146,20 @@
   </aside>
 </main>
 <script src="profiles-ui.js"></script>
+<script src="collaboration-profile-ui.js"></script>
 <script src="worker-ui.js"></script>
 <script src="draft-ui.js"></script>
 <script src="task-timeline-model.js"></script>
 <script src="task-timeline-ui.js"></script>
 <script src="activity-ui.js"></script>
 <script src="chat-ui.js"></script>
+<script src="profile-suggestions-ui.js"></script>
 <script src="task-ui.js"></script>
 <script src="repo-ui.js"></script>
 <script src="client.js"></script>
 <script src="task-chat.js"></script>
+<script src="account-ui.js"></script>
+<script src="contacts-ui.js"></script>
 <script src="client-chrome.js"></script>
 </body>
 </html>

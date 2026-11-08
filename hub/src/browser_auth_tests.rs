@@ -146,6 +146,27 @@ impl Provider {
                     request.push(byte[0]);
                 }
                 let headers = String::from_utf8_lossy(&request);
+                if headers.starts_with("GET /api/v4/user HTTP/1.1") {
+                    let authorized = headers.lines().any(|line| {
+                        line.split_once(':').is_some_and(|(key, value)| {
+                            key.eq_ignore_ascii_case("authorization")
+                                && value.trim() == "Bearer server-only-test-access-token"
+                        })
+                    });
+                    let body = if authorized {
+                        r#"{"id":7,"name":"GitLab Alice","state":"active"}"#
+                    } else {
+                        "{}"
+                    };
+                    let code = if authorized {
+                        "200 OK"
+                    } else {
+                        "401 Unauthorized"
+                    };
+                    let _ = write!(stream,"HTTP/1.1 {code}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                    let _ = stream.flush();
+                    continue;
+                }
                 let length: usize = headers
                     .lines()
                     .find_map(|line| {
@@ -174,9 +195,27 @@ impl Provider {
                     .and_then(|code| server_codes.lock().unwrap().remove(code));
                 let valid = headers.starts_with("POST /token HTTP/1.1")
                     && form.get("grant_type").map(String::as_str) == Some("authorization_code")
-                    && form.get("client_id").map(String::as_str) == Some("browser-client")
+                    && (if code
+                        .as_ref()
+                        .is_some_and(|code| code.claims["require_basic"] == true)
+                    {
+                        let expected = base64::engine::general_purpose::STANDARD
+                            .encode("browser-client:test-client-secret");
+                        headers.lines().any(|line| {
+                            line.split_once(':').is_some_and(|(key, value)| {
+                                key.eq_ignore_ascii_case("authorization")
+                                    && value.trim() == format!("Basic {expected}")
+                            })
+                        }) && !form.contains_key("client_secret")
+                    } else {
+                        form.get("client_id").map(String::as_str) == Some("browser-client")
+                    })
                     && form.get("redirect_uri").map(String::as_str)
-                        == Some("https://hub.example.test/auth/callback");
+                        == Some(
+                            code.as_ref()
+                                .and_then(|c| c.claims["expected_redirect"].as_str())
+                                .unwrap_or("https://hub.example.test/auth/callback"),
+                        );
                 let reply = match code {
                     Some(code)
                         if valid
@@ -221,6 +260,13 @@ impl Provider {
             .unwrap();
         let auth = BrowserAuth::with_http(
             Config {
+                shared_gitlab_login: None,
+                shared_gitlab_callback: None,
+                allow_loopback_http: false,
+                allow_private_http: false,
+                callback_path: None,
+                gitlab_oauth: false,
+                gitlab_auto_signup: false,
                 issuer: self.origin.clone(),
                 authorization_endpoint: format!("{}/authorize", self.origin),
                 token_endpoint: format!("{}/token", self.origin),
@@ -270,9 +316,12 @@ impl Provider {
         let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
         assert_eq!(params["code_challenge_method"], "S256");
         assert_eq!(params["response_type"], "code");
-        assert!(params["scope"]
-            .split_whitespace()
-            .any(|scope| scope == "openid"));
+        assert!(params["scope"].split_whitespace().any(|scope| scope
+            == if hub.browser_auth.as_ref().unwrap().gitlab_oauth {
+                "read_user"
+            } else {
+                "openid"
+            }));
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -326,7 +375,7 @@ async fn browser_tls_login_session_guards_and_logout() {
     let provider = Provider::new();
     let hub = provider.hub();
     let (headers, query) = provider.begin(&hub).await;
-    let response = callback(State(hub.clone()), headers, Query(query))
+    let response = callback_inner(hub.clone(), headers, Query(query))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
@@ -449,7 +498,7 @@ async fn browser_task_creation_requires_guarded_proposal_confirmation() {
     let provider = Provider::new();
     let hub = provider.hub();
     let (headers, query) = provider.begin(&hub).await;
-    let response = callback(State(hub.clone()), headers, Query(query))
+    let response = callback_inner(hub.clone(), headers, Query(query))
         .await
         .unwrap();
     let mut headers = session_headers(&response);
@@ -547,12 +596,12 @@ async fn browser_rejects_state_binding_replay_and_invalid_pkce() {
     let mut wrong_state = attempt();
     wrong_state.state = random();
     assert!(
-        callback(State(hub.clone()), headers.clone(), Query(wrong_state))
+        callback_inner(hub.clone(), headers.clone(), Query(wrong_state))
             .await
             .is_err()
     );
     assert!(
-        callback(State(hub.clone()), HeaderMap::new(), Query(attempt()))
+        callback_inner(hub.clone(), HeaderMap::new(), Query(attempt()))
             .await
             .is_err()
     );
@@ -561,15 +610,15 @@ async fn browser_rejects_state_binding_replay_and_invalid_pkce() {
         header::COOKIE,
         format!("{}={}", LOGIN_COOKIE, random()).parse().unwrap(),
     );
-    assert!(callback(State(hub.clone()), other, Query(attempt()))
+    assert!(callback_inner(hub.clone(), other, Query(attempt()))
         .await
         .is_err());
     assert!(
-        callback(State(hub.clone()), headers.clone(), Query(attempt()))
+        callback_inner(hub.clone(), headers.clone(), Query(attempt()))
             .await
             .is_ok()
     );
-    assert!(callback(State(hub.clone()), headers, Query(attempt()))
+    assert!(callback_inner(hub.clone(), headers, Query(attempt()))
         .await
         .is_err());
     let (headers, query) = provider.begin(&hub).await;
@@ -580,7 +629,7 @@ async fn browser_rejects_state_binding_replay_and_invalid_pkce() {
         .get_mut(&query.code)
         .unwrap()
         .challenge = "invalid-pkce".into();
-    assert!(callback(State(hub.clone()), headers, Query(query))
+    assert!(callback_inner(hub.clone(), headers, Query(query))
         .await
         .is_err());
     assert!(
@@ -611,7 +660,7 @@ async fn browser_rejects_invalid_id_token_claims() {
             .claims[field] = value;
         let code = query.code.clone();
         assert!(
-            callback(State(hub.clone()), headers, Query(query))
+            callback_inner(hub.clone(), headers, Query(query))
                 .await
                 .is_err(),
             "accepted invalid {field}"
@@ -633,7 +682,7 @@ async fn browser_rejects_invalid_id_token_claims() {
     let hub = provider.hub();
     let (headers, mut query) = provider.begin(&hub).await;
     query.iss = Some("https://wrong.example".into());
-    assert!(callback(State(hub.clone()), headers, Query(query))
+    assert!(callback_inner(hub.clone(), headers, Query(query))
         .await
         .is_err());
 }
@@ -674,11 +723,11 @@ async fn browser_rejects_expired_pending_and_session() {
         .get_mut(&hash(&query.state))
         .unwrap()
         .expires = Instant::now() - Duration::from_secs(1);
-    assert!(callback(State(hub.clone()), headers, Query(query))
+    assert!(callback_inner(hub.clone(), headers, Query(query))
         .await
         .is_err());
     let (headers, query) = provider.begin(&hub).await;
-    let response = callback(State(hub.clone()), headers, Query(query))
+    let response = callback_inner(hub.clone(), headers, Query(query))
         .await
         .unwrap();
     let headers = session_headers(&response);
@@ -727,7 +776,7 @@ async fn browser_mock_provider_rejects_code_reuse() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(!provider.codes.lock().unwrap().contains_key(&query.code));
-    assert!(callback(State(hub.clone()), headers, Query(query))
+    assert!(callback_inner(hub.clone(), headers, Query(query))
         .await
         .is_err());
     assert!(auth.store.lock().unwrap().sessions.is_empty());
@@ -745,7 +794,7 @@ async fn browser_rejects_oversize_token_response_without_session() {
         .get_mut(&query.code)
         .unwrap()
         .claims["oversized"] = json!("x".repeat(140000));
-    assert!(callback(State(hub.clone()), headers, Query(query))
+    assert!(callback_inner(hub.clone(), headers, Query(query))
         .await
         .is_err());
     assert!(hub
@@ -779,7 +828,436 @@ fn browser_rejects_untrusted_configuration() {
         )
         .is_err());
     }
+    let mut local = base.clone();
+    local["public_origin"] = json!("http://localhost:8081");
+    let known = HashSet::from(["alice".to_string()]);
+    assert!(BrowserAuth::new(serde_json::from_value(local.clone()).unwrap(), &known).is_err());
+    local["allow_loopback_http"] = json!(true);
+    local["gitlab_oauth"] = json!(true);
+    local["shared_gitlab_login"] =
+        json!("http://localhost:18082/identity/v1/auth/oidc/gitlab/login");
+    local["shared_gitlab_callback"] =
+        json!("http://localhost:5176/identity/v1/auth/oidc/gitlab/callback");
+    assert!(BrowserAuth::new(serde_json::from_value(local.clone()).unwrap(), &known).is_ok());
+    local["public_origin"] = json!("http://192.168.1.1:8081");
+    assert!(BrowserAuth::new(serde_json::from_value(local.clone()).unwrap(), &known).is_err());
+    local["public_origin"] = json!("http://localhost:8081");
+    local["shared_gitlab_login"] = json!("http://untrusted.example/login");
+    assert!(BrowserAuth::new(serde_json::from_value(local).unwrap(), &known).is_err());
     let mut secret = base;
     secret["client_secret"] = json!("not-supported");
     assert!(serde_json::from_value::<Config>(secret).is_err());
+}
+
+async fn member_login(provider: &Provider, hub: &Hub, subject: &str) -> HeaderMap {
+    let (headers, query) = provider.begin(hub).await;
+    provider
+        .codes
+        .lock()
+        .unwrap()
+        .get_mut(&query.code)
+        .unwrap()
+        .claims["sub"] = json!(subject);
+    let response = callback_inner(hub.clone(), headers, Query(query))
+        .await
+        .unwrap();
+    let mut headers = session_headers(&response);
+    let Json(data) = session(State(hub.clone()), headers.clone()).await;
+    headers.insert(
+        "x-csrf-token",
+        data["csrf_token"].as_str().unwrap().parse().unwrap(),
+    );
+    headers.insert(
+        header::ORIGIN,
+        HeaderValue::from_static("https://hub.example.test"),
+    );
+    headers
+}
+#[tokio::test]
+async fn member_invitation_is_bound_single_use_and_revocation_is_immediate() {
+    let provider = Provider::new();
+    let mut hub = provider
+        .hub()
+        .with_member_admins(vec!["alice".into()])
+        .unwrap();
+    hub.browser_auth
+        .as_mut()
+        .unwrap()
+        .subjects
+        .insert("subject-bob".into(), "bob".into());
+    let alice = member_login(&provider, &hub, "subject-alice").await;
+    let old_bob = member_login(&provider, &hub, "subject-bob").await;
+    let update = serde_json::from_value(
+        json!({"expected_revision":0,"display_name":"Bob","color":"blue","status":"disabled"}),
+    )
+    .unwrap();
+    let _updated = crate::members::update(
+        State(hub.clone()),
+        alice.clone(),
+        axum::extract::Path("bob".into()),
+        Json(update),
+    )
+    .await
+    .unwrap();
+    assert!(
+        hub.raw_identity(&old_bob).is_err(),
+        "disabled member's old cookie revoked"
+    );
+    let response = post_json(
+        &hub,
+        "/api/invitations",
+        alice.clone(),
+        json!({"owner":"bob","expected_revision":1}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let result: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 8192).await.unwrap()).unwrap();
+    let token = result["path"]
+        .as_str()
+        .unwrap()
+        .split("#invite=")
+        .nth(1)
+        .unwrap();
+    assert_eq!(
+        post_json(
+            &hub,
+            "/api/invitations/accept",
+            alice,
+            json!({"token":token})
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    let bob = member_login(&provider, &hub, "subject-bob").await;
+    assert_eq!(
+        request(&hub, "GET", "/api/me", bob.clone()).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        post_json(
+            &hub,
+            "/api/invitations/accept",
+            bob.clone(),
+            json!({"token":token})
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        request(&hub, "GET", "/api/me", bob.clone()).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_json(&hub, "/api/invitations/accept", bob, json!({"token":token}))
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    assert!(
+        hub.raw_identity(&old_bob).is_err(),
+        "reenabling does not revive the old cookie"
+    );
+}
+#[test]
+fn oidc_identity_binding_cannot_take_over_existing_account() {
+    let provider = Provider::new();
+    let hub = provider.hub();
+    let first = HashMap::from([("subject-alice".into(), "alice".into())]);
+    hub.bind_subjects(&provider.origin, &first).unwrap();
+    hub.bind_subjects(&provider.origin, &first).unwrap();
+    assert!(hub
+        .bind_subjects(
+            &provider.origin,
+            &HashMap::from([("another-person".into(), "alice".into())])
+        )
+        .is_err());
+    assert!(hub.bind_subjects("https://other.example", &first).is_err());
+}
+
+#[tokio::test]
+async fn confidential_gitlab_style_login_uses_basic_auth_and_pkce() {
+    let provider = Provider::new();
+    let mut hub = provider.hub();
+    let auth = hub.browser_auth.as_mut().unwrap();
+    auth.client = auth
+        .client
+        .clone()
+        .set_client_secret(openidconnect::ClientSecret::new(
+            "test-client-secret".into(),
+        ))
+        .set_auth_type(openidconnect::AuthType::BasicAuth);
+    let (headers, query) = provider.begin(&hub).await;
+    provider
+        .codes
+        .lock()
+        .unwrap()
+        .get_mut(&query.code)
+        .unwrap()
+        .claims["require_basic"] = json!(true);
+    let response = callback_inner(hub.clone(), headers, Query(query))
+        .await
+        .unwrap();
+    assert_eq!(hub.identity(&session_headers(&response)).unwrap(), "alice");
+}
+
+#[tokio::test]
+async fn gitlab_oauth_uses_https_user_id_and_imports_name_without_email_binding() {
+    let provider = Provider::new();
+    let mut hub = provider.hub();
+    let auth = hub.browser_auth.as_mut().unwrap();
+    auth.gitlab_oauth = true;
+    auth.client = auth.client.clone().disable_openid_scope();
+    auth.subjects = HashMap::from([("7".into(), "alice".into())]);
+    let (headers, query) = provider.begin(&hub).await;
+    let response = callback_inner(hub.clone(), headers, Query(query))
+        .await
+        .unwrap();
+    assert_eq!(hub.identity(&session_headers(&response)).unwrap(), "alice");
+    assert_eq!(hub.member("alice").unwrap().display_name, "GitLab Alice");
+    hub.browser_auth.as_mut().unwrap().subjects = HashMap::from([("8".into(), "alice".into())]);
+    let (headers, query) = provider.begin(&hub).await;
+    assert!(callback_inner(hub, headers, Query(query)).await.is_err());
+}
+
+#[tokio::test]
+async fn gitlab_signup_creates_fresh_identity_and_preserves_disabled_state() {
+    let provider = Provider::new();
+    let legacy = provider.hub();
+    let mut auth = legacy.browser_auth.clone().unwrap();
+    auth.gitlab_oauth = true;
+    auth.gitlab_auto_signup = true;
+    auth.subjects.clear();
+    auth.client = auth.client.disable_openid_scope();
+    let mut hub = Hub::open(crate::Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        database: ":memory:".into(),
+        users: vec![crate::UserConfig {
+            id: "login-bootstrap".into(),
+            token_sha256: "a".repeat(64),
+        }],
+        runtime: crate::Runtime::Mock,
+    })
+    .unwrap();
+    hub.browser_auth = Some(auth);
+    hub.restore_gitlab_workspace(&provider.origin).unwrap();
+    assert_eq!(hub.directory.ids().count(), 0);
+    let (headers, query) = provider.begin(&hub).await;
+    let response = callback_inner(hub.clone(), headers, Query(query))
+        .await
+        .unwrap();
+    assert_eq!(
+        hub.identity(&session_headers(&response)).unwrap(),
+        "gitlab-7"
+    );
+    assert_eq!(hub.member("gitlab-7").unwrap().display_name, "GitLab Alice");
+    assert!(!hub.directory.contains("alice"));
+    assert!(!hub.directory.contains("login-bootstrap"));
+    hub.restore_gitlab_workspace(&provider.origin).unwrap();
+    assert!(hub.directory.contains("gitlab-7"));
+    hub.db()
+        .unwrap()
+        .execute(
+            "UPDATE member_profiles SET status='disabled' WHERE owner='gitlab-7'",
+            [],
+        )
+        .unwrap();
+    let (headers, query) = provider.begin(&hub).await;
+    let response = callback_inner(hub.clone(), headers, Query(query))
+        .await
+        .unwrap();
+    assert!(hub.identity(&session_headers(&response)).is_err());
+    assert!(legacy
+        .clone()
+        .restore_gitlab_workspace(&provider.origin)
+        .is_err());
+    assert!(hub
+        .restore_gitlab_workspace("https://other.example")
+        .is_err());
+}
+
+#[tokio::test]
+async fn shared_gitlab_handoff_on_localhost_keeps_pkce_and_browser_binding() {
+    let provider = Provider::new();
+    let mut hub = provider.hub();
+    let auth = hub.browser_auth.as_mut().unwrap();
+    auth.gitlab_oauth = true;
+    auth.local_http = true;
+    auth.origin = "http://localhost:8081".into();
+    auth.authority = "localhost:8081".into();
+    auth.shared_gitlab_login =
+        Some("http://localhost:18082/identity/v1/auth/oidc/gitlab/login".into());
+    auth.client = auth.client.clone().disable_openid_scope().set_redirect_uri(
+        RedirectUrl::new("http://localhost:5176/identity/v1/auth/oidc/gitlab/callback".into())
+            .unwrap(),
+    );
+    auth.subjects = HashMap::from([("7".into(), "alice".into())]);
+    let response = login(State(hub.clone()), HeaderMap::new()).await.unwrap();
+    let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+    assert!(cookie.starts_with("agenct-local-login="));
+    assert!(cookie.contains("HttpOnly") && !cookie.contains("Secure"));
+    let url = reqwest::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+    let params: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(params["origin"], "http://localhost:8081");
+    assert_eq!(params["response_mode"], "code_handoff");
+    assert_eq!(params["code_challenge_method"], "S256");
+    let code = random();
+    provider.codes.lock().unwrap().insert(code.clone(), Code {
+        challenge: params["code_challenge"].clone(),
+        claims: json!({"iss":provider.origin,"aud":"browser-client","expected_redirect":"http://localhost:5176/identity/v1/auth/oidc/gitlab/callback","sub":"unused","nonce":"unused","iat":1,"exp":4102444800u64}),
+    });
+    let query = || Callback {
+        code: code.clone(),
+        state: params["state"].clone(),
+        iss: None,
+    };
+    assert!(
+        callback_inner(hub.clone(), HeaderMap::new(), Query(query()))
+            .await
+            .is_err()
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        cookie.split(';').next().unwrap().parse().unwrap(),
+    );
+    let result = callback_inner(hub.clone(), headers.clone(), Query(query()))
+        .await
+        .unwrap();
+    assert!(callback_inner(hub.clone(), headers, Query(query()))
+        .await
+        .is_err());
+    let session = result
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .find(|v| v.starts_with("agenct-local-session="))
+        .unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        session.split(';').next().unwrap().parse().unwrap(),
+    );
+    headers.insert(header::HOST, "localhost:8081".parse().unwrap());
+    assert_eq!(hub.identity(&headers).unwrap(), "alice");
+    let csrf = hub
+        .browser_auth
+        .as_ref()
+        .unwrap()
+        .session(&headers)
+        .unwrap()
+        .csrf;
+    headers.insert("x-csrf-token", csrf.parse().unwrap());
+    assert_eq!(
+        request(&hub, "GET", "/api/me", headers.clone())
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    headers.insert(header::ORIGIN, "http://evil.example".parse().unwrap());
+    assert!(logout(State(hub.clone()), headers.clone()).await.is_err());
+    headers.insert(header::ORIGIN, "http://localhost:8081".parse().unwrap());
+    logout(State(hub.clone()), headers.clone()).await.unwrap();
+    assert!(hub.identity(&headers).is_err());
+}
+
+#[test]
+fn http_login_is_explicit_and_limited_to_loopback() {
+    assert!(loopback_http("http://localhost:8081"));
+    assert!(!loopback_http("http://localhost.evil.example:8081"));
+    assert!(!loopback_http("http://192.168.1.1:8081"));
+    assert!(!loopback_http("http://user@localhost:8081"));
+    assert!(https("http://localhost:8081").is_err());
+}
+
+#[test]
+fn explicit_private_http_callback_matches_registered_gitlab_address() {
+    let cfg = json!({"gitlab_oauth":true,"gitlab_auto_signup":true,
+      "issuer":"https://gitlab.example", "authorization_endpoint":"https://gitlab.example/oauth/authorize",
+      "token_endpoint":"https://gitlab.example/oauth/token", "client_id":"test",
+      "public_origin":"http://100.64.0.12:5176", "allow_private_http":true,
+      "callback_path":"/identity/v1/auth/oidc/gitlab/callback", "subjects":{}, "jwks":{"keys":[]}});
+    let auth = BrowserAuth::new(
+        serde_json::from_value(cfg.clone()).unwrap(),
+        &HashSet::new(),
+    )
+    .unwrap();
+    assert_eq!(auth.authority, "100.64.0.12:5176");
+    assert_eq!(
+        auth.client.redirect_uri().unwrap().as_str(),
+        "http://100.64.0.12:5176/identity/v1/auth/oidc/gitlab/callback"
+    );
+    assert!(auth.shared_gitlab_login.is_none());
+    for origin in ["http://8.8.8.8:5176", "http://example.com:5176"] {
+        let mut bad_cfg = cfg.clone();
+        bad_cfg["public_origin"] = json!(origin);
+        assert!(
+            BrowserAuth::new(serde_json::from_value(bad_cfg).unwrap(), &HashSet::new()).is_err()
+        );
+    }
+    let mut bad_cfg = cfg;
+    bad_cfg["allow_private_http"] = json!(false);
+    assert!(BrowserAuth::new(serde_json::from_value(bad_cfg).unwrap(), &HashSet::new()).is_err());
+}
+
+#[tokio::test]
+async fn failed_callbacks_return_to_the_app_with_a_coarse_reason() {
+    let provider = Provider::new();
+    let hub = provider.hub();
+    let location = |response: &Response| {
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    };
+    // No login cookie: begun elsewhere, too long ago, or before a restart.
+    let (_, query) = provider.begin(&hub).await;
+    let response = callback(State(hub.clone()), HeaderMap::new(), Query(query)).await;
+    assert_eq!(location(&response), "/?login_error=expired");
+    assert!(response.headers().get(header::SET_COOKIE).is_none());
+    // A pending login lost to a restart looks the same to the user.
+    let (headers, query) = provider.begin(&hub).await;
+    let restarted = provider.hub();
+    let response = callback(State(restarted), headers, Query(query)).await;
+    assert_eq!(location(&response), "/?login_error=expired");
+    // A valid callback still signs in.
+    let (headers, query) = provider.begin(&hub).await;
+    let response = callback(State(hub.clone()), headers, Query(query)).await;
+    assert_eq!(hub.identity(&session_headers(&response)).unwrap(), "alice");
+}
+
+#[test]
+fn identity_proxy_must_be_an_explicit_http_url() {
+    // Process-wide variable: one test covers both the rejection and the default.
+    let config = || Config {
+        shared_gitlab_login: None,
+        shared_gitlab_callback: None,
+        allow_loopback_http: false,
+        allow_private_http: false,
+        callback_path: None,
+        gitlab_oauth: true,
+        gitlab_auto_signup: true,
+        issuer: "https://gitlab.example".into(),
+        authorization_endpoint: "https://gitlab.example/oauth/authorize".into(),
+        token_endpoint: "https://gitlab.example/oauth/token".into(),
+        client_id: "client".into(),
+        public_origin: "https://agenct.example".into(),
+        subjects: HashMap::new(),
+        jwks: json!({"keys": []}),
+    };
+    let known = HashSet::new();
+    std::env::set_var("AGENCT_IDENTITY_PROXY", "socks5://127.0.0.1:1080");
+    let bad = BrowserAuth::new(config(), &known).err();
+    std::env::set_var("AGENCT_IDENTITY_PROXY", "http://127.0.0.1:10809");
+    let ok = BrowserAuth::new(config(), &known).err();
+    std::env::remove_var("AGENCT_IDENTITY_PROXY");
+    assert_eq!(
+        bad,
+        Some("AGENCT_IDENTITY_PROXY must be an http(s) proxy URL")
+    );
+    assert_eq!(ok, None);
 }
