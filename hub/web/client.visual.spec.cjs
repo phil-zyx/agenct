@@ -17,6 +17,8 @@ for (const width of [1330, 1440, 400]) {
         await f.page.emulateMedia({ colorScheme, reducedMotion: 'reduce' });
         // Match the explicitly installed CI fonts, independent of desktop defaults.
         await f.page.addStyleTag({ content: 'body { font-family: "DejaVu Sans", "Droid Sans Fallback", sans-serif; }' });
+        // Transient toasts fade on their own timer (covered by interaction tests); keep them out of layout baselines.
+        await f.page.addStyleTag({ content: '#status { visibility: hidden !important; }' });
         await f.page.locator('#open-chat').click();
         await f.send('请总结本周工作，并保留下面的列表和代码示例。');
         await settled(f);

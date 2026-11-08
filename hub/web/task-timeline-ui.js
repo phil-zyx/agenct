@@ -24,7 +24,7 @@ function createTaskTimelineUI({ api, current, article, conversation }) {
     const version = ++generation;
     selected = { ...task };
     if (panel) panel.replaceChildren(article('旧时间线已关闭。'));
-    const card = article('正在读取共享任务记录…'); panel = card; conversation().append(card); card.scrollIntoView?.({ block: 'nearest' });
+    const card = article('正在读取共享任务记录…'); panel = card; conversation(task.id).append(card); card.scrollIntoView?.({ block: 'nearest' });
     const valid = () => current(context) && version === generation && tasks.has(task.id)
       && signature(tasks.get(task.id)) === signature(task);
     const abort = new AbortController(), stop = () => abort.abort();

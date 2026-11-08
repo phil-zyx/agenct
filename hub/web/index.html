@@ -33,7 +33,7 @@
   </button>
 </nav>
 
-<p id="status" class="toast" role="status" title="点击关闭"></p>
+<p id="status" class="toast" role="status" tabindex="0" aria-keyshortcuts="Escape" title="点击或按 Escape 关闭"></p>
 
 <section id="login" class="login">
   <div class="login-card">
@@ -75,9 +75,10 @@
         <p id="turn-status" role="status" aria-live="polite"></p>
         <div class="row"><button type="button" id="check-turn" class="primary">核对发送状态</button><button type="button" id="new-turn">开始新尝试</button></div>
       </section>
+      <span id="task-context-status" class="sr-only" role="status" aria-live="polite"></span>
       <section id="task-context" class="chip-bar hide" aria-label="下一条聊天的任务上下文">
         <span id="task-context-label" class="chip-label">讨论</span><span id="task-context-title" class="chip-title"></span>
-        <details class="chip-more"><summary>附带内容</summary><p id="task-context-details" role="status" aria-live="polite"></p></details>
+        <details class="chip-more"><summary>附带内容</summary><p id="task-context-details"></p></details>
         <button type="button" id="clear-task-context" class="icon-btn small" title="清除讨论的任务" aria-label="清除讨论的任务"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
       </section>
       <section id="repository-context" class="chip-bar hide" aria-label="下一条聊天的仓库内容"><span id="repository-context-text"></span><button type="button" id="clear-repository" class="text-btn">清除仓库选择</button></section>
