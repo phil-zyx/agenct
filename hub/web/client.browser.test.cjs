@@ -11,10 +11,10 @@ const { chromium } = require('playwright');
 const STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 const server = http.createServer((request, response) => {
   const name = request.url === '/' ? 'index.html' : request.url.slice(1);
-  if (!/^[a-z][a-z0-9-]*\.(?:html|css|js|png)$/.test(name) || !fs.existsSync(path.join(__dirname, name))) {
+  if (!/^(?:brand\/)?[a-z][a-z0-9-]*\.(?:html|css|js|png|svg)$/.test(name) || !fs.existsSync(path.join(__dirname, name))) {
     response.writeHead(404).end(); return;
   }
-  response.setHeader('Content-Type', name.endsWith('.png') ? 'image/png' : name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
+  response.setHeader('Content-Type', name.endsWith('.svg') ? 'image/svg+xml' : name.endsWith('.png') ? 'image/png' : name.endsWith('.js') ? 'text/javascript' : name.endsWith('.css') ? 'text/css' : 'text/html');
   response.end(fs.readFileSync(path.join(__dirname, name)));
 });
 
