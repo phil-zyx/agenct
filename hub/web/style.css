@@ -1,7 +1,7 @@
 :root {
   --bg: #f6f6f7; --surface: #ffffff; --soft: #efeff1; --line: #e6e6e9; --line-strong: #d6d6db;
   --text: #1d1d1f; --muted: #6e6e76; --faint: #6e6e76;
-  --brand: #1f7a5c; --brand-ink: #ffffff; --brand-soft: #e5f2ec;
+  --brand: #1f5440; --brand-ink: #ffffff; --brand-soft: #e3eee8; --brand-mark: #1f5440;
   --bubble-user: #ece1da; --bubble-user-ink: #2a211c; --bubble-ai: #ececee;
   --warn: #9a5b12; --warn-soft: #fbf1e3; --danger: #c0392b; --danger-soft: #fcebea;
   --info: #3a5fa8; --info-soft: #e9eef8; --done: #2f7a3d; --done-soft: #e6f3e8;
@@ -14,7 +14,7 @@
   :root {
     --bg: #161618; --surface: #202023; --soft: #2a2a2e; --line: #2e2e33; --line-strong: #3a3a40;
     --text: #ececef; --muted: #a2a2ab; --faint: #a2a2ab;
-    --brand: #4cbf94; --brand-ink: #0b2219; --brand-soft: #1b3229;
+    --brand: #4cbf94; --brand-ink: #0b2219; --brand-soft: #1b3229; --brand-mark: #e9f3ee;
     --bubble-user: #3a302a; --bubble-user-ink: #f3e9e2; --bubble-ai: #2a2a2e;
     --warn: #f0b25c; --warn-soft: #2e2516; --danger: #f07b72; --danger-soft: #361b19;
     --info: #92b2ee; --info-soft: #1c2436; --done: #7ccb8a; --done-soft: #19291c;
@@ -64,10 +64,8 @@ textarea, input { font: inherit; color: var(--text); background: var(--surface);
   grid-column: 1; height: 100vh; position: sticky; top: 0; display: flex; flex-direction: column; align-items: center;
   gap: 6px; padding: 14px 0; background: var(--surface); border-right: 1px solid var(--line);
 }
-.rail-logo, .avatar {
-  display: grid; place-items: center; border-radius: 50%; font-weight: 800; color: #fff;
-  background: linear-gradient(145deg, #227a5b, #1c6b51);
-}
+/* Brand icon (deep-green tile, see hub/web/brand/). Avatars crop it to a circle. */
+.rail-logo, .avatar { display: block; border-radius: 50%; background: #1f5440; }
 .rail-logo { width: 38px; height: 38px; font-size: 17px; margin-bottom: 18px; border-radius: 12px; }
 .rail-btn {
   position: relative; width: 48px; height: 48px; padding: 0; display: grid; place-items: center;
@@ -100,6 +98,9 @@ textarea, input { font: inherit; color: var(--text); background: var(--surface);
 .login { grid-column: 1 / -1; display: grid; place-items: center; padding: 32px 16px; min-height: 100vh; }
 .login-card { width: min(420px, 100%); text-align: center; padding: 36px 28px; background: var(--surface); border-radius: 28px; box-shadow: var(--shadow); }
 .login-card h1 { margin: 6px 0 0; font-size: 26px; }
+.login-brand { display: flex; align-items: center; justify-content: center; gap: 12px; margin: 0 0 10px; }
+.login-brand img { width: 52px; height: 52px; border-radius: 12px; }
+.login-wordmark { height: 34px; width: auto; fill: var(--brand-mark); }
 .lead { color: var(--muted); margin: 2px 0 24px; }
 .login-form { display: flex; gap: 8px; margin: 0 0 14px; }
 .login-form input { flex: 1; min-width: 0; border-radius: 999px; padding: 10px 18px; }
