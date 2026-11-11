@@ -86,7 +86,12 @@ async function freePort() {
     await panel(page).locator('.project-title').filter({ hasText: name }).waitFor();
   }
   async function reloadProject(page, name) {
-    await page.reload(); await page.locator('#room:not(.hide)').waitFor();
+    // These explicit reloads intentionally discard local previews/history.
+    // Playwright otherwise dismisses beforeunload and can leave navigation pending.
+    const acceptReload = dialog => { void dialog.accept(); };
+    page.on('dialog', acceptReload);
+    try { await page.reload(); } finally { page.off('dialog', acceptReload); }
+    await page.locator('#room:not(.hide)').waitFor();
     await openProject(page, name);
   }
   async function editor(page, kind, content, source = 'human_statement') {
@@ -300,12 +305,38 @@ async function freePort() {
     await reloadProject(carol, name);
     assert.equal(await panel(carol).locator('.project-state-card').count(), 5);
     await carol.setViewportSize({ width: 390, height: 844 });
+    await carol.waitForFunction(() => document.querySelector('.chat-pane').inert);
     assert(await carol.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Project layout must fit mobile viewport');
     await carol.screenshot({ path: path.join(screenshotDir, 'project-mobile.png') });
     await carol.locator('#open-chat').click();
     await carol.locator('#text').waitFor();
+    await carol.waitForFunction(() => !document.querySelector('.chat-pane').inert);
+    const unsent = '尚未发送的私人想法，不得被项目讨论覆盖';
+    const privateMessages = await ok('carol', 'messages');
+    await carol.locator('#text').fill(unsent);
     await openProject(carol, name);
     await card(carol, items.goal.id).waitFor();
+    await carol.waitForFunction(() => document.querySelector('.chat-pane').inert);
+    assert.equal(await carol.locator('#text').inputValue(), unsent);
+    await button(carol, '和助手讨论').click();
+    await panel(carol).getByText('请先处理当前输入或已选择的聊天上下文，再讨论项目。', { exact: true }).waitFor();
+    assert.equal(await carol.locator('#text').inputValue(), unsent);
+    assert(await panel(carol).isVisible());
+    assert.deepEqual(await ok('carol', 'messages'), privateMessages, 'Discuss must not send or overwrite an existing private draft');
+    await button(carol, '回到私聊').click();
+    await carol.waitForFunction(() => !document.querySelector('.chat-pane').inert);
+    assert.equal(await carol.locator('#text').inputValue(), unsent);
+    await carol.locator('#text').fill('');
+    await openProject(carol, name);
+    await panel(carol).evaluate(element => { element.scrollTop = 0; });
+    await panel(alice).evaluate(element => { element.scrollTop = 0; });
+    await carol.emulateMedia({ colorScheme: 'dark' });
+    await carol.screenshot({ path: path.join(screenshotDir, 'project-mobile-dark.png') });
+    await alice.emulateMedia({ colorScheme: 'dark' });
+    await alice.screenshot({ path: path.join(screenshotDir, 'project-desktop-dark.png') });
+    await alice.emulateMedia({ colorScheme: 'light' });
+    await carol.emulateMedia({ colorScheme: 'light' });
+    console.log('PASS mobile panel isolates focus, restores private composer, and preserves unsent text');
     await carol.locator('#logout').click();
     await carol.locator('#token').waitFor();
     await login(carol, 'eve');

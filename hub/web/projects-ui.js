@@ -11,6 +11,8 @@ function projectField(form, label, type = 'text', value = '', options) {
   const input = el(type === 'textarea' ? 'textarea' : options ? 'select' : 'input');
   if (options) for (const [key, name] of options) { const option = el('option', '', name); option.value = key; input.append(option); }
   else if (type !== 'textarea') input.type = type;
+  // Explicit naming prevents a wrapped select's option text from entering its label.
+  input.setAttribute('aria-label', label);
   input.value = value; input.required = true;
   if (type === 'textarea') input.rows = 4;
   wrap.append(input); form.append(wrap); return input;
