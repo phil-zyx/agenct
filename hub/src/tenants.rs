@@ -166,6 +166,7 @@ impl Hub {
                     }
                 }
             }
+            crate::projects::audit_tenants(&tx)?;
             tx.commit().map_err(|_| "tenant startup audit failed")?;
         }
         self.directory = Arc::new(directory);
