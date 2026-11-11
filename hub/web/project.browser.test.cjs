@@ -331,9 +331,9 @@ async function freePort() {
     await panel(carol).evaluate(element => { element.scrollTop = 0; });
     await panel(alice).evaluate(element => { element.scrollTop = 0; });
     await carol.emulateMedia({ colorScheme: 'dark' });
-    await carol.screenshot({ path: path.join(screenshotDir, 'project-mobile-dark.png') });
+    await carol.screenshot({ path: path.join(screenshotDir, 'project-mobile-dark.png'), animations: 'disabled' });
     await alice.emulateMedia({ colorScheme: 'dark' });
-    await alice.screenshot({ path: path.join(screenshotDir, 'project-desktop-dark.png') });
+    await alice.screenshot({ path: path.join(screenshotDir, 'project-desktop-dark.png'), animations: 'disabled' });
     await alice.emulateMedia({ colorScheme: 'light' });
     await carol.emulateMedia({ colorScheme: 'light' });
     console.log('PASS mobile panel isolates focus, restores private composer, and preserves unsent text');
@@ -345,7 +345,7 @@ async function freePort() {
     assert(!(await panel(carol).innerText()).includes(name));
     assert.equal(await panel(carol).locator('.project-state-card').count(), 0);
     assert.deepEqual(await ok('eve', 'projects'), []);
-    await alice.screenshot({ path: path.join(screenshotDir, 'project-desktop.png') });
+    await alice.screenshot({ path: path.join(screenshotDir, 'project-desktop.png'), animations: 'disabled' });
     // A poll already in flight before a commit must not poison the retained
     // request when it observes the newer server revision before POST fails.
     await reloadProject(alice, name);
