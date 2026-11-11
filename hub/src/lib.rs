@@ -19,6 +19,7 @@ mod policy;
 mod private_staging;
 mod profile_suggestions;
 mod profiles;
+mod project_state;
 mod projects;
 mod proposals;
 pub mod publication;
@@ -404,6 +405,18 @@ pub fn app(mut hub: Hub) -> Router {
         .route("/api/projects", get(projects::list).post(projects::create))
         .route("/api/project-invitations", get(projects::invitations))
         .route("/api/projects/{id}", get(projects::detail))
+        .route(
+            "/api/projects/{id}/state",
+            get(project_state::list).post(project_state::create),
+        )
+        .route(
+            "/api/projects/{id}/state/{item}",
+            get(project_state::history),
+        )
+        .route(
+            "/api/projects/{id}/state/{item}/actions",
+            post(project_state::action),
+        )
         .route("/api/projects/{id}/members", post(projects::invite))
         .route(
             "/api/projects/{id}/membership",
