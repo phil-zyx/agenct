@@ -163,7 +163,7 @@ function discussProject() {
 }
 function beginProjectEditor(title) {
   if (!projectCanNavigate()) return null;
-  const editor = el('section', 'project-editor'); editor.setAttribute('aria-label', title);
+  const editor = el('section', 'project-editor'); editor.setAttribute('aria-label', title + '面板');
   editor.append(el('h3', '', title));
   const context = session();
   projectDraft = { editor, context, generation: projectGeneration, projectId: projectView?.project.id, revision: projectView?.project.revision, invalid: false };

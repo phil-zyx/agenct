@@ -245,11 +245,11 @@ async function freePort() {
     assert.equal((await ok('alice', route + '/state/' + assignment.id)).versions.length, 3);
     console.log('PASS exact version confirmation, explicit revision, reset confirmation and history');
 
-    // Freeze background polling so the stale preview reaches the Hub and the
-    // test deterministically exercises its 409 rather than the polling guard.
+    // Isolate the server conflict from the separately tested polling guard.
+    // Drain outstanding project reads before deliberately holding an old preview.
     await reloadProject(bob, name);
-    await bob.clock.install();
-    await bob.clock.pauseAt(new Date());
+    await bob.evaluate(() => { refreshProjects = async () => {}; });
+    await bob.waitForFunction(() => !projectRead);
     await card(bob, assignment.id).getByRole('button', { name: '确认这项分工', exact: true }).click();
     const revised = await ok('alice', route + '/state/' + assignment.id + '/actions', 'POST', {
       action: 'revise', expected_revision: await revision(), expected_version: assignment.version,
@@ -349,8 +349,8 @@ async function freePort() {
     // A poll already in flight before a commit must not poison the retained
     // request when it observes the newer server revision before POST fails.
     await reloadProject(alice, name);
-    await alice.clock.install();
-    await alice.clock.pauseAt(new Date());
+    await alice.evaluate(() => { globalThis.projectTestRead = refreshProjects; refreshProjects = async () => {}; });
+    await alice.waitForFunction(() => !projectRead);
     await editor(alice, 'goal', '旧轮询不能阻止原编号重试');
     const gate = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
     const bounded = async promise => {
@@ -379,9 +379,8 @@ async function freePort() {
     });
     let poll;
     try {
-      // Wait out any initial read, then explicitly own this poll's lifetime.
-      await alice.waitForFunction(() => !projectRead);
-      poll = alice.evaluate(() => refreshProjects());
+      // Background project reads were disabled and drained before interception.
+      poll = alice.evaluate(() => globalThis.projectTestRead());
       await bounded(pollHeld.promise);
       await button(alice, '确认发布给项目成员').click();
       await bounded(postCommitted.promise);
