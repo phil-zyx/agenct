@@ -878,7 +878,7 @@ $('form').onsubmit = async event => {
   const context = session();
   const text = $('text').value.trim();
   if (!text || !current(context) || busy.has('send')) return;
-  // A short yes/no to a step waiting on the card is that confirmation itself.
+  // Only a named action or cancellation can directly answer a waiting card.
   if (await replyToPendingAction(context, text)) return;
   if (pendingTurn) {
     status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
