@@ -185,13 +185,19 @@ async function freePort() {
 
     // Cancel while project reads are outstanding. Their late response must not
     // replace a newer candidate, nor carry the old destination into it.
-    let releaseRead, markHeld;
+    let releaseRead, markHeld, markReadDone, holdNextDetail = true;
     const held = new Promise(resolve => { markHeld = resolve; });
     const release = new Promise(resolve => { releaseRead = resolve; });
+    const readDone = new Promise(resolve => { markReadDone = resolve; });
     const detailUrl = origin + '/api/' + route;
     await alice.route(detailUrl, async intercepted => {
-      const response = await intercepted.fetch(); markHeld(); await release;
-      await intercepted.fulfill({ response });
+      if (!holdNextDetail) return intercepted.continue();
+      holdNextDetail = false;
+      try {
+        const response = await intercepted.fetch(); markHeld(); await release;
+        await intercepted.fulfill({ response }); markReadDone(null);
+      } catch (error) { markReadDone(error); }
+
     });
     await promote(alice).click(); await selection(alice).selectOption(project.id);
     await button(alice, '整理候选').click();
@@ -199,7 +205,10 @@ async function freePort() {
     assert(await selection(alice).isDisabled());
     await button(alice, '取消编辑').click();
     await promote(alice).click(); await selection(alice).waitFor();
-    releaseRead(); await alice.unroute(detailUrl);
+    releaseRead();
+    const readError = await readDone;
+    if (readError) throw readError;
+    await alice.unrouteAll({ behavior: 'wait' });
     await pause(200);
     assert.equal(await selection(alice).inputValue(), '');
     assert.equal(await field(alice, '内容').count(), 0);
@@ -214,7 +223,7 @@ async function freePort() {
     await panel(alice).getByText(/无法准备候选/).waitFor();
     assert.equal(await field(alice, '内容').count(), 0);
     assert.equal(projectPosts.length, 0);
-    await button(alice, '取消编辑').click(); await alice.unroute(stateUrl);
+    await button(alice, '取消编辑').click(); await alice.unrouteAll({ behavior: 'wait' });
     console.log('PASS read failure never creates an editable stale-state publication');
 
     const note = await prepare(alice, '公开的分工候选');
@@ -330,32 +339,54 @@ async function freePort() {
     const modelItem = items.find(item => item.content === '整理后的模型建议，不代表承诺');
     assert.equal(modelItem.source_kind, 'model_suggestion');
     assert.equal(modelItem.status, 'proposed');
-    await alice.unroute(messagesUrl);
+    await alice.unrouteAll({ behavior: 'wait' });
     console.log('PASS assistant provenance remains a suggestion');
 
     await button(alice, '回到私聊').click();
     await prepare(alice, '丢失响应仍是同一次候选发布');
     const lost = origin + '/api/' + route + '/state';
     const bodies = [];
+    let markCommitted, releaseFailure;
+    const committed = new Promise(resolve => { markCommitted = resolve; });
+    const failureGate = new Promise(resolve => { releaseFailure = resolve; });
     await alice.route(lost, async intercepted => {
       if (intercepted.request().method() !== 'POST') return intercepted.continue();
       bodies.push(intercepted.request().postDataJSON());
-      if (bodies.length === 1) { await intercepted.fetch(); await intercepted.abort('failed'); }
-      else await intercepted.continue();
+      if (bodies.length === 1) {
+        await intercepted.fetch(); markCommitted();
+        await failureGate; await intercepted.abort('failed');
+      } else await intercepted.continue();
     });
-    await panel(alice).getByLabel('我已核对项目、共享文字和来源', { exact: true }).check();
-    await button(alice, '确认发布给项目成员').click();
-    await button(alice, '核对并重试原提交').waitFor();
-    await pause(3500); // Polling sees the committed revision before the UI retry.
-    await button(alice, '回到私聊').click();
-    await alice.locator('#open-projects').click();
-    await button(alice, '核对并重试原提交').waitFor();
+    try {
+      await review(alice).check();
+      await button(alice, '确认发布给项目成员').click();
+      let timer;
+      try {
+        await Promise.race([committed, new Promise((_, reject) => {
+          timer = setTimeout(() => reject(Error('Candidate POST did not commit before interruption')), 15000);
+        })]);
+      } finally { clearTimeout(timer); }
+      // Close while the POST is still unresolved, not after its failure UI.
+      await button(alice, '回到私聊').click();
+      assert(!(await review(alice).isChecked()));
+      releaseFailure();
+      await alice.waitForFunction(() => !projectBusy && projectDraft?.uncertain);
+      await button(alice, '核对并重试原提交').waitFor({ state: 'attached' });
+      assert(await button(alice, '核对并重试原提交').isDisabled(), 'Failure must not visually re-enable a closed, unacknowledged preview');
+      await alice.locator('#open-projects').click();
+      await button(alice, '核对并重试原提交').waitFor();
+      assert(!(await review(alice).isChecked()));
+      assert(await button(alice, '核对并重试原提交').isDisabled());
+      await pause(3500); // Polling sees the committed revision before the UI retry.
+      assert(await button(alice, '核对并重试原提交').isDisabled());
+      assert.equal(bodies.length, 1, 'Reopening and polling must not retry implicitly');
+    } finally { releaseFailure(); }
     await commit(alice, '核对并重试原提交', true);
     assert.equal(bodies.length, 2);
     assert.deepEqual(bodies[1], bodies[0]);
     assert.equal((await state()).filter(item => item.content === '丢失响应仍是同一次候选发布').length, 1);
-    await alice.unroute(lost);
-    console.log('PASS lost POST response, polling, close/reopen and repeated exact retry do not duplicate');
+    await alice.unrouteAll({ behavior: 'wait' });
+    console.log('PASS close during pending POST keeps failed retry unacknowledged; explicit exact retry does not duplicate');
 
     await button(alice, '回到私聊').click();
     await prepare(alice, '结果未知后取消不会撤回发布');
@@ -378,7 +409,7 @@ async function freePort() {
     assert.equal(uncertainPosts, 1);
     assert.equal(await button(alice, '核对并重试原提交').count(), 0);
     assert.equal((await state()).filter(item => item.content === '结果未知后取消不会撤回发布').length, 1);
-    await alice.unroute(lost);
+    await alice.unrouteAll({ behavior: 'wait' });
     console.log('PASS uncertain cancellation warns, can be declined, and never claims to undo publication');
 
     await button(alice, '回到私聊').click();

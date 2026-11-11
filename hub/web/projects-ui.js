@@ -292,6 +292,8 @@ async function commitProject(draft, path, body, button, preview) {
       if (body.request_id) button.textContent = '核对并重试原提交';
       projectNotice('提交结果未知。' + (body.request_id ? '可用同一编号重试以上原内容，不会重复创建。' : '请取消编辑并刷新核对，系统不会自动重发。'));
     } else projectNotice('未提交：' + error.message);
+    // Closing during the request clears review even if the failure arrives later.
+    if (draft.acknowledgement && !draft.acknowledgement.checked) button.disabled = true;
   } finally { if (current(draft.context) && (projectDraft === draft || !projectDraft)) projectBusy = false; }
 }
 function createProjectEditor() {
