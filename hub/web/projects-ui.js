@@ -1,4 +1,4 @@
-/* Project coordination stays beside private chat. Nothing reads or publishes chat history. */
+/* Project coordination stays beside private chat. Only an explicitly selected message can seed a local candidate. */
 let projectView = null, projectGeneration = 0, projectRead = null, projectDraft = null, projectBusy = false;
 let projectDirectory = [], projectInvitations = [];
 const projectPath = id => 'projects/' + encodeURIComponent(id);
@@ -19,6 +19,10 @@ function projectField(form, label, type = 'text', value = '', options) {
 }
 function projectNotice(message) { const notice = $('project-notice'); if (notice) notice.textContent = message; }
 function closeProjects() {
+  if (projectDraft?.acknowledgement) {
+    projectDraft.acknowledgement.checked = false;
+    projectDraft.preview?.querySelector('button.primary')?.setAttribute('disabled', '');
+  }
   $('room').classList.remove('projects-open'); projectHost().classList.add('hide');
   $('open-projects').classList.remove('active'); $('open-projects').setAttribute('aria-expanded', 'false');
 }
@@ -32,11 +36,14 @@ function projectShell() {
   const notice = el('p', 'project-notice note'); notice.id = 'project-notice'; notice.setAttribute('role', 'status');
   projectHost().replaceChildren(head, el('p', 'note', '与助手讨论仍仅自己可见。只有预览并确认发布的内容会成为项目材料。'), notice);
 }
-async function openProjects() {
-  if (!current(session())) return;
+function showProjectPanel() {
   closeContacts(); closePeerConversation(); profileUI.reset(); hideCollaborationSettings(); setTasksOpen(false);
   $('room').classList.add('projects-open'); projectHost().classList.remove('hide');
   $('open-projects').classList.add('active'); $('open-projects').setAttribute('aria-expanded', 'true');
+}
+async function openProjects() {
+  if (!current(session())) return;
+  showProjectPanel();
   if (projectDraft) { void refreshProjects(); return; }
   if (projectView) await loadProject(projectView.project.id); else await loadProjectDirectory();
 }
@@ -161,6 +168,48 @@ function discussProject() {
   $('text').value = '我想讨论项目「' + projectView.project.name + '」。请帮我整理下一步，任何共同状态都等我预览后再手动发布。';
   $('text').dispatchEvent(new Event('input')); closeProjects(); $('text').focus();
 }
+async function proposeChatProject(context, message) {
+  if (!current(context)) return;
+  const candidate = ProjectStateModel.chatCandidate(message, context.user); if (!candidate) return;
+  showProjectPanel();
+  if (!projectCanNavigate()) return;
+  projectGeneration++; projectView = null; projectRead = null; projectShell();
+  const editor = beginProjectEditor('从私聊整理项目候选'); if (!editor) return;
+  const draft = projectDraft;
+  editor.append(el('p', 'note', '当前仅自己可见。请主动选择项目，再删改要共享的文字。不会自动发布，也不会把助手建议当成共同事实。'), editorCancel());
+  projectNotice('正在读取可选项目…');
+  try {
+    const projects = await contactApi(context, 'projects');
+    if (!current(context) || projectDraft !== draft) return;
+    projectNotice('');
+    const active = projects.filter(project => project.status === 'active');
+    if (!active.length) { editor.append(el('p', 'note', '还没有可发布的项目。请取消编辑，创建或加入项目后再选择这条消息。')); return; }
+    const form = el('form');
+    const choice = projectField(form, '发布到项目', 'text', '', [['', '请明确选择项目'], ...active.map(project => [project.id, project.name + ' · ' + project.id])]);
+    const prepare = el('button', 'primary', '整理候选'); prepare.type = 'submit'; form.append(prepare);
+    form.onsubmit = async event => {
+      event.preventDefault();
+      if (!current(context) || projectDraft !== draft || draft.loading || !form.reportValidity()) return;
+      const id = choice.value; if (!active.some(project => project.id === id)) return;
+      draft.loading = true; prepare.disabled = true; choice.disabled = true; projectNotice('正在核对所选项目和成员…');
+      try {
+        const view = await fetchProject(context, id);
+        if (!current(context) || projectDraft !== draft) return;
+        if (view.project.id !== id || view.project.status !== 'active'
+            || !view.members.some(member => member.owner === context.user && member.status === 'active')) throw Error('所选项目已不可发布，请取消后重新选择');
+        projectGeneration++; projectView = view; projectDraft = null; editor.remove(); renderProject();
+        stateEditor(null, candidate);
+      } catch (error) {
+        if (current(context) && projectDraft === draft) projectNotice('无法准备候选：' + error.message + '。尚未共享任何文字。');
+      } finally {
+        if (current(context) && projectDraft === draft) { draft.loading = false; prepare.disabled = false; choice.disabled = false; }
+      }
+    };
+    editor.append(form); choice.focus();
+  } catch (error) {
+    if (current(context) && projectDraft === draft) projectNotice('无法读取项目：' + error.message + '。请取消后重试，尚未共享任何文字。');
+  }
+}
 function beginProjectEditor(title) {
   if (!projectCanNavigate()) return null;
   const editor = el('section', 'project-editor'); editor.setAttribute('aria-label', title + '面板');
@@ -171,27 +220,47 @@ function beginProjectEditor(title) {
 }
 function cancelProjectEditor() {
   if (projectBusy) return;
+  if (projectDraft?.uncertain && !confirm('上次提交结果未知，可能已经发布。取消只会丢弃本页重试凭据，不会撤回已发布内容。取消后请先刷新核对，不要重新发布相同内容。仍要取消编辑吗？')) return;
   projectDraft?.editor.remove(); projectDraft = null;
   if (projectView) void loadProject(projectView.project.id); else void loadProjectDirectory();
 }
 function editorCancel() { return projectButton('取消编辑', cancelProjectEditor); }
+function activeProjectPreview(draft, preview) {
+  return projectDraft === draft && draft.preview === preview && preview?.isConnected
+    && draft.editor.contains(preview) && $('room').classList.contains('projects-open');
+}
 function projectPreview(form, title, lines, label, path, body) {
-  const draft = projectDraft; if (!draft || draft.invalid || projectBusy) return;
+  const draft = projectDraft;
+  if (!draft || draft.invalid || projectBusy || !current(draft.context)
+      || !form.isConnected || !draft.editor.contains(form) || !$('room').classList.contains('projects-open')) return;
   draft.idempotent = !!body.request_id;
   const preview = el('div', 'project-preview'); preview.append(el('h4', '', title));
   for (const text of lines) preview.append(el('p', 'project-copy', text));
   preview.append(el('p', 'note', '只提交以上内容，不附带私聊、私密草稿或其他来源正文。'));
-  const confirm = projectButton(label, () => commitProject(draft, path, body, confirm), 'primary');
+  let acknowledgement = null;
+  const confirm = projectButton(label, () => {
+    if (!activeProjectPreview(draft, preview) || (acknowledgement && !acknowledgement.checked)) return;
+    void commitProject(draft, path, body, confirm, preview);
+  }, 'primary');
+  if (draft.chatCandidate) {
+    const wrap = el('label', 'project-acknowledgement');
+    acknowledgement = el('input'); acknowledgement.type = 'checkbox';
+    acknowledgement.setAttribute('aria-label', '我已核对项目、共享文字和来源');
+    wrap.append(acknowledgement, el('span', '', '我已核对项目、共享文字和来源。只发布为待确认建议，不代表本人或他人已接受分工。'));
+    draft.acknowledgement = acknowledgement;
+    acknowledgement.onchange = () => { confirm.disabled = !activeProjectPreview(draft, preview) || !acknowledgement.checked || draft.invalid || projectBusy; };
+    confirm.disabled = true; preview.append(wrap);
+  }
   preview.append(confirm);
   if (form.tagName === 'FORM') preview.append(projectButton('返回修改', () => {
-    if (projectBusy || draft.uncertain) return;
-    preview.replaceWith(form);
+    if (!activeProjectPreview(draft, preview) || projectBusy || draft.uncertain) return;
+    draft.preview = null; draft.acknowledgement = null; preview.replaceWith(form);
   }));
   preview.append(editorCancel());
-  form.replaceWith(preview); confirm.focus();
+  draft.preview = preview; form.replaceWith(preview); (acknowledgement || confirm).focus();
 }
-async function commitProject(draft, path, body, button) {
-  if (projectBusy || projectDraft !== draft || draft.invalid || !current(draft.context)) return;
+async function commitProject(draft, path, body, button, preview) {
+  if (projectBusy || !activeProjectPreview(draft, preview) || draft.invalid || !current(draft.context)) return;
   // Discard every read started before this write, including a poll that sees its commit
   // before the POST response arrives. Such a read cannot invalidate recovery.
   projectGeneration++;
@@ -223,6 +292,8 @@ async function commitProject(draft, path, body, button) {
       if (body.request_id) button.textContent = '核对并重试原提交';
       projectNotice('提交结果未知。' + (body.request_id ? '可用同一编号重试以上原内容，不会重复创建。' : '请取消编辑并刷新核对，系统不会自动重发。'));
     } else projectNotice('未提交：' + error.message);
+    // Closing during the request clears review even if the failure arrives later.
+    if (draft.acknowledgement && !draft.acknowledgement.checked) button.disabled = true;
   } finally { if (current(draft.context) && (projectDraft === draft || !projectDraft)) projectBusy = false; }
 }
 function createProjectEditor() {
@@ -239,24 +310,33 @@ function createProjectEditor() {
   };
   editor.append(form); name.focus();
 }
-function stateEditor(item) {
+function stateEditor(item, candidate = null) {
   const editor = beginProjectEditor(item ? '修订共同状态' : '发布共同状态'); if (!editor) return;
-  const project = projectView.project; const form = el('form');
+  const project = projectView.project, draft = projectDraft; const form = el('form');
+  draft.chatCandidate = !!candidate;
+  if (candidate) editor.append(el('p', 'note', '这是一条本地候选，尚未共享。只保留准备公开的文字；原消息未改动，其他聊天不会附带。'));
   const kind = projectField(form, '类型', 'text', item?.kind || 'goal', Object.entries(ProjectStateModel.kinds)); kind.disabled = !!item;
-  const content = projectField(form, '内容', 'textarea', item?.content || ''); content.maxLength = 4000;
-  const sourceKind = projectField(form, '来源类型', 'text', item?.source_kind || 'human_statement', [['human_statement', '人工陈述'], ['model_suggestion', '模型建议']]);
-  const note = projectField(form, '来源说明', 'textarea', item?.source_note || ''); note.maxLength = 1000;
+  const content = projectField(form, '内容', 'textarea', candidate?.content || item?.content || '');
+  const sourceKind = projectField(form, '来源类型', 'text', candidate?.source_kind || item?.source_kind || 'human_statement', [['human_statement', '人工陈述'], ['model_suggestion', '模型建议']]);
+  if (candidate) sourceKind.disabled = true;
+  const note = projectField(form, '来源说明', 'textarea', candidate?.source_note || item?.source_note || '');
+  if (candidate) { note.readOnly = true; form.append(el('p', 'note', '来源保留所选消息的类型与时间，不证明内容真实。请在上方编辑要共享的内容。')); }
   const members = projectView.members.filter(member => member.status === 'active');
   const assignee = projectField(form, '负责人', 'text', item?.assignee || '', [['', '选择需本人确认的成员'], ...members.map(m => [m.owner, m.owner])]);
   const updateKind = () => { assignee.parentElement.classList.toggle('hide', kind.value !== 'assignment'); assignee.required = kind.value === 'assignment'; }; kind.onchange = updateKind; updateKind();
   form.append(el('p', 'note', '请只填准备向全体项目成员公开的内容和来源说明。模型建议保持建议标记；分工需要负责人本人确认。修订会清除原有确认。'));
   const preview = el('button', 'primary', '预览发布'); preview.type = 'submit'; form.append(preview, editorCancel());
   form.onsubmit = event => {
-    event.preventDefault(); if (!form.reportValidity()) return;
-    const value = { kind: kind.value, content: content.value.trim(), source_kind: sourceKind.value, source_note: note.value.trim(), assignee: kind.value === 'assignment' ? assignee.value : null };
+    event.preventDefault();
+    if (projectDraft !== draft || draft.invalid || projectBusy || !current(draft.context)
+        || !form.isConnected || !$('room').classList.contains('projects-open') || !form.reportValidity()) return;
+    const value = { kind: kind.value, content: content.value.trim(), source_kind: candidate?.source_kind || sourceKind.value, source_note: candidate?.source_note || note.value.trim(), assignee: kind.value === 'assignment' ? assignee.value : null };
+    if (!ProjectStateModel.boundedText(value.content, 4000) || !ProjectStateModel.boundedText(value.source_note, 1000)) {
+      projectNotice('内容需为 1–4000 个字符，来源说明需为 1–1000 个字符，且不能含特殊控制字符。请删改后重新预览；不会自动截断或共享。'); return;
+    }
     const body = item ? { action: 'revise', expected_revision: project.revision, expected_version: item.version, content: value } : { request_id: crypto.randomUUID(), expected_revision: project.revision, content: value };
     const path = projectPath(project.id) + '/state' + (item ? '/' + encodeURIComponent(item.id) + '/actions' : '');
-    const lines = ['项目：' + project.name, '可见范围：所有已加入的项目成员（包括之后加入的成员）', ProjectStateModel.kinds[value.kind] + '：' + value.content, '来源类型：' + sourceKind.selectedOptions[0].textContent, '来源说明：' + value.source_note, ...(value.assignee ? ['负责人：' + value.assignee] : []), '发布后状态：待本人确认' + (item ? '。原确认作废，生成新版本。' : '')];
+    const lines = ['项目：' + project.name, '项目编号：' + project.id + ' · 项目版本 ' + project.revision + ' · ' + (item ? '当前条目版本 ' + item.version + ' → 新版本 ' + (item.version + 1) : '新条目版本 1'), '发布人：' + draft.context.user, '可见范围：所有已加入的项目成员（包括之后加入的成员）', ProjectStateModel.kinds[value.kind] + '：' + value.content, '来源类型：' + sourceKind.selectedOptions[0].textContent, '来源说明：' + value.source_note, ...(value.assignee ? ['负责人：' + value.assignee] : []), '发布后状态：待本人确认' + (item ? '。原确认作废，生成新版本。' : '')];
     projectPreview(form, '发布前核对', lines, '确认发布给项目成员', path, body);
   };
   editor.append(form); content.focus();

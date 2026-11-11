@@ -105,7 +105,13 @@ function addMessageActions(bubble, context, message) {
     $('text').oninput?.(); $('text').focus?.();
     status('已填入输入框，可以修改后再发送。');
   };
-  actions.append(copy, delegate, retry); bubble.append(actions);
+  actions.append(copy, delegate, retry);
+  if (typeof ProjectStateModel !== 'undefined' && ProjectStateModel.chatCandidate(message, context.user)) {
+    const propose = el('button', 'text-btn', '提为项目候选'); propose.type = 'button';
+    propose.onclick = () => { if (current(context)) void proposeChatProject(context, message); };
+    actions.append(propose);
+  }
+  bubble.append(actions);
   if (messagePanels.has(messageKey)) bubble.append(messagePanels.get(messageKey));
 }
 

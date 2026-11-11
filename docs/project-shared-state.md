@@ -1,15 +1,18 @@
 # Explicit shared project state
 
-This API-only slice builds on project membership. It records explicitly published
-coordination items: goals, assignments, blockers, and pending decisions. It does
-not yet provide a project UI, chat extraction, agent-to-agent negotiation,
-notifications, task execution, or automatic fact checking.
+Project membership and the chat-side project panel record explicitly published
+coordination items: goals, assignments, blockers, and pending decisions. A member
+can prepare a private candidate from one chosen chat message, then review and
+publish it. There is no automatic chat extraction, group chat, agent-to-agent
+negotiation, task execution, or automatic fact checking.
 
 ## Publication and confirmation
 
 A member manually supplies the text, source type, and source note to share with
 all accepted project members, including future joiners. Publishing never reads a
-private conversation, task, draft, attachment, or model result. Source notes are
+private conversation, task, draft, attachment, or model result on the server.
+The browser can copy only a message the user explicitly selects into a local
+editor; this is not publication. Source notes are
 plain, unverified statements supplied by the publisher, not resolved links or
 proof that another person said something. The server records the authenticated
 publisher, each actor, timestamp, and immutable version history. Unknown fields
@@ -123,5 +126,49 @@ confirmation, revision invalidation, replay/concurrency, cross-project URLs,
 withdrawal, removal/rejoin, invitations, account/tenant controls, archive, forged
 fields, and immutable history. `schema.rs` tests additive/idempotent v18 upgrade
 and trigger verification. The complete Rust/test/clippy/fmt and existing browser,
-private-staging, and Docker CI matrix remains the merge gate. No UI acceptance or
-production deployment is claimed by this API-only slice.
+private-staging, and Docker CI matrix remains the merge gate.
+`project.browser.test.cjs` covers the panel with three real Hub clients.
+`project-chat.browser.test.cjs` covers explicit message candidates and interrupted
+publication; it uses one labeled assistant display fixture because Mock notices
+are not eligible candidates. No production deployment is implied.
+
+
+## From private chat to a project candidate
+
+On a completed private user message or assistant reply, choose **提为项目候选**.
+Failed/pending messages and system/Mock notices have no candidate action. This
+copies only that message into a temporary browser editor. It does not send a
+model request, store a new suggestion on the server, or share anything yet.
+
+1. Explicitly select **发布到项目**, even if another project was just viewed.
+   The picker has no default selection. It loads a fresh accepted-member view
+   and current project revision before preparing the candidate.
+2. Choose the goal/assignment/blocker/decision type and edit **内容** down to
+   exactly what should be public. Assignments require an active named member.
+   The original private message is unchanged. Nothing else from the conversation
+   or task/draft context is copied.
+3. The source type stays `human_statement` for the user's message or
+   `model_suggestion` for an assistant reply. The source note records the
+   selecting owner, role, and timestamp when available. These are publisher
+   annotations, not verified evidence; no private message IDs or resolvable links
+   are sent. The candidate source fields cannot be silently relabeled.
+4. **预览发布** shows the selected project name and ID, its reviewed revision,
+   new item version 1, publisher, exact shared text/source, assignee, and audience
+   (all accepted members, including future joiners). Check the review box, then
+   **确认发布给项目成员**. Only this step calls the existing state creation API.
+   It creates `proposed`, never a confirmation or task execution.
+5. The named person can separately review and confirm the published version.
+   The publisher can use **撤回** after a mistaken publication. Withdrawal keeps
+   history; it does not erase material already read by members.
+
+Back invalidates the old preview and requires a new review. Closing retains the
+local candidate but clears its review checkbox. A hidden or detached confirmation
+cannot publish. Cancel discards the local candidate. Refresh/logout clears it;
+it is not saved in local/session storage. A pending write cannot be cancelled,
+and a result-unknown cancellation warns that it cannot undo an existing write.
+
+Project/member changes invalidate the preview, and the API checks membership
+and the reviewed revision again at write time. No newer revision is substituted
+automatically. An uncertain creation response retains the exact `request_id` and
+body for an explicit replay; repeated clicks cannot create multiple items.
+Changing accounts destroys candidates and ignores old in-flight reads/callbacks.
