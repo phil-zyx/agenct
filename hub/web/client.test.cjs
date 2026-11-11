@@ -1681,19 +1681,61 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const body = JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body);
     assert.deepEqual([body.action, body.source_draft_id, body.expected_revision, body.result], ['deliver', 'auto-draft-id', 3, 'Auto draft 需要补充的信息']);
   });
-  await test('a typed yes carries out the waiting step and a typed no drops it, without a model turn', async () => {
+  await test('ambiguous replies never execute a pending delivery after unrelated chat or reload', async () => {
+    const storage = new Map();
+    const settings = { storage, tasks: [task({ result: null, my_draft: { status: 'complete', request_id: 'private-draft' } })],
+      taskAction: body => body.message === '交付' ? { action: 'deliver', task_id: 'task-one', expected_revision: 3 } : null };
+    const f = fixture(undefined, settings); await f.login('bob'); await settle();
+    await f.send('交付'); await settle();
+    await f.send('明天天气怎么样'); await settle();
+    await f.send('嗯'); await settle();
+    assert.equal(posts(f, '/actions').length, 0, 'an unrelated reply cannot authorize old delivery');
+    assert.equal(said(f).message, '嗯', 'ambiguous agreement remains ordinary chat');
+    const again = fixture(undefined, settings); await again.login('bob'); await settle();
+    assert(findButton(again.$('conversation'), '确认交付'), 'the explicit card remains recoverable');
+    for (const reply of ['嗯', '好', '好的', '可以', '确认', '确定', 'yes', 'OK!', 'y', '确认交付了吗？', '不要确认交付']) {
+      const turns = chatPosts(again).length;
+      await again.send(reply); await settle();
+      assert.equal(posts(again, '/actions').length, 0, reply + ' cannot execute a restored action');
+      assert.equal(chatPosts(again).length, turns + 1, reply + ' remains ordinary chat');
+    }
+    const turns = chatPosts(again).length;
+    await again.send('确认交付'); await settle();
+    assert.equal(chatPosts(again).length, turns, 'explicit confirmation needs no model interpretation');
+    assert.deepEqual(JSON.parse(posts(again, '/tasks/task-one/actions')[0].options.body), {
+      action: 'deliver', expected_revision: 3, result: 'Auto draft 需要补充的信息', source_draft_id: 'auto-draft-id'
+    });
+    await again.send('确认交付'); await settle();
+    assert.equal(posts(again, '/actions').length, 1, 'a consumed confirmation cannot execute again');
+  });
+  await test('all waiting actions require an exact named confirmation, not generic agreement', async () => {
+    for (const [action, label, status, user] of [
+      ['accept', '接手', 'awaiting_owner', 'bob'], ['deliver', '交付', 'working', 'bob'],
+      ['approve', '验收', 'ready_for_acceptance', 'alice'], ['return', '退回', 'ready_for_acceptance', 'alice']
+    ]) {
+      const f = fixture(undefined, { tasks: [task({ status, my_draft: { status: 'complete', request_id: 'private-draft' } })],
+        taskAction: body => body.message === label ? { action, task_id: 'task-one', expected_revision: 3 } : null });
+      await f.login(user); await settle(); await f.send(label); await settle();
+      await f.send('好的'); await settle();
+      assert.equal(posts(f, '/actions').length, 0, action + ' requires a named confirmation');
+      assert.match(f.$('conversation').textContent, new RegExp('可以直接回复「确认' + label + '」'));
+      await f.send('确定' + label + '！'); await settle();
+      assert.equal(JSON.parse(posts(f, '/actions')[0].options.body).action, action);
+    }
+  });
+  await test('a typed named action carries out the waiting step and a typed no drops it, without a model turn', async () => {
     const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance', result: 'done' })],
       taskAction: body => /退回/.test(body.message) ? { action: 'return', task_id: 'task-one', expected_revision: 3 } : null });
     await f.login('alice'); await settle();
     await f.send('退回，改一下开头'); await settle();
-    assert.match(f.$('conversation').textContent, /可以直接回复「确认」或「算了」/);
+    assert.match(f.$('conversation').textContent, /可以直接回复「确认退回」或「算了」/);
     const turns = chatPosts(f).length;
     await f.send('算了'); await settle();
     assert.equal(chatPosts(f).length, turns, 'no model turn for a plain no');
     assert.equal(posts(f, '/actions').length, 0);
     assert(!findButton(f.$('conversation'), '确认退回'), 'the step is withdrawn');
     await f.send('退回，改一下开头'); await settle();
-    await f.send('确认'); await settle();
+    await f.send('确认退回'); await settle();
     assert.equal(chatPosts(f).length, turns + 1, 'only the request itself reached the model');
     assert.equal(JSON.parse(posts(f, '/tasks/task-one/actions')[0].options.body).action, 'return');
     assert.equal(f.$('text').value, '');
@@ -1744,10 +1786,25 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
       await f.login('alice'); await settle(); await f.send('验收'); await settle();
       if (mode === 'detach') f.$('clear-task-context').onclick();
       if (mode === 'other') f.discussion('other').onclick();
-      await f.send(mode === 'wrong-action' ? '确认退回' : '好的'); await settle();
+      await f.send(mode === 'wrong-action' ? '确认退回' : '确认验收'); await settle();
       assert.equal(posts(f,'/actions').length,0);
       if (mode === 'wrong-action') assert.equal(f.$('text').value,'确认退回');
     }
+  });
+  await test('named confirmation executes only the selected one of multiple waiting tasks', async () => {
+    const f = fixture(undefined, { tasks: [task({ status: 'ready_for_acceptance' }), task({ id: 'other', status: 'ready_for_acceptance' })],
+      taskAction: body => body.message === '验收' ? { action: 'approve', ...body.selected_task } : null });
+    await f.login('alice'); await settle();
+    for (const id of ['task-one', 'other']) {
+      f.discussion(id).onclick(); await f.send('验收'); await settle();
+    }
+    assert.equal(walk(f.$('conversation')).filter(node => node.tagName === 'button' && node.textContent === '确认验收').length, 2);
+    await f.send('嗯'); await settle();
+    assert.equal(posts(f, '/actions').length, 0);
+    f.discussion('other').onclick(); await f.send('确认验收'); await settle();
+    assert.equal(posts(f, '/actions').length, 1);
+    assert.equal(posts(f, '/actions')[0].url, '/api/tasks/other/actions');
+    assert(findButton(f.$('conversation'), '确认验收'), 'the other task still requires its own confirmation');
   });
   await test('polling keeps typed input bound to its snapshot and preserves stale invalidation', async () => {
     const f=fixture(undefined,{tasks:[task({id:'A'})]}); await f.login('bob'); await settle();
@@ -1953,6 +2010,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.equal(JSON.parse(storage.get('agenct.task-actions.v1')).items[0][1].draftId,'reviewed');
     assert(!storage.get('agenct.task-actions.v1').includes('Auto draft'));
     const again=fixture(undefined,{storage,tasks,draftId:'newer'});await again.login('bob');await settle();
+    await again.send('确认交付'); await settle();
+    assert.equal(posts(again,'/actions').length,0);
     await findButton(again.$('conversation'),'确认交付').onclick();await settle();
     assert.equal(posts(again,'/actions').length,0);
     assert.match(again.$('status').textContent,/草稿版本已变更/);
