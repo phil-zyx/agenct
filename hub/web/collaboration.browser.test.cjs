@@ -214,7 +214,8 @@ async function freePort() {
     await deliver(bob, '已补充权限校验示例、异常返回和验收清单。');
     await refresh(alice);
     await say(alice, '验收通过');
-    await say(alice, '确认');
+    await alice.locator('.task-chat', { hasText: '交付了结果' }).getByRole('button', { name: '确认验收', exact: true }).waitFor();
+    await say(alice, '确认验收');
     await alice.locator('.task-line', { hasText: '已验收完成' }).waitFor();
     await showTasks(alice);
     await alice.locator('#task-filter').selectOption('completed');
