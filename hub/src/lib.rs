@@ -19,8 +19,8 @@ mod policy;
 mod private_staging;
 mod profile_suggestions;
 mod profiles;
-mod proposals;
 mod projects;
+mod proposals;
 pub mod publication;
 mod repo_context;
 mod runtime;
@@ -405,11 +405,20 @@ pub fn app(mut hub: Hub) -> Router {
         .route("/api/project-invitations", get(projects::invitations))
         .route("/api/projects/{id}", get(projects::detail))
         .route("/api/projects/{id}/members", post(projects::invite))
-        .route("/api/projects/{id}/membership", get(projects::membership_status).post(projects::change_membership))
-        .route("/api/projects/{id}/members/{member}/remove", post(projects::remove_member))
+        .route(
+            "/api/projects/{id}/membership",
+            get(projects::membership_status).post(projects::change_membership),
+        )
+        .route(
+            "/api/projects/{id}/members/{member}/remove",
+            post(projects::remove_member),
+        )
         .route("/api/projects/{id}/archive", post(projects::archive))
         .route("/api/projects/{id}/tasks", post(projects::link_task))
-        .route("/api/projects/{id}/tasks/{task}/actions", post(projects::link_action))
+        .route(
+            "/api/projects/{id}/tasks/{task}/actions",
+            post(projects::link_action),
+        )
         .route("/api/profile-suggestions", get(profile_suggestions::list))
         .route(
             "/api/profile-suggestions/{id}/actions",

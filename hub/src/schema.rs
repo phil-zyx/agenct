@@ -348,7 +348,8 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                     && version < 15)
                 || (table == "profile_suggestions" && version < 16)
                 || (table == "chat_failures" && version < 17)
-                || (["projects", "project_members", "project_tasks"].contains(&table) && version < 18)
+                || (["projects", "project_members", "project_tasks"].contains(&table)
+                    && version < 18)
             {
                 continue;
             }
@@ -991,7 +992,9 @@ mod tests {
     #[test]
     fn projects_upgrade_is_additive_empty_and_idempotent() {
         let mut db = Connection::open_in_memory().unwrap();
-        for next in 1..=17 { step(&db, next).unwrap(); }
+        for next in 1..=17 {
+            step(&db, next).unwrap();
+        }
         db.pragma_update(None, "user_version", 17).unwrap();
         db.execute_batch("INSERT INTO sessions VALUES ('alice','session-a'),('bob','session-b');
             INSERT INTO tasks(id,requester,owner,summary,status) VALUES ('legacy','alice','bob','private summary','working');
@@ -1001,11 +1004,10 @@ mod tests {
         for table in ["projects", "project_members", "project_tasks"] {
             assert_eq!(scalar(&db, &format!("SELECT count(*) FROM {table}")), 0);
         }
-        assert_eq!(text(&db,"SELECT summary FROM tasks"), "private summary");
-        assert_eq!(text(&db,"SELECT content FROM messages"), "private chat");
+        assert_eq!(text(&db, "SELECT summary FROM tasks"), "private summary");
+        assert_eq!(text(&db, "SELECT content FROM messages"), "private chat");
         let before = schema(&db);
         migrate(&mut db).unwrap();
         assert_eq!(schema(&db), before);
     }
-
 }
