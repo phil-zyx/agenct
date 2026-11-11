@@ -602,6 +602,10 @@ async function nextStepsInteractions(browser, origin) {
     await card('draft-beta').locator('.agent-draft').waitFor();
     await f.send('确认交付'); await settled(f);
     assert.equal(actionPosts().length, 0, 'explicit confirmation cannot execute another task’s waiting card');
+    assert.equal(f.posts().at(-1).body.selected_task.task_id, 'draft-beta');
+    // Explicit task selection belongs to one ordinary chat turn, so select B
+    // again before asking it to prepare its own waiting confirmation.
+    await select(1);
     await f.send('交付'); await settled(f);
     await card('draft-beta').getByRole('button', { name: '确认交付', exact: true }).waitFor();
     await f.send('好的'); await settled(f);
