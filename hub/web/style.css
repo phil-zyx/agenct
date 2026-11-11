@@ -696,3 +696,6 @@ textarea, input { caret-color: var(--brand); }
   .project-field input, .project-field textarea, .project-field select { font-size: 16px; }
   .rail .rail-btn { width: clamp(34px, 11vw, 44px); }
 }
+
+.project-acknowledgement { display: flex; align-items: flex-start; gap: 10px; margin: 16px 0; font-size: 13px; line-height: 1.6; cursor: pointer; }
+.project-acknowledgement input { flex: 0 0 auto; width: 20px; height: 20px; margin-top: 2px; }
