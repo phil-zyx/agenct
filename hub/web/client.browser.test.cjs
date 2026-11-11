@@ -161,6 +161,9 @@ if (require.main === module) (async () => {
       await f.page.getByRole('button', { name: '保存资料', exact: true }).first().click();
       await f.page.waitForFunction(() => document.querySelector('input[aria-label="alice 显示姓名"]')?.value === 'Alice Chen');
       assert.equal(writes[0].expected_revision, 0); assert.equal(writes[0].display_name, 'Alice Chen');
+      // Saving rebuilds the account view asynchronously. A filled input alone
+      // is not evidence that the refreshed administrator controls are ready.
+      await f.page.getByRole('button', { name: '停用账号', exact: true }).waitFor({ state: 'visible' });
       assert.equal(await f.page.getByRole('button', { name: '停用账号', exact: true }).count(), 1);
       await f.page.keyboard.press('Escape');
       assert.equal(await f.page.locator('#contacts-view').isVisible(), false);
