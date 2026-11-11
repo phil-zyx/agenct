@@ -541,15 +541,18 @@ async function nextStepsInteractions(browser, origin) {
     assert((await card.textContent()).includes('帮我写一版，语气正式'));
     assert.equal(f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').length, 0,
       'missing base must not discard the instruction and dispatch an uninstructed draft');
-    task.my_draft = { status: 'complete', automatic: true, request_id: 'existing-base' };
-    await f.page.locator('#refresh').evaluate(button => button.click());
+    await card.getByRole('button', { name: '先生成基础草稿', exact: true }).click();
     await f.page.waitForFunction(() => [...document.querySelectorAll('.deferred-revision button')].some(b => !b.disabled));
+    const initial = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST');
+    assert.equal(initial.length, 1, 'creating the base does not silently submit the retained instruction');
+    assert.equal(initial[0].body.revision, undefined);
+    assert((await card.textContent()).includes('帮我写一版，语气正式'));
     await retry.click();
     await f.page.waitForFunction(() => !document.querySelector('.deferred-revision'));
     await card.locator('.agent-draft').waitFor();
     assert((await card.textContent()).includes('Private generated draft'));
     const asked = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').at(-1).body;
-    assert.deepEqual(asked.revision, { base_draft_id: 'draft-existing-base', instruction: '帮我写一版，语气正式' });
+    assert.deepEqual(asked.revision, { base_draft_id: 'draft-' + initial[0].body.request_id, instruction: '帮我写一版，语气正式' });
     assert(!f.calls.some(c => c.pathname.endsWith('/actions')), 'drafting never delivers');
     await f.page.locator('#text').fill('更正式一些'); await f.page.locator('#text').press('Enter');
     await f.page.waitForFunction(() => document.querySelectorAll('.task-chat .agent-draft').length >= 1);
