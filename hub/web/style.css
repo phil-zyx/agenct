@@ -683,6 +683,15 @@ textarea, input { caret-color: var(--brand); }
 .project-state-group > h3 { margin-bottom: 10px; }
 .project-card, .project-state-card { padding: 14px; margin: 10px 0; border: 1px solid var(--line); border-radius: 10px; box-shadow: none; background: var(--surface); }
 .project-state-card > p { margin: 6px 0; }
+.project-state-card:focus { outline: 2px solid var(--brand); outline-offset: 3px; }
+.project-alignment { margin-top: 20px; padding: 16px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--soft); }
+.project-alignment > h3 { margin-top: 0; }
+.project-alignment-card { padding-top: 14px; margin-top: 14px; border-top: 1px solid var(--line); }
+.project-alignment-card > h4 { margin-bottom: 6px; }
+.project-alignment-card > p { font-size: 13px; line-height: 1.65; }
+.project-alignment-sources { font-size: 12px; }
+.project-alignment-source { padding: 8px 0; overflow-wrap: anywhere; }
+.project-alignment-source > p { margin: 5px 0; }
 .project-item-status { color: var(--brand); font-size: 12px; font-weight: 600; }
 .project-editor { margin-top: 20px; padding: 16px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--soft); }
 .project-field { display: grid; gap: 6px; margin-bottom: 14px; font-size: 13px; }
