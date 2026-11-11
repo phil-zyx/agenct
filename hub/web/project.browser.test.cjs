@@ -315,6 +315,81 @@ async function freePort() {
     assert.equal(await panel(carol).locator('.project-state-card').count(), 0);
     assert.deepEqual(await ok('eve', 'projects'), []);
     await alice.screenshot({ path: path.join(screenshotDir, 'project-desktop.png') });
+    // A poll already in flight before a commit must not poison the retained
+    // request when it observes the newer server revision before POST fails.
+    await reloadProject(alice, name);
+    await alice.clock.install();
+    await alice.clock.pauseAt(new Date());
+    await editor(alice, 'goal', '旧轮询不能阻止原编号重试');
+    const gate = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+    const bounded = async promise => {
+      let timer;
+      try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(Error('Held-response regression timed out')), 15000); })]); }
+      finally { clearTimeout(timer); }
+    };
+    const pollHeld = gate(), releasePoll = gate(), postCommitted = gate(), releaseFailure = gate();
+    let holdNextGet = true, holdNextPost = true;
+    const submittedBodies = [];
+    await alice.route(lost, async interceptedRoute => {
+      const request = interceptedRoute.request();
+      if (request.method() === 'GET' && holdNextGet) {
+        holdNextGet = false; pollHeld.resolve(); await releasePoll.promise;
+        // Read after the POST committed, so fetchProject must re-read the
+        // earlier detail revision and eventually return the newer snapshot.
+        await interceptedRoute.fulfill({ response: await interceptedRoute.fetch() });
+      } else if (request.method() === 'POST') {
+        submittedBodies.push(request.postDataJSON());
+        if (holdNextPost) {
+          holdNextPost = false;
+          await interceptedRoute.fetch(); postCommitted.resolve();
+          await releaseFailure.promise; await interceptedRoute.abort('failed');
+        } else await interceptedRoute.continue();
+      } else await interceptedRoute.continue();
+    });
+    let poll;
+    try {
+      // Wait out any initial read, then explicitly own this poll's lifetime.
+      await alice.waitForFunction(() => !projectRead);
+      poll = alice.evaluate(() => refreshProjects());
+      await bounded(pollHeld.promise);
+      await button(alice, '确认发布给项目成员').click();
+      await bounded(postCommitted.promise);
+      releasePoll.resolve();
+      await bounded(poll);
+      releaseFailure.resolve();
+      await button(alice, '核对并重试原提交').waitFor();
+      assert(await button(alice, '核对并重试原提交').isEnabled());
+      assert.equal(await alice.evaluate(() => projectDraft.invalid), false, 'Pre-commit read must not invalidate the draft');
+      await commit(alice, '核对并重试原提交');
+      await panel(alice).getByText('旧轮询不能阻止原编号重试', { exact: true }).waitFor();
+      assert.equal(submittedBodies.length, 2);
+      assert.deepEqual(submittedBodies[1], submittedBodies[0], 'Retry must preserve exact body and request ID');
+      assert.equal((await state()).filter(item => item.content === '旧轮询不能阻止原编号重试').length, 1);
+    } finally {
+      releasePoll.resolve(); releaseFailure.resolve();
+      if (poll) await poll.catch(() => {});
+      await alice.unroute(lost);
+    }
+    console.log('PASS pre-existing poll cannot invalidate uncertain idempotent publication');
+
+    // Historical membership remains in the server record, but must not be
+    // presented as the current roster or an eligible assignment target.
+    await ok('alice', route + '/members', 'POST', { owner: 'eve', expected_revision: await revision() });
+    await ok('eve', route + '/membership', 'POST', { action: 'decline', expected_revision: await revision() });
+    await ok('carol', route + '/membership', 'POST', { action: 'leave', expected_revision: await revision() });
+    const inactive = (await ok('alice', route)).members;
+    assert(inactive.some(member => member.owner === 'eve' && member.status === 'declined'));
+    assert(inactive.some(member => member.owner === 'carol' && member.status === 'left'));
+    await reloadProject(alice, name);
+    const roster = await panel(alice).locator('.project-members').innerText();
+    assert(!roster.includes('eve') && !roster.includes('carol'));
+    assert(roster.includes('alice') && roster.includes('bob'));
+    await button(alice, '发布共同状态').click();
+    await panel(alice).getByLabel('类型', { exact: true }).selectOption('assignment');
+    const options = await panel(alice).getByLabel('负责人', { exact: true }).locator('option').allTextContents();
+    assert(!options.includes('eve') && !options.includes('carol'));
+    await button(alice, '取消编辑').click();
+    console.log('PASS declined and departed members are absent from current roster and assignee choices');
     assert.deepEqual(pageErrors, []);
     console.log('PASS refresh persistence, mobile navigation, account-switch isolation, no browser exceptions');
     console.log('Screenshots: ' + screenshotDir);
