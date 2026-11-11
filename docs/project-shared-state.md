@@ -82,6 +82,8 @@ source_kind, source_note}}`.
 - `request_id`: 1–128 ASCII letters/digits, underscores, or hyphens. Scoped to the
   authenticated publisher and project. Exact creation replay returns the latest
   item without resetting it; reuse with different original content returns 409.
+  An authorized publisher can also reconcile the original request after archive
+  or assignee departure: this replay is read-only and never restores consent.
 
 `GET /api/projects/{id}/state/{item}`
 
