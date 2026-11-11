@@ -26,11 +26,13 @@ function closePeerConversation() {
 }
 function hideCollaborationSettings() { collaborationProfileUI.close(); }
 function restorePrivateChat() {
+  if (typeof closeProjects === 'function') closeProjects();
   closeContacts(); closePeerConversation(); profileUI.reset(); hideCollaborationSettings();
   setTasksOpen(false); $('open-chat').classList.add('active');
   $('open-chat').setAttribute('aria-current', 'page'); $('text').focus?.();
 }
 async function openContactDirectory() {
+  if (typeof closeProjects === 'function') closeProjects();
   const context = session(); if (!current(context)) return;
   const owner = context.epoch + ':' + context.user;
   if (contactDraftOwner !== owner) { clearContactDrafts(); contactDraftOwner = owner; }
@@ -82,6 +84,7 @@ function renderContactDirectory() {
   }
 }
 async function openPeerConversation(id) {
+  if (typeof closeProjects === 'function') closeProjects();
   const context = session(); if (!current(context)) return;
   profileUI.reset(); hideCollaborationSettings(); closeContacts(); setTasksOpen(false);
   const generation = ++peerGeneration;

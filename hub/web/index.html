@@ -21,6 +21,9 @@
     <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="15" height="18" rx="3"/><path d="M3 7h4M3 12h4M3 17h4"/><circle cx="12.5" cy="9" r="2.2"/><path d="M9 17a3.5 3.5 0 0 1 7 0"/></svg>
     <span id="contacts-badge" class="rail-badge"></span>
   </button>
+  <button type="button" id="open-projects" class="rail-btn" title="项目" aria-label="项目" aria-expanded="false" aria-controls="project-panel">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2-3h9v16H3Z"/><path d="M7 12h10M7 16h6"/></svg>
+  </button>
   <button type="button" id="open-agents" class="rail-btn" title="个人角色设置" aria-label="个人角色设置">
     <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19a5.5 5.5 0 0 1 11 0"/><circle cx="17" cy="9" r="2.4"/><path d="M15.5 14.2A4.5 4.5 0 0 1 20.5 18.5"/></svg>
   </button>
@@ -133,6 +136,7 @@
   <section id="contacts-view" class="profile-view contacts-view hide" aria-label="联系人协作资料"></section>
   <section id="collaboration-profile-view" class="profile-view hide" aria-label="助手记住的我"></section>
   <section id="profile-view" class="profile-view hide" role="dialog" aria-modal="false" aria-label="个人角色设置"></section>
+  <aside id="project-panel" class="project-panel hide" aria-label="项目共同状态"></aside>
   <aside class="task-pane" aria-label="任务">
     <div class="pane-head">
       <div class="seg" role="tablist" aria-label="工作视图">
@@ -161,6 +165,8 @@
 <script src="task-chat.js"></script>
 <script src="account-ui.js"></script>
 <script src="contacts-ui.js"></script>
+<script src="project-state-model.js"></script>
+<script src="projects-ui.js"></script>
 <script src="client-chrome.js"></script>
 </body>
 </html>

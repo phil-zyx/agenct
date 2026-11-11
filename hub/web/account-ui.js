@@ -1,5 +1,6 @@
 /* Account settings share the right-hand surface with the directory. */
 async function openAccount() {
+  if (typeof closeProjects === 'function') closeProjects();
   const context = session(); if (!current(context)) return;
   profileUI.reset(); hideCollaborationSettings(); closeContacts();
   const version = contactsGeneration;

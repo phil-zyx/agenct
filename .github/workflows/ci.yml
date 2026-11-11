@@ -27,8 +27,18 @@ jobs:
           node scripts/three-person-acceptance.test.cjs
           AGENCT_TEST_HUB_BINARY="$PWD/hub/target/debug/agenct-hub" node scripts/three-person-acceptance.cjs --scope all
       - run: npm run test:local
-      - name: Browser flows against a real Hub (contacts, collaboration, profile chat, chat failures)
+      - name: Browser flows against a real Hub (contacts, collaboration, profile chat, chat failures, projects)
+        env:
+          AGENCT_TEST_SCREENSHOT_DIR: ${{ runner.temp }}/hub-browser-screens
         run: npm run test:hub-browser
+      - name: Upload real-Hub browser screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hub-browser-screens
+          path: ${{ runner.temp }}/hub-browser-screens/
+          if-no-files-found: ignore
+          retention-days: 14
   browser:
     runs-on: ubuntu-22.04
     timeout-minutes: 15
