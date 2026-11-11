@@ -208,17 +208,20 @@ async function runPendingAction(context, task, pending) {
   }
 }
 
-const YES = /^(确认|确定)(接手|交付|验收|退回)?[。.!！~～]*$|^(好的?|好啊|好嘞|可以|行|是的?|对|嗯+|没问题|ok|okay|yes|y)[。.!！~～]*$/i;
+// Waiting cards survive unrelated chat and reloads, so ordinary agreement can
+// never authorize them. The exact named action still needs the selected task,
+// task revision and (for delivery) reviewed draft checks below.
+const CONFIRM_ACTION = /^(?:确认|确定)(接手|交付|验收|退回)[。.!！~～]*$/;
 const NO = /^(算了|取消|不了|先不|不要|不用了?|cancel|no|n)[。.!！~～]*$/i;
 
-/** A short yes or no typed while a step waits on the card answers it directly,
-    without another model turn. Returns true when the text was used that way. */
+/** Only an explicit named confirmation or a cancellation answers a waiting card
+    without another model turn. Generic agreement remains ordinary chat. */
 async function replyToPendingAction(context, text) {
   if (!selectedTask || selectedTask.invalidated || pendingTurn || busy.has('turn-check')) return false;
   const task = visibleTasks.get(selectedTask.id), pending = pendingActions.get(selectedTask.id);
+  const named = CONFIRM_ACTION.exec(text)?.[1];
   if (!task || !pending || task.revision !== selectedTask.revision || pending.revision !== task.revision
-      || !(YES.test(text) || NO.test(text))) return false;
-  const named = /^(确认|确定)(接手|交付|验收|退回)/.exec(text)?.[2];
+      || !(named || NO.test(text))) return false;
   if (named && named !== { accept: '接手', deliver: '交付', approve: '验收', return: '退回' }[pending.action]) {
     status('确认的动作与当前待确认操作不同，请核对任务卡片。'); return true;
   }
@@ -235,10 +238,10 @@ function confirmation(context, task, card) {
   if (!pending) return;
   if (pending.revision !== task.revision) { forgetAction(task.id); return; }
   const [label, note] = ACTION_TEXT[pending.action](task);
-  // Answerable by typing as well as by the button.
+  // The prompt names the exact action required for a typed confirmation.
   const draft = latestDraft(task);
   const box = el('div', 'task-confirm');
-  box.append(el('p', 'note', note + ' 可以直接回复「确认」或「算了」。'))
+  box.append(el('p', 'note', note + ` 可以直接回复「${label}」或「算了」。`));
   const actions = el('div', 'actions');
   const key = 'tasks:' + task.id;
   if (pending.action === 'deliver' && !draft) {
