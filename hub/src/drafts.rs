@@ -812,9 +812,7 @@ mod tests {
                     assert_eq!(count, 0);
                 }
                 set_auto_access(&f.h, "active");
-                let replay = generate(&f.h, "bob", "task", f.input(true))
-                    .await
-                    .unwrap();
+                let replay = generate(&f.h, "bob", "task", f.input(true)).await.unwrap();
                 assert_eq!(replay["status"], "uncertain");
                 assert_eq!(f.calls.load(Ordering::SeqCst), 1);
             }
@@ -832,9 +830,7 @@ mod tests {
                 ["x".repeat(16000)],
             )
             .unwrap();
-        let out = generate(&f.h, "bob", "task", f.input(false))
-            .await
-            .unwrap();
+        let out = generate(&f.h, "bob", "task", f.input(false)).await.unwrap();
         assert_eq!(out["status"], "complete");
         assert_eq!(f.calls.load(Ordering::SeqCst), 2);
     }
