@@ -158,7 +158,9 @@ if (require.main === module) (async () => {
       });
       await f.page.locator('#open-account').click();
       await f.page.getByRole('textbox', { name: 'alice 显示姓名', exact: true }).fill('Alice Chen');
+      const editedInput = await f.page.getByRole('textbox', { name: 'alice 显示姓名', exact: true }).elementHandle();
       await f.page.getByRole('button', { name: '保存资料', exact: true }).first().click();
+      await f.page.waitForFunction(input => !input.isConnected, editedInput);
       await f.page.waitForFunction(() => document.querySelector('input[aria-label="alice 显示姓名"]')?.value === 'Alice Chen');
       assert.equal(writes[0].expected_revision, 0); assert.equal(writes[0].display_name, 'Alice Chen');
       // Saving rebuilds the account view asynchronously. A filled input alone
