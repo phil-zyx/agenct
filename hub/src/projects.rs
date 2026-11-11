@@ -22,12 +22,12 @@ CREATE INDEX IF NOT EXISTS project_members_owner ON project_members(owner,status
 #[derive(Serialize)]
 pub(super) struct Project {
     id: String,
-    creator: String,
+    pub(super) creator: String,
     name: String,
     goal: String,
     kind: String,
     status: String,
-    revision: i64,
+    pub(super) revision: i64,
     created_at: String,
 }
 const COLUMNS: &str = "id,creator,name,goal,kind,status,revision,created_at";
@@ -52,7 +52,7 @@ fn read(db: &Connection, id: &str) -> Result<Project> {
     .optional()?
     .ok_or_else(denied)
 }
-fn bounded(value: &str, limit: usize) -> bool {
+pub(super) fn bounded(value: &str, limit: usize) -> bool {
     !value.trim().is_empty()
         && value.chars().count() <= limit
         && !value
@@ -81,13 +81,13 @@ fn same_workspace(h: &Hub, db: &Connection, p: &Project, user: &str) -> Result<b
         && account_active(h, db, &p.creator)?
         && (p.creator == user || h.directory.can_delegate(&p.creator, user)))
 }
-fn active_member(h: &Hub, db: &Connection, p: &Project, user: &str) -> Result<bool> {
+pub(super) fn active_member(h: &Hub, db: &Connection, p: &Project, user: &str) -> Result<bool> {
     Ok(
         same_workspace(h, db, p, user)?
             && membership(db, &p.id, user)?.as_deref() == Some("active"),
     )
 }
-fn authorize(h: &Hub, db: &Connection, id: &str, user: &str) -> Result<Project> {
+pub(super) fn authorize(h: &Hub, db: &Connection, id: &str, user: &str) -> Result<Project> {
     let p = read(db, id)?;
     if !active_member(h, db, &p, user)? {
         return Err(denied());
@@ -108,13 +108,13 @@ fn owner(p: &Project, user: &str) -> Result<()> {
     }
     Ok(())
 }
-fn writable(p: &Project) -> Result<()> {
+pub(super) fn writable(p: &Project) -> Result<()> {
     if p.status != "active" {
         return Err(Error(StatusCode::CONFLICT, "project is archived"));
     }
     Ok(())
 }
-fn bump(db: &Connection, p: &Project, expected: i64) -> Result<i64> {
+pub(super) fn bump(db: &Connection, p: &Project, expected: i64) -> Result<i64> {
     if expected != p.revision || expected == i64::MAX {
         return Err(Error(
             StatusCode::CONFLICT,
@@ -342,8 +342,9 @@ pub(super) struct Action {
     action: String,
     expected_revision: i64,
 }
-fn revoke_member_links(db: &Connection, project: &str, user: &str) -> Result<()> {
+fn revoke_member_links(db: &Connection, project: &str, user: &str, actor: &str) -> Result<()> {
     db.execute("UPDATE project_tasks SET status='revoked' WHERE project_id=?1 AND task_id IN (SELECT id FROM tasks WHERE requester=?2 OR owner=?2)",params![project,user])?;
+    crate::project_state::revoke_member(db, project, user, actor)?;
     Ok(())
 }
 pub(super) async fn membership_status(
@@ -390,7 +391,7 @@ pub(super) async fn change_membership(
         params![next, id, actor],
     )?;
     if next != "active" {
-        revoke_member_links(&tx, &id, &actor)?;
+        revoke_member_links(&tx, &id, &actor, &actor)?;
     }
     tx.commit()?;
     Ok(receipt(revision))
@@ -423,7 +424,7 @@ pub(super) async fn remove_member(
         "UPDATE project_members SET status='removed' WHERE project_id=?1 AND owner=?2",
         params![id, member],
     )?;
-    revoke_member_links(&tx, &id, &member)?;
+    revoke_member_links(&tx, &id, &member, &actor)?;
     tx.commit()?;
     Ok(receipt(revision))
 }
