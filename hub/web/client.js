@@ -139,7 +139,7 @@ const draftUI = createDraftUI({ api, current, article, conversation: taskPane })
 
 const profileUI = createProfileUI({ api, current, article, host: () => $('profile-view'), status,
   onVisibility: open => {
-    if (open) { closeContacts(); collaborationProfileUI.close(); }
+    if (open) { if (typeof closeProjects === 'function') closeProjects(); closeContacts(); collaborationProfileUI.close(); }
     $('room').classList[open ? 'add' : 'remove']('settings-open');
     $('profile-view').classList[open ? 'remove' : 'add']('hide');
     $('open-agents').classList[open ? 'add' : 'remove']('active');
@@ -157,7 +157,7 @@ const profileUI = createProfileUI({ api, current, article, host: () => $('profil
 
 const collaborationProfileUI = createCollaborationProfileUI({ api: (context, ...args) => contactApi(context, ...args), current, host: () => $('collaboration-profile-view'), status, onEdit: () => editPersonalInfo(),
   onVisibilityChange: open => {
-    if (open) { closeContacts(); profileUI.reset(); }
+    if (open) { if (typeof closeProjects === 'function') closeProjects(); closeContacts(); profileUI.reset(); }
     $('room').classList[open ? 'add' : 'remove']('collaboration-settings-open');
     $('collaboration-profile-view').classList[open ? 'remove' : 'add']('hide');
     $('open-collaboration').classList[open ? 'add' : 'remove']('active');
@@ -453,6 +453,7 @@ async function completeTurn(context, response) {
 }
 
 function resetIdentity({ preserveRecovery = false } = {}) {
+  if (typeof resetProjects === 'function') resetProjects();
   collaborationProfileUI.reset({ discard: true });
   clearPeerSession();
   resetProfileSuggestions();
@@ -598,6 +599,7 @@ async function readSnapshot(context) {
   }
   if (!current(context) || version !== refreshVersion) return;
   void refreshPeerContacts(context);
+  if (typeof refreshProjects === 'function') void refreshProjects();
   workerUI.update(context, tasks);
   draftUI.update(context, tasks);
   timelineUI.update(context, tasks);

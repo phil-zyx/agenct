@@ -18,7 +18,7 @@ const contactDrafts = new Map();
 let contactDraftOwner = '';
 function clearContactDrafts() { contactDrafts.clear(); contactDraftOwner = ''; }
 function setTasksOpen(open) {
-  if (open) { closeContacts(); profileUI.reset(); hideCollaborationSettings(); }
+  if (open) { if (typeof closeProjects === 'function') closeProjects(); closeContacts(); profileUI.reset(); hideCollaborationSettings(); }
   $('room').classList[open ? 'add' : 'remove']('tasks-open');
   $('toggle-tasks').setAttribute('aria-pressed', String(open));
   preference.set('agenct.tasksOpen', open ? '1' : '0');
@@ -77,6 +77,7 @@ document.addEventListener('keydown', event => {
     (open ? $('tab-activity') : $('text')).focus?.(); return;
   }
   if (event.key !== 'Escape' || event.defaultPrevented) return;
+  if ($('room').classList.contains('projects-open')) { closeProjects(); $('open-projects').focus?.(); return; }
   if ($('room').classList.contains('collaboration-settings-open')) { collaborationProfileUI.close(); $('open-collaboration').focus?.(); return; }
   if ($('room').classList.contains('contacts-open')) { closeContacts(); $('open-contacts').focus?.(); return; }
   if ($('room').classList.contains('settings-open')) { profileUI.close(); return; }
@@ -132,7 +133,8 @@ function updatePanelAccessibility() {
   const room = $('room'), chat = document.querySelector('.chat-pane');
   if (!chat) return;
   const narrow = globalThis.innerWidth <= 900 && !room.classList.contains('hide');
-  const panel = room.classList.contains('collaboration-settings-open') ? $('collaboration-profile-view')
+  const panel = room.classList.contains('projects-open') ? $('project-panel')
+    : room.classList.contains('collaboration-settings-open') ? $('collaboration-profile-view')
     : room.classList.contains('contact-list-open') ? $('contact-sidebar')
     : room.classList.contains('contacts-open') ? $('contacts-view')
     : room.classList.contains('settings-open') ? $('profile-view')
@@ -153,7 +155,7 @@ if (typeof MutationObserver !== 'undefined') {
   updatePanelAccessibility();
 }
 globalThis.addEventListener?.('beforeunload', event => {
-  if (profileUI.hasUnsaved() || collaborationProfileUI.hasUnsaved() || [...peerDrafts.values()].some(draft => draft.value.trim() || draft.pending) || [...contactDrafts.values()].some(draft => draft.value.trim())) {
+  if ((typeof projectDraft !== 'undefined' && projectDraft) || profileUI.hasUnsaved() || collaborationProfileUI.hasUnsaved() || [...peerDrafts.values()].some(draft => draft.value.trim() || draft.pending) || [...contactDrafts.values()].some(draft => draft.value.trim())) {
     event.preventDefault(); event.returnValue = '';
   }
 });
