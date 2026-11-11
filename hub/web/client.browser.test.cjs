@@ -541,15 +541,18 @@ async function nextStepsInteractions(browser, origin) {
     assert((await card.textContent()).includes('帮我写一版，语气正式'));
     assert.equal(f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').length, 0,
       'missing base must not discard the instruction and dispatch an uninstructed draft');
-    task.my_draft = { status: 'complete', automatic: true, request_id: 'existing-base' };
-    await f.page.locator('#refresh').evaluate(button => button.click());
+    await card.getByRole('button', { name: '先生成基础草稿', exact: true }).click();
     await f.page.waitForFunction(() => [...document.querySelectorAll('.deferred-revision button')].some(b => !b.disabled));
+    const initial = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST');
+    assert.equal(initial.length, 1, 'creating the base does not silently submit the retained instruction');
+    assert.equal(initial[0].body.revision, undefined);
+    assert((await card.textContent()).includes('帮我写一版，语气正式'));
     await retry.click();
     await f.page.waitForFunction(() => !document.querySelector('.deferred-revision'));
     await card.locator('.agent-draft').waitFor();
     assert((await card.textContent()).includes('Private generated draft'));
     const asked = f.calls.filter(c => c.pathname === '/api/tasks/draft-task/drafts' && c.method === 'POST').at(-1).body;
-    assert.deepEqual(asked.revision, { base_draft_id: 'draft-existing-base', instruction: '帮我写一版，语气正式' });
+    assert.deepEqual(asked.revision, { base_draft_id: 'draft-' + initial[0].body.request_id, instruction: '帮我写一版，语气正式' });
     assert(!f.calls.some(c => c.pathname.endsWith('/actions')), 'drafting never delivers');
     await f.page.locator('#text').fill('更正式一些'); await f.page.locator('#text').press('Enter');
     await f.page.waitForFunction(() => document.querySelectorAll('.task-chat .agent-draft').length >= 1);
@@ -568,6 +571,64 @@ async function nextStepsInteractions(browser, origin) {
     assert.equal(delivered.result, 'Human reviewed delivery\nSecond paragraph');
     assert(delivered.source_draft_id.startsWith('draft-'));
     await f.close(); console.log('PASS Chromium plain-language drafting, supplement, one-step delivery confirmation and human editing');
+  }
+  {
+    const f = await fixture(browser, origin);
+    const tasks = ['draft-alpha', 'draft-beta'].map((id, index) => ({
+      id, revision: 2, requester: index ? 'carol' : 'bob', owner: 'alice', status: 'working', summary: id,
+      my_draft: { status: 'complete', request_id: 'private-' + id }
+    }));
+    f.state.taskAction = message => message === '交付' ? { action: 'deliver' } : null;
+    const actionPosts = () => f.calls.filter(c => c.method === 'POST' && c.pathname.endsWith('/actions'));
+    const card = id => f.page.locator('#task-chat-' + id);
+    const select = async index => {
+      await showTasks(f, tasks); await discussButtons(f).nth(index).click();
+      await f.page.locator('#open-chat').click();
+    };
+    await select(0);
+    await card('draft-alpha').locator('.agent-draft').waitFor();
+    await f.send('交付'); await settled(f);
+    await card('draft-alpha').getByRole('button', { name: '确认交付', exact: true }).waitFor();
+    await f.send('明天天气怎么样'); await settled(f);
+    await f.send('嗯'); await settled(f);
+    assert.equal(actionPosts().length, 0, 'unrelated chat followed by agreement must not deliver');
+    assert.equal(f.posts().at(-1).body.message, '嗯');
+    await f.page.reload(); await f.login();
+    await card('draft-alpha').locator('.agent-draft').waitFor();
+    await card('draft-alpha').getByRole('button', { name: '确认交付', exact: true }).waitFor();
+    for (const reply of ['嗯', '好', '可以', '确认', 'OK']) {
+      await f.send(reply); await settled(f);
+      assert.equal(actionPosts().length, 0, 'reload must not turn ' + reply + ' into authorization');
+      assert.equal(f.posts().at(-1).body.message, reply);
+    }
+    await select(1);
+    await card('draft-beta').locator('.agent-draft').waitFor();
+    await f.send('确认交付'); await settled(f);
+    assert.equal(actionPosts().length, 0, 'explicit confirmation cannot execute another task’s waiting card');
+    assert.equal(f.posts().at(-1).body.selected_task.task_id, 'draft-beta');
+    // Explicit task selection belongs to one ordinary chat turn, so select B
+    // again before asking it to prepare its own waiting confirmation.
+    await select(1);
+    await f.send('交付'); await settled(f);
+    await card('draft-beta').getByRole('button', { name: '确认交付', exact: true }).waitFor();
+    await f.send('好的'); await settled(f);
+    assert.equal(actionPosts().length, 0, 'agreement cannot choose between multiple waiting tasks');
+    await select(0);
+    await f.send('确认退回'); await settled(f);
+    assert.equal(await f.page.locator('#text').inputValue(), '确认退回');
+    assert.equal(actionPosts().length, 0, 'the named action must match');
+    await f.send('确认交付'); await settled(f);
+    await f.page.waitForFunction(() => document.getElementById('task-chat-draft-alpha') === null);
+    assert.equal(actionPosts().length, 1);
+    assert.equal(actionPosts()[0].pathname, '/api/tasks/draft-alpha/actions');
+    assert.deepEqual(actionPosts()[0].body, {
+      action: 'deliver', expected_revision: 2, result: 'Private generated draft\nSecond paragraph', source_draft_id: 'draft-private-draft-alpha'
+    });
+    await card('draft-beta').getByRole('button', { name: '确认交付', exact: true }).click();
+    await f.page.waitForFunction(() => document.getElementById('task-chat-draft-beta') === null);
+    assert.equal(actionPosts().length, 2, 'explicit card confirmation is still supported');
+    assert.equal(actionPosts()[1].pathname, '/api/tasks/draft-beta/actions');
+    await f.close(); console.log('PASS Chromium ambiguous replies never confirm stale tasks after chat, reload or task switching');
   }
   {
     const f = await fixture(browser, origin);

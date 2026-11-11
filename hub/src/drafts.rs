@@ -183,14 +183,22 @@ pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> 
     generate_inner(h, owner, task, input, false).await
 }
 
-// Refresh live membership before each new automatic model call. This cannot
-// retract a request already sent, and credential rotation alone is not removal.
+// Refresh live membership, account state and the owner's permission before each
+// new automatic model call. This cannot retract a request already sent, and
+// credential rotation alone is not removal.
 fn auto_authorized(h: &Hub, owner: &str, task: &str, revision: i64) -> Result<()> {
     h.reload_private_users()?;
-    if !h.directory.contains(owner) {
+    if !h.member_active(owner)? {
         return Err(denied());
     }
-    let state = owner_task(&*h.db()?, owner, task)?;
+    let db = h.db()?;
+    if !crate::collaboration::read(&db, owner)?
+        .permissions
+        .auto_prepare_drafts
+    {
+        return Err(Error(StatusCode::CONFLICT, AUTO_DISABLED));
+    }
+    let state = owner_task(&db, owner, task)?;
     if state.0 != "working" || state.1 != revision {
         return Err(Error(StatusCode::CONFLICT, STALE));
     }
@@ -204,6 +212,9 @@ async fn generate_inner(
     input: Input,
     automatic: bool,
 ) -> Result<Value> {
+    // A caller cannot turn a Hub-reserved automatic key into a manual request
+    // to bypass the live checks between summary chunks and final drafting.
+    let automatic = automatic || input.request_id.starts_with(AUTO_PREFIX);
     let (owner, task) = (owner.to_owned(), task.to_owned());
     let authorized = || {
         if automatic {
@@ -568,6 +579,8 @@ mod tests {
         root: std::path::PathBuf,
         roster: std::path::PathBuf,
         calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
         server: tokio::task::JoinHandle<()>,
     }
     impl Drop for AutoFixture {
@@ -588,6 +601,9 @@ mod tests {
     }
     impl AutoFixture {
         async fn new(revoke_after_first_call: bool, fail: bool) -> Self {
+            Self::with_pause(revoke_after_first_call, fail, false).await
+        }
+        async fn with_pause(revoke_after_first_call: bool, fail: bool, pause: bool) -> Self {
             let root = std::env::temp_dir().join(format!("agenct-auto-safety-{}", Uuid::new_v4()));
             std::fs::create_dir(&root).unwrap();
             let roster = root.join("config.json");
@@ -599,12 +615,16 @@ mod tests {
             }
             let calls = Arc::new(AtomicUsize::new(0));
             let counter = calls.clone();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let resume = Arc::new(tokio::sync::Notify::new());
+            let (entered, released) = (started.clone(), resume.clone());
             let config_file = roster.clone();
             let adapter = Router::new().route(
                 "/turn",
                 post(move |Json(request): Json<Value>| {
                     let count = counter.clone();
                     let config_file = config_file.clone();
+                    let (entered, released) = (entered.clone(), released.clone());
                     async move {
                         // Integration with chat actions must not grant the private
                         // draft or summary model permission to suggest task actions.
@@ -617,6 +637,10 @@ mod tests {
                             assert_eq!(request["history"], json!([]));
                         }
                         let previous = count.fetch_add(1, Ordering::SeqCst);
+                        if pause && previous == 0 {
+                            entered.notify_one();
+                            released.notified().await;
+                        }
                         if revoke_after_first_call && previous == 0 {
                             std::fs::write(config_file, roster_value(false)).unwrap();
                         }
@@ -653,6 +677,8 @@ mod tests {
                 root,
                 roster,
                 calls,
+                started,
+                resume,
                 server,
             }
         }
@@ -704,6 +730,109 @@ mod tests {
             assert_eq!(f.calls.load(Ordering::SeqCst), 0);
             assert_eq!(f.receipt_count(), 0);
         }
+    }
+
+    fn set_auto_access(h: &Hub, state: &str) {
+        let db = h.db().unwrap();
+        db.execute(
+            "INSERT OR REPLACE INTO member_profiles(owner,display_name,status) VALUES ('bob','Bob',?1)",
+            [if state == "opt_out" { "active" } else { state }],
+        )
+        .unwrap();
+        let mut profile = crate::collaboration::Profile::default();
+        profile.permissions.auto_prepare_drafts = state != "opt_out";
+        db.execute(
+            "INSERT OR REPLACE INTO collaboration_profiles(owner,revision,profile_json) VALUES ('bob',0,?1)",
+            [serde_json::to_string(&profile).unwrap()],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_retry_checks_disabled_invited_and_opted_out_owner_before_reserving() {
+        for state in ["disabled", "invited", "opt_out"] {
+            let f = AutoFixture::new(false, false).await;
+            let gate = f.h.gate("bob").unwrap().lock_owned().await;
+            assert!(matches!(
+                generate_inner(&f.h, "bob", "task", f.input(true), true).await,
+                Err(Error(StatusCode::CONFLICT, BUSY))
+            ));
+            set_auto_access(&f.h, state);
+            drop(gate);
+            assert!(
+                f.h.directory.contains("bob"),
+                "directory membership alone is insufficient"
+            );
+            assert!(generate_inner(&f.h, "bob", "task", f.input(true), true)
+                .await
+                .is_err());
+            assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(f.receipt_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_during_summary_stops_next_call_and_never_redispatches() {
+        for state in ["disabled", "invited", "opt_out"] {
+            // Small material has one summary then the draft; large material
+            // has several summaries. Guard both boundaries, including a caller
+            // supplying an automatic key through the ordinary POST entry point.
+            for size in [16000, 90000] {
+                let f = AutoFixture::with_pause(false, false, true).await;
+                f.h.db()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO task_details(task_id,author,content) VALUES ('task','alice',?1)",
+                        ["x".repeat(size)],
+                    )
+                    .unwrap();
+                let h = f.h.clone();
+                let input = f.input(true);
+                let run = tokio::spawn(async move {
+                    generate_inner(&h, "bob", "task", input, size == 90000).await
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(5), f.started.notified())
+                    .await
+                    .unwrap();
+                set_auto_access(&f.h, state);
+                f.resume.notify_one();
+                assert!(run.await.unwrap().is_err());
+                assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+                {
+                    let db = f.h.db().unwrap();
+                    assert_eq!(
+                        receipt(&db, "bob", "task", &auto_request_id("task", 1))
+                            .unwrap()
+                            .unwrap()["status"],
+                        "uncertain"
+                    );
+                    let count: i64 = db
+                        .query_row("SELECT count(*) FROM deliveries", [], |r| r.get(0))
+                        .unwrap();
+                    assert_eq!(count, 0);
+                }
+                set_auto_access(&f.h, "active");
+                let replay = generate(&f.h, "bob", "task", f.input(true)).await.unwrap();
+                assert_eq!(replay["status"], "uncertain");
+                assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn automatic_opt_out_still_allows_an_explicit_manual_draft_with_summary() {
+        let f = AutoFixture::new(false, false).await;
+        set_auto_access(&f.h, "opt_out");
+        f.h.db()
+            .unwrap()
+            .execute(
+                "INSERT INTO task_details(task_id,author,content) VALUES ('task','alice',?1)",
+                ["x".repeat(16000)],
+            )
+            .unwrap();
+        let out = generate(&f.h, "bob", "task", f.input(false)).await.unwrap();
+        assert_eq!(out["status"], "complete");
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
