@@ -97,8 +97,12 @@ function taskCard(task, kicker) {
 async function startDraft(context, task, revision, requestId) {
   const key = 'draft:' + task.id;
   if (!current(context) || busy.has(key) || !requestId) return;
-  const saved = { instruction: revision.instruction, requestId, revision: task.revision,
-    baseDraftId: revision.base_draft_id, sent: true, queued: deferredRevisions.get(task.id)?.queued || [] };
+  const existing = deferredRevisions.get(task.id);
+  // A first draft has no base. Keep an unsent revision behind that request so
+  // generating a base never discards or silently submits the user's instruction.
+  const queued = existing && !revision ? [existing, ...(existing.queued || [])] : existing?.queued || [];
+  const saved = { instruction: revision?.instruction, requestId, revision: task.revision,
+    baseDraftId: revision?.base_draft_id, sent: true, queued };
   deferredRevisions.set(task.id, saved);
   busy.add(key);
   status(revision ? '已发送补充要求，Agent 正在生成新版本…' : 'Agent 正在起草…');
@@ -110,11 +114,17 @@ async function startDraft(context, task, revision, requestId) {
     if (receipt?.status === 'complete') {
       draftReceipts.set(receipt.request_id, receipt);
       finishDeferred(task.id, saved);
-      status('新版本草稿已生成，仅你可见。');
+      status(revision ? '新版本草稿已生成，仅你可见。' : '基础草稿已生成，仅你可见。请核对后应用保留的修改要求。');
     }
     else status('起草结果尚未确认；不会自动重发。');
   } catch (error) {
-    if (current(context)) status('起草未完成：' + error.message);
+    if (current(context)) {
+      const notReserved = error.httpStatus === 409 && ['draft_task_stale_before_reservation',
+        'draft_task_state_before_reservation', 'draft_role_unavailable_before_reservation',
+        'draft_busy_before_reservation'].includes(error.code);
+      if (!revision && notReserved) finishDeferred(task.id, saved);
+      status(notReserved ? '请求未登记、未调用模型。请核对任务后再手动起草。' : '起草未完成：' + error.message);
+    }
   } finally {
     if (current(context)) { busy.delete(key); await refresh(context).catch(error => status(error.message)); }
   }
@@ -297,11 +307,35 @@ function ownerWorking(context, task, card) {
       : '在下面告诉 Agent 怎么写，它会起草一版只有你可见的草稿。'));
   }
   const deferred = deferredRevisions.get(task.id);
+  const restartInitial = deferred?.sent && !deferred.baseDraftId && deferred.retryAllowed;
+  if (!drafting && !draft && mine?.status !== 'complete' && (!deferred?.sent || restartInitial)
+      && (deferred || mine?.status === 'uncertain')
+      && (!deferred || deferred.revision === task.revision)) {
+    const initial = el('button', null, mine?.status === 'uncertain' || restartInitial ? '明确重新起草' : '先生成基础草稿');
+    initial.type = 'button';
+    let started = false;
+    initial.onclick = () => {
+      const live = visibleTasks.get(task.id);
+      if (started || !current(context) || busy.has('draft:' + task.id) || live?.revision !== task.revision
+          || live.status !== 'working' || live.owner !== context.user
+          || deferredRevisions.get(task.id) !== deferred || live.my_draft?.status === 'pending'
+          || live.my_draft?.status === 'complete' || (restartInitial && !deferred.retryAllowed)) return;
+      if ((live.my_draft?.status === 'uncertain' || restartInitial)
+          && !confirm('原请求可能已调用模型并产生费用。重新起草可能重复工作。确认开始一次新的手动起草？')) return;
+      started = true; initial.disabled = true;
+      // Abandon only this explicitly checked initial attempt, not its queued
+      // unsent instructions. The new attempt always receives a new receipt key.
+      if (restartInitial) finishDeferred(task.id, deferred);
+      return startDraft(context, task, null, crypto.randomUUID());
+    };
+    card.append(initial, el('p', 'note', '基础草稿先使用本任务的共享材料；已保留的修改要求会在基础草稿完成后供你手动应用。'));
+  }
   if (deferred) {
     const box = el('section', 'deferred-revision');
-    box.append(el('p', 'note', deferred.sent ? '修改要求已保留，结果尚未确认。仅核对原请求，不会重发。'
-      : '修改要求已保留，尚未发送。请等待基础草稿可用后重试。'), el('pre', null, deferred.instruction));
-    const retry = el('button', null, deferred.sent ? '核对这次修订' : '用保留的要求修改草稿'); retry.type = 'button';
+    box.append(el('p', 'note', deferred.sent ? '起草请求已保留，结果尚未确认。仅核对原请求，不会重发。'
+      : '修改要求已保留，尚未发送。请等待基础草稿可用后重试。'));
+    if (deferred.instruction) box.append(el('pre', null, deferred.instruction));
+    const retry = el('button', null, deferred.sent ? (deferred.baseDraftId ? '核对这次修订' : '核对这次起草') : '用保留的要求修改草稿'); retry.type = 'button';
     retry.disabled = drafting || (!deferred.sent && (!draft || deferred.revision !== task.revision));
     retry.onclick = async () => {
       if (!current(context) || deferredRevisions.get(task.id) !== deferred
@@ -313,8 +347,16 @@ function ownerWorking(context, task, card) {
           if (!current(context) || deferredRevisions.get(task.id) !== deferred) return;
           if (receipt?.status === 'complete') {
             draftReceipts.set(deferred.requestId, receipt); finishDeferred(task.id, deferred);
-          } else status('修订结果仍未确认，保留原请求；不会重发。');
-        } catch (error) { if (current(context)) status('未能核对修订：' + error.message); }
+          } else {
+            deferred.retryAllowed = receipt?.status === 'uncertain';
+            status('起草结果仍未确认，保留原请求；不会重发。');
+          }
+        } catch (error) {
+          if (current(context) && deferredRevisions.get(task.id) === deferred) {
+            deferred.retryAllowed = error.httpStatus === 404;
+            status('未能核对起草：' + error.message);
+          }
+        }
         finally { if (current(context)) { retry.disabled = false; await refresh(context).catch(() => {}); } }
         return;
       }
