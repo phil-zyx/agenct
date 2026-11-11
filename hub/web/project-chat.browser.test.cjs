@@ -371,8 +371,9 @@ async function freePort() {
       assert(!(await review(alice).isChecked()));
       releaseFailure();
       await alice.waitForFunction(() => !projectBusy && projectDraft?.uncertain);
-      await button(alice, '核对并重试原提交').waitFor({ state: 'attached' });
-      assert(await button(alice, '核对并重试原提交').isDisabled(), 'Failure must not visually re-enable a closed, unacknowledged preview');
+      const hiddenRetry = panel(alice).getByRole('button', { name: '核对并重试原提交', exact: true, includeHidden: true });
+      await hiddenRetry.waitFor({ state: 'attached' });
+      assert(await hiddenRetry.isDisabled(), 'Failure must not visually re-enable a closed, unacknowledged preview');
       await alice.locator('#open-projects').click();
       await button(alice, '核对并重试原提交').waitFor();
       assert(!(await review(alice).isChecked()));
