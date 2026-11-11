@@ -182,8 +182,12 @@ async function freePort() {
     await alice.waitForFunction(() => !document.getElementById('task-context').classList.contains('hide'));
     await say(alice, '验收通过');
     await result.getByRole('button', { name: '确认验收', exact: true }).waitFor();
-    // A typed yes is the confirmation itself.
+    // Generic agreement stays ordinary chat even with a waiting action.
     await say(alice, '确认');
+    await alice.waitForFunction(() => !document.getElementById('send').disabled);
+    assert.equal((await (await api('alice', 'tasks')).json())[0].status, 'ready_for_acceptance');
+    await result.getByRole('button', { name: '确认验收', exact: true }).waitFor();
+    await say(alice, '确认验收');
     await alice.locator('.task-line', { hasText: '已验收完成' }).waitFor();
     await tasks(alice);
     await alice.locator('.task-completed').waitFor({ state: 'attached' });
