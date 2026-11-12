@@ -1,6 +1,7 @@
 /* Project coordination stays beside private chat. Only an explicitly selected message can seed a local candidate. */
 let projectView = null, projectGeneration = 0, projectRead = null, projectDraft = null, projectBusy = false;
 let projectDirectory = [], projectInvitations = [];
+let projectAlignment = null, projectAlignmentGeneration = 0;
 const projectPath = id => 'projects/' + encodeURIComponent(id);
 const projectHost = () => $('project-panel');
 function projectButton(text, action, className = '') {
@@ -19,12 +20,17 @@ function projectField(form, label, type = 'text', value = '', options) {
 }
 function projectNotice(message) { const notice = $('project-notice'); if (notice) notice.textContent = message; }
 function closeProjects() {
+  clearProjectAlignment();
   if (projectDraft?.acknowledgement) {
     projectDraft.acknowledgement.checked = false;
     projectDraft.preview?.querySelector('button.primary')?.setAttribute('disabled', '');
   }
   $('room').classList.remove('projects-open'); projectHost().classList.add('hide');
   $('open-projects').classList.remove('active'); $('open-projects').setAttribute('aria-expanded', 'false');
+}
+function clearProjectAlignment() {
+  projectAlignment = null; projectAlignmentGeneration++;
+  projectHost().querySelector('.project-alignment')?.remove();
 }
 function resetProjects() {
   projectGeneration++; projectView = null; projectRead = null; projectDraft = null; projectBusy = false;
@@ -53,6 +59,7 @@ function projectCanNavigate() {
 }
 async function loadProjectDirectory() {
   if (!projectCanNavigate()) return;
+  clearProjectAlignment();
   const context = session(), generation = ++projectGeneration; projectView = null; projectRead = null;
   projectShell(); projectNotice('正在读取项目…');
   try {
@@ -93,22 +100,30 @@ async function fetchProject(context, id) {
   }
   throw Error('项目正在更新，请重新读取');
 }
-async function loadProject(id) {
+async function loadProject(id, checkAlignment = false) {
   if (!projectCanNavigate()) return;
+  clearProjectAlignment();
+  const alignmentGeneration = projectAlignmentGeneration;
   const context = session(), generation = ++projectGeneration; projectRead = null; projectView = null;
   projectShell(); projectNotice('正在读取共同状态…');
+  projectHost().append(projectButton('项目列表', loadProjectDirectory));
   try {
     const view = await fetchProject(context, id);
     if (!current(context) || generation !== projectGeneration) return;
-    projectView = view; renderProject();
+    projectView = view;
+    if (checkAlignment && alignmentGeneration === projectAlignmentGeneration && $('room').classList.contains('projects-open')) {
+      projectAlignment = ProjectStateModel.alignment(view.project, view.items);
+    }
+    renderProject();
   } catch (error) {
     if (!current(context) || generation !== projectGeneration) return;
     projectNotice('无法读取项目：' + error.message);
-    projectHost().append(projectButton('重新读取项目', () => loadProject(id)), projectButton('项目列表', loadProjectDirectory));
+    projectHost().append(projectButton('重新读取项目', () => loadProject(id)));
   }
 }
 function projectCard(item, historical = false) {
   const card = el('article', 'project-state-card'); card.dataset.item = item.id;
+  card.tabIndex = -1;
   card.append(el('p', 'project-item-status', historical ? '历史版本 ' + item.version + ' · ' + (item.status === 'confirmed' ? '当时由 ' + item.confirmed_by + ' 确认' : ProjectStateModel.status(item)) : ProjectStateModel.status(item) + ' · 版本 ' + item.version));
   card.append(el('p', 'project-copy', item.content));
   if (item.assignee) card.append(el('p', 'note', '负责人：' + item.assignee));
@@ -135,10 +150,14 @@ function renderProject() {
   const actions = el('div', 'actions');
   actions.append(projectButton('和助手讨论', discussProject));
   if (project.status === 'active') {
+    const view = projectView, context = session(), generation = projectGeneration;
+    const check = projectButton('检查对齐', () => checkProjectAlignment(view, context, generation, check));
+    actions.append(check);
     actions.append(projectButton('发布共同状态', () => stateEditor(), 'primary'));
     if (project.creator === user) actions.append(projectButton('邀请成员', inviteProjectEditor));
   }
   actions.append(projectButton('刷新共同状态', () => loadProject(project.id))); projectHost().append(actions);
+  renderProjectAlignment();
   for (const [kind, name] of Object.entries(ProjectStateModel.kinds)) {
     const section = el('section', 'project-state-group'); section.setAttribute('aria-label', name);
     section.append(el('h3', '', name));
@@ -159,6 +178,46 @@ function renderProject() {
     }
     projectHost().append(links);
   }
+}
+function checkProjectAlignment(view, context, generation, button) {
+  if (!current(context) || projectView !== view || generation !== projectGeneration
+      || !button?.isConnected || !projectHost().contains(button) || !view || view.project.status !== 'active'
+      || !$('room').classList.contains('projects-open') || !projectCanNavigate()) return;
+  void loadProject(view.project.id, true);
+}
+function renderProjectAlignment() {
+  const snapshot = projectAlignment, view = projectView, context = session(), generation = projectGeneration;
+  if (!snapshot || !view || snapshot.project_id !== view.project.id || snapshot.project_revision !== view.project.revision) return;
+  const section = el('section', 'project-alignment'); section.setAttribute('aria-label', '对齐建议');
+  section.append(el('h3', '', '对齐建议'), el('p', 'note', '规则检查 · 项目版本 ' + snapshot.project_revision),
+    el('p', 'note', '仅检查本次读取的共同状态，不读取私聊、私密草稿或任务正文，也不调用模型。以下是只读建议，不是事实、承诺或全员共识；不会自动发布、确认或发送。无法仅凭这些规则判断文字中的分歧。'));
+  if (!snapshot.suggestions.length) section.append(el('p', 'note', '本次规则未发现需提示的缺项或确认问题。这不代表所有成员已对齐，也不代表项目已完成。'));
+  for (const suggestion of snapshot.suggestions) {
+    const card = el('article', 'project-alignment-card'); card.dataset.suggestion = suggestion.key;
+    card.append(el('h4', '', suggestion.title), el('p', 'project-copy', suggestion.detail));
+    if (!suggestion.sources.length) card.append(el('p', 'note', '依据：本次项目版本 ' + snapshot.project_revision + ' 的完整共同状态列表（共 ' + snapshot.item_count + ' 条，检查时排除已撤回项）。这是记录缺项，不是对实际工作的判断。'));
+    else {
+      const evidence = el('details', 'project-alignment-sources'); evidence.append(el('summary', '', '查看依据（' + suggestion.sources.length + ' 条）'));
+      for (const source of suggestion.sources) {
+        const item = view.items.find(item => item.id === source.item_id && item.version === source.version);
+        if (!item) continue;
+        const reference = el('div', 'project-alignment-source');
+        reference.append(el('p', 'note', ProjectStateModel.kinds[item.kind] + ' · ' + item.id + ' · 版本 ' + item.version),
+          el('p', 'note', ProjectStateModel.status(item) + ' · ' + (item.source_kind === 'model_suggestion' ? '模型建议（不是本人承诺）' : '人工陈述') + ' · 发布人：' + item.created_by));
+        if (item.status === 'proposed') reference.append(el('p', 'note', '等待确认：' + ProjectStateModel.confirmer(view.project, item)));
+        reference.append(projectButton('查看共享条目', () => {
+          if (!current(context) || generation !== projectGeneration || projectAlignment !== snapshot || projectView !== view
+              || !section.isConnected || !$('room').classList.contains('projects-open')) return;
+          const target = [...projectHost().querySelectorAll('.project-state-card')].find(card => card.dataset.item === item.id);
+          target?.scrollIntoView?.({ block: 'center' }); target?.focus({ preventScroll: true });
+        }));
+        evidence.append(reference);
+      }
+      card.append(evidence);
+    }
+    section.append(card);
+  }
+  projectHost().append(section);
 }
 function discussProject() {
   // This action prepares only the user's own input. It never reads private chat or sends.
@@ -212,6 +271,7 @@ async function proposeChatProject(context, message) {
 }
 function beginProjectEditor(title) {
   if (!projectCanNavigate()) return null;
+  clearProjectAlignment();
   const editor = el('section', 'project-editor'); editor.setAttribute('aria-label', title + '面板');
   editor.append(el('h3', '', title));
   const context = session();
@@ -394,13 +454,20 @@ async function refreshProjects() {
         projectDraft.editor.querySelectorAll('button.primary').forEach(button => { button.disabled = true; });
         projectNotice('项目已更新，请取消编辑后重新核对。未自动重试或覆盖。');
       }
-    } else if (JSON.stringify(view) !== JSON.stringify(projectView)) { projectView = view; renderProject(); }
+    } else if (JSON.stringify(view) !== JSON.stringify(projectView)) {
+      const hadAlignment = !!projectAlignment; clearProjectAlignment(); projectView = view; renderProject();
+      if (hadAlignment) projectNotice('共同状态或成员信息已更新，已清除旧建议。请重新检查对齐。');
+    }
   } catch (error) {
     if (!current(context) || generation !== projectGeneration) return;
     if ([401, 403, 404].includes(error.httpStatus)) {
+      clearProjectAlignment();
       projectDraft = null; projectView = null; projectGeneration++; projectShell(); projectHost().append(projectButton('项目列表', loadProjectDirectory));
       projectNotice('项目访问权限已失效，已清除此页内容。');
-    } else projectNotice('共同状态暂未同步：' + error.message);
+    } else {
+      clearProjectAlignment();
+      projectNotice('共同状态暂未同步：' + error.message + '。旧对齐建议已清除，请重新读取后检查。');
+    }
   } finally { if (projectRead === read) projectRead = null; }
 }
 $('open-projects').onclick = openProjects;

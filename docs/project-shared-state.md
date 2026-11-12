@@ -172,3 +172,51 @@ and the reviewed revision again at write time. No newer revision is substituted
 automatically. An uncertain creation response retains the exact `request_id` and
 body for an explicit replay; repeated clicks cannot create multiple items.
 Changing accounts destroys candidates and ignores old in-flight reads/callbacks.
+
+## Read-only alignment suggestions
+
+In an active project, **检查对齐** reads the project and current shared-state list
+again through the existing accepted-member APIs. Both responses must have the
+same project revision. It then runs a deterministic browser-side rule check,
+not an AI/model call, and shows **对齐建议** for that snapshot only:
+
+- No non-withdrawn goal or assignment: consider whether the project needs an
+  explicitly published goal or named assignment. An absent record is not
+  evidence that the actual work has no goal or owner.
+- Proposed items: review their individual sources and let the named person
+  decide whether to confirm. Multiple proposals do not establish disagreement,
+  agreement, truth, or team consensus.
+- Confirmed items whose confirmation is no longer valid: check current members
+  and versions rather than relying on the old assertion.
+- Published blockers: check with their reporters whether further work is needed.
+  Publication/confirmation status does not indicate whether a blocker is resolved.
+
+The rules never parse item text, source notes, private chat, task bodies or drafts.
+They do not find semantic contradictions or invent missing facts. A source list
+identifies each supporting shared item's ID, exact version, type, publication
+source, publisher and confirmation status. **查看共享条目** focuses that same item
+and its full provenance in the existing shared-state panel. A missing-record
+suggestion cites the complete current shared-state snapshot and its revision.
+Source notes remain publisher annotations, not independently verified evidence.
+
+Checking and viewing sources issue no writes, confirmations, model turns,
+notifications or external messages. There is no one-click acceptance of a
+suggestion. Any change still uses the separate explicit publication/confirmation
+flow. A check with no findings does not establish consensus or completion.
+
+Suggestions are held only in browser memory. Closing the panel, navigating,
+refreshing, starting an editor or switching accounts clears them. Any changed
+snapshot, including changed membership or confirmation validity without a
+revision change, clears them and asks for a new check. Failed background reads
+also clear suggestions; authorization failures clear the project material.
+Late checks cannot restore suggestions after close, navigation or identity
+change. Archived projects remain readable but have no active alignment check.
+This is read-time authorization with existing polling, not instantaneous push
+revocation or a guarantee that already displayed material can be erased.
+
+`project-state-model.test.cjs` covers deterministic sources, versions, withdrawal,
+malformed/mixed snapshots and private-context isolation.
+`project-alignment.browser.test.cjs` covers the real-Hub, Mock-runtime member
+views, provenance, read-only behavior, stale snapshots, access removal, identity
+switching and desktop/mobile screenshots. No live-model trial or deployment is
+part of this slice.
