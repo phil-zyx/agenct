@@ -18,6 +18,7 @@ pub(super) const STALE: &str = "draft task revision changed before reservation";
 pub(super) const STATE: &str = "draft task must be working before reservation";
 pub(super) const ROLE: &str = "draft role unavailable or changed before reservation";
 pub(super) const BUSY: &str = "draft runtime busy before reservation";
+pub(super) const SUPERSEDED: &str = "automatic draft superseded by an existing attempt";
 pub(super) const AUTO_DISABLED: &str = "automatic private drafts disabled by owner";
 
 #[derive(Deserialize, Serialize)]
@@ -125,58 +126,27 @@ pub(super) fn auto_request_id(task: &str, revision: i64) -> String {
     format!("{AUTO_PREFIX}{task}-r{revision}")
 }
 
-/// Starts the owner's private draft in the background once a task is (back) in
-/// `working`. It is exactly the draft a click would make: owner-only, the owner's
-/// recommended enabled role, same receipt and at-most-once rules; nothing is
-/// shared, delivered or approved without the owner. Skipped silently if the
-/// task moves on first; waits briefly while the owner's own turn is running.
-pub(super) fn spawn_auto(h: Hub, owner: String, task: String, revision: i64) {
-    let allowed = h
-        .db()
-        .and_then(|db| crate::collaboration::read(&db, &owner))
-        .is_ok_and(|profile| profile.permissions.auto_prepare_drafts);
-    if !allowed {
-        return;
-    }
-    tokio::spawn(async move {
-        for _ in 0..40 {
-            let profile = {
-                let Ok(db) = h.db() else { return };
-                if !crate::collaboration::read(&db, &owner)
-                    .is_ok_and(|profile| profile.permissions.auto_prepare_drafts)
-                {
-                    return;
-                }
-                let summary: Option<String> = db
-                    .query_row(
-                        "SELECT summary FROM tasks WHERE id=?1 AND owner=?2 AND status='working' AND revision=?3",
-                        params![task, owner, revision],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .ok()
-                    .flatten();
-                let Some(summary) = summary else { return };
-                match profiles::recommend(&db, &owner, &summary) {
-                    Ok(profile) => profile,
-                    Err(_) => return,
-                }
-            };
-            let input = Input {
-                request_id: auto_request_id(&task, revision),
-                expected_revision: revision,
-                agent_id: Some(profile.agent_id.clone()),
-                expected_profile_revision: Some(profile.revision as i64),
-                revision: None,
-            };
-            match generate_inner(&h, &owner, &task, input, true).await {
-                Err(Error(StatusCode::CONFLICT, BUSY)) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await
-                }
-                _ => return,
-            }
-        }
-    });
+pub(super) async fn generate_auto(
+    h: &Hub,
+    owner: &str,
+    task: &str,
+    revision: i64,
+    profile: profiles::RuntimeProfile,
+) -> Result<Value> {
+    generate_inner(
+        h,
+        owner,
+        task,
+        Input {
+            request_id: auto_request_id(task, revision),
+            expected_revision: revision,
+            agent_id: Some(profile.agent_id),
+            expected_profile_revision: Some(profile.revision as i64),
+            revision: None,
+        },
+        true,
+    )
+    .await
 }
 
 pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> Result<Value> {
@@ -186,7 +156,13 @@ pub(super) async fn generate(h: &Hub, owner: &str, task: &str, input: Input) -> 
 // Refresh live membership, account state and the owner's permission before each
 // new automatic model call. This cannot retract a request already sent, and
 // credential rotation alone is not removal.
-fn auto_authorized(h: &Hub, owner: &str, task: &str, revision: i64) -> Result<()> {
+pub(super) fn auto_authorized(h: &Hub, owner: &str, task: &str, revision: i64) -> Result<()> {
+    if !h.auto_draft {
+        return Err(Error(StatusCode::CONFLICT, AUTO_DISABLED));
+    }
+    if !h.startup_ok.unwrap_or_else(|| h.validate_startup().is_ok()) {
+        return Err(denied());
+    }
     h.reload_private_users()?;
     if !h.member_active(owner)? {
         return Err(denied());
@@ -275,11 +251,19 @@ async fn generate_inner(
                 |r| r.get(0),
             )?;
             if existing {
-                return Err(Error(
-                    StatusCode::CONFLICT,
-                    "automatic draft superseded by an existing attempt",
-                ));
+                return Err(Error(StatusCode::CONFLICT, SUPERSEDED));
             }
+        }
+        if automatic {
+            // The irreversible boundary is shared with the receipt insertion below.
+            // Only the canonical, still-queued intent may reserve an automatic call.
+            if input.request_id != auto_request_id(&task, input.expected_revision)
+                || tx.execute("UPDATE auto_draft_intents SET status='reserved',reason=NULL WHERE owner=?1 AND task_id=?2 AND task_revision=?3 AND request_id=?4 AND status='queued' AND created_at+900>unixepoch()",
+                    params![owner,task,input.expected_revision,input.request_id])? != 1 {
+                return Err(Error(StatusCode::CONFLICT, SUPERSEDED));
+            }
+        } else {
+            tx.execute("UPDATE auto_draft_intents SET status='skipped',reason='superseded' WHERE owner=?1 AND task_id=?2 AND task_revision=?3 AND status='queued'", params![owner,task,input.expected_revision])?;
         }
         let (status, revision) = owner_task(&tx, &owner, &task)?;
         if revision != input.expected_revision {
@@ -670,8 +654,10 @@ mod tests {
             })
             .unwrap()
             .with_private_config(roster.clone())
-            .unwrap();
+            .unwrap()
+            .with_auto_draft(true);
             h.db().unwrap().execute("INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('task','alice','bob','shared','working',1)", []).unwrap();
+            crate::auto_drafts::enqueue(&h.db().unwrap(), "bob", "task", 1).unwrap();
             Self {
                 h,
                 root,
