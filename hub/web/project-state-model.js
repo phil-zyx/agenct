@@ -31,7 +31,35 @@
     return typeof value === 'string' && !!value.trim() && [...value.trim()].length <= maximum
       && !/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/.test(value);
   }
-  const api = { kinds, confirmations, confirmer, permissions, status, chatCandidate, boundedText };
+  function alignment(project, items) {
+    // A deterministic, read-only projection of an already authorized snapshot.
+    // Do not consume free text, private chat, tasks, drafts or model output here.
+    if (!project || project.status !== 'active' || typeof project.id !== 'string'
+        || !Number.isSafeInteger(project.revision) || !Array.isArray(items)
+        || items.some(item => !item || item.project_id !== project.id || typeof item.id !== 'string'
+          || !Number.isSafeInteger(item.version) || !Object.hasOwn(kinds, item.kind)
+          || !['proposed', 'confirmed', 'withdrawn'].includes(item.status))
+        || new Set(items.map(item => item.id)).size !== items.length) return null;
+    const live = items.filter(item => item.status !== 'withdrawn').sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+    const suggestions = [];
+    const add = (key, title, detail, sources = []) => suggestions.push({ key, title, detail,
+      sources: sources.map(item => ({ item_id: item.id, version: item.version })) });
+    if (!live.some(item => item.kind === 'goal')) add('missing_goal', '核对是否需要共同目标',
+      '当前没有未撤回的目标条目。如需共同目标，可先讨论再手动发布。项目说明不代表成员已确认。');
+    if (!live.some(item => item.kind === 'assignment')) add('missing_assignment', '核对是否需要明确分工',
+      '当前没有未撤回的分工条目。未发布不代表无人负责；如需分工，请先讨论人选，再由负责人本人确认。');
+    const proposed = live.filter(item => item.status === 'proposed');
+    if (proposed.length) add('pending_confirmation', proposed.length + ' 条等待具名确认',
+      '建议按来源逐条核对，由条目指定的人自行决定是否确认。待确认不表示存在分歧，也不是全员共识。', proposed);
+    const invalid = live.filter(item => item.status === 'confirmed' && item.confirmation_valid !== true);
+    if (invalid.length) add('invalid_confirmation', invalid.length + ' 条确认已失效',
+      '建议先核对成员资格和当前版本。旧确认不能作为当前承诺；需要更新时，请按原有修订和本人确认流程处理。', invalid);
+    const blockers = live.filter(item => item.kind === 'blocker');
+    if (blockers.length) add('reported_blockers', '核对 ' + blockers.length + ' 条已发布阻塞',
+      '建议与报告人核对是否仍需处理，再讨论下一步。条目状态不代表阻塞已解决或仍未解决。', blockers);
+    return { project_id: project.id, project_revision: project.revision, item_count: items.length, suggestions };
+  }
+  const api = { kinds, confirmations, confirmer, permissions, status, chatCandidate, boundedText, alignment };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.ProjectStateModel = api;
 })(globalThis);
