@@ -2,6 +2,7 @@
 mod activity;
 mod audit;
 mod audit_migration;
+mod auto_drafts;
 pub mod browser_auth;
 mod chat_failures;
 mod chat_turns;
@@ -151,6 +152,8 @@ pub struct Hub {
     material_summaries: Arc<Mutex<HashMap<String, String>>>,
     /// Start the owner's private draft when a task enters `working`.
     auto_draft: bool,
+    auto_draft_slots: Arc<tokio::sync::Semaphore>,
+    auto_draft_notify: Arc<tokio::sync::Notify>,
     extra_gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     directory: Arc<directory::Directory>,
     // Arc per user so a turn can own its gate across a detached dispatch task.
@@ -254,6 +257,8 @@ impl Hub {
             startup_ok: None,
             material_summaries: Arc::new(Mutex::new(HashMap::new())),
             auto_draft: false,
+            auto_draft_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            auto_draft_notify: Arc::new(tokio::sync::Notify::new()),
             extra_gates: Arc::new(Mutex::new(HashMap::new())),
             directory: Arc::new(directory),
             gates: Arc::new(gates),

@@ -26,6 +26,10 @@ jobs:
         run: |
           node scripts/three-person-acceptance.test.cjs
           AGENCT_TEST_HUB_BINARY="$PWD/hub/target/debug/agenct-hub" node scripts/three-person-acceptance.cjs --scope all
+      - name: Durable automatic draft dispatch (real process restarts, fake loopback adapter)
+        run: |
+          node scripts/durable-draft-acceptance.cjs --self-test
+          AGENCT_TEST_HUB_BINARY="$PWD/hub/target/debug/agenct-hub" node scripts/durable-draft-acceptance.cjs
       - run: npm run test:local
       - name: Browser flows against a real Hub (contacts, collaboration, profile chat, chat failures, projects)
         env:

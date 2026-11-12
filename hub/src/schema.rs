@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 19;
+pub(super) const VERSION: i64 = 20;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -71,6 +71,7 @@ const TABLES: &[&str] = &[
     "worker_jobs",
     "deliveries",
     "draft_turns",
+    "auto_draft_intents",
     "task_details",
     "context_summaries",
     "tenant_memberships",
@@ -185,6 +186,7 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
         17 => db.execute_batch(crate::chat_failures::SCHEMA)?,
         18 => db.execute_batch(crate::projects::SCHEMA)?,
         19 => db.execute_batch(crate::project_state::SCHEMA)?,
+        20 => db.execute_batch(crate::auto_drafts::SCHEMA)?,
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -257,6 +259,7 @@ fn introduced(table: &str, column: &str) -> i64 {
     match (table, column) {
         ("deliveries", _) => 5,
         ("draft_turns", _) => 7,
+        ("auto_draft_intents", _) => 20,
         ("task_details", _) => 10,
         ("context_summaries", _) => 12,
         ("tenant_memberships", _) => 13,
@@ -338,6 +341,7 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
             if version == 0
                 || (table == "deliveries" && version < 5)
                 || (table == "draft_turns" && version < 7)
+                || (table == "auto_draft_intents" && version < 20)
                 || (table == "task_details" && version < 10)
                 || (table == "context_summaries" && version < 12)
                 || (table == "tenant_memberships" && version < 13)
@@ -394,6 +398,7 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         if matches!(
             table,
             "draft_turns"
+                | "auto_draft_intents"
                 | "task_details"
                 | "context_summaries"
                 | "tenant_memberships"
@@ -503,6 +508,14 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         ("draft_turns_no_delete", 7),
         ("draft_turns_binding_immutable", 7),
         ("draft_turns_terminal", 7),
+        ("auto_draft_binding_immutable", 20),
+        ("auto_draft_terminal", 20),
+        ("auto_draft_no_replace", 20),
+        ("auto_draft_no_delete", 20),
+        ("auto_draft_opt_out_insert", 20),
+        ("auto_draft_opt_out_update", 20),
+        ("auto_draft_member_insert", 20),
+        ("auto_draft_member_update", 20),
         ("task_details_no_replace", 10),
         ("task_details_no_update", 10),
         ("task_details_no_delete", 10),

@@ -3,10 +3,10 @@ function createDraftUI({ api, current, article, conversation }) {
   const storageKey = 'agenct.private-draft-request.v1';
   const codes = new Set(['draft_task_stale_before_reservation', 'draft_task_state_before_reservation',
     'draft_role_unavailable_before_reservation', 'draft_busy_before_reservation']);
-  let generation = 0, card = null, tasks = new Map(), edit = null, editors = [];
+  let generation = 0, card = null, tasks = new Map(), edit = null, editors = [], intentNote = null;
   const key = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
   function reset({ preserveRecovery = false } = {}) {
-    generation++; card = null; tasks = new Map(); edit = null; editors = [];
+    generation++; card = null; tasks = new Map(); edit = null; editors = []; intentNote = null;
     if (!preserveRecovery) { try { sessionStorage.removeItem(storageKey); } catch {} }
   }
   function saved(context) {
@@ -22,6 +22,7 @@ function createDraftUI({ api, current, article, conversation }) {
   function update(context, rows) {
     saved(context);
     tasks = new Map(rows.filter(t => t.owner === context.user).map(t => [t.id, t]));
+    if (intentNote) intentNote.element.textContent = intentStatus(tasks.get(intentNote.task));
     if (edit && (tasks.get(edit.task)?.revision !== edit.revision || tasks.get(edit.task)?.status !== 'working')) {
       edit = null;
       if (card) card.append(article('任务已变更，草稿不可用于当前交付。请重新读取并人工审阅。'));
@@ -39,12 +40,26 @@ function createDraftUI({ api, current, article, conversation }) {
   // Hub-started drafts (receipt key "auto-…") are the Hub's to finish; the browser
   // never needs to keep a recovery key for them.
   const automatic = id => typeof id === 'string' && id.startsWith('auto-');
+  function intentStatus(task) {
+    const d = task?.status === 'working' ? task.my_draft : null;
+    if (!d?.automatic) return '';
+    if (d.status === 'queued') return '自动起草已排队，尚未登记起草请求或调用模型。也可以手动起草。';
+    if (d.status !== 'skipped') return '';
+    const reasons = { busy: '起草服务繁忙', retry_exhausted: '等待重试次数已用完',
+      owner_disabled: '任务接收者已停用', auto_disabled: '自动起草已关闭',
+      task_changed: '任务已变更', superseded: '已被其他起草请求替代', unavailable: '起草服务不可用' };
+    return '自动起草已跳过' + (reasons[d.reason] ? '（' + reasons[d.reason] + '）' : '')
+      + '，不会自动重试。可手动起草。';
+  }
   function draftState(task) {
     const d = task.status === 'working' ? task.my_draft : null;
     return d && ['pending', 'complete', 'uncertain'].includes(d.status) ? d : null;
   }
   // Owner-only status line for the current task version; never draft content.
   function status(task) {
+    if (!tasks.has(task.id)) return '';
+    const intent = intentStatus(task);
+    if (intent) return intent;
     const d = draftState(task);
     if (!d) return '';
     if (d.status === 'pending') return d.automatic ? '正在自动起草，完成后请在这里审阅。' : '起草中…';
@@ -67,6 +82,8 @@ function createDraftUI({ api, current, article, conversation }) {
     edit = null;
     const panel = article('草稿仅你可见，审阅并确认后才会交付。起草不会执行任务或自动验收。起草时只使用本任务的共享摘要、任务发起人确认共享的材料、交付结果和所选角色，不发送私聊。过长的内容可能只使用其中一部分。');
     if (card) card.replaceChildren(article('已关闭旧草稿视图。'));
+    const intentElement = article(intentStatus(tasks.get(taskId)));
+    intentNote = { task: taskId, element: intentElement }; panel.append(intentElement);
     card = panel; conversation(taskId).append(panel); panel.scrollIntoView?.({ block: 'nearest' });
     const openedRevision = tasks.get(taskId)?.revision;
     let working = false, view = 0, unresolved = saved(context), role = null, roleInvalid = false;
@@ -183,6 +200,7 @@ function createDraftUI({ api, current, article, conversation }) {
       try { sessionStorage.setItem(storageKey, JSON.stringify(unresolved)); }
       catch { unresolved = null; panel.append(article('无法保存恢复编号，未发送。')); return; }
       view++; working = true;
+      intentElement.textContent = ''; intentNote = null;
       panel.append(article('正在发送，尚未收到服务端回执。'));
       try {
         const receipt = await request(route, 'POST', body);
