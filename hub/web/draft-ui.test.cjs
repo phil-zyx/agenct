@@ -52,6 +52,30 @@ function fixture() {
      assert.equal(check.storage.size,0);
    }
  }
+ // Automatic intents are not receipts: opening/reopening never checks an absent turn
+ // or dispatches work. They do not prevent an explicit manual draft.
+ for (const state of ['queued', 'skipped']) {
+   const q=fixture();q.change({my_draft:{status:state,automatic:true,request_id:'auto-task1-r1',reason:'retry_exhausted',attempts:3}});
+   const expected=state==='queued'?'尚未登记起草请求或调用模型':'不会自动重试';
+   assert(q.ui.status(q.task()).includes(expected));
+   await q.open();await q.open();
+   assert(walk(q.conversation).some(e=>e.textContent.includes(expected)));
+   assert.equal(q.posts().length,0);assert.equal(q.storage.size,0);
+   assert(!q.calls.some(c=>c.p.includes('/turns/')));
+   assert.equal(q.buttons('核对起草请求').length,0);
+   const manual=q.buttons('让我的 Agent 起草（不交付）').at(-1);
+   await manual.onclick();await manual.onclick();assert.equal(q.posts().length,1);
+   assert(!q.posts()[0].b.request_id.startsWith('auto-'));
+   q.change({my_draft:{status:'pending',automatic:true,request_id:'auto-task1-r1'}});
+   assert(q.ui.status(q.task()).includes('正在自动起草'));
+   q.change({owner:'alice'});assert.equal(q.ui.status(q.task()),'');
+ }
+ const transition=fixture();transition.change({my_draft:{status:'queued',automatic:true}});await transition.open();
+ transition.change({my_draft:{status:'skipped',automatic:true,reason:'auto_disabled'}});
+ assert(walk(transition.conversation).some(e=>e.textContent.includes('自动起草已关闭')));
+ assert(!walk(transition.conversation).some(e=>e.textContent.includes('自动起草已排队')));
+ transition.change({status:'completed'});
+ assert.equal(transition.ui.status(transition.task()),'');
  const other=fixture();other.change({owner:'alice'});assert.equal(other.render().children.length,0);
  const g=fixture();await g.open();const old=g.buttons('让我的 Agent 起草（不交付）')[0];g.error(Object.assign(Error('conflict'),{httpStatus:409}));await old.onclick();await old.onclick();assert.equal(g.posts().length,1);assert.equal(g.storage.size,1);await g.click('核对起草请求');assert.equal(g.posts().length,1);assert.equal(g.storage.size,0);
  for(const code of ['draft_task_stale_before_reservation','draft_task_state_before_reservation','draft_role_unavailable_before_reservation','draft_busy_before_reservation']){const k=fixture();await k.open();k.error(Object.assign(Error('known'),{httpStatus:409,code}));await k.click('让我的 Agent 起草（不交付）');assert.equal(k.storage.size,0);}

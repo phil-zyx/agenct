@@ -1,4 +1,5 @@
 use agenct_hub::{app, Config, Hub};
+use std::future::IntoFuture;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -86,10 +87,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
     eprintln!("Agenct Hub listening at http://{bind}; runtime={mode}; development service");
-    axum::serve(listener, app(hub))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await?;
+    // Stop scheduling before draining HTTP requests. Dropping the dispatcher
+    // aborts its batch; queued intents survive and reserved receipts never retry.
+    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+    let stopped = shutdown.clone();
+    let mut dispatcher = Box::pin(hub.run_auto_drafts());
+    let mut server = Box::pin(
+        axum::serve(listener, app(hub.clone()))
+            .with_graceful_shutdown(async move { stopped.notified().await })
+            .into_future(),
+    );
+    tokio::select! {
+        result = &mut server => result?,
+        () = &mut dispatcher => return Err("automatic draft dispatcher stopped".into()),
+        _ = tokio::signal::ctrl_c() => {
+            drop(dispatcher);
+            shutdown.notify_one();
+            server.await?;
+        }
+    }
     Ok(())
 }

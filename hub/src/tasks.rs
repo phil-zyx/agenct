@@ -75,6 +75,7 @@ pub(super) async fn tasks(
                     },
                 )
                 .optional()?
+                .or(crate::auto_drafts::projection(&db, &id, &task.id, task.revision)?)
                 .unwrap_or(serde_json::Value::Null);
         }
         out.push(value);
@@ -215,19 +216,25 @@ pub(super) async fn action(
     }
     // Task revision changes revoke queued work and lease capabilities atomically.
     worker::revoke_task(&tx, &id)?;
+    crate::auto_drafts::revoke_task(&tx, &id)?;
     let auto_prepare = h.auto_draft
         && next == "working"
         && crate::collaboration::read(&tx, &t.owner)?
             .permissions
             .auto_prepare_drafts;
+    if auto_prepare {
+        crate::auto_drafts::enqueue(&tx, &t.owner, &id, t.revision + 1)?;
+    }
     tx.commit()?;
     drop(db);
     let mut out = serde_json::json!({"id":id,"status":next,"revision":t.revision+1});
-    if auto_prepare {
+    if auto_prepare && user == t.owner {
         out["auto_draft"] = serde_json::json!({
             "request_id": crate::drafts::auto_request_id(&id, t.revision + 1)
         });
-        crate::drafts::spawn_auto(h.clone(), t.owner.clone(), id.clone(), t.revision + 1);
+    }
+    if auto_prepare {
+        h.auto_draft_notify.notify_one();
     }
     Ok(Json(out))
 }

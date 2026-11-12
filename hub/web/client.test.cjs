@@ -1663,6 +1663,32 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     g.$('clear-task-context').onclick(); await g.send('随便聊聊'); await settle();
     assert.equal(said(g).selected_task, undefined);
   });
+  await test('automatic queued and skipped intents stay owner-only and never trigger browser dispatch or receipt lookup', async () => {
+    for (const state of ['queued', 'skipped']) {
+      const tasks = [task({ my_draft: { status: state, automatic: true, request_id: 'auto-task-one-r3', reason: 'retry_exhausted', attempts: 3 } })];
+      const settings = { tasks, taskAction: () => ({ action: 'revise', task_id: 'task-one', expected_revision: 3, instruction: 'Write this manually' }) };
+      const f = fixture(undefined, settings); await f.login('bob'); await settle();
+      const expected = state === 'queued' ? /尚未登记起草请求或调用模型/ : /不会自动重试/;
+      assert.match(f.$('conversation').textContent, expected);
+      assert.doesNotMatch(f.$('conversation').textContent, /Agent 正在起草|上次起草结果未知/);
+      await f.$('refresh').onclick(); await settle();
+      assert.match(f.$('conversation').textContent, expected);
+      assert.equal(posts(f, '/tasks/task-one/drafts').length, 0);
+      assert(!f.calls.some(c => c.url.includes('/drafts/turns/')));
+      // The queue can be superseded by an explicit, fresh manual attempt.
+      await f.send('Write this manually'); await settle();
+      const initial = findButton(f.$('conversation'), '先生成基础草稿');
+      await initial.onclick(); await initial.onclick(); await settle();
+      assert.equal(posts(f, '/tasks/task-one/drafts').length, 1);
+      const g = fixture(undefined, { tasks }); await g.login('alice'); await settle();
+      assert.doesNotMatch(g.$('conversation').textContent, /自动起草已排队|自动起草已跳过/);
+      assert.doesNotMatch(g.$('tasks').textContent, /自动起草已排队|自动起草已跳过/);
+      assert(!g.calls.some(c => c.url.includes('/drafts/turns/')));
+      const reopened = fixture(undefined, { tasks }); await reopened.login('bob'); await settle();
+      assert.match(reopened.$('conversation').textContent, expected);
+      assert.equal(posts(reopened, '/tasks/task-one/drafts').length, 0);
+    }
+  });
   await test('agent draft is supplemented and delivered by talking to it', async () => {
     const draft = { status: 'complete', automatic: true, request_id: 'auto-task-one-r3' };
     const f = fixture(undefined, { tasks: [task({ result: null, my_draft: draft })],

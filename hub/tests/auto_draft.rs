@@ -16,9 +16,11 @@ fn token(id: &str) -> String {
 struct Fixture {
     app: Router,
     dir: std::path::PathBuf,
+    dispatcher: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        self.dispatcher.abort();
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -37,9 +39,14 @@ impl Fixture {
                 .into(),
             runtime: Runtime::Mock,
         };
+        let hub = Hub::open(config).unwrap().with_auto_draft(auto);
+        hub.validate_startup().unwrap();
+        let worker = hub.clone();
+        let dispatcher = tokio::spawn(async move { worker.run_auto_drafts().await });
         Self {
-            app: app(Hub::open(config).unwrap().with_auto_draft(auto)),
+            app: app(hub),
             dir,
+            dispatcher,
         }
     }
     fn draft_turns(&self) -> i64 {
@@ -113,7 +120,7 @@ impl Fixture {
     async fn settled(&self, task: &str) -> Value {
         for _ in 0..200 {
             let draft = self.task("bob", task).await["my_draft"].clone();
-            if draft["status"] != "pending" && !draft.is_null() {
+            if !matches!(draft["status"].as_str(), Some("pending" | "queued")) && !draft.is_null() {
                 return draft;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -384,4 +391,42 @@ async fn owner_can_disable_automatic_preparation_without_disabling_manual_drafts
     assert_eq!(status, StatusCode::OK);
     assert_eq!(draft["status"], "complete");
     assert_eq!(f.draft_turns(), 1);
+}
+
+#[tokio::test]
+async fn intent_storage_failure_rolls_back_acceptance_and_audit() {
+    let f = Fixture::new(true);
+    let id = f.delegated().await;
+    let db = rusqlite::Connection::open(f.dir.join("hub.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fixture_reject_intent BEFORE INSERT ON auto_draft_intents BEGIN SELECT RAISE(ABORT,'fixture failure'); END;").unwrap();
+    let before: i64 = db
+        .query_row("SELECT count(*) FROM events WHERE task_id=?1", [&id], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let (status, _) = f
+        .call(
+            "bob",
+            "POST",
+            &format!("/api/tasks/{id}/actions"),
+            json!({"action":"accept","expected_revision":0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let task = f.task("bob", &id).await;
+    assert_eq!(task["status"], "awaiting_owner");
+    assert_eq!(task["revision"], 0);
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM events WHERE task_id=?1", [&id], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        db.query_row("SELECT count(*) FROM auto_draft_intents", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(f.draft_turns(), 0);
 }

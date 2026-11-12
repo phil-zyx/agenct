@@ -252,3 +252,40 @@ Chromium 使用真实渲染器与本机 fixture API，覆盖聊天发送/恢复�
 明确询问当前同事或联系人名单时，Hub 直接查询本人有权联系的已启用成员及其公开职责，不调用模型、不枚举 GitLab 全站用户。旧的未确认纯名单查询可在核对状态时重新读取当前目录并恢复答复；其他未确认请求不会因此重新执行。
 
 模型桥接诊断日志仅记录固定错误码、处理阶段和异常类型，不记录聊天正文、提供商响应正文或密钥。
+
+### Durable private automatic drafting
+
+Accepting a task while automatic drafting is enabled records a private queue
+intent in the same SQLite transaction as the task transition. The Hub resumes
+only these **not-yet-reserved** intents after restart. It does not backfill older
+working tasks that have no intent.
+
+The owner's current task view distinguishes `queued` (no model reservation),
+`pending` (reserved), `complete`, `uncertain`, and `skipped`. Only the owner sees
+these states. The requester receives neither private progress nor draft content.
+Manual drafting can supersede a queued intent. It still requires human review and
+explicit delivery; automation never sends, approves, or executes a task.
+
+Reservation changes the intent to `reserved` atomically with creating the
+`draft_turns` receipt, before any summary or draft model call. Restart makes
+pending receipts uncertain. Reserved, complete and uncertain requests are never
+automatically sent again, including if a response or the process was lost.
+
+Only runtime-busy rejection **before reservation** is retried. Retry counts and
+next eligibility times are persisted: at most 40 scheduling attempts, a 2–30
+second backoff, a 15-minute intent lifetime, and at most four automatic jobs in
+flight. Busy exhaustion and other pre-reservation failures are shown as skipped,
+not as proof that a later manual retry is required. A new manual attempt is always
+an explicit owner action.
+
+Task changes/cancellation, owner opt-out, member deactivation, and a restart with
+`AGENCT_AUTO_DRAFT=0` cancel queued intent. Re-enabling does not resurrect skipped
+work. Live roster membership, account status, the global switch, owner permission,
+and task state/revision are checked before each automatic model call, including
+summary chunks. Revocation cannot retract a request already sent.
+
+The executable owns and stops the periodic dispatcher with the HTTP server.
+Library integrations that use `app(Hub)` must also run `Hub::run_auto_drafts()`
+after all configuration builders and successful startup validation, and cancel
+that future at shutdown. Task actions wake this dispatcher after committing their intent; all automatic
+work, periodic retries and restart recovery belong to this lifecycle-owned future.

@@ -292,6 +292,7 @@ function ownerWorking(context, task, card) {
   if (mine?.status === 'complete' && !draftReceipts.has(mine.request_id)) readDraft(context, task, mine.request_id);
   const draft = latestDraft(task);
   if (drafting) card.append(el('p', 'draft-status working', 'Agent 正在起草，仅你可见…'));
+  else if (mine?.automatic && ['queued', 'skipped'].includes(mine.status)) card.append(el('p', 'draft-status', draftUI.status(task)));
   else if (mine?.status === 'complete' && !draft) card.append(el('p', 'draft-status', '正在读取 Agent 草稿…'));
   else if (mine?.status === 'uncertain') card.append(el('p', 'note', '上次起草结果未知，不会自动重发。可以在聊天里让 Agent 重新起草。'));
   if (draft && !drafting) {
