@@ -399,7 +399,7 @@ if (require.main === module) (async () => {
       assert.equal(await f.page.locator('#task-context').isVisible(), true);
       assert((await f.page.locator('#task-context-details').textContent()).includes('失效'));
       assert.match(await f.page.locator('#task-context-status').ariaSnapshot(), /已失效/);
-      assert.equal(await f.page.locator('.chip-more').getAttribute('open'), null, 'announcement does not depend on expanded details');
+      assert.equal(await f.page.locator('#task-context .chip-more').getAttribute('open'), null, 'announcement does not depend on expanded details');
       if (change === 'revision') {
         await discussButtons(f).click();
         await f.send('Discuss the new revision'); await settled(f);

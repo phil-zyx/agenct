@@ -138,7 +138,7 @@ pub(super) async fn prepare_with_extra(
             )
             .optional()?;
         let (summary, through) = saved.unwrap_or_default();
-        let mut query = db.prepare("SELECT id,role,content,status,created_at FROM messages WHERE owner=?1 AND status='complete' AND id>?2 ORDER BY id")?;
+        let mut query = db.prepare("SELECT id,role,content,status,created_at FROM messages WHERE owner=?1 AND status='complete' AND project_id IS NULL AND id>?2 ORDER BY id")?;
         let rows = query
             .query_map(params![owner, through], |r| {
                 Ok((
@@ -386,7 +386,43 @@ mod tests {
             expected_profile_revision: None,
             request_id: None,
             selected_task: None,
+            selected_project: None,
         }
+    }
+    #[tokio::test]
+    async fn project_turns_never_enter_ordinary_history_or_summary() {
+        let h = Hub::open(config(":memory:".into(), Runtime::Mock)).unwrap();
+        seed(&h, "alice", 45, "ordinary private chat");
+        {
+            let db = h.db().unwrap();
+            for role in ["user", "assistant"] {
+                db.execute("INSERT INTO messages(owner,role,content,status,project_id) VALUES ('alice',?1,'PROJECT_SENTINEL','complete','project-fixture')",[role]).unwrap();
+            }
+        }
+        let history = prepare(&h, "alice", &input(), &profile(), None)
+            .await
+            .unwrap();
+        assert!(history
+            .iter()
+            .all(|m| !m.content.contains("PROJECT_SENTINEL")));
+        let db = h.db().unwrap();
+        let summary: String = db
+            .query_row(
+                "SELECT content FROM context_summaries WHERE owner='alice'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!summary.contains("PROJECT_SENTINEL"));
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM messages WHERE project_id IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
     }
     fn seed(h: &Hub, owner: &str, count: usize, content: &str) {
         let db = h.db().unwrap();

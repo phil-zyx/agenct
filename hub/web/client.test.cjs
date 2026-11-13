@@ -35,6 +35,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
   let repositoryPreview = null;
   const repositoryTurns = settings.repositoryTurns || new Map();
   const turnContexts = settings.turnContexts || new Map();
+  const projectContexts = settings.projectContexts || new Map();
   let responseContextOverride, responseProfileOverride;
   const defaultProfile = { revision: 0, agents: [{ id: 'butler', name: '管家', role: 'coordinator', model_ref: 'server-default', enabled: true }] };
   let profile = settings.profile || defaultProfile;
@@ -90,6 +91,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       // Capture the context at dispatch, including an eventually lost response.
       if (url === '/api/messages' && options.method === 'POST') {
         const body = JSON.parse(options.body), selected = body.selected_task;
+        projectContexts.set(body.request_id, body.selected_project ? { project_id: body.selected_project.project_id, revision: body.selected_project.expected_revision, omitted_items: 0 } : null);
         repositoryTurns.set(body.request_id, /^\/repo(?:-search)? /.test(body.message) ? repositoryPreview : null);
         const agent = profile.agents?.find(agent => body.agent_id ? agent.id === body.agent_id : agent.role === 'coordinator');
         turnProfiles.set(body.request_id, agent ? { revision: profile.revision, agent_id: agent.id,
@@ -135,6 +137,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
         const requestId = JSON.parse(options.body).request_id;
         data = { repository_context: settings.repositoryMismatch ? null : repositoryTurns.get(requestId), reply: postTurnStatus === 'complete' ? 'Saved chat reply' : null,
           runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
+          project_context: settings.projectMismatch ? { project_id: 'wrong', revision: 0 } : projectContexts.get(requestId),
           task_context: responseContextOverride === undefined ? turnContexts.get(requestId) : responseContextOverride,
           task_action: settings.taskAction ? settings.taskAction(JSON.parse(options.body)) : null,
           turn: { request_id: requestId, status: postTurnStatus } };
@@ -145,7 +148,8 @@ function fixture(auth = { enabled: false }, settings = {}) {
         data = { request_id: requestId, status: checkTurnStatus,
           response: checkTurnStatus === 'complete' ? { task_action: settings.recoveredTaskAction || null, repository_context: settings.repositoryMismatch ? null : repositoryTurns.get(requestId), reply: 'Saved chat reply',
             runtime_profile: responseProfileOverride === undefined ? turnProfiles.get(requestId) : responseProfileOverride,
-            task_context: responseContextOverride === undefined ? turnContexts.get(requestId) ?? null : responseContextOverride,
+            project_context: settings.projectMismatch ? { project_id: 'wrong', revision: 0 } : projectContexts.get(requestId),
+          task_context: responseContextOverride === undefined ? turnContexts.get(requestId) ?? null : responseContextOverride,
             turn: { request_id: requestId, status: 'complete' } } : null };
       }
       if (url.startsWith('/api/tasks/') && options.method === 'GET' && !url.includes('/drafts') && !url.includes('/worker')) {
@@ -180,7 +184,12 @@ function fixture(auth = { enabled: false }, settings = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, 'task-timeline-ui.js'), 'utf8'), context);
   for (const name of ['activity-ui.js', 'chat-ui.js', 'profile-suggestions-ui.js', 'task-ui.js', 'repo-ui.js', 'client.js', 'task-chat.js', 'account-ui.js', 'contacts-ui.js', 'client-chrome.js']) vm.runInContext(fs.readFileSync(path.join(__dirname, name), 'utf8'), context);
   return {
-    $, calls, timers, storage, confirmations, turnContexts, turnProfiles, document,
+    $, calls, timers, storage, confirmations, turnContexts, turnProfiles, projectContexts, document,
+    project(selection = { id: 'project-one', name: 'Private project name', revision: 4, sources: 'model_suggestion source v1' }) {
+      // Selection/fresh project reads are exercised against a real Hub separately.
+      context.validateSelectedProject = async () => true;
+      vm.runInContext('selectedTask = null; selectedProject = ' + JSON.stringify(selection) + '; renderTaskContext(); renderProjectContext();', context);
+    },
     key(event) { listeners.get('keydown')?.({ preventDefault() {}, ...event }); },
     profile(value) { profile = value; },
     responseProfile(value) { responseProfileOverride = value; },
@@ -237,6 +246,52 @@ const task = (overrides = {}) => ({ id: 'task-one', revision: 3, requester: 'ali
 const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && call.options.method === 'POST');
 
 (async () => {
+
+  await test('project selection attaches only to one private turn and records no source text in recovery storage', async () => {
+    const f = fixture(); await f.login('alice'); f.project();
+    assert(!f.$('project-context').classList.contains('hide'));
+    assert.match(f.$('project-context-details').textContent, /不读取私聊历史/);
+    f.postTurn('pending'); await f.send('请依据当前共同状态建议下一步');
+    const sent = JSON.parse(chatPosts(f)[0].options.body);
+    assert.deepEqual(sent.selected_project, { project_id: 'project-one', expected_revision: 4 });
+    assert.equal(sent.selected_task, undefined);
+    assert(!JSON.stringify([...f.storage.values()]).includes('Private project name'));
+    assert(!JSON.stringify([...f.storage.values()]).includes('model_suggestion'));
+    const saved = JSON.parse([...f.storage.values()][0]);
+    assert.deepEqual(saved.project, { id: 'project-one', revision: 4 });
+    await f.$('check-turn').onclick();
+    assert(f.$('project-context').classList.contains('hide'));
+    assert.match(f.$('status').textContent, /本次项目上下文：project-one/);
+    f.postTurn('complete'); await f.send('普通消息');
+    assert.equal(JSON.parse(chatPosts(f)[1].options.body).selected_project, undefined);
+  });
+  await test('project discussion blocks slash commands and stale selections without writes', async () => {
+    for (const command of ['/delegate bob publish this', '/repo source deadbeef README.md', '/profile']) {
+      const f = fixture(); await f.login('alice'); f.project(); await f.send(command);
+      assert.equal(f.calls.filter(c => c.options.method === 'POST').length, 0);
+      assert.equal(f.$('text').value, command); assert.match(f.$('status').textContent, /仅接受普通问题/);
+    }
+    const f = fixture(); await f.login('alice');
+    f.project({ id: 'project-one', revision: 4, invalidated: true }); await f.send('普通问题');
+    assert.equal(chatPosts(f).length, 0); assert.equal(f.$('text').value, '普通问题');
+    f.$('clear-project-context').onclick(); await f.send('普通问题'); assert.equal(chatPosts(f).length, 1);
+  });
+  await test('mismatched project receipt stays unresolved and checking cannot redispatch', async () => {
+    const f = fixture(undefined, { projectMismatch: true }); await f.login('alice'); f.project();
+    await f.send('项目问题'); assert.match(f.$('status').textContent, /项目上下文回执与本次选择不符/);
+    await f.$('check-turn').onclick(); assert.equal(chatPosts(f).length, 1);
+    assert(!f.$('turn-recovery').classList.contains('hide'));
+    await f.$('logout').onclick(); await f.login('bob');
+    assert(f.$('project-context').classList.contains('hide'));
+    assert.equal(f.$('project-context-details').textContent, '');
+  });
+  await test('unknown project send uses read-only recovery and no repeated model dispatch', async () => {
+    const f = fixture(); await f.login('alice'); f.project(); f.failNextPost();
+    await f.send('项目问题'); assert.match(f.$('status').textContent, /发送结果未知/);
+    assert.equal(chatPosts(f).length, 1); await f.$('check-turn').onclick();
+    assert.equal(chatPosts(f).length, 1); assert(f.$('turn-recovery').classList.contains('hide'));
+    assert.match(f.$('status').textContent, /本次项目上下文：project-one/);
+  });
 
   await test('work index reveals filtered tasks without changing composer, selection or task state', async () => {
     for (const [filter, status, requester, expected] of [

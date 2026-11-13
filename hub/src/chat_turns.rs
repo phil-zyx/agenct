@@ -38,18 +38,25 @@ fn receipt(db: &Connection, owner: &str, key: &str) -> Result<Option<serde_json:
     })
     .transpose()
 }
-fn replay(db: &Connection, owner: &str, input: &ChatInput) -> Result<Option<serde_json::Value>> {
+fn replay(
+    h: &Hub,
+    db: &Connection,
+    owner: &str,
+    input: &ChatInput,
+) -> Result<Option<serde_json::Value>> {
     let Some(key) = input.request_id.as_deref() else {
         return Ok(None);
     };
     let binding = db
         .query_row(
-            "SELECT message,agent_id,selected_task,expected_profile_revision FROM chat_turns WHERE owner=?1 AND request_id=?2",
+            "SELECT message,agent_id,selected_task,expected_profile_revision,selected_project FROM chat_turns WHERE owner=?1 AND request_id=?2",
             params![owner, key],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<i64>>(3)?)),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<i64>>(3)?,r.get::<_,Option<String>>(4)?)),
         )
         .optional()?;
-    let Some((message, agent_id, selected_task, expected_profile_revision)) = binding else {
+    let Some((message, agent_id, selected_task, expected_profile_revision, selected_project)) =
+        binding
+    else {
         return Ok(None);
     };
     let selection = input
@@ -60,11 +67,19 @@ fn replay(db: &Connection, owner: &str, input: &ChatInput) -> Result<Option<serd
         || agent_id != input.agent_id
         || selected_task != selection
         || expected_profile_revision != input.expected_profile_revision
+        || selected_project
+            != input
+                .selected_project
+                .as_ref()
+                .map(|s| serde_json::to_string(s).expect("selection JSON"))
     {
         return Err(Error(
             StatusCode::CONFLICT,
-            "request_id already used for different content, agent, profile revision or selected task",
+            "request_id already used for different content, agent, profile revision, selected task or project",
         ));
+    }
+    if let Some(selection) = &input.selected_project {
+        projects::authorize(h, db, &selection.project_id, owner)?;
     }
     let found = receipt(db, owner, key)?.ok_or_else(denied)?;
     if found["status"] == "complete" {
@@ -102,6 +117,11 @@ pub(super) async fn chat(
     Json(input): Json<ChatInput>,
 ) -> Result<Json<serde_json::Value>> {
     let id = h.identity(&headers)?;
+    if input.selected_project.as_ref().is_some_and(|s| !s.valid())
+        || (input.selected_project.is_some() && input.selected_task.is_some())
+    {
+        return Err(invalid("invalid or conflicting selected project"));
+    }
     if input.message.trim().is_empty() || input.message.len() > 8000 {
         return Err(invalid("message must contain 1..8000 bytes"));
     }
@@ -132,17 +152,17 @@ pub(super) async fn chat(
         return Err(invalid("invalid explicit agent selection"));
     }
     // Completed/uncertain replays are independent of current profile and active turns.
-    if let Some(response) = replay(&*h.db()?, &id, &input)? {
+    if let Some(response) = replay(&h, &*h.db()?, &id, &input)? {
         return Ok(Json(response));
     }
     let guard = h
         .gate(&id)?
         .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, "a turn is already running"))?;
-    if let Some(response) = replay(&*h.db()?, &id, &input)? {
+    if let Some(response) = replay(&h, &*h.db()?, &id, &input)? {
         return Ok(Json(response));
     }
-    let (runtime_profile, task_context) = {
+    let (runtime_profile, task_context, project_context) = {
         // Capture and reserve under the shared profile/task mutation mutex.
         // Later edits cannot alter the frozen routing or discussion snapshot.
         let db = h.db()?;
@@ -152,6 +172,8 @@ pub(super) async fn chat(
             input.agent_id.as_deref(),
             input.expected_profile_revision,
         )?;
+        let project_context =
+            crate::project_context::capture(&h, &db, &id, input.selected_project.as_ref())?;
         let task_context = task_context::capture(&db, &id, input.selected_task.as_ref())?;
         if let Some(key) = input.request_id.as_deref() {
             let collision: bool = db.query_row(
@@ -169,10 +191,10 @@ pub(super) async fn chat(
                 .selected_task
                 .as_ref()
                 .map(|s| serde_json::to_string(s).expect("selection JSON"));
-            db.execute("INSERT INTO chat_turns(owner,request_id,message,agent_id,runtime_profile,status,selected_task,task_context,expected_profile_revision) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?8)",
-                params![id,key,input.message,input.agent_id,serde_json::to_string(&runtime_profile).map_err(|_| invalid("invalid runtime profile"))?,selection,task_context.as_ref().map(|c|c.to_string()),input.expected_profile_revision])?;
+            db.execute("INSERT INTO chat_turns(owner,request_id,message,agent_id,runtime_profile,status,selected_task,task_context,expected_profile_revision,selected_project) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?8,?9)",
+                params![id,key,input.message,input.agent_id,serde_json::to_string(&runtime_profile).map_err(|_| invalid("invalid runtime profile"))?,selection,task_context.as_ref().map(|c|c.to_string()),input.expected_profile_revision,input.selected_project.as_ref().map(|s| serde_json::to_string(s).expect("selection JSON"))])?;
         }
-        (runtime_profile, task_context)
+        (runtime_profile, task_context, project_context)
     };
     // Dispatch in a detached task that owns the per-user gate. If the client
     // disconnects (tab refresh, network drop), the single dispatch still runs to
@@ -182,7 +204,12 @@ pub(super) async fn chat(
     let (task_hub, task_id) = (h.clone(), id.clone());
     let dispatch = tokio::spawn(async move {
         let _guard = guard;
-        let result = execute_chat(&task_hub, &task_id, &input, runtime_profile, task_context).await;
+        let result = if let Some(context) = project_context {
+            crate::project_context::execute(&task_hub, &task_id, &input, runtime_profile, context)
+                .await
+        } else {
+            execute_chat(&task_hub, &task_id, &input, runtime_profile, task_context).await
+        };
         if let Err(error) = &result {
             if let Some(key) = input.request_id.as_deref() {
                 if let Some(code) = crate::chat_failures::code(error) {
@@ -239,7 +266,23 @@ pub(super) async fn status(
             }
         }
     }
-    Ok(Json(receipt(&*h.db()?, &id, &key)?.ok_or_else(denied)?))
+    // Authorization and retrieval must share the same lock: membership removal
+    // cannot interleave between checking access and reading the project snapshot.
+    let db = h.db()?;
+    let selection: Option<String> = db
+        .query_row(
+            "SELECT selected_project FROM chat_turns WHERE owner=?1 AND request_id=?2",
+            params![id, key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(raw) = selection {
+        let selected: crate::project_context::Selection =
+            serde_json::from_str(&raw).map_err(|_| invalid("invalid stored project selection"))?;
+        projects::authorize(&h, &db, &selected.project_id, &id)?;
+    }
+    Ok(Json(receipt(&db, &id, &key)?.ok_or_else(denied)?))
 }
 
 #[cfg(test)]
@@ -267,6 +310,7 @@ mod tests {
             expected_profile_revision: None,
             request_id: Some("failure-fixture".into()),
             selected_task: None,
+            selected_project: None,
         }
     }
 
@@ -499,6 +543,7 @@ mod tests {
             expected_profile_revision: None,
             request_id: Some("timeout".into()),
             selected_task: None,
+            selected_project: None,
         };
         let result = chat(State(h.clone()), headers.clone(), Json(input())).await;
         assert_eq!(result.unwrap_err().0, StatusCode::BAD_GATEWAY);

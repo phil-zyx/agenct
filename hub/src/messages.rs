@@ -49,6 +49,7 @@ pub(super) struct ChatInput {
     pub(super) expected_profile_revision: Option<i64>,
     pub(super) request_id: Option<String>,
     pub(super) selected_task: Option<task_context::Selection>,
+    pub(super) selected_project: Option<crate::project_context::Selection>,
 }
 pub(super) async fn execute_chat(
     h: &Hub,

@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 20;
+pub(super) const VERSION: i64 = 21;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -187,6 +187,10 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
         18 => db.execute_batch(crate::projects::SCHEMA)?,
         19 => db.execute_batch(crate::project_state::SCHEMA)?,
         20 => db.execute_batch(crate::auto_drafts::SCHEMA)?,
+        21 => {
+            add_column(db, "chat_turns", "selected_project", "TEXT")?;
+            add_column(db, "messages", "project_id", "TEXT")?;
+        }
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -274,6 +278,7 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("events", "revision" | "delivery_seq") => 8,
         ("events", "reason") => 9,
         ("tasks", "revision") => 2,
+        ("chat_turns", "selected_project") | ("messages", "project_id") => 21,
         ("chat_turns", "selected_task" | "task_context" | "expected_profile_revision") => 3,
         ("worker_jobs", "execution_authorized") => 4,
         _ => 1,
@@ -589,6 +594,35 @@ mod tests {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap();
         rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn project_discussion_migration_is_additive_and_rolls_back() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for next in 1..=20 {
+            step(&db, next).unwrap();
+        }
+        db.pragma_update(None, "user_version", 20).unwrap();
+        db.execute("INSERT INTO sessions VALUES ('alice','session')", [])
+            .unwrap();
+        db.execute("INSERT INTO messages(owner,role,content,status) VALUES ('alice','user','keep','complete')",[]).unwrap();
+        let before = schema(&db);
+        assert!(migrate_with_hook(&mut db, |_| Err("fixture failure".into())).is_err());
+        assert_eq!(schema(&db), before);
+        assert_eq!(version(&db).unwrap(), 20);
+        migrate(&mut db).unwrap();
+        assert_eq!(version(&db).unwrap(), 21);
+        assert_eq!(text(&db, "SELECT content FROM messages"), "keep");
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT count(*) FROM messages WHERE project_id IS NULL"
+            ),
+            1
+        );
+        let after = schema(&db);
+        migrate(&mut db).unwrap();
+        assert_eq!(schema(&db), after);
     }
 
     #[test]
