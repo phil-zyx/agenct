@@ -138,7 +138,7 @@ function projectCard(item, historical = false) {
   if (permissions.confirm) actions.append(projectButton(ProjectStateModel.confirmations[item.kind], () => stateActionEditor(item, 'confirm'), 'primary'));
   if (permissions.revise) actions.append(projectButton('修订', () => stateEditor(item)));
   if (permissions.withdraw) actions.append(projectButton('撤回', () => stateActionEditor(item, 'withdraw')));
-  actions.append(projectButton('版本记录', () => stateHistory(item)));
+  actions.append(projectButton('共享问答', () => stateQuestions(item)), projectButton('版本记录', () => stateHistory(item)));
   card.append(actions); return card;
 }
 function renderProject() {
@@ -361,11 +361,11 @@ function projectPreview(form, title, lines, label, path, body) {
     if (!activeProjectPreview(draft, preview) || (acknowledgement && !acknowledgement.checked)) return;
     void commitProject(draft, path, body, confirm, preview);
   }, 'primary');
-  if (draft.chatCandidate) {
+  if (draft.chatCandidate || draft.sharedQuestion) {
     const wrap = el('label', 'project-acknowledgement');
     acknowledgement = el('input'); acknowledgement.type = 'checkbox';
-    acknowledgement.setAttribute('aria-label', '我已核对项目、共享文字和来源');
-    wrap.append(acknowledgement, el('span', '', '我已核对项目、共享文字和来源。只发布为待确认建议，不代表本人或他人已接受分工。'));
+    acknowledgement.setAttribute('aria-label', draft.feedbackWithdrawal ? '我已核对撤回范围与历史保留说明' : draft.sharedQuestion ? '我已核对项目、问题版本和共享文字' : '我已核对项目、共享文字和来源');
+    wrap.append(acknowledgement, el('span', '', draft.feedbackWithdrawal ? '我已核对撤回范围与历史保留说明。只撤回我自己的反馈正文，其他人的回复及数据库历史记录仍保留。' : draft.sharedQuestion ? '我已核对项目、问题版本和共享文字。只发布以上反馈，不代表确认、承诺或全员共识。' : '我已核对项目、共享文字和来源。只发布为待确认建议，不代表本人或他人已接受分工。'));
     draft.acknowledgement = acknowledgement;
     acknowledgement.onchange = () => { confirm.disabled = !activeProjectPreview(draft, preview) || !acknowledgement.checked || draft.invalid || projectBusy; };
     confirm.disabled = true; preview.append(wrap);
@@ -392,7 +392,9 @@ async function commitProject(draft, path, body, button, preview) {
     projectBusy = false; projectDraft = null; draft.editor.remove();
     const id = draft.projectId || (path === 'projects' ? result.id : null);
     if (id && !draft.returnToDirectory) await loadProject(id); else await loadProjectDirectory();
-    if (current(draft.context)) projectNotice('操作已保存。共享内容仍须按规则由对应成员确认。');
+    if (current(draft.context)) projectNotice(draft.sharedQuestion
+      ? (draft.feedbackWithdrawal || result.message?.withdrawn ? '反馈已撤回，正文不再展示；历史记录和他人已看到的内容无法收回。' : '反馈已保存。问答不改变共同状态，也不代表任何人的确认或全员共识。')
+      : '操作已保存。共享内容仍须按规则由对应成员确认。');
   } catch (error) {
     if (!current(draft.context) || projectDraft !== draft) return;
     if (succeeded) { projectNotice('操作已保存，读取失败。请刷新项目，不要重复提交。'); return; }
@@ -478,6 +480,94 @@ async function stateHistory(item) {
     if (!current(draft.context) || projectDraft !== draft) return;
     for (const version of result.versions) editor.append(projectCard(version, true));
   } catch (error) { if (current(draft.context) && projectDraft === draft) projectNotice('无法读取版本记录：' + error.message); }
+}
+// Shared feedback is manually entered, separately previewed and never a state confirmation.
+const projectQuestionsPath = (project, item) => projectPath(project) + '/state/' + encodeURIComponent(item) + '/questions';
+function activeQuestionView(draft) {
+  return projectDraft === draft && current(draft.context) && !draft.invalid && !projectBusy
+    && draft.editor.isConnected && $('room').classList.contains('projects-open');
+}
+function leaveQuestionView(draft, next) {
+  if (!activeQuestionView(draft)) return;
+  draft.editor.remove(); projectDraft = null; next();
+}
+async function stateQuestions(item) {
+  const editor = beginProjectEditor('共享问答'); if (!editor) return;
+  const draft = projectDraft, project = projectView.project;
+  editor.append(el('p', 'project-copy', ProjectStateModel.kinds[item.kind] + ' · 条目 ' + item.id + ' · 当前版本 ' + item.version + '\n' + item.content),
+    el('p', 'note', '这里只展示成员主动发布的反馈，不代表确认、承诺或共识。私聊不会自动带入，也不会通知外部联系人。撤回后正文不再展示，但数据库保留历史记录，无法收回他人已看到的内容。'), editorCancel());
+  try {
+    const result = await contactApi(draft.context, projectQuestionsPath(project.id, item.id));
+    if (!current(draft.context) || projectDraft !== draft || !editor.isConnected) return;
+    if (result.project_revision !== draft.revision || result.item_version !== item.version || result.item_status !== item.status) {
+      draft.invalid = true; projectNotice('项目或条目已更新，请取消后重新读取问答。'); return;
+    }
+    const writable = project.status === 'active' && item.status !== 'withdrawn';
+    if (writable) editor.append(projectButton('提出共享问题', () => leaveQuestionView(draft, () => questionEditor(item))));
+    else editor.append(el('p', 'note', '项目已归档或条目已撤回，只读；仍可撤回自己发布的反馈。'));
+    if (!result.messages.length) editor.append(el('p', 'note', '还没有共享问题。'));
+    const renderMessage = (message, root) => {
+      const card = el('article', 'project-card project-question-message'); card.dataset.question = message.id; card.classList.toggle('project-question-reply', !!message.reply_to);
+      card.append(el('p', 'note', (message.reply_to ? '回复' : '问题') + ' · ' + message.author + ' · ' + message.created_at + ' · 依据条目版本 ' + message.item_version),
+        el('p', 'project-copy', message.withdrawn ? '作者已撤回此反馈，正文不再展示。' : message.content));
+      if (message.item_version !== item.version) card.append(el('p', 'note', '旧版本反馈，仅供历史参考，不能继续回复；新版本请重新提出问题。'));
+      const actions = el('div', 'actions');
+      if (!message.reply_to && !message.withdrawn && writable && message.item_version === item.version)
+        actions.append(projectButton('回复此问题', () => leaveQuestionView(draft, () => questionEditor(item, message))));
+      if (!message.withdrawn && message.author === draft.context.user)
+        actions.append(projectButton('撤回我的反馈', () => leaveQuestionView(draft, () => withdrawQuestionEditor(item, message))));
+      card.append(actions); root.append(card);
+    };
+    for (const message of result.messages.filter(message => !message.reply_to)) {
+      const thread = el('section', 'project-question-thread'); thread.setAttribute('aria-label', '共享问题讨论');
+      renderMessage(message, thread);
+      for (const reply of result.messages.filter(reply => reply.reply_to === message.id)) renderMessage(reply, thread);
+      editor.append(thread);
+    }
+  } catch (error) {
+    if (!current(draft.context) || projectDraft !== draft) return;
+    if ([401, 403, 404].includes(error.httpStatus)) {
+      projectDraft = null; projectView = null; projectGeneration++; projectShell();
+      projectNotice('无法访问项目，已清除此页内容。'); projectHost().append(projectButton('项目列表', loadProjectDirectory));
+    } else projectNotice('无法读取共享问答：' + error.message + '。请取消后重试。');
+  }
+}
+function questionEditor(item, reply = null) {
+  const editor = beginProjectEditor(reply ? '回复共享问题' : '提出共享问题'); if (!editor) return;
+  const draft = projectDraft, project = projectView.project; draft.sharedQuestion = true;
+  const form = el('form');
+  form.append(el('p', 'project-copy', '依据条目版本 ' + item.version + '：' + item.content));
+  if (reply) form.append(el('p', 'project-copy', '回复 ' + reply.author + ' 的问题：' + reply.content));
+  form.append(el('p', 'note', '仅输入你准备公开的反馈。发布前可预览；不会附带私聊，也不会修改共同状态或替他人确认。'));
+  const content = projectField(form, reply ? '共享回复内容' : '共享问题内容', 'textarea'); content.maxLength = 4000;
+  const preview = el('button', 'primary', '预览共享反馈'); preview.type = 'submit'; form.append(preview, editorCancel());
+  form.onsubmit = event => {
+    event.preventDefault(); if (!activeQuestionView(draft) || !form.reportValidity()) return;
+    const text = content.value.trim();
+    if (!ProjectStateModel.boundedText(text, 4000)) { projectNotice('反馈需为 1–4000 个字符，且不能含特殊控制字符。'); return; }
+    const body = { request_id: crypto.randomUUID(), expected_revision: project.revision, expected_version: item.version, content: text, reply_to: reply?.id || null };
+    projectPreview(form, '共享反馈前核对', [
+      '项目：' + project.name + ' · ' + project.id + ' · 项目版本 ' + project.revision,
+      '依据条目：' + item.id + ' · 版本 ' + item.version + '\n' + item.content,
+      ...(reply ? ['回复的问题：' + reply.id + ' · 作者 ' + reply.author + '\n' + reply.content] : []),
+      '发布人：' + draft.context.user,
+      '可见范围：所有已加入和今后加入的项目成员。退出项目不会自动撤回已发布的问答。',
+      (reply ? '共享回复：' : '共享问题：') + text,
+      '这是主动发布的反馈，不代表确认、承诺、接受分工或全员共识。撤回后不展示正文，但数据库保留历史，无法收回成员已看到的内容。'
+    ], '确认共享反馈', projectQuestionsPath(project.id, item.id), body);
+  };
+  editor.append(form); content.focus();
+}
+function withdrawQuestionEditor(item, message) {
+  const editor = beginProjectEditor('撤回我的反馈'); if (!editor) return;
+  const project = projectView.project, form = el('div'); editor.append(form);
+  projectDraft.sharedQuestion = true; projectDraft.feedbackWithdrawal = true;
+  projectPreview(form, '核对撤回反馈', [
+    '项目：' + project.name + ' · ' + project.id + ' · 项目版本 ' + project.revision,
+    '反馈编号：' + message.id + ' · 依据条目版本 ' + message.item_version,
+    '原反馈：' + message.content,
+    '撤回后不再展示此反馈正文，数据库仍保留历史记录；无法收回其他成员已看到的内容。撤回问题会停止新增回复，但不会撤回其他成员已有的回复，也不会改变共同状态。'
+  ], '确认撤回我的反馈', projectQuestionsPath(project.id, item.id) + '/' + encodeURIComponent(message.id) + '/withdraw', { expected_revision: project.revision });
 }
 function membershipEditor(project, action) {
   const editor = beginProjectEditor(action === 'accept' ? '接受项目邀请' : '婉拒项目邀请'); if (!editor) return;
