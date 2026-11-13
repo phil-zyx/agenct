@@ -91,7 +91,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       // Capture the context at dispatch, including an eventually lost response.
       if (url === '/api/messages' && options.method === 'POST') {
         const body = JSON.parse(options.body), selected = body.selected_task;
-        projectContexts.set(body.request_id, body.selected_project ? { project_id: body.selected_project.project_id, revision: body.selected_project.expected_revision, omitted_items: 0 } : null);
+        projectContexts.set(body.request_id, body.selected_project ? { project_id: body.selected_project.project_id, revision: body.selected_project.expected_revision, omitted_items: 0, ...(settings.projectContext || {}) } : null);
         repositoryTurns.set(body.request_id, /^\/repo(?:-search)? /.test(body.message) ? repositoryPreview : null);
         const agent = profile.agents?.find(agent => body.agent_id ? agent.id === body.agent_id : agent.role === 'coordinator');
         turnProfiles.set(body.request_id, agent ? { revision: profile.revision, agent_id: agent.id,
@@ -251,6 +251,10 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(); await f.login('alice'); f.project();
     assert(!f.$('project-context').classList.contains('hide'));
     assert.match(f.$('project-context-details').textContent, /不读取私聊历史/);
+    assert.match(f.$('project-context-details').textContent, /共享问答/);
+    assert.match(f.$('project-context-details').textContent, /已撤回的问答不附正文/);
+    assert.match(f.$('project-context-details').textContent, /旧版本反馈/);
+    assert.match(f.$('project-context-details').textContent, /缺少原问题时不能推断原文/);
     f.postTurn('pending'); await f.send('请依据当前共同状态建议下一步');
     const sent = JSON.parse(chatPosts(f)[0].options.body);
     assert.deepEqual(sent.selected_project, { project_id: 'project-one', expected_revision: 4 });
@@ -264,6 +268,20 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert.match(f.$('status').textContent, /本次项目上下文：project-one/);
     f.postTurn('complete'); await f.send('普通消息');
     assert.equal(JSON.parse(chatPosts(f)[1].options.body).selected_project, undefined);
+  });
+  await test('project receipt reports bounded feedback coverage without copying feedback text into status or storage', async () => {
+    const f = fixture(undefined, { projectContext: { omitted_items: 2, omitted_feedback: 3,
+      feedback: [{ content: 'Shared feedback not for the status banner', withdrawn: false }, { content: '', withdrawn: true }] } });
+    await f.login('alice'); f.project(); await f.send('结合共享问答建议下一步');
+    const receipt = f.$('status').textContent;
+    assert.match(receipt, /包含 2 条共享问答记录/);
+    assert.match(receipt, /已省略 2 条.*状态条目/);
+    assert.match(receipt, /已省略 3 条共享问答/);
+    assert.match(receipt, /不代表确认或承诺/);
+    assert.match(receipt, /不能据此判断完整讨论/);
+    assert(!receipt.includes('Shared feedback not for the status banner'));
+    assert(!JSON.stringify([...f.storage.values()]).includes('Shared feedback'));
+    assert.equal(chatPosts(f).length, 1);
   });
   await test('project discussion blocks slash commands and stale selections without writes', async () => {
     for (const command of ['/delegate bob publish this', '/repo source deadbeef README.md', '/profile']) {
@@ -701,7 +719,8 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
 
   await test('chat shows time separators only for dated messages with gaps', async () => {
     const utc = d => d.toISOString().slice(0, 19).replace('T', ' ');
-    const t0 = new Date(Date.now() - 3600000);
+    // Keep the formatting assertion on the local calendar day, including near midnight.
+    const t0 = new Date(); t0.setHours(12, 0, 0, 0);
     const messages = [
       { role: 'user', content: 'legacy', status: 'complete' },
       { role: 'user', content: 'a', status: 'complete', created_at: utc(t0) },

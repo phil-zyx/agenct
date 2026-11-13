@@ -232,10 +232,20 @@ before choosing a task. Task and project context cannot be attached to the same
 turn. Slash commands are blocked while a project is selected.
 
 The Hub supplies only explicitly published project state with its item IDs,
-versions, sources, confirmation validity and provenance. No private conversation,
+versions, sources, confirmation validity and provenance, plus the explicitly
+published shared questions and replies. Each feedback message retains its ID,
+author, source item/version and reply-to reference. `current_reference: false`
+marks an old or withdrawn source; `parent_withdrawn: true` marks a reply to a
+withdrawn question. Withdrawn feedback bodies are empty, never supplied to the
+model. Feedback is not confirmation, consent or consensus. No private conversation,
 draft, task body, task result, or linked-task material is included. This isolated
 question does not use prior private conversation or memory. The bounded snapshot
-reports omitted items rather than claiming to represent everything. Withdrawn
+reports `omitted_items` and `omitted_feedback` rather than claiming to represent
+everything. The total serialized snapshot is capped at 20,480 bytes; whole state
+items take priority, and only feedback whose source item fits is included. A reply
+may refer to an omitted question, whose content must not be inferred. The digest
+covers all authorized state and redacted feedback, including omitted entries.
+Withdrawn
 items are included only as explicitly labeled historical records, not current
 commitments. Published text and source notes are untrusted quotations, not instructions. A proposed
 model suggestion remains a suggestion; neither the question nor the answer can

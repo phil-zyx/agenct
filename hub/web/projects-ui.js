@@ -246,7 +246,7 @@ async function validateSelectedProject(context, notify = true) {
     if (!current(context) || selectedProject !== selection || selection.invalidated) return false;
     if (view.project.status !== 'active' || projectDiscussionSignature(view) !== selection.signature) {
       invalidateProjectDiscussion(selection);
-      if (notify) status('项目共同状态或成员权限已更新，未发送。请重新选择项目并核对，未自动采用新版。');
+      if (notify) status('项目共同状态、共享问答或成员权限已更新，未发送。请重新选择项目并核对，未自动采用新版。');
       return false;
     }
     return true;
@@ -264,7 +264,7 @@ async function discussProject() {
   }
   const view = projectView, context = session(), generation = projectGeneration;
   const read = {}; projectRead = read;
-  projectNotice('正在核对可用于本轮讨论的共同状态…');
+  projectNotice('正在核对可用于本轮讨论的共同状态与共享问答范围…');
   try {
     const latest = await fetchProject(context, view.project.id);
     if (!current(context) || generation !== projectGeneration || projectView !== view
@@ -278,7 +278,7 @@ async function discussProject() {
         + ' · 发布人 ' + item.created_by + ' · ' + (item.source_kind === 'model_suggestion' ? '模型建议' : '人工陈述')
         + ' · ' + ProjectStateModel.status(item)).join('\n') || '尚无共同状态，不能据此推断实际工作进展。' };
     renderProjectContext(); closeProjects(); $('text').focus();
-    status('已选择项目，尚未发送。输入问题后发送，仅用于你与自己的 Agent 讨论；不会自动共享或执行。');
+    status('已选择项目，尚未发送。输入问题后发送，会使用有界的共同状态及共享问答，仅用于你与自己的 Agent 讨论；不会自动共享或执行。');
   } catch (error) {
     if (current(context) && generation === projectGeneration && projectView === view)
       projectNotice('无法选择项目：' + error.message + '。未发送消息。');
