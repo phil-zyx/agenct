@@ -382,3 +382,192 @@ async fn revoked_sources_revision_conflicts_and_unknown_fields_never_publish() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+async fn context(h: &Hub, p: &str) -> Value {
+    let selection = crate::project_context::Selection {
+        project_id: p.into(),
+        expected_revision: revision(h, p).await,
+    };
+    crate::project_context::capture(h, &h.db().unwrap(), "alice", Some(&selection))
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn discussion_feedback_preserves_provenance_redacts_withdrawal_and_marks_history() {
+    let h = fixture();
+    let p = project(&h, "discussion-feedback").await;
+    join(&h, &p, "bob").await;
+    let item = create_item(&h, &p, "alice", "goal").await;
+    let (_, q) = post(&h, &p, &item, "alice", "question", Value::Null).await;
+    let qid = q["message"]["id"].clone();
+    let (_, reply) = post(&h, &p, &item, "bob", "reply", qid.clone()).await;
+    let other = project(&h, "private-other-project").await;
+    let other_item = create_item(&h, &other, "alice", "goal").await;
+    post(
+        &h,
+        &other,
+        &other_item,
+        "alice",
+        "OTHER_PROJECT_SECRET",
+        Value::Null,
+    )
+    .await;
+    h.db().unwrap().execute("INSERT INTO messages(owner,role,content,status) VALUES ('bob','user','PRIVATE_CHAT_SECRET','complete')",[]).unwrap();
+    let before = context(&h, &p).await;
+    assert_eq!(before["feedback"].as_array().unwrap().len(), 2);
+    assert_eq!(before["feedback"][1]["id"], reply["message"]["id"]);
+    assert_eq!(before["feedback"][1]["author"], "bob");
+    assert_eq!(before["feedback"][1]["reply_to"], qid);
+    assert_eq!(before["feedback"][1]["current_reference"], true);
+    assert_eq!(before["feedback"][1]["parent_withdrawn"], false);
+    assert_eq!(before["items"][0]["status"], "proposed");
+    assert!(!before.to_string().contains("SECRET"));
+    let rev = revision(&h, &p).await;
+    let req = json!({"message":"Summarize published feedback only", "request_id":"feedback-turn", "selected_project":{"project_id":p,"expected_revision":rev}});
+    let (status, response) = call(&h, "alice", "POST", "/api/messages", req.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["project_context"], before);
+    assert_eq!(
+        call(&h, "alice", "POST", "/api/messages", req).await.1,
+        response
+    );
+    assert_eq!(revision(&h, &p).await, rev);
+    let withdraw = format!("{}/{}/withdraw", path(&p, &item), qid.as_str().unwrap());
+    assert_eq!(
+        call(
+            &h,
+            "alice",
+            "POST",
+            &withdraw,
+            json!({"expected_revision":rev})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let redacted = context(&h, &p).await;
+    assert_eq!(redacted["feedback"][0]["content"], "");
+    assert_eq!(redacted["feedback"][0]["withdrawn"], true);
+    assert_eq!(redacted["feedback"][1]["parent_withdrawn"], true);
+    assert_ne!(before["snapshot_sha256"], redacted["snapshot_sha256"]);
+    assert_eq!(
+        act(&h, &p, "alice", &item, "confirm").await.0,
+        StatusCode::OK
+    );
+    let stale = context(&h, &p).await;
+    assert_eq!(stale["feedback"][1]["item_version"], 1);
+    assert_eq!(stale["feedback"][1]["current_item_version"], 2);
+    assert_eq!(stale["feedback"][1]["current_reference"], false);
+}
+
+#[tokio::test]
+async fn discussion_bounds_complete_feedback_and_hashes_omitted_feedback() {
+    let h = fixture();
+    let p = project(&h, "bounded-feedback").await;
+    let item = create_item(&h, &p, "alice", "goal").await;
+    for n in 0..8 {
+        let (s, _) = call(&h,"alice","POST",&path(&p,&item),json!({"request_id":format!("big-{n}"),"expected_revision":revision(&h,&p).await,"expected_version":1,"content":"界".repeat(4000),"reply_to":null})).await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let before = context(&h, &p).await;
+    assert!(before.to_string().len() <= crate::project_context::MAX_BYTES);
+    assert_eq!(before["feedback"][0]["content"], "界".repeat(4000));
+    assert_eq!(
+        before["feedback"].as_array().unwrap().len()
+            + before["omitted_feedback"].as_u64().unwrap() as usize,
+        8
+    );
+    assert!(before["omitted_feedback"].as_u64().unwrap() > 0);
+    assert_eq!(
+        post(&h, &p, &item, "alice", "last-omitted", Value::Null)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let after = context(&h, &p).await;
+    assert_eq!(before["feedback"], after["feedback"]);
+    assert_ne!(before["snapshot_sha256"], after["snapshot_sha256"]);
+    assert_eq!(
+        after["omitted_feedback"].as_u64().unwrap(),
+        before["omitted_feedback"].as_u64().unwrap() + 1
+    );
+}
+
+#[tokio::test]
+async fn feedback_withdrawal_during_discussion_rejects_result_without_redispatch() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let count = Arc::new(AtomicUsize::new(0));
+    let (e, r, c) = (entered.clone(), release.clone(), count.clone());
+    let adapter = Router::new().route("/v1/turn", axum::routing::post(move |Json(payload): Json<Value>| {
+        let (e,r,c) = (e.clone(),r.clone(),c.clone());
+        async move {
+            c.fetch_add(1, Ordering::SeqCst);
+            let prompt = payload["history"][0]["content"].as_str().unwrap();
+            assert!(prompt.contains("feedback shared-question"));
+            assert!(prompt.contains("current_reference"));
+            assert!(!prompt.contains("PRIVATE_SENTINEL"));
+            e.notify_one(); r.notified().await;
+            Json(json!({"reply":"STALE_FEEDBACK_ANSWER", "backend":"dsh", "proposal":null,"profile_update":null}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/turn", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+    let mut h = fixture();
+    h.runtime = Runtime::Dsh {
+        url,
+        token: "test-adapter-token".into(),
+    };
+    let p = project(&h, "in-flight-feedback").await;
+    let item = create_item(&h, &p, "alice", "goal").await;
+    let (_, q) = post(&h, &p, &item, "alice", "shared-question", Value::Null).await;
+    h.db().unwrap().execute("INSERT INTO messages(owner,role,content,status) VALUES ('alice','user','PRIVATE_SENTINEL','complete')",[]).unwrap();
+    let rev = revision(&h, &p).await;
+    let body = json!({"message":"read feedback", "request_id":"feedback-running", "selected_project":{"project_id":p,"expected_revision":rev}});
+    let (clone, request) = (h.clone(), body.clone());
+    let pending =
+        tokio::spawn(async move { call(&clone, "alice", "POST", "/api/messages", request).await });
+    entered.notified().await;
+    let route = format!(
+        "{}/{}/withdraw",
+        path(&p, &item),
+        q["message"]["id"].as_str().unwrap()
+    );
+    assert_eq!(
+        call(
+            &h,
+            "alice",
+            "POST",
+            &route,
+            json!({"expected_revision":rev})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    release.notify_one();
+    assert_eq!(pending.await.unwrap().0, StatusCode::CONFLICT);
+    let (status, receipt) = call(&h, "alice", "POST", "/api/messages", body).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["turn"]["status"], "uncertain");
+    assert!(!receipt.to_string().contains("STALE_FEEDBACK_ANSWER"));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        h.db()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM messages WHERE content='STALE_FEEDBACK_ANSWER'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    server.abort();
+}

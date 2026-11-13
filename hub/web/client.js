@@ -273,7 +273,8 @@ function renderProjectContext() {
       : pendingTurn ? '本次项目选择已锁定；结果未知时只核对回执，不自动重发。'
         : '仅附给下一条普通聊天，尚未发送。服务端在发送前核对权限和版本。')
       + `\n项目编号：${project.id} · 项目版本 ${project.revision}`
-      + '\n只使用本轮问题和已发布的项目共同状态（包含标为已撤回的历史条目，不代表当前承诺）；不读取私聊历史、任务正文、材料或草稿。可能省略超出上下文上限的条目，回复会标明。'
+      + '\n只使用本轮问题、已发布的项目共同状态及其共享问答；不读取私聊历史、任务正文、材料或草稿。已撤回的状态条目仅作历史参考；已撤回的问答不附正文。旧版本反馈、已撤回问题下的回复不代表当前结论。'
+      + '\n共享问答保留作者、所依据的条目版本与回复关系，不是确认或承诺。上下文优先包含状态条目，可能省略超限条目或问答；缺少原问题时不能推断原文，完成后会标明省略数量。'
       + '\n发给你选择的模型处理，回复仅自己可见。不会向成员发消息、发布状态、确认分工或执行任务。来源说明未经独立验证，具名确认不代表全员共识。'
       + (project.sources ? '\n已发布条目的来源与当前版本：\n' + project.sources : '')
     : '';
@@ -475,7 +476,9 @@ async function completeTurn(context, response) {
   if (project && (response.task_action != null || response.proposal != null)) throw Error('项目讨论返回了未授权操作，保留恢复凭据');
   const projectReceipt = project
     ? `\n本次项目上下文：${project.project_id} · 版本 ${project.revision}。仅自己可见，未改变项目或任务。`
-      + (project.omitted_items > 0 ? `已省略 ${project.omitted_items} 条超出上下文上限的条目。` : '') : '';
+      + (Array.isArray(project.feedback) ? `本轮包含 ${project.feedback.length} 条共享问答记录（含无正文的撤回记录），不代表确认或承诺。` : '')
+      + (project.omitted_items > 0 ? `已省略 ${project.omitted_items} 条超出上下文上限的状态条目。` : '')
+      + (project.omitted_feedback > 0 ? `已省略 ${project.omitted_feedback} 条共享问答，不能据此判断完整讨论或推断缺失原文。` : '') : '';
   const receiptContext = task
     ? `\n本次任务上下文：${task.id} · 版本 ${task.revision}。`
       + (task.summary_truncated ? '共享摘要已截断。' : '')
