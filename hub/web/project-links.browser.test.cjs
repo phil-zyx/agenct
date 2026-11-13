@@ -274,39 +274,40 @@ async function freePort() {
     await reloadProject(alice, name);
     await button(alice, '归档项目').click();
     assert.equal((await ok('alice', route)).project.status, 'active');
-    // Commit succeeds as Alice, but its post-write GET returns only after Eve
-    // has opened her own project panel. Neither data nor the success notice may
-    // be written into Eve's session by that old commit continuation.
+    // Delay the loadProject *continuation*, not its network request: logout
+    // aborts fetch, so holding a GET alone cannot reliably test late notices.
     await alice.evaluate(() => { refreshProjects = async () => {}; });
     await alice.waitForFunction(() => !projectRead);
-    let releaseSavedRead, savedReadEntered;
-    const savedReadGate = new Promise(resolve => { releaseSavedRead = resolve; });
-    const savedReadHeld = new Promise(resolve => { savedReadEntered = resolve; });
-    await alice.route(detailUrl, async intercepted => {
-      const response = await intercepted.fetch(); savedReadEntered(); await savedReadGate;
-      await intercepted.fulfill({ response }).catch(() => {});
-    });
     await alice.evaluate(() => {
-      const original = commitProject;
-      globalThis.testOldCommitSettled = false;
-      commitProject = async (...args) => { try { return await original(...args); } finally { globalThis.testOldCommitSettled = true; } };
+      const originalLoad = loadProject, originalCommit = commitProject;
+      let holdNext = true;
+      const gate = new Promise(resolve => { globalThis.releaseSavedLoad = resolve; });
+      globalThis.testSavedLoadHeld = false; globalThis.testOldCommitSettled = false;
+      loadProject = async (...args) => {
+        const hold = holdNext; holdNext = false;
+        const result = await originalLoad(...args);
+        if (hold) { globalThis.testSavedLoadHeld = true; await gate; }
+        return result;
+      };
+      commitProject = async (...args) => { try { return await originalCommit(...args); } finally { globalThis.testOldCommitSettled = true; } };
     });
     try {
       const saved = alice.waitForResponse(r => r.url().endsWith('/archive') && r.request().method() === 'POST');
       await button(alice, '确认归档项目').click();
       assert.equal((await saved).status(), 200);
-      await bounded(savedReadHeld);
+      await alice.waitForFunction(() => globalThis.testSavedLoadHeld);
       await alice.locator('#logout').click();
       await alice.locator('#token').fill(tokens.eve); await alice.locator('#enter').click();
       await alice.locator('#room:not(.hide)').waitFor();
       await openProjects(alice);
       await button(alice, '创建项目').waitFor();
       const newSessionNotice = await alice.locator('#project-notice').innerText();
-      releaseSavedRead();
+      assert.equal(await alice.evaluate(() => globalThis.testOldCommitSettled), false, 'Old continuation must still be held after new session opens');
+      await alice.evaluate(() => globalThis.releaseSavedLoad());
       await alice.waitForFunction(() => globalThis.testOldCommitSettled);
       assert.equal(await alice.locator('#project-notice').innerText(), newSessionNotice, 'Old commit must not overwrite new-session notice');
       assert.equal(await panel(alice).locator('.project-title').count(), 0);
-    } finally { releaseSavedRead(); await alice.unroute(detailUrl); }
+    } finally { await alice.evaluate(() => globalThis.releaseSavedLoad()); }
     await alice.locator('#logout').click();
     await login(alice, 'alice'); await openProject(alice, name);
     console.log('PASS post-success read and notice cannot cross account switch');
