@@ -154,7 +154,7 @@ async function freePort() {
     assert.equal(source.created_by, 'carol');
     assert(!JSON.stringify(sent.result).includes(secret), 'Other member private chat must never enter project context');
     assert.equal(writes.filter(url => url !== origin + '/api/messages').length, 0, 'Only private chat is written');
-    await alice.locator('#project-context.hide').waitFor();
+    await alice.locator('#project-context.hide').waitFor({ state: 'attached' });
     const ordinary = await send(alice, '接下来普通聊天');
     assert(!ordinary.body.selected_project, 'Project selection is one turn only');
     assert.deepEqual((await api('alice', 'messages', 'POST', sent.body)).value, sent.result, 'Same request replays without model redispatch');
@@ -179,7 +179,7 @@ async function freePort() {
     assert.equal(await bob.locator('#text').inputValue(), '保留我针对旧版本的问题');
     bob.off('request', observeStale);
     await bob.locator('#clear-project-context').click();
-    await bob.locator('#project-context.hide').waitFor();
+    await bob.locator('#project-context.hide').waitFor({ state: 'attached' });
     await select(bob, project.name);
     const removedRevision = await revision();
     const bobTurn = { message: '保留在本人历史的项目讨论', request_id: randomUUID(),
@@ -221,7 +221,7 @@ async function freePort() {
     await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
     releaseRead(); await alice.unroute(detailUrl, delayDetail);
     await login(alice, 'eve');
-    await alice.locator('#project-context.hide').waitFor();
+    await alice.locator('#project-context.hide').waitFor({ state: 'attached' });
     assert(!(await alice.locator('#project-context').textContent()).includes(project.name), 'Account change clears context text');
     const afterSwitch = await send(alice, '新账号普通聊天');
     assert(!afterSwitch.body.selected_project);
