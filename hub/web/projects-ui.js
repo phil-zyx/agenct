@@ -96,7 +96,8 @@ async function fetchProject(context, id) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const detail = await contactApi(context, projectPath(id));
     const state = await contactApi(context, projectPath(id) + '/state');
-    if (detail.project.revision === state.project_revision) return { ...detail, items: state.items };
+    const completion = await contactApi(context, projectPath(id) + '/completion');
+    if (detail.project.revision === state.project_revision && state.project_revision === completion.project_revision) return { ...detail, items: state.items, completion };
   }
   throw Error('项目正在更新，请重新读取');
 }
@@ -138,6 +139,7 @@ function projectCard(item, historical = false) {
   if (permissions.confirm) actions.append(projectButton(ProjectStateModel.confirmations[item.kind], () => stateActionEditor(item, 'confirm'), 'primary'));
   if (permissions.revise) actions.append(projectButton('修订', () => stateEditor(item)));
   if (permissions.withdraw) actions.append(projectButton('撤回', () => stateActionEditor(item, 'withdraw')));
+  if (item.kind === 'blocker') renderBlockerResolution(card, actions, item);
   actions.append(projectButton('共享问答', () => stateQuestions(item)), projectButton('版本记录', () => stateHistory(item)));
   card.append(actions); return card;
 }
@@ -162,6 +164,7 @@ function renderProject() {
     if (members.some(m => m.owner !== user && ['active', 'invited'].includes(m.status))) actions.append(projectButton('移除成员', removeProjectMemberEditor));
   } else actions.append(projectButton('退出项目', () => projectLifecycleEditor('leave')));
   actions.append(projectButton('刷新共同状态', () => loadProject(project.id))); projectHost().append(actions);
+  renderProjectCompletion();
   renderProjectAlignment();
   for (const [kind, name] of Object.entries(ProjectStateModel.kinds)) {
     const section = el('section', 'project-state-group'); section.setAttribute('aria-label', name);
@@ -187,6 +190,101 @@ function renderProject() {
     projectHost().append(links);
   }
 }
+function renderBlockerResolution(card, actions, item) {
+  const blocker = projectView.completion?.blockers.find(b => b.item_id === item.id && b.item_version === item.version);
+  if (item.status === 'withdrawn') {
+    card.append(el('p', 'note', '已撤回报告，不代表已解除阻塞。')); return;
+  }
+  card.append(el('p', 'project-blocker-resolution note', blocker?.resolved ? '已由原报告人明确解除阻塞' : '尚未解除阻塞；确认报告不等于解决'));
+  if (blocker?.resolution) {
+    card.append(el('p', 'project-copy note', '最近记录（是否生效以上述状态为准）：' + blocker.resolution.author + ' · ' + (blocker.resolution.action === 'resolve' ? '解除' : '重新打开') + ' · ' + blocker.resolution.note));
+  }
+  if (projectView.project.status === 'active' && item.created_by === user && item.status === 'confirmed' && item.confirmation_valid && blocker) {
+    actions.append(projectButton(blocker.resolved ? '重新打开阻塞' : '解除阻塞', () => blockerResolutionEditor(item, blocker.resolved ? 'reopen' : 'resolve')));
+  }
+}
+function renderProjectCompletion() {
+  const { project, completion } = projectView;
+  if (!completion) return;
+  const section = el('section', 'project-completion'); section.setAttribute('aria-label', '项目最终验收');
+  section.append(el('h3', '', '项目最终验收'), el('p', 'note', '由创建人针对明确目标版本作出本人验收声明，不代表全体成员共识。单个任务验收、阻塞撤回和项目归档均不等于项目完成。'));
+  const acceptance = completion.acceptance;
+  if (acceptance) {
+    section.append(el('p', 'project-acceptance-status', acceptance.withdrawn ? '本人已撤回项目验收，历史记录保留' : acceptance.valid ? '当前项目版本已由 ' + acceptance.author + ' 最终验收' : '历史验收不再代表当前项目已完成'),
+      el('p', 'note', '验收人：' + acceptance.author + ' · 目标项目版本 ' + acceptance.target_revision + ' · 验收记录版本 ' + acceptance.accepted_revision),
+      el('p', 'project-copy', acceptance.note));
+    for (const goal of acceptance.goals || []) section.append(el('p', 'note', '已验收目标：' + goal.item_id + ' · 版本 ' + goal.item_version));
+    if (acceptance.valid && project.status === 'active' && project.creator === user) section.append(projectButton('撤回项目验收', () => withdrawProjectAcceptanceEditor(acceptance)));
+  } else section.append(el('p', 'project-acceptance-status', '尚未作出项目最终验收'));
+  if (!completion.ready) {
+    section.append(el('p', 'note', '当前不满足验收条件：'));
+    for (const reason of completion.reasons || []) section.append(el('p', 'project-completion-reason note', completionReason(reason)));
+  } else if (!acceptance?.valid) {
+    section.append(el('p', 'note', '记录条件已满足，仍需创建人核对实际成果后明确验收。'));
+    if (project.status === 'active' && project.creator === user) section.append(projectButton('验收项目', projectAcceptanceEditor, 'primary'));
+  }
+  projectHost().append(section);
+}
+function completionReason(reason) {
+  const labels = {
+    no_confirmed_goal: '尚无当前有效且已确认的目标。',
+    unconfirmed_shared_state: '仍有共同状态等待本人确认或确认已失效。',
+    unresolved_blocker: '仍有尚未明确解除的阻塞。',
+    pending_task_links: '仍有任务关联等待另一方同意公开。',
+    linked_task_not_accepted: '仍有关联任务未通过任务验收。',
+    linked_task_party_unavailable: '有关联任务参与者已不可用，需重新核对公开关联。',
+    project_archived: '项目已归档，不能提交新的验收。'
+  };
+  return labels[reason] || String(reason);
+}
+function completionNoteEditor(title, fieldLabel, lines, buttonLabel, path, makeBody, message) {
+  const editor = beginProjectEditor(title); if (!editor) return;
+  const draft = projectDraft, form = el('form'); draft.completionAction = true; draft.completionMessage = message;
+  editor.append(el('p', 'note', '这将形成所有项目成员可见的本人声明。请自行填写准备公开的核对结果，不要粘贴私密草稿或聊天。'));
+  const note = projectField(form, fieldLabel, 'textarea');
+  const preview = el('button', 'primary', '预览声明'); preview.type = 'submit'; form.append(preview, editorCancel());
+  form.onsubmit = event => {
+    event.preventDefault();
+    if (projectDraft !== draft || draft.invalid || projectBusy || !current(draft.context) || !form.isConnected || !$('room').classList.contains('projects-open') || !form.reportValidity()) return;
+    const text = note.value.trim();
+    if (!ProjectStateModel.boundedText(text, 1000)) { projectNotice('说明需为 1–1000 个字符，且不能含特殊控制字符。'); return; }
+    projectPreview(form, title + '前核对', [...lines, '声明人：' + user, '可见范围：所有已加入的项目成员（包括之后加入的成员）', fieldLabel + '：' + text], buttonLabel, path, makeBody(text));
+  };
+  editor.append(form); note.focus();
+}
+function blockerResolutionEditor(item, action) {
+  const project = projectView.project, snapshot = projectView.completion?.snapshot_token, resolving = action === 'resolve';
+  completionNoteEditor(resolving ? '解除阻塞' : '重新打开阻塞', resolving ? '阻塞解除说明' : '重新打开说明', [
+    '项目：' + project.name + ' · 项目版本 ' + project.revision,
+    '阻塞：' + item.content, '条目：' + item.id + ' · 版本 ' + item.version,
+    resolving ? '仅由原报告人声明这一版阻塞已解决，不等于验收任务或项目。撤回报告与解除阻塞是不同操作。' : '声明这一版阻塞再次存在；已有项目验收将失效，其他成员的任务不受修改。'
+  ], resolving ? '确认解除阻塞' : '确认重新打开阻塞', projectPath(project.id) + '/state/' + encodeURIComponent(item.id) + '/resolution',
+  note => ({ request_id: crypto.randomUUID(), expected_revision: project.revision, expected_version: item.version, expected_snapshot: snapshot, action, note }),
+  resolving ? '阻塞解除声明已保存，不代表任务或项目已验收。' : '阻塞已重新打开，原项目验收不再代表当前完成状态。');
+}
+function projectAcceptanceEditor() {
+  const { project, completion, items, tasks } = projectView;
+  if (!completion?.ready || completion.acceptance?.valid || project.creator !== user || project.status !== 'active') return;
+  const acceptedTasks = (completion.tasks || []).map(t => ({ task_id: t.task_id, accepted_version: t.accepted_version, status: t.status }));
+  const goals = completion.goals.map(g => ({ item_id: g.item_id, item_version: g.item_version }));
+  const lines = ['项目：' + project.name + ' · 目标项目版本 ' + project.revision,
+    '请核对实际成果确已满足以下目标。系统只检查记录条件，不替你判断交付质量。',
+    ...goals.map(g => { const item = items.find(i => i.id === g.item_id && i.version === g.item_version); return '验收目标：' + g.item_id + ' · 版本 ' + g.item_version + ' · ' + (item?.content || '请重新读取目标'); }),
+    ...acceptedTasks.map(t => { const shared = tasks.find(row => row.task_id === t.task_id && row.status === 'active'); return '关联任务：' + t.task_id + ' · 已核对版本 ' + t.accepted_version + ' · 共享标签：' + (shared?.label || '请重新读取关联') + ' · ' + (TASK_STATUS[t.status]?.[0] || t.status); }),
+    '这是创建人本人的项目最终验收声明，不代表全体成员一致同意；不会自动交付、验收任务或归档项目。后续目标、成员、共同状态或关联任务变化会使旧验收失效。'];
+  completionNoteEditor('项目最终验收', '项目验收说明', lines, '确认项目最终验收', projectPath(project.id) + '/completion',
+    note => ({ request_id: crypto.randomUUID(), expected_revision: project.revision, expected_snapshot: completion.snapshot_token, goals, tasks: acceptedTasks, note }), '项目最终验收声明已保存；仅对所核对的版本有效，不代表全员共识。');
+}
+function withdrawProjectAcceptanceEditor(acceptance) {
+  const project = projectView.project;
+  const editor = beginProjectEditor('撤回项目验收'); if (!editor) return;
+  projectDraft.completionAction = true; projectDraft.completionMessage = '项目验收声明已撤回，历史记录仍保留。';
+  const form = el('div'); editor.append(form);
+  projectPreview(form, '撤回项目验收前核对', ['项目：' + project.name + ' · 项目版本 ' + project.revision, '验收记录：' + acceptance.id + ' · 验收人：' + acceptance.author,
+    '撤回本人这一条项目验收声明，历史记录仍保留。不会撤回其他人的声明、改变任务验收结果或归档项目。'], '确认撤回项目验收', projectPath(project.id) + '/completion/' + encodeURIComponent(acceptance.id) + '/withdraw',
+    { expected_revision: project.revision });
+}
+
 function checkProjectAlignment(view, context, generation, button) {
   if (!current(context) || projectView !== view || generation !== projectGeneration
       || !button?.isConnected || !projectHost().contains(button) || !view || view.project.status !== 'active'
@@ -332,7 +430,7 @@ function beginProjectEditor(title) {
   const editor = el('section', 'project-editor'); editor.setAttribute('aria-label', title + '面板');
   editor.append(el('h3', '', title));
   const context = session();
-  projectDraft = { editor, context, generation: projectGeneration, projectId: projectView?.project.id, revision: projectView?.project.revision, invalid: false };
+  projectDraft = { editor, context, generation: projectGeneration, projectId: projectView?.project.id, revision: projectView?.project.revision, snapshot: JSON.stringify(projectView), invalid: false };
   projectHost().append(editor); editor.scrollIntoView?.({ block: 'nearest' }); return editor;
 }
 function cancelProjectEditor() {
@@ -361,11 +459,11 @@ function projectPreview(form, title, lines, label, path, body) {
     if (!activeProjectPreview(draft, preview) || (acknowledgement && !acknowledgement.checked)) return;
     void commitProject(draft, path, body, confirm, preview);
   }, 'primary');
-  if (draft.chatCandidate || draft.sharedQuestion) {
+  if (draft.chatCandidate || draft.sharedQuestion || draft.completionAction) {
     const wrap = el('label', 'project-acknowledgement');
     acknowledgement = el('input'); acknowledgement.type = 'checkbox';
-    acknowledgement.setAttribute('aria-label', draft.feedbackWithdrawal ? '我已核对撤回范围与历史保留说明' : draft.sharedQuestion ? '我已核对项目、问题版本和共享文字' : '我已核对项目、共享文字和来源');
-    wrap.append(acknowledgement, el('span', '', draft.feedbackWithdrawal ? '我已核对撤回范围与历史保留说明。只撤回我自己的反馈正文，其他人的回复及数据库历史记录仍保留。' : draft.sharedQuestion ? '我已核对项目、问题版本和共享文字。只发布以上反馈，不代表确认、承诺或全员共识。' : '我已核对项目、共享文字和来源。只发布为待确认建议，不代表本人或他人已接受分工。'));
+    acknowledgement.setAttribute('aria-label', draft.completionAction ? '我已核对版本、共享范围和本人声明' : draft.feedbackWithdrawal ? '我已核对撤回范围与历史保留说明' : draft.sharedQuestion ? '我已核对项目、问题版本和共享文字' : '我已核对项目、共享文字和来源');
+    wrap.append(acknowledgement, el('span', '', draft.completionAction ? '我已核对版本、共享范围和本人声明。只提交以上内容，不代替其他成员确认，也不自动验收任务或归档项目。' : draft.feedbackWithdrawal ? '我已核对撤回范围与历史保留说明。只撤回我自己的反馈正文，其他人的回复及数据库历史记录仍保留。' : draft.sharedQuestion ? '我已核对项目、问题版本和共享文字。只发布以上反馈，不代表确认、承诺或全员共识。' : '我已核对项目、共享文字和来源。只发布为待确认建议，不代表本人或他人已接受分工。'));
     draft.acknowledgement = acknowledgement;
     acknowledgement.onchange = () => { confirm.disabled = !activeProjectPreview(draft, preview) || !acknowledgement.checked || draft.invalid || projectBusy; };
     confirm.disabled = true; preview.append(wrap);
@@ -392,7 +490,7 @@ async function commitProject(draft, path, body, button, preview) {
     projectBusy = false; projectDraft = null; draft.editor.remove();
     const id = draft.projectId || (path === 'projects' ? result.id : null);
     if (id && !draft.returnToDirectory) await loadProject(id); else await loadProjectDirectory();
-    if (current(draft.context)) projectNotice(draft.sharedQuestion
+    if (current(draft.context)) projectNotice(draft.completionAction ? (draft.completionMessage || '本人声明已保存；当前有效性以重新读取的项目状态为准。') : draft.sharedQuestion
       ? (draft.feedbackWithdrawal || result.message?.withdrawn ? '反馈已撤回，正文不再展示；历史记录和他人已看到的内容无法收回。' : '反馈已保存。问答不改变共同状态，也不代表任何人的确认或全员共识。')
       : '操作已保存。共享内容仍须按规则由对应成员确认。');
   } catch (error) {
@@ -408,7 +506,7 @@ async function commitProject(draft, path, body, button, preview) {
     if (error.httpStatus === 409) {
       draft.invalid = true; button.disabled = true; projectNotice('项目已更新，请取消编辑后重新核对。未自动重试或覆盖。'); return;
     }
-    // Only creation has a request ID. Replay exactly that body, never a newly inferred intent.
+    // Idempotent writes have a request ID. Replay exactly that body, never a newly inferred intent.
     draft.uncertain = !error.httpStatus || error.httpStatus >= 500;
     if (draft.uncertain) {
       button.disabled = !body.request_id;
@@ -468,7 +566,7 @@ function stateActionEditor(item, action) {
   const editor = beginProjectEditor(action === 'confirm' ? '核对当前版本' : '撤回共同状态'); if (!editor) return;
   const project = projectView.project, form = el('div'); editor.append(form);
   projectPreview(form, action === 'confirm' ? '由 ' + user + ' 确认版本 ' + item.version : '撤回版本 ' + item.version,
-    [ProjectStateModel.kinds[item.kind] + '：' + item.content, ...(item.assignee ? ['负责人：' + item.assignee] : []), '来源类型：' + (item.source_kind === 'model_suggestion' ? '模型建议' : '人工陈述'), '来源说明：' + item.source_note, action === 'confirm' ? '仅确认这一版内容，不代表全体成员达成一致，也不会接手或交付关联任务。' : '撤回后保留发布和确认历史，不再作为当前共同状态。'],
+    [ProjectStateModel.kinds[item.kind] + '：' + item.content, ...(item.assignee ? ['负责人：' + item.assignee] : []), '来源类型：' + (item.source_kind === 'model_suggestion' ? '模型建议' : '人工陈述'), '来源说明：' + item.source_note, action === 'confirm' ? '仅确认这一版内容，不代表全体成员达成一致，也不会接手或交付关联任务。' : '撤回后保留发布和确认历史，不再作为当前共同状态。' + (item.kind === 'blocker' ? '撤回不表示阻塞已经解决；解除阻塞需原报告人单独填写说明。' : '')],
     action === 'confirm' ? '确认当前版本' : '确认撤回', projectPath(project.id) + '/state/' + encodeURIComponent(item.id) + '/actions',
     { action, expected_revision: project.revision, expected_version: item.version });
 }
@@ -678,7 +776,7 @@ async function refreshProjects() {
     const view = await fetchProject(context, id);
     if (!current(context) || generation !== projectGeneration) return;
     if (projectDraft) {
-      if (!(projectDraft.uncertain && projectDraft.idempotent) && (view.project.revision !== projectDraft.revision || JSON.stringify(view.members) !== JSON.stringify(projectView.members))) {
+      if (!(projectDraft.uncertain && projectDraft.idempotent) && (view.project.revision !== projectDraft.revision || JSON.stringify(view.members) !== JSON.stringify(projectView.members) || (projectDraft.completionAction && JSON.stringify(view) !== projectDraft.snapshot))) {
         projectDraft.invalid = true;
         projectDraft.editor.querySelectorAll('button.primary').forEach(button => { button.disabled = true; });
         projectNotice('项目已更新，请取消编辑后重新核对。未自动重试或覆盖。');

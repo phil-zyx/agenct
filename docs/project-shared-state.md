@@ -288,7 +288,8 @@ can read published feedback; outsiders and departed members cannot fetch it.
 Feedback is historical member-published text, not a confirmed state item, an
 accepted assignment, an agreement, or team consensus. Even “yes” and “可以” do
 not change state. No model is called, no external communication is sent, and
-no task is executed. This slice deliberately has no inferred resolution status.
+no task is executed. Replies never infer resolution; use the separate explicit
+blocker-resolution action described below.
 A revised source makes its old question threads read-only; create a new question
 for the new version. Archived projects and withdrawn items cannot receive new
 questions or replies. Existing feedback remains explicitly version-labelled.
@@ -315,3 +316,43 @@ withdrawal, revoked access, late logout responses, and desktop/mobile screenshot
 when `AGENCT_TEST_SCREENSHOT_DIR` is set. It is also in `test:hub-browser`, whose
 CI job uploads those screenshots. These tests do not validate live paid models,
 real users on WSL, deployment, or production delivery.
+
+
+## Explicit blocker resolution and project final acceptance
+
+A blocker confirmation means the named reporter confirms that the blocker exists,
+not that it is solved. Only its original reporter can select **解除阻塞**, write
+a shared resolution note, review the exact item version and explicitly confirm.
+**重新打开阻塞** records that it exists again. Both are append-only statements;
+withdrawal remains retirement of a report, not resolution. Revised items and
+revoked authority invalidate old resolution evidence.
+
+**项目最终验收** is separate from an individual task’s acceptance and from archive.
+The creator reviews exact current goal versions and mutually shared task progress,
+writes a public acceptance note, and acknowledges the preview. The server checks
+current membership, effective confirmations, unresolved blockers, linked-task
+acceptance and the exact snapshot under its database lock. Record readiness does
+not establish deliverable quality: the creator must inspect the actual result.
+No model or another participant can accept on the creator’s behalf. The wording
+identifies the creator’s assertion, never unanimous team agreement.
+
+A later project revision, relevant account-authority change or linked-task change
+makes the old acceptance historical; returning to similar content cannot revive
+it. A new explicit acceptance is required. The creator can withdraw an acceptance
+without changing any task, other member’s statement or archive status. Shared
+notes are manually entered, never copied automatically from private chats,
+task bodies or drafts. Internal task snapshots are used for validation, not
+continued access after a task’s public association is withdrawn.
+
+The API rejects stale previews rather than silently updating their targets.
+Idempotent retry reconciles the original request and does not recreate a claim
+or restore its validity. The UI requires acknowledgement again after closing
+and reopening a preview. All project APIs still enforce current access; already
+received shared information cannot be remotely erased.
+
+Explicitly selected private project discussion includes the shared resolution
+status and the creator’s acceptance statement with its current validity. It
+never includes linked-task snapshots or private task bodies. Oversized shared
+state/feedback is still bounded and labelled incomplete. The server rechecks
+completion validity and its snapshot around model dispatch, so a concurrent
+linked-task change cannot return an apparently current old acceptance.
