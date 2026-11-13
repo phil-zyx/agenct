@@ -174,10 +174,32 @@ async function freePort() {
     assert(!(await editor(alice).innerText()).includes(secret));
     if (process.env.AGENCT_TEST_SCREENSHOT_DIR) {
       fs.mkdirSync(process.env.AGENCT_TEST_SCREENSHOT_DIR, { recursive: true });
-      await alice.screenshot({ path: path.join(process.env.AGENCT_TEST_SCREENSHOT_DIR, 'project-questions-desktop.png'), fullPage: true });
+      const thread = editor(alice).locator('.project-question-thread');
+      const cards = thread.locator('.project-question-message');
+      assert.equal(await cards.count(), 3, 'Screenshot evidence must include all three published contributions');
+      const captureDiscussion = async layout => {
+        // fullPage does not expand the independently scrolling project panel.
+        // Position the actual discussion, not merely its surrounding state cards.
+        await thread.evaluate(node => node.scrollIntoView({ block: 'start', behavior: 'instant' }));
+        await alice.screenshot({ path: path.join(process.env.AGENCT_TEST_SCREENSHOT_DIR, `project-questions-${layout}.png`), fullPage: true });
+        const fullyVisible = card => card.evaluate(node => {
+          const box = node.getBoundingClientRect(), panel = document.getElementById('project-panel').getBoundingClientRect();
+          return box.top >= Math.max(0, panel.top) && box.bottom <= Math.min(innerHeight, panel.bottom);
+        });
+        // Narrow viewports may not fit the entire thread. Preserve additional
+        // real scroll positions so every author's complete contribution is shown.
+        for (let index = 0; index < 3; index++) {
+          const card = cards.nth(index);
+          if (await fullyVisible(card)) continue;
+          await card.evaluate(node => node.scrollIntoView({ block: 'center', behavior: 'instant' }));
+          assert(await fullyVisible(card), 'Each screenshot contribution must fit the visible project panel');
+          await alice.screenshot({ path: path.join(process.env.AGENCT_TEST_SCREENSHOT_DIR, `project-questions-${layout}-message-${index + 1}.png`), fullPage: true });
+        }
+      };
+      await captureDiscussion('desktop');
       await alice.setViewportSize({ width: 390, height: 844 });
       assert(await alice.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), 'Shared discussion fits mobile');
-      await alice.screenshot({ path: path.join(process.env.AGENCT_TEST_SCREENSHOT_DIR, 'project-questions-mobile.png'), fullPage: true });
+      await captureDiscussion('mobile');
       await alice.setViewportSize({ width: 1440, height: 1000 });
     }
     await button(alice, '取消编辑').click(); await editor(alice).waitFor({ state: 'detached' });
