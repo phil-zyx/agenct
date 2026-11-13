@@ -484,7 +484,8 @@ async function linkProjectEditor() {
     const form = el('form');
     const choice = projectField(form, '我的任务', 'text', '', [['', '选择任务'], ...eligible.map(t => [t.id, t.summary.slice(0, 100) + ' · ' + t.requester + ' / ' + t.owner + ' · ' + t.id])]);
     const label = projectField(form, '共享协调标签', 'textarea'); label.maxLength = 240;
-    const submit = el('button', 'primary', '预览关联'); submit.type = 'submit'; form.append(submit);
+    const submit = el('button', 'primary', '预览关联'); submit.type = 'submit'; form.append(submit, editorCancel());
+    editor.querySelector('button')?.remove(); // Move the loading cancel into the replaceable form.
     form.onsubmit = event => {
       event.preventDefault(); if (!form.reportValidity()) return;
       const task = eligible.find(t => t.id === choice.value), text = label.value.trim();
