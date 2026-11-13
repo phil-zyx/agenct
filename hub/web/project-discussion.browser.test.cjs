@@ -198,9 +198,11 @@ async function freePort() {
     // A real authorized response delayed across logout must not restore project
     // material to the newly logged-in account. No mock response content is used.
     await openProject(alice, project.name);
-    let releaseRead, readStarted;
+    let releaseRead, readStarted, handlerFinished;
+    let handlerError = null, loggedOut = false;
     const readGate = new Promise(resolve => { releaseRead = resolve; });
     const readReady = new Promise(resolve => { readStarted = resolve; });
+    const handlerSettled = new Promise(resolve => { handlerFinished = resolve; });
     const detailUrl = origin + '/api/' + route;
     let held = false;
     const delayDetail = async intercepted => {
@@ -210,16 +212,34 @@ async function freePort() {
         const response = await intercepted.fetch(); readStarted(); await readGate;
         await intercepted.fulfill({ response });
       } catch (error) {
-        if (!/closed|cancel|abort|disposed/i.test(error.message)) throw error;
-      }
+        // Logout can abort/handle this route while its genuine response is held.
+        // Never throw in an unawaited Playwright callback: carry unexpected
+        // errors back to the awaited test, and only tolerate verified logout.
+        if (!(loggedOut && /Route is already handled|closed|cancel|abort|disposed/i.test(error.message))) handlerError = error;
+      } finally { handlerFinished(); }
+    };
+    const bounded = async (promise, message) => {
+      let timer;
+      try { return await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Error(message)), 15000);
+      })]); } finally { clearTimeout(timer); }
     };
     await alice.route(detailUrl, delayDetail);
-    await button(alice, '与我的 Agent 讨论').click();
-    let readTimeout;
-    try { await Promise.race([readReady, new Promise((_, reject) => { readTimeout = setTimeout(() => reject(Error('Discussion did not freshly read project')), 15000); })]); }
-    finally { clearTimeout(readTimeout); }
-    await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
-    releaseRead(); await alice.unroute(detailUrl, delayDetail);
+    try {
+      await button(alice, '与我的 Agent 讨论').click();
+      await bounded(readReady, 'Discussion did not freshly read project');
+      await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
+      loggedOut = true;
+    } finally {
+      releaseRead();
+      // Finish the route before unroute/navigation/browser teardown. Otherwise a
+      // delayed fulfill races with cleanup and its rejection escapes the test.
+      if (held) await bounded(handlerSettled, 'Delayed project handler did not settle');
+      await alice.unroute(detailUrl, delayDetail);
+    }
+    if (handlerError) throw handlerError;
+    await alice.locator('#project-context.hide').waitFor({ state: 'attached' });
+    assert.equal(await alice.locator('#project-context-title').textContent(), '', 'Late old-account callback cannot restore the selection');
     await login(alice, 'eve');
     await alice.locator('#project-context.hide').waitFor({ state: 'attached' });
     assert(!(await alice.locator('#project-context').textContent()).includes(project.name), 'Account change clears context text');
