@@ -392,7 +392,7 @@ pub(super) async fn withdraw(
     let mut db = h.db()?;
     let tx = db.transaction()?;
     let p = projects::authorize(&h, &tx, &id, &actor)?;
-    projects::writable(&p)?;
+    // Archiving prevents new commitments, not retraction of an existing assertion.
     let a = tx
         .query_row(
             &format!("SELECT {ACC} FROM project_acceptances a WHERE a.project_id=?1 AND a.id=?2"),

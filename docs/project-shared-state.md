@@ -338,8 +338,8 @@ identifies the creator’s assertion, never unanimous team agreement.
 
 A later project revision, relevant account-authority change or linked-task change
 makes the old acceptance historical; returning to similar content cannot revive
-it. A new explicit acceptance is required. The creator can withdraw an acceptance
-without changing any task, other member’s statement or archive status. Shared
+it. A new explicit acceptance is required. The creator can withdraw an acceptance while still an active member, including
+after archive, without changing any task, other member’s statement or archive status. Shared
 notes are manually entered, never copied automatically from private chats,
 task bodies or drafts. Internal task snapshots are used for validation, not
 continued access after a task’s public association is withdrawn.

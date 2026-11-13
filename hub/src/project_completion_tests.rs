@@ -463,6 +463,64 @@ async fn stale_previews_request_collisions_and_immutable_records_fail_closed() {
 }
 
 #[tokio::test]
+async fn archived_project_still_allows_author_to_retract_acceptance() {
+    let h = fixture();
+    let p = project(&h, "archived-withdraw").await;
+    join(&h, &p, "bob").await;
+    confirmed(&h, &p, "alice", "goal").await;
+    let v = view(&h, &p).await;
+    let (status, receipt) = call(
+        &h,
+        "alice",
+        "POST",
+        &format!("/api/projects/{p}/completion"),
+        acceptance(&v, "accept"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let aid = receipt["acceptance"]["id"].as_str().unwrap();
+    {
+        h.db()
+            .unwrap()
+            .execute(
+                "UPDATE projects SET status='archived',revision=revision+1 WHERE id=?1",
+                [&p],
+            )
+            .unwrap();
+    }
+    let v = view(&h, &p).await;
+    let path = format!("/api/projects/{p}/completion/{aid}/withdraw");
+    let input = json!({"expected_revision":v["project_revision"]});
+    assert_eq!(
+        call(&h, "bob", "POST", &path, input.clone()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&h, "eve", "POST", &path, input.clone()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&h, "alice", "POST", &path, json!({"expected_revision":0}))
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        call(&h, "alice", "POST", &path, input.clone()).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&h, "alice", "POST", &path, input).await.0,
+        StatusCode::OK
+    );
+    let v = view(&h, &p).await;
+    assert_eq!(v["acceptance"]["withdrawn"], true);
+    assert_eq!(v["acceptance"]["valid"], false);
+    assert_eq!(v["acceptance"]["note"], "");
+    assert_eq!(v["ready"], false);
+}
+
+#[tokio::test]
 async fn private_discussion_sees_resolution_and_acceptance_without_private_material() {
     let h = fixture();
     let p = project(&h, "context").await;

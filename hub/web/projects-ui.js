@@ -214,7 +214,7 @@ function renderProjectCompletion() {
       el('p', 'note', '验收人：' + acceptance.author + ' · 目标项目版本 ' + acceptance.target_revision + ' · 验收记录版本 ' + acceptance.accepted_revision),
       el('p', 'project-copy', acceptance.note));
     for (const goal of acceptance.goals || []) section.append(el('p', 'note', '已验收目标：' + goal.item_id + ' · 版本 ' + goal.item_version));
-    if (acceptance.valid && project.status === 'active' && project.creator === user) section.append(projectButton('撤回项目验收', () => withdrawProjectAcceptanceEditor(acceptance)));
+    if (!acceptance.withdrawn && project.creator === user) section.append(projectButton('撤回项目验收', () => withdrawProjectAcceptanceEditor(acceptance)));
   } else section.append(el('p', 'project-acceptance-status', '尚未作出项目最终验收'));
   if (!completion.ready) {
     section.append(el('p', 'note', '当前不满足验收条件：'));
