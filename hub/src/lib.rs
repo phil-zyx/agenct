@@ -20,6 +20,7 @@ mod policy;
 mod private_staging;
 mod profile_suggestions;
 mod profiles;
+mod project_completion;
 mod project_context;
 mod project_questions;
 mod project_state;
@@ -412,6 +413,18 @@ pub fn app(mut hub: Hub) -> Router {
         .route("/api/projects", get(projects::list).post(projects::create))
         .route("/api/project-invitations", get(projects::invitations))
         .route("/api/projects/{id}", get(projects::detail))
+        .route(
+            "/api/projects/{id}/completion",
+            get(project_completion::list).post(project_completion::accept),
+        )
+        .route(
+            "/api/projects/{id}/completion/{acceptance}/withdraw",
+            post(project_completion::withdraw),
+        )
+        .route(
+            "/api/projects/{id}/state/{item}/resolution",
+            post(project_completion::resolve),
+        )
         .route(
             "/api/projects/{id}/state",
             get(project_state::list).post(project_state::create),

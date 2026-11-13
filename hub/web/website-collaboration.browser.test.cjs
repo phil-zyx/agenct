@@ -216,9 +216,31 @@ async function freePort() {
     await feedback('alice', blocker, '本轮使用 hello@example.test 占位，不发送邮件。', query.id);
     const resolved = await discuss('bob', '根据共享回复说明如何收尾；不要把回复当作分工确认。');
     assert(JSON.stringify(resolved.project_context).includes('hello@example.test'));
-    // Withdrawal is explicit retirement of the report, not an invented resolved state.
-    await ok('bob', route + '/state/' + blocker.id + '/actions', 'POST', { action: 'withdraw', expected_revision: await revision(), expected_version: blocker.version });
-    console.log('PASS website clarification → private Mock suggestions → named assignments → explicit blocker retirement');
+    const completion = () => ok('alice', route + '/completion');
+    assert.equal((await completion()).ready, false, 'Confirming blocker is not resolving it');
+    assert.equal((await api('alice', route + '/state/' + blocker.id + '/resolution', 'POST', { request_id: randomUUID(), expected_revision: await revision(), expected_version: blocker.version, expected_snapshot: (await completion()).snapshot_token, action: 'resolve', note: 'Cannot resolve for Bob' })).status, 404);
+    async function declaration(who, action, field, note, confirmLabel, cancel = false) {
+      const page = userPages[who]; await reloadProject(page, name);
+      await button(page, action).click();
+      if (field) { await page.getByLabel(field, { exact: true }).fill(note); await button(page, '预览声明').click(); }
+      assert(await button(page, confirmLabel).isDisabled(), 'Explicit acknowledgement required');
+      const before = await completion();
+      if (cancel) { await button(page, '取消编辑').click(); assert.deepEqual(await completion(), before); return; }
+      await page.getByLabel('我已核对版本、共享范围和本人声明', { exact: true }).check();
+      const response = page.waitForResponse(r => r.request().method() === 'POST' && r.url().includes('/api/projects'));
+      await button(page, confirmLabel).evaluate(b => { b.click(); b.click(); });
+      const result = await response; assert.equal(result.status(), 200, confirmLabel);
+      await page.waitForFunction(() => !projectBusy && !projectDraft);
+      return { value: await result.json(), body: result.request().postDataJSON(), url: result.url() };
+    }
+    await declaration('bob', '解除阻塞', '阻塞解除说明', '占位邮箱由 Alice 明确提供，仅用于 Mock 清单。', '确认解除阻塞', true);
+    assert.equal((await completion()).blockers[0].resolved, false, 'Cancel leaves blocker unresolved');
+    const resolution = await declaration('bob', '解除阻塞', '阻塞解除说明', '占位邮箱由 Alice 明确提供，仅用于 Mock 清单。', '确认解除阻塞');
+    assert.equal((await completion()).blockers[0].resolved, true);
+    const resolutionRevision = await revision();
+    await ok('bob', route + '/state/' + blocker.id + '/resolution', 'POST', resolution.body);
+    assert.equal(await revision(), resolutionRevision, 'Resolution replay is idempotent');
+    console.log('PASS website clarification → private Mock suggestions → named assignments → explicit blocker resolution');
 
     const bobProfile = await ok('bob', 'collaboration-profile');
     await ok('bob', 'collaboration-profile', 'PUT', { expected_revision: bobProfile.revision, public: bobProfile.public, private: bobProfile.private,
@@ -261,14 +283,44 @@ async function freePort() {
     assert(!JSON.stringify(publicProject).includes(privateTask));
     assert(!(await panel(carol).innerText()).includes(privateTask));
     assert.equal(publicProject.tasks[0].can_open_task, false);
+    assert.equal((await completion()).acceptance, null, 'Task acceptance is not project final acceptance');
+    assert.equal((await completion()).ready, true);
+    assert.equal(await button(carol, '验收项目').count(), 0, 'Only creator can finally accept');
+    await declaration('alice', '验收项目', '项目验收说明', '核对本轮 Mock 网站清单，不是实际代码或上线交付。', '确认项目最终验收', true);
+    assert.equal((await completion()).acceptance, null, 'Preview and cancel do not complete project');
+    const accepted = await declaration('alice', '验收项目', '项目验收说明', '核对本轮 Mock 网站清单，不是实际代码或上线交付。', '确认项目最终验收');
+    let acceptedState = await completion();
+    assert.equal(acceptedState.acceptance.valid, true);
+    assert.deepEqual(acceptedState.acceptance.goals, [{ item_id: goal.id, item_version: goal.version }]);
+    assert.equal((await ok('alice', route)).project.status, 'active', 'Acceptance does not archive');
+    assert.equal((await api('carol', route + '/completion', 'POST', { ...accepted.body, request_id: randomUUID() })).status, 404);
+    const acceptedRevision = await revision();
+    assert.equal((await ok('alice', route + '/completion', 'POST', accepted.body)).acceptance.valid, true);
+    assert.equal(await revision(), acceptedRevision, 'Acceptance replay creates no duplicate');
+    assert(!JSON.stringify(await ok('carol', route + '/completion')).includes(privateTask));
+    await reloadProject(carol, name);
+    await panel(carol).getByText('当前项目版本已由 alice 最终验收', { exact: true }).waitFor();
     await carol.setViewportSize({ width: 390, height: 844 });
     assert(await carol.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1));
     await carol.screenshot({ path: path.join(screenshotDir, 'website-collaboration-mobile.png') });
     await alice.screenshot({ path: path.join(screenshotDir, 'website-delivery-completed.png') });
+    await declaration('bob', '重新打开阻塞', '重新打开说明', '占位邮箱仍需下一轮最终核对。', '确认重新打开阻塞');
+    assert.equal((await completion()).acceptance.valid, false, 'Reopened blocker invalidates acceptance');
+    assert.equal((await ok('alice', route + '/completion', 'POST', accepted.body)).acceptance.valid, false, 'Old replay cannot revive completion');
+    await declaration('bob', '解除阻塞', '阻塞解除说明', '再次核对本轮仅使用占位信息。', '确认解除阻塞');
+    assert.equal((await completion()).acceptance.valid, false, 'Re-resolving is not implicit re-acceptance');
+    await declaration('alice', '验收项目', '项目验收说明', '针对当前目标版本重新核对 Mock 清单。', '确认项目最终验收');
+    await declaration('alice', '撤回项目验收', null, null, '确认撤回项目验收');
+    assert.equal((await completion()).acceptance.valid, false);
+    assert.equal((await completion()).acceptance.withdrawn, true);
+    const finalAccepted = await declaration('alice', '验收项目', '项目验收说明', '再次明确接受本轮当前版本，仅是本人声明。', '确认项目最终验收');
     const oldRevision = await revision();
     await ok('carol', route + '/membership', 'POST', { action: 'leave', expected_revision: oldRevision });
     assert.equal((await api('carol', 'messages', 'POST', { message: '旧项目讨论', request_id: randomUUID(), selected_project: { project_id: project.id, expected_revision: oldRevision } })).status, 404);
     assert.equal((await api('alice', 'messages', 'POST', { message: '旧修订讨论', request_id: randomUUID(), selected_project: { project_id: project.id, expected_revision: oldRevision } })).status, 409);
+    assert.equal((await api('carol', route + '/completion')).status, 404);
+    assert.equal((await completion()).acceptance.valid, false, 'Membership change invalidates acceptance');
+    assert.equal((await ok('alice', route + '/completion', 'POST', finalAccepted.body)).acceptance.valid, false);
     assert.deepEqual(pageErrors, []);
     console.log('PASS human delivery/acceptance, reload persistence, private task ACL, revoked/stale contexts; mock only, no site built or deployed');
   } catch (error) {
