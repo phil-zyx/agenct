@@ -149,7 +149,7 @@ function renderProject() {
   const description = el('details', 'project-description'); description.append(el('summary', '', '项目说明（创建人提供，不代表全员确认）'), el('p', 'project-copy', project.goal)); projectHost().append(description);
   projectHost().append(el('p', 'project-members note', '成员：' + members.filter(m => ['active', 'invited'].includes(m.status)).map(m => m.owner + (m.status === 'invited' ? '（待加入）' : '')).join('、')));
   const actions = el('div', 'actions');
-  actions.append(projectButton('和助手讨论', discussProject));
+  if (project.status === 'active') actions.append(projectButton('与我的 Agent 讨论', discussProject));
   if (project.status === 'active') {
     const view = projectView, context = session(), generation = projectGeneration;
     const check = projectButton('检查对齐', () => checkProjectAlignment(view, context, generation, check));
@@ -227,13 +227,62 @@ function renderProjectAlignment() {
   }
   projectHost().append(section);
 }
-function discussProject() {
-  // This action prepares only the user's own input. It never reads private chat or sends.
-  if ($('text').value.trim() || pendingSend || pendingTurn || selectedTask || selectedRepository) {
-    projectNotice('请先处理当前输入或已选择的聊天上下文，再讨论项目。'); return;
+function projectDiscussionSignature(view) {
+  // Include membership/confirmation validity: disabling an account need not bump revision.
+  return JSON.stringify([view.project, view.members, view.items]);
+}
+function invalidateProjectDiscussion(selection) {
+  if (selectedProject !== selection) return;
+  selection.invalidated = true;
+  // Do not keep shared source text after a failed authorization/freshness check.
+  selection.sources = null; selection.signature = null; selection.name = selection.id;
+  renderProjectContext();
+}
+async function validateSelectedProject(context, notify = true) {
+  const selection = selectedProject;
+  if (!selection || selection.invalidated || !current(context)) return false;
+  try {
+    const view = await fetchProject(context, selection.id);
+    if (!current(context) || selectedProject !== selection || selection.invalidated) return false;
+    if (view.project.status !== 'active' || projectDiscussionSignature(view) !== selection.signature) {
+      invalidateProjectDiscussion(selection);
+      if (notify) status('项目共同状态或成员权限已更新，未发送。请重新选择项目并核对，未自动采用新版。');
+      return false;
+    }
+    return true;
+  } catch (error) {
+    if (!current(context) || selectedProject !== selection || selection.invalidated) return false;
+    invalidateProjectDiscussion(selection);
+    if (notify) status('无法核对项目上下文，未发送：' + error.message + '。请重新选择项目。');
+    return false;
   }
-  $('text').value = '我想讨论项目「' + projectView.project.name + '」。请帮我整理下一步，任何共同状态都等我预览后再手动发布。';
-  $('text').dispatchEvent(new Event('input')); closeProjects(); $('text').focus();
+}
+async function discussProject() {
+  if (!projectView || projectDraft || projectBusy || projectRead || pendingSend || pendingTurn || busy.has('send') || busy.has('turn-check')) return;
+  if (selectedTask || selectedRepository) {
+    projectNotice('请先清除已选择的任务或仓库上下文，再讨论项目。'); return;
+  }
+  const view = projectView, context = session(), generation = projectGeneration;
+  const read = {}; projectRead = read;
+  projectNotice('正在核对可用于本轮讨论的共同状态…');
+  try {
+    const latest = await fetchProject(context, view.project.id);
+    if (!current(context) || generation !== projectGeneration || projectView !== view
+        || !$('room').classList.contains('projects-open') || pendingTurn || busy.has('send')
+        || selectedTask || selectedRepository) return;
+    if (latest.project.status !== 'active') throw Error('项目已归档，请重新查看');
+    selectedProject = { id: latest.project.id, revision: latest.project.revision, name: latest.project.name,
+      signature: projectDiscussionSignature(latest), invalidated: false,
+      sources: latest.items.map(item =>
+        item.id + ' · 版本 ' + item.version + ' · ' + ProjectStateModel.kinds[item.kind]
+        + ' · 发布人 ' + item.created_by + ' · ' + (item.source_kind === 'model_suggestion' ? '模型建议' : '人工陈述')
+        + ' · ' + ProjectStateModel.status(item)).join('\n') || '尚无共同状态，不能据此推断实际工作进展。' };
+    renderProjectContext(); closeProjects(); $('text').focus();
+    status('已选择项目，尚未发送。输入问题后发送，仅用于你与自己的 Agent 讨论；不会自动共享或执行。');
+  } catch (error) {
+    if (current(context) && generation === projectGeneration && projectView === view)
+      projectNotice('无法选择项目：' + error.message + '。未发送消息。');
+  } finally { if (projectRead === read) projectRead = null; }
 }
 async function proposeChatProject(context, message) {
   if (!current(context)) return;
@@ -531,6 +580,7 @@ function removeProjectMemberEditor() {
   editor.append(form); choice.focus();
 }
 async function refreshProjects() {
+  if (selectedProject && !selectedProject.invalidated && !pendingTurn && !busy.has('send')) void validateSelectedProject(session(), false);
   if (!$('room').classList.contains('projects-open') || !projectView || projectBusy || projectRead) return;
   const context = session(), generation = projectGeneration, id = projectView.project.id;
   const read = {}; projectRead = read;

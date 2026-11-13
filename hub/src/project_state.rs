@@ -212,17 +212,27 @@ pub(super) async fn list(
     let actor = h.identity(&headers)?;
     let db = h.db()?;
     let p = projects::authorize(&h, &db, &id, &actor)?;
-    let mut q = db.prepare(&format!("SELECT {COLUMNS} FROM project_state_items i JOIN project_state_versions v ON v.item_id=i.id WHERE i.project_id=?1 AND v.version=(SELECT max(version) FROM project_state_versions WHERE item_id=i.id) ORDER BY i.rowid"))?;
-    let mut items = q
-        .query_map([&id], row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for item in &mut items {
-        confirmation(&h, &db, &p, item)?;
-    }
+    let items = snapshot(&h, &db, &p, &id)?;
     Ok(Json(
         serde_json::json!({"project_revision":p.revision,"items":items}),
     ))
 }
+pub(super) fn snapshot(
+    h: &Hub,
+    db: &Connection,
+    p: &projects::Project,
+    id: &str,
+) -> Result<Vec<Item>> {
+    let mut q = db.prepare(&format!("SELECT {COLUMNS} FROM project_state_items i JOIN project_state_versions v ON v.item_id=i.id WHERE i.project_id=?1 AND v.version=(SELECT max(version) FROM project_state_versions WHERE item_id=i.id) ORDER BY i.rowid"))?;
+    let mut items = q
+        .query_map([id], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for item in &mut items {
+        confirmation(h, db, p, item)?;
+    }
+    Ok(items)
+}
+
 pub(super) async fn history(
     State(h): State<Hub>,
     headers: HeaderMap,

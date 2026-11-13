@@ -20,6 +20,7 @@ mod policy;
 mod private_staging;
 mod profile_suggestions;
 mod profiles;
+mod project_context;
 mod project_state;
 mod projects;
 mod proposals;

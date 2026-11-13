@@ -647,3 +647,220 @@ async fn failed_confirmation_revocation_rolls_back_membership_revision_and_all_v
     assert_eq!(v["item"]["version"], 2);
     assert_eq!(v["versions"].as_array().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn project_discussion_is_private_bound_and_revocable() {
+    let h = fixture();
+    let id = project(&h, "discussion").await;
+    join(&h, &id, "bob").await;
+    let item = create_item(&h, &id, "alice", "goal").await;
+    let rev = revision(&h, &id).await;
+    let selection = json!({"project_id":id,"expected_revision":rev});
+    let request = json!({"message":"What should we align next?", "request_id":"discussion-turn", "selected_project":selection});
+    let (s, response) = call(&h, "bob", "POST", "/api/messages", request.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{response}");
+    assert_eq!(response["project_context"]["project_id"], id);
+    assert_eq!(response["project_context"]["items"][0]["id"], item["id"]);
+    assert!(response["proposal"].is_null());
+    assert!(response["task_action"].is_null());
+    assert_eq!(revision(&h, &id).await, rev);
+    assert_eq!(
+        call(&h, "bob", "POST", "/api/messages", request.clone())
+            .await
+            .1,
+        response
+    );
+    let mut changed = request.clone();
+    changed["selected_project"]["expected_revision"] = json!(rev + 1);
+    assert_eq!(
+        call(&h, "bob", "POST", "/api/messages", changed).await.0,
+        StatusCode::CONFLICT
+    );
+    let mut other = request.clone();
+    other["request_id"] = json!("outsider");
+    assert_eq!(
+        call(&h, "eve", "POST", "/api/messages", other).await.0,
+        StatusCode::NOT_FOUND
+    );
+    {
+        let db = h.db().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM messages WHERE owner='bob' AND project_id IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT count(*) FROM messages WHERE owner='bob' AND project_id IS NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM proposals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    assert_eq!(
+        call(
+            &h,
+            "bob",
+            "POST",
+            &format!("/api/projects/{id}/membership"),
+            json!({"action":"leave","expected_revision":rev})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&h, "bob", "POST", "/api/messages", request.clone())
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        call(&h, "bob", "GET", "/api/turns/discussion-turn", Value::Null)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    let mut fresh = request;
+    fresh["request_id"] = json!("after-leave");
+    assert_eq!(
+        call(&h, "bob", "POST", "/api/messages", fresh).await.0,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn project_context_bounds_whole_items_and_rejects_mixed_selection() {
+    let h = fixture();
+    let id = project(&h, "bounded-discussion").await;
+    for n in 0..6 {
+        let rev = revision(&h, &id).await;
+        let mut c = content("goal");
+        c["content"] = json!("界".repeat(4000));
+        assert_eq!(
+            call(
+                &h,
+                "alice",
+                "POST",
+                &format!("/api/projects/{id}/state"),
+                json!({"request_id":format!("large-{n}"),"expected_revision":rev,"content":c})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+    }
+    let rev = revision(&h, &id).await;
+    let selection = crate::project_context::Selection {
+        project_id: id.clone(),
+        expected_revision: rev,
+    };
+    let context = crate::project_context::capture(&h, &h.db().unwrap(), "alice", Some(&selection))
+        .unwrap()
+        .unwrap();
+    assert!(context.to_string().len() <= crate::project_context::MAX_BYTES);
+    assert!(context["omitted_items"].as_u64().unwrap() > 0);
+    assert_eq!(context["items"][0]["content"], "界".repeat(4000));
+    let body = json!({"message":"hello","request_id":"mixed","selected_project":selection,"selected_task":{"task_id":"fake","expected_revision":0}});
+    assert_eq!(
+        call(&h, "alice", "POST", "/api/messages", body).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    let stale = json!({"message":"hello","request_id":"stale-project","selected_project":{"project_id":id,"expected_revision":rev-1}});
+    assert_eq!(
+        call(&h, "alice", "POST", "/api/messages", stale).await.0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn project_discussion_revoked_during_adapter_call_never_commits_or_redispatches() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (e, r, c) = (entered.clone(), release.clone(), calls.clone());
+    let adapter=Router::new().route("/v1/turn",post(move |Json(payload):Json<Value>| {
+        let (e,r,c)=(e.clone(),r.clone(),c.clone());
+        async move {
+            c.fetch_add(1,Ordering::SeqCst);
+            assert_eq!(payload["history"].as_array().unwrap().len(),1);
+            assert!(!payload.to_string().contains("PRIVATE_SENTINEL"));
+            e.notify_one(); r.notified().await;
+            Json(json!({"reply":"REVOKED_REPLY_SENTINEL","backend":"dsh","proposal":null,"profile_update":null}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1/turn", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+    let mut h = fixture();
+    h.runtime = Runtime::Dsh {
+        url,
+        token: "fake-adapter-token".into(),
+    };
+    let id = project(&h, "revoke-running").await;
+    join(&h, &id, "bob").await;
+    {
+        let db = h.db().unwrap();
+        db.execute("INSERT INTO messages(owner,role,content,status) VALUES ('bob','user','PRIVATE_SENTINEL','complete')",[]).unwrap();
+    }
+    let rev = revision(&h, &id).await;
+    let body = json!({"message":"What next?","request_id":"revoking-turn","selected_project":{"project_id":id,"expected_revision":rev}});
+    let (cloned, request) = (h.clone(), body.clone());
+    let pending =
+        tokio::spawn(async move { call(&cloned, "bob", "POST", "/api/messages", request).await });
+    entered.notified().await;
+    assert_eq!(
+        call(
+            &h,
+            "bob",
+            "POST",
+            &format!("/api/projects/{id}/membership"),
+            json!({"action":"leave","expected_revision":rev})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    release.notify_one();
+    assert_eq!(pending.await.unwrap().0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        call(&h, "bob", "POST", "/api/messages", body).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let db = h.db().unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM messages WHERE content LIKE '%REVOKED_REPLY_SENTINEL%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT status FROM chat_turns WHERE request_id='revoking-turn'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "uncertain"
+    );
+    server.abort();
+}

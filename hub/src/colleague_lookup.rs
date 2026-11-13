@@ -178,7 +178,7 @@ pub(super) fn recover(h: &Hub, owner: &str, request_id: &str) -> Result<Option<s
         return Ok(None);
     }
     let saved = tx.query_row(
-        "SELECT message,runtime_profile,message_id,agent_id,expected_profile_revision FROM chat_turns WHERE owner=?1 AND request_id=?2 AND status='uncertain' AND selected_task IS NULL AND task_context IS NULL AND response IS NULL",
+        "SELECT message,runtime_profile,message_id,agent_id,expected_profile_revision FROM chat_turns WHERE owner=?1 AND request_id=?2 AND status='uncertain' AND selected_task IS NULL AND selected_project IS NULL AND task_context IS NULL AND response IS NULL",
         params![owner,request_id], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<i64>>(4)?)),
     ).optional()?;
     let Some((message, raw_profile, message_id, selected_agent, expected_profile_revision)) = saved

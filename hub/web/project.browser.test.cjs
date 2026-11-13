@@ -318,12 +318,12 @@ async function freePort() {
     await card(carol, items.goal.id).waitFor();
     await carol.waitForFunction(() => document.querySelector('.chat-pane').inert);
     assert.equal(await carol.locator('#text').inputValue(), unsent);
-    await button(carol, '和助手讨论').click();
-    await panel(carol).getByText('请先处理当前输入或已选择的聊天上下文，再讨论项目。', { exact: true }).waitFor();
+    await button(carol, '与我的 Agent 讨论').click();
+    await carol.locator('#project-context:not(.hide)').waitFor();
     assert.equal(await carol.locator('#text').inputValue(), unsent);
-    assert(await panel(carol).isVisible());
+    assert(!(await panel(carol).isVisible()));
     assert.deepEqual(await ok('carol', 'messages'), privateMessages, 'Discuss must not send or overwrite an existing private draft');
-    await button(carol, '回到私聊').click();
+    await carol.locator('#clear-project-context').click();
     await carol.waitForFunction(() => !document.querySelector('.chat-pane').inert);
     assert.equal(await carol.locator('#text').inputValue(), unsent);
     await carol.locator('#text').fill('');

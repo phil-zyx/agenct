@@ -220,3 +220,47 @@ malformed/mixed snapshots and private-context isolation.
 views, provenance, read-only behavior, stale snapshots, access removal, identity
 switching and desktop/mobile screenshots. No live-model trial or deployment is
 part of this slice.
+
+## Discuss shared state privately with your own Agent
+
+On an active project's panel, choose **与我的 Agent 讨论**. This performs a fresh
+membership-checked read and selects that project for **one** private question;
+it does not send the question, publish a suggestion, or notify other members.
+The composer shows the selected project revision and the scope of the context.
+Review it, enter your question, then send normally. Clear the project selection
+before choosing a task. Task and project context cannot be attached to the same
+turn. Slash commands are blocked while a project is selected.
+
+The Hub supplies only explicitly published project state with its item IDs,
+versions, sources, confirmation validity and provenance. No private conversation,
+draft, task body, task result, or linked-task material is included. This isolated
+question does not use prior private conversation or memory. The bounded snapshot
+reports omitted items rather than claiming to represent everything. Withdrawn
+items are included only as explicitly labeled historical records, not current
+commitments. Published text and source notes are untrusted quotations, not instructions. A proposed
+model suggestion remains a suggestion; neither the question nor the answer can
+establish another person's commitment, consensus, or completion.
+
+The reply is private to the asking member. The route cannot publish or confirm
+state, create proposals, change tasks, or update profiles. To share a useful
+answer, use the existing explicit **提为项目候选** preview-and-publication flow.
+Successfully received project questions and replies remain in the asking
+person’s private message history. Leaving a project or losing access is not a
+remote erase of material already received. These messages are excluded from
+ordinary chat context and summaries, so a later ordinary turn does not implicitly
+inherit this selected project context. Fetching a new project snapshot or reading
+a project-turn receipt still checks current project eligibility.
+
+The server binds the request ID to the exact selection and checks current
+membership and project version again around dispatch. A stale selection fails
+instead of silently switching to a newer snapshot. Leaving or removal prevents
+new discussion requests. While still authorized, retrying the same completed
+request returns its private receipt without another model dispatch. Revoked
+members cannot retrieve that receipt or its stored snapshot through replay. An uncertain result must be reconciled through its receipt, not
+silently dispatched again. Successful sends consume the selection; account
+changes clear it and fence late callbacks.
+
+`project-discussion.browser.test.cjs` uses a real temporary Hub and Mock runtime
+to check explicit selection, one-turn scope, private-only writes, exact replay,
+stale versions, removal, outsider denial and account switching. Mock success is
+not evidence of live-model answer quality or a production deployment.
