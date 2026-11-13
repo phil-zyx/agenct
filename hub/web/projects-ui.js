@@ -147,7 +147,7 @@ function renderProject() {
   if (!projectView || projectDraft) return;
   projectShell(); const { project, members, items, tasks } = projectView;
   projectHost().append(projectButton('项目列表', loadProjectDirectory));
-  projectHost().append(el('h3', 'project-title', project.name), el('p', 'note', (project.kind === 'ongoing' ? '持续项目' : '临时项目') + ' · ' + (project.status === 'archived' ? '已归档，仍可退出或撤回关联' : '进行中') + ' · 项目版本 ' + project.revision));
+  projectHost().append(el('h3', 'project-title', project.name), el('p', 'note', (project.kind === 'ongoing' ? '持续项目' : '临时项目') + ' · ' + (project.status === 'archived' ? '已归档，仍可退出或撤回本人声明及关联' : '未归档') + ' · 项目版本 ' + project.revision));
   const description = el('details', 'project-description'); description.append(el('summary', '', '项目说明（创建人提供，不代表全员确认）'), el('p', 'project-copy', project.goal)); projectHost().append(description);
   projectHost().append(el('p', 'project-members note', '成员：' + members.filter(m => ['active', 'invited'].includes(m.status)).map(m => m.owner + (m.status === 'invited' ? '（待加入）' : '')).join('、')));
   const actions = el('div', 'actions');

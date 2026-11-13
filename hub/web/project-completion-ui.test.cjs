@@ -61,3 +61,5 @@ assert.equal(button('验收项目'), undefined, 'archived project cannot create 
 reset(); run('projectView.completion.acceptance = { id: "old", author: "alice", valid: false, withdrawn: true, goals: [], note: "" }; renderProjectCompletion()');
 assert.equal(button('撤回项目验收'), undefined, 'withdrawn acceptance has no repeated withdrawal action');
 console.log('Project completion UI explicit preview, named roles, exact goal/task binding, and withdrawal distinction passed');
+
+assert(fs.readFileSync(__dirname + '/projects-ui.js', 'utf8').includes("\'未归档\'"), "Active project lifecycle must not contradict an accepted current version");
