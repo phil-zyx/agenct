@@ -264,3 +264,44 @@ changes clear it and fence late callbacks.
 to check explicit selection, one-turn scope, private-only writes, exact replay,
 stale versions, removal, outsider denial and account switching. Mock success is
 not evidence of live-model answer quality or a production deployment.
+
+
+## Explicit shared questions and replies
+
+Each state card has **共享问答**. An active member can manually enter a question
+about that exact item version, or reply to a question on the current version.
+The preview names the project, item/version, author and audience, and requires
+an explicit acknowledgement before publication. Private chats and Agent replies
+are never automatically copied. All current and future accepted project members
+can read published feedback; outsiders and departed members cannot fetch it.
+
+Feedback is historical member-published text, not a confirmed state item, an
+accepted assignment, an agreement, or team consensus. Even “yes” and “可以” do
+not change state. No model is called, no external communication is sent, and
+no task is executed. This slice deliberately has no inferred resolution status.
+A revised source makes its old question threads read-only; create a new question
+for the new version. Archived projects and withdrawn items cannot receive new
+questions or replies. Existing feedback remains explicitly version-labelled.
+
+Authors may explicitly withdraw their own feedback, including after the source
+changes or the project is archived while they still have access. Ordinary reads
+and replay receipts hide withdrawn text, but append-only database records retain
+it for history. Withdrawal is not erasure of copies members already saw. A
+withdrawn root question stops new replies, without withdrawing other authors'
+existing replies. Leaving a project does not retract previously published text.
+
+The Hub authorizes reads and writes against current membership under its database
+lock. Creates bind a request ID to the exact item, source version, reply target
+and content. The UI can retry the same original submission after response loss;
+it does not invent a new key or silently overwrite a stale source. Logout and
+navigation fence delayed callbacks. Privacy revocation is checked on reads and
+through existing polling, not guaranteed instantaneous removal of displayed text.
+
+`npm run test:questions` runs `project-questions.browser.test.cjs` against a real
+temporary Hub with Mock runtime. It covers three separate browser identities,
+preview/acknowledgement/cancellation, duplicate clicks, real response loss and
+replay, no private-history or state-confirmation side effects, stale sources,
+withdrawal, revoked access, late logout responses, and desktop/mobile screenshots
+when `AGENCT_TEST_SCREENSHOT_DIR` is set. It is also in `test:hub-browser`, whose
+CI job uploads those screenshots. These tests do not validate live paid models,
+real users on WSL, deployment, or production delivery.

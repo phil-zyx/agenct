@@ -21,6 +21,7 @@ mod private_staging;
 mod profile_suggestions;
 mod profiles;
 mod project_context;
+mod project_questions;
 mod project_state;
 mod projects;
 mod proposals;
@@ -422,6 +423,14 @@ pub fn app(mut hub: Hub) -> Router {
         .route(
             "/api/projects/{id}/state/{item}/actions",
             post(project_state::action),
+        )
+        .route(
+            "/api/projects/{id}/state/{item}/questions",
+            get(project_questions::list).post(project_questions::create),
+        )
+        .route(
+            "/api/projects/{id}/state/{item}/questions/{message}/withdraw",
+            post(project_questions::withdraw),
         )
         .route("/api/projects/{id}/members", post(projects::invite))
         .route(
