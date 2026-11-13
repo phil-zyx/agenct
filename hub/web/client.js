@@ -20,6 +20,7 @@ let controller = new AbortController(), pendingSend = null, pendingTurn = null;
 let displayedMessages = [];
 let turnStorageAvailable = true;
 let selectedAgent = null, roleGeneration = 0, roleRead = null, roleButtons = [];
+let selectedProject = null;
 let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
 const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 const actionEditors = new Map();
@@ -262,6 +263,28 @@ const taskSignature = task => JSON.stringify([
 ]);
 const MAX_DETAILS_BYTES = 256 * 1024;
 
+function renderProjectContext() {
+  const project = pendingTurn?.selectedProject || selectedProject;
+  const locked = !!pendingTurn || busy.has('send') || busy.has('turn-check');
+  $('project-context').classList[project ? 'remove' : 'add']('hide');
+  $('project-context-title').textContent = project ? (project.invalidated ? '（已失效）' : '') + (project.name || project.id) : '';
+  $('project-context-details').textContent = project
+    ? (project.invalidated ? '项目状态或权限已变更，请重新选择或清除后发送。'
+      : pendingTurn ? '本次项目选择已锁定；结果未知时只核对回执，不自动重发。'
+        : '仅附给下一条普通聊天，尚未发送。服务端在发送前核对权限和版本。')
+      + `\n项目编号：${project.id} · 项目版本 ${project.revision}`
+      + '\n只使用本轮问题和已发布的项目共同状态（包含标为已撤回的历史条目，不代表当前承诺）；不读取私聊历史、任务正文、材料或草稿。可能省略超出上下文上限的条目，回复会标明。'
+      + '\n发给你选择的模型处理，回复仅自己可见。不会向成员发消息、发布状态、确认分工或执行任务。来源说明未经独立验证，具名确认不代表全员共识。'
+      + (project.sources ? '\n已发布条目的来源与当前版本：\n' + project.sources : '')
+    : '';
+  $('clear-project-context').disabled = !selectedProject || locked;
+}
+$('clear-project-context').onclick = () => {
+  if (!current(session()) || pendingTurn || busy.has('send') || busy.has('turn-check')) return;
+  selectedProject = null; renderProjectContext();
+  status('已清除项目上下文，输入的问题未改变。');
+};
+
 function renderTaskContext() {
   const task = pendingTurn?.selectedTask || selectedTask;
   const locked = !!pendingTurn || busy.has('send') || busy.has('turn-check');
@@ -309,6 +332,7 @@ function addDiscussion(element, context, task) {
   button.textContent = '讨论此任务';
   button.onclick = () => {
     if (!current(context) || view !== taskView || pendingTurn || busy.has('send') || busy.has('turn-check')) return;
+    if (selectedProject) { status('请先清除项目上下文，再选择任务。'); return; }
     const visible = visibleTasks.get(task.id);
     if (!visible || taskSignature(visible) !== taskSignature(task)) return;
     selectedTask = { ...visible, invalidated: false };
@@ -342,7 +366,8 @@ function rememberTurn(context) {
   try {
     sessionStorage.setItem(TURN_STORAGE_KEY, JSON.stringify({
       id: pendingTurn.id, user: context.user, browserMode: context.browserMode,
-      ...(pendingTurn.selectedAgent ? { agent: { id: pendingTurn.selectedAgent.id, revision: pendingTurn.selectedAgent.revision } } : {})
+      ...(pendingTurn.selectedAgent ? { agent: { id: pendingTurn.selectedAgent.id, revision: pendingTurn.selectedAgent.revision } } : {}),
+      ...(pendingTurn.selectedProject ? { project: { id: pendingTurn.selectedProject.id, revision: pendingTurn.selectedProject.revision } } : {})
     }));
     turnStorageAvailable = true;
   } catch { turnStorageAvailable = false; }
@@ -357,6 +382,11 @@ function restoreTurn(context) {
     pendingTurn = { id: saved.id, status: 'checking', text: null,
       selectedAgent: validAgentBinding(saved.agent) ? { id: saved.agent.id, revision: saved.agent.revision } : null };
     if (saved.agent && !validAgentBinding(saved.agent)) pendingTurn.invalidAgentBinding = true;
+    if (saved.project) {
+      if (typeof saved.project.id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(saved.project.id) && Number.isSafeInteger(saved.project.revision) && saved.project.revision >= 0)
+        pendingTurn.selectedProject = { id: saved.project.id, revision: saved.project.revision };
+      else pendingTurn.invalidProjectBinding = true;
+    }
     renderTurn();
   } else {
     forgetTurn();
@@ -397,6 +427,7 @@ function renderTurn() {
   $('send').disabled = waiting || busy.has('send');
   renderTaskContext();
   renderRoleSelection();
+  renderProjectContext();
   renderRepositorySelection();
 }
 
@@ -410,13 +441,14 @@ async function failTurn(context, failure) {
   // A confirmed server failure is terminal. Never repeat the provider call by
   // polling, and never discard text the user typed while waiting.
   if (!$('text').value.trim() && turn.text) $('text').value = turn.text;
+  if (turn.selectedProject) selectedProject = { ...turn.selectedProject, invalidated: true, sources: null };
   if (turn.selectedTask) selectedTask = { ...turn.selectedTask, invalidated: true };
   if (turn.selectedAgent) selectedAgent = { ...turn.selectedAgent, invalidated: true };
   selectedRepository = turn.selectedRepository || null;
   forgetTurn();
   try { await refresh(context); } catch { /* The error notice remains usable offline. */ }
   if (current(context)) {
-    status(failure.message.replace(/[。.!！]+$/, '') + '。可以修改问题后再发送。' + (turn.selectedTask || turn.selectedAgent ? '原任务或角色需重新选择。' : ''));
+    status(failure.message.replace(/[。.!！]+$/, '') + '。可以修改问题后再发送。' + (turn.selectedTask || turn.selectedAgent || turn.selectedProject ? '原任务、项目或角色需重新选择。' : ''));
     $('text').focus?.();
   }
 }
@@ -436,6 +468,14 @@ async function completeTurn(context, response) {
   if (text !== null && (expectedTask
     ? !task || task.id !== expectedTask.id || task.revision !== expectedTask.revision
     : task != null)) throw Error('任务上下文回执与本次选择不符');
+  const project = response.project_context, expectedProject = pendingTurn.selectedProject;
+  if (pendingTurn.invalidProjectBinding || (expectedProject
+      ? !project || project.project_id !== expectedProject.id || project.revision !== expectedProject.revision
+      : text !== null && project != null)) throw Error('项目上下文回执与本次选择不符，保留恢复凭据');
+  if (project && (response.task_action != null || response.proposal != null)) throw Error('项目讨论返回了未授权操作，保留恢复凭据');
+  const projectReceipt = project
+    ? `\n本次项目上下文：${project.project_id} · 版本 ${project.revision}。仅自己可见，未改变项目或任务。`
+      + (project.omitted_items > 0 ? `已省略 ${project.omitted_items} 条超出上下文上限的条目。` : '') : '';
   const receiptContext = task
     ? `\n本次任务上下文：${task.id} · 版本 ${task.revision}。`
       + (task.summary_truncated ? '共享摘要已截断。' : '')
@@ -443,11 +483,11 @@ async function completeTurn(context, response) {
       + (task.details_truncated ? '共享材料已截断。' : '')
     : '';
   forgetTurn();
-  if (current(context)) handleTaskAction(context, response.task_action, requestId);
-  status('已核实消息处理完成。' + receiptContext + receiptRole);
+  if (current(context) && !project) handleTaskAction(context, response.task_action, requestId);
+  status('已核实消息处理完成。' + receiptContext + projectReceipt + receiptRole);
   try { await refresh(context); }
   catch (error) {
-    if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message + receiptContext + receiptRole
+    if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message + receiptContext + projectReceipt + receiptRole
       + (typeof response.reply === 'string' ? '\n已保存的回复：' + response.reply : ''));
   }
 }
@@ -484,6 +524,7 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   pendingSend = null;
   pendingTurn = null;
   selectedTask = null;
+  selectedProject = null;
   selectedAgent = null;
   closeRolePicker();
   resetRepositoryUI();
@@ -604,7 +645,7 @@ async function readSnapshot(context) {
   draftUI.update(context, tasks);
   timelineUI.update(context, tasks);
   updateTaskContext(context, tasks);
-  focusTask(context, tasks, activity);
+  if (!selectedProject) focusTask(context, tasks, activity);
   updateNotifications(context, tasks);
   if (!Array.isArray(activity)) activity = lastActivity;
   lastActivity = activity;
@@ -880,8 +921,8 @@ $('form').onsubmit = async event => {
   const context = session();
   const text = $('text').value.trim();
   if (!text || !current(context) || busy.has('send')) return;
-  // Only a named action or cancellation can directly answer a waiting card.
-  if (await replyToPendingAction(context, text)) return;
+  // Project discussion is read-only: never reinterpret its question as a task action.
+  if (!selectedProject && await replyToPendingAction(context, text)) return;
   if (pendingTurn) {
     status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
     return;
@@ -892,7 +933,15 @@ $('form').onsubmit = async event => {
   status('');
   let chatTurn = null;
   try {
-    if (await profileUI.handle(context, text)) {
+    if (selectedProject) {
+      if (selectedProject.invalidated || selectedTask || selectedRepository || /^\//.test(text)) {
+        status('项目讨论仅接受普通问题。请重新选择失效的项目，并清除任务或仓库选择；如需执行命令，先清除项目上下文。');
+        return;
+      }
+      if (!await validateSelectedProject(context)) return;
+      if (!current(context) || !selectedProject || selectedProject.invalidated) return;
+    }
+    if (!selectedProject && await profileUI.handle(context, text)) {
       if (current(context)) {
         if ($('text').value.trim() === text) $('text').value = '';
         pendingSend = null;
@@ -925,10 +974,11 @@ $('form').onsubmit = async event => {
       }
       const message = repositoryChatMessage(text, selectedRepository);
       closeRepositoryPicker();
-      chatTurn = { text, message, history: displayedMessages, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent, selectedRepository };
+      chatTurn = { text, message, history: displayedMessages, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent, selectedRepository, selectedProject };
       selectedRepository = null;
       selectedAgent = null;
       selectedTask = null;
+      selectedProject = null;
       pendingTurn = chatTurn;
       $('text').value = '';
       if ($('text').style) $('text').style.height = 'auto';
@@ -939,6 +989,7 @@ $('form').onsubmit = async event => {
       const response = await postChat(context, { message: chatTurn.message, request_id: chatTurn.id,
         ...(chatTurn.selectedAgent ? { agent_id: chatTurn.selectedAgent.id,
           expected_profile_revision: chatTurn.selectedAgent.revision } : {}),
+        ...(chatTurn.selectedProject ? { selected_project: { project_id: chatTurn.selectedProject.id, expected_revision: chatTurn.selectedProject.revision } } : {}),
         ...(chatTurn.selectedTask ? { selected_task: {
           task_id: chatTurn.selectedTask.id, expected_revision: chatTurn.selectedTask.revision
         } } : {})
@@ -969,6 +1020,7 @@ $('form').onsubmit = async event => {
       if (rejectedAgent || rejectedSelection) {
         if (!$('text').value) $('text').value = chatTurn.text;
         selectedRepository = chatTurn.selectedRepository;
+        selectedProject = chatTurn.selectedProject ? { ...chatTurn.selectedProject, invalidated: true, sources: null } : null;
         selectedAgent = chatTurn.selectedAgent ? { ...chatTurn.selectedAgent,
           invalidated: rejectedAgent || chatTurn.selectedAgent.invalidated } : null;
         // These two server codes guarantee rejection before receipt reservation
@@ -980,7 +1032,7 @@ $('form').onsubmit = async event => {
         if (!$('text').value.trim()) $('text').value = chatTurn.text;
         status(error.message + (rejectedAgent
           ? '。服务端尚未处理本次消息，所选角色已失效。请重新选择角色或明确恢复默认管家。未自动重发。'
-          : '。服务端尚未处理本次消息，任务上下文已失效。请重新选择任务，或清除后再发送。未自动重发。'));
+          : '。服务端尚未处理本次消息，任务或项目上下文已失效。请重新选择任务，或清除后再发送。未自动重发。'));
         await refresh(context).catch(() => {});
       } else {
         chatTurn.status = 'uncertain';

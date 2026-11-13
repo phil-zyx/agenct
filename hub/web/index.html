@@ -78,6 +78,11 @@
         <p id="turn-status" role="status" aria-live="polite"></p>
         <div class="row"><button type="button" id="check-turn" class="primary">核对发送状态</button><button type="button" id="new-turn">开始新尝试</button></div>
       </section>
+      <section id="project-context" class="chip-bar hide" aria-label="下一条聊天的项目上下文">
+        <span class="chip-label">讨论项目</span><span id="project-context-title" class="chip-title"></span>
+        <details class="chip-more"><summary>来源与范围</summary><p id="project-context-details"></p></details>
+        <button type="button" id="clear-project-context" class="text-btn">清除项目上下文</button>
+      </section>
       <span id="task-context-status" class="sr-only" role="status" aria-live="polite"></span>
       <section id="task-context" class="chip-bar hide" aria-label="下一条聊天的任务上下文">
         <span id="task-context-label" class="chip-label">讨论</span><span id="task-context-title" class="chip-title"></span>
