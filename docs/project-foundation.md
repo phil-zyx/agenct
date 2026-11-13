@@ -1,8 +1,7 @@
 # Project and membership foundation
 
-This is an additive API foundation for a three-person shared goal. It is not yet
-an end-to-end conversational project UI, autonomous agent negotiation, or a
-production access-control claim. Existing one-requester/one-owner tasks keep their
+This is an additive project foundation with a three-person coordination UI.
+It is not autonomous agent negotiation or a production access-control claim. Existing one-requester/one-owner tasks keep their
 existing lifecycle and authorization.
 
 ## Scope and safe defaults
@@ -102,12 +101,27 @@ tenant initialization audits historical project membership before committing a
 partition assignment. Keep normal database backups before upgrades; old binaries
 reject newer database versions instead of silently serving them.
 
+The project panel now supports invitations, shared state with source/version
+confirmation, explicit private-chat candidates, read-only alignment checks, and
+bilateral task association. Choose **关联我的任务**, select a task whose two original
+participants are active project members, and write a new **共享协调标签**. No task
+summary is copied into that label. Preview and confirm the proposal; the other
+participant must separately preview and approve public coordination visibility.
+Either participant can withdraw, and the creator can withdraw an active link.
+The third member sees only the approved projection, with no task-opening control.
+
+**退出项目**, creator-only **移除成员**, and **归档项目** each explain their effects
+before confirmation. Archived projects retain reads and withdrawal/removal, not
+new sharing. A stale revision requires fresh review. A lost response to these
+non-idempotent writes disables submission: cancel and read current state before
+considering a new action; never automatically retry. If a currently open project
+becomes unavailable because its creator is disabled, the panel clears project
+contents and offers withdrawal using only the caller’s membership revision.
+
 This deliberately leaves project edits, owner succession, immutable project event
-history, shared facts/decisions/dependencies, material publication, conversational
-proposals/confirmation UI, invitations in the UI, notifications, reminders and
-agent execution to separately reviewed work. Bilateral link approval and
-creator-only membership management are conservative implementation choices for
-this foundation, not evidence that users approved broader autonomous sharing.
+history, material publication, notifications, reminders and agent execution to
+separately reviewed work. Bilateral link approval and creator-only membership
+management remain conservative choices, not consent to autonomous sharing.
 
 ## Verification
 
@@ -118,3 +132,10 @@ tenant isolation. `schema.rs` covers additive migration without history sharing.
 Run the full repository checks (including Rust test/clippy/fmt and the separate
 three-person HTTP acceptance harness) before merge. JavaScript checks alone do
 not verify this backend implementation.
+
+`hub/web/project-links.browser.test.cjs` exercises the real Hub with three isolated
+browser identities and Mock runtime: private link proposal, bilateral approval,
+third-member projection/denied task access, stale confirmation, uncertain writes,
+withdrawal and rejoining, member removal, archive, mobile layout and identity
+changes. These synthetic-browser checks are not real-user device or paid-model
+acceptance. Run `npm run test:projects` after building the Hub.
