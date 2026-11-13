@@ -708,3 +708,7 @@ textarea, input { caret-color: var(--brand); }
 
 .project-acknowledgement { display: flex; align-items: flex-start; gap: 10px; margin: 16px 0; font-size: 13px; line-height: 1.6; cursor: pointer; }
 .project-acknowledgement input { flex: 0 0 auto; width: 20px; height: 20px; margin-top: 2px; }
+
+.project-question-thread { margin: 18px 0; padding-top: 2px; border-top: 1px solid var(--line-strong); }
+.project-question-reply { margin-left: 16px; border-left: 3px solid var(--brand); }
+.project-question-message > p { margin: 6px 0; }

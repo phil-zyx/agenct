@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 21;
+pub(super) const VERSION: i64 = 22;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -88,6 +88,8 @@ const TABLES: &[&str] = &[
     "project_tasks",
     "project_state_items",
     "project_state_versions",
+    "project_questions",
+    "project_question_withdrawals",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -191,6 +193,7 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
             add_column(db, "chat_turns", "selected_project", "TEXT")?;
             add_column(db, "messages", "project_id", "TEXT")?;
         }
+        22 => db.execute_batch(crate::project_questions::SCHEMA)?,
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -273,6 +276,7 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("chat_failures", _) => 17,
         ("projects" | "project_members" | "project_tasks", _) => 18,
         ("project_state_items" | "project_state_versions", _) => 19,
+        ("project_questions" | "project_question_withdrawals", _) => 22,
         ("messages" | "proposals", "created_at") => 11,
         ("events", "from_status" | "to_status" | "task_revision") => 6,
         ("events", "revision" | "delivery_seq") => 8,
@@ -365,6 +369,8 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                     && version < 18)
                 || (["project_state_items", "project_state_versions"].contains(&table)
                     && version < 19)
+                || (["project_questions", "project_question_withdrawals"].contains(&table)
+                    && version < 22)
             {
                 continue;
             }
@@ -420,6 +426,8 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 | "project_tasks"
                 | "project_state_items"
                 | "project_state_versions"
+                | "project_questions"
+                | "project_question_withdrawals"
         ) {
             let wanted_sql: String = expected.query_row(
                 "SELECT sql FROM sqlite_schema WHERE name=?1",
@@ -537,6 +545,12 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
         ("project_state_versions_no_update", 19),
         ("project_state_versions_no_delete", 19),
         ("project_state_versions_no_replace", 19),
+        ("project_questions_no_update", 22),
+        ("project_questions_no_delete", 22),
+        ("project_questions_no_replace", 22),
+        ("project_question_withdrawals_no_update", 22),
+        ("project_question_withdrawals_no_delete", 22),
+        ("project_question_withdrawals_no_replace", 22),
     ] {
         let actual: Option<String> = db
             .query_row(
@@ -611,7 +625,7 @@ mod tests {
         assert_eq!(schema(&db), before);
         assert_eq!(version(&db).unwrap(), 20);
         migrate(&mut db).unwrap();
-        assert_eq!(version(&db).unwrap(), 21);
+        assert_eq!(version(&db).unwrap(), VERSION);
         assert_eq!(text(&db, "SELECT content FROM messages"), "keep");
         assert_eq!(
             scalar(
@@ -1070,6 +1084,26 @@ mod tests {
         let before = schema(&db);
         migrate(&mut db).unwrap();
         assert_eq!(schema(&db), before);
+    }
+    #[test]
+    fn feedback_upgrade_is_empty_and_validates_immutable_storage() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for next in 1..=21 {
+            step(&db, next).unwrap();
+        }
+        db.pragma_update(None, "user_version", 21).unwrap();
+        db.execute_batch("INSERT INTO sessions VALUES ('alice','session-a'); INSERT INTO messages(owner,role,content,status) VALUES ('alice','user','PRIVATE CHAT','complete');").unwrap();
+        migrate(&mut db).unwrap();
+        for table in ["project_questions", "project_question_withdrawals"] {
+            assert_eq!(scalar(&db, &format!("SELECT count(*) FROM {table}")), 0);
+        }
+        assert_eq!(text(&db, "SELECT content FROM messages"), "PRIVATE CHAT");
+        let before = schema(&db);
+        migrate(&mut db).unwrap();
+        assert_eq!(schema(&db), before);
+        db.execute_batch("DROP TRIGGER project_questions_no_update")
+            .unwrap();
+        assert!(migrate(&mut db).is_err());
     }
     #[test]
     fn shared_state_upgrade_does_not_promote_existing_goals_or_copy_private_data() {
