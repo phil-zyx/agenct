@@ -65,6 +65,28 @@ fn source(db: &Connection, project: &str, item: &str) -> Result<(i64, String)> {
 fn read(db: &Connection, project: &str, item: &str, id: &str) -> Result<Message> {
     db.query_row(&format!("SELECT {COLUMNS} FROM project_questions q WHERE q.project_id=?1 AND q.item_id=?2 AND q.id=?3"),params![project,item,id],row).optional()?.ok_or_else(denied)
 }
+/// Called only after project membership authorization by the context capturer.
+/// Preserve reference provenance, but never restore withdrawn feedback bodies.
+pub(super) fn snapshot(db: &Connection, project: &str) -> Result<Vec<serde_json::Value>> {
+    let mut q = db.prepare(&format!("SELECT {COLUMNS},v.version,v.status,EXISTS(SELECT 1 FROM project_question_withdrawals w WHERE w.message_id=q.reply_to) FROM project_questions q JOIN project_state_versions v ON v.item_id=q.item_id AND v.version=(SELECT MAX(version) FROM project_state_versions WHERE item_id=q.item_id) WHERE q.project_id=?1 ORDER BY q.rowid"))?;
+    let messages = q
+        .query_map([project], |r| {
+            let message = redact(row(r)?);
+            let current_version: i64 = r.get(8)?;
+            let item_status: String = r.get(9)?;
+            let parent_withdrawn: bool = r.get(10)?;
+            let mut value = serde_json::to_value(&message).expect("feedback serializes");
+            value["current_item_version"] = serde_json::json!(current_version);
+            value["item_status"] = serde_json::json!(item_status);
+            value["current_reference"] = serde_json::json!(
+                message.item_version == current_version && item_status != "withdrawn"
+            );
+            value["parent_withdrawn"] = serde_json::json!(parent_withdrawn);
+            Ok(value)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(messages)
+}
 pub(super) async fn list(
     State(h): State<Hub>,
     headers: HeaderMap,
