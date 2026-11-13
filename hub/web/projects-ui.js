@@ -119,6 +119,7 @@ async function loadProject(id, checkAlignment = false) {
     if (!current(context) || generation !== projectGeneration) return;
     projectNotice('无法读取项目：' + error.message);
     projectHost().append(projectButton('重新读取项目', () => loadProject(id)));
+    if (error.httpStatus === 404) void projectWithdrawalRecovery(context, generation, id);
   }
 }
 function projectCard(item, historical = false) {
@@ -144,7 +145,7 @@ function renderProject() {
   if (!projectView || projectDraft) return;
   projectShell(); const { project, members, items, tasks } = projectView;
   projectHost().append(projectButton('项目列表', loadProjectDirectory));
-  projectHost().append(el('h3', 'project-title', project.name), el('p', 'note', (project.kind === 'ongoing' ? '持续项目' : '临时项目') + ' · ' + (project.status === 'archived' ? '已归档，只读' : '进行中') + ' · 项目版本 ' + project.revision));
+  projectHost().append(el('h3', 'project-title', project.name), el('p', 'note', (project.kind === 'ongoing' ? '持续项目' : '临时项目') + ' · ' + (project.status === 'archived' ? '已归档，仍可退出或撤回关联' : '进行中') + ' · 项目版本 ' + project.revision));
   const description = el('details', 'project-description'); description.append(el('summary', '', '项目说明（创建人提供，不代表全员确认）'), el('p', 'project-copy', project.goal)); projectHost().append(description);
   projectHost().append(el('p', 'project-members note', '成员：' + members.filter(m => ['active', 'invited'].includes(m.status)).map(m => m.owner + (m.status === 'invited' ? '（待加入）' : '')).join('、')));
   const actions = el('div', 'actions');
@@ -154,8 +155,12 @@ function renderProject() {
     const check = projectButton('检查对齐', () => checkProjectAlignment(view, context, generation, check));
     actions.append(check);
     actions.append(projectButton('发布共同状态', () => stateEditor(), 'primary'));
-    if (project.creator === user) actions.append(projectButton('邀请成员', inviteProjectEditor));
+    actions.append(projectButton('关联我的任务', linkProjectEditor));
+    if (project.creator === user) actions.append(projectButton('邀请成员', inviteProjectEditor), projectButton('归档项目', () => projectLifecycleEditor('archive')));
   }
+  if (project.creator === user) {
+    if (members.some(m => m.owner !== user && ['active', 'invited'].includes(m.status))) actions.append(projectButton('移除成员', removeProjectMemberEditor));
+  } else actions.append(projectButton('退出项目', () => projectLifecycleEditor('leave')));
   actions.append(projectButton('刷新共同状态', () => loadProject(project.id))); projectHost().append(actions);
   renderProjectAlignment();
   for (const [kind, name] of Object.entries(ProjectStateModel.kinds)) {
@@ -171,8 +176,11 @@ function renderProject() {
   if (tasks.length) {
     const links = el('section', 'project-state-group'); links.append(el('h3', '', '关联任务'), el('p', 'note', '这里只展示经任务双方同意公开的标签和进度。任务正文与私密草稿仍仅双方可见。'));
     for (const task of tasks) {
-      const card = el('article', 'project-card');
-      card.append(el('p', 'project-copy', task.label), el('p', 'note', task.status === 'pending' ? '等待另一方同意公开' : (TASK_STATUS[task.task_status]?.[0] || task.task_status)));
+      const card = el('article', 'project-card project-task-card'); card.dataset.task = task.task_id;
+      const participant = task.requester === user || task.owner === user;
+      card.append(el('p', 'note', '任务：' + task.task_id + ' · 双方：' + task.requester + ' / ' + task.owner), el('p', 'project-copy', task.label), el('p', 'note', task.status === 'pending' ? '等待另一方同意公开' : (TASK_STATUS[task.task_status]?.[0] || task.task_status)));
+      if (participant && task.status === 'pending' && task.proposed_by !== user && project.status === 'active') card.append(projectButton('同意公开关联', () => linkProjectActionEditor(task, 'approve')));
+      if (participant || (project.creator === user && task.status === 'active')) card.append(projectButton('撤回任务关联', () => linkProjectActionEditor(task, 'revoke')));
       if (task.can_open_task) card.append(projectButton('打开我的任务', () => { closeProjects(); showTaskInChat(task.task_id); }));
       links.append(card);
     }
@@ -280,8 +288,10 @@ function beginProjectEditor(title) {
 }
 function cancelProjectEditor() {
   if (projectBusy) return;
-  if (projectDraft?.uncertain && !confirm('上次提交结果未知，可能已经发布。取消只会丢弃本页重试凭据，不会撤回已发布内容。取消后请先刷新核对，不要重新发布相同内容。仍要取消编辑吗？')) return;
+  if (projectDraft?.uncertain && !confirm('上次操作结果未知，可能已经保存。取消只会关闭本页编辑，不会撤回已发布内容，也不会撤销已完成的操作。取消后请先刷新核对，不要重复提交。仍要取消编辑吗？')) return;
+  const recoveryId = projectDraft?.withdrawalRecoveryId;
   projectDraft?.editor.remove(); projectDraft = null;
+  if (recoveryId) { void loadProject(recoveryId); return; }
   if (projectView) void loadProject(projectView.project.id); else void loadProjectDirectory();
 }
 function editorCancel() { return projectButton('取消编辑', cancelProjectEditor); }
@@ -332,15 +342,17 @@ async function commitProject(draft, path, body, button, preview) {
     if (!current(draft.context) || projectDraft !== draft) return;
     projectBusy = false; projectDraft = null; draft.editor.remove();
     const id = draft.projectId || (path === 'projects' ? result.id : null);
-    if (id) await loadProject(id); else await loadProjectDirectory();
-    projectNotice('操作已保存。发布不代表其他成员已确认。');
+    if (id && !draft.returnToDirectory) await loadProject(id); else await loadProjectDirectory();
+    if (current(draft.context)) projectNotice('操作已保存。共享内容仍须按规则由对应成员确认。');
   } catch (error) {
     if (!current(draft.context) || projectDraft !== draft) return;
     if (succeeded) { projectNotice('操作已保存，读取失败。请刷新项目，不要重复提交。'); return; }
     projectBusy = false;
     draft.editor.querySelectorAll('button').forEach(b => { b.disabled = false; });
     if ([401, 403, 404].includes(error.httpStatus)) {
-      projectDraft = null; projectView = null; projectGeneration++; projectShell(); projectNotice('无法访问项目，已清除此页内容。请重新读取项目列表。'); projectHost().append(projectButton('项目列表', loadProjectDirectory)); return;
+      projectDraft = null; projectView = null; projectGeneration++; projectShell(); projectNotice('无法访问项目，已清除此页内容。请重新读取项目列表。'); projectHost().append(projectButton('项目列表', loadProjectDirectory));
+      if (error.httpStatus === 404 && draft.projectId) void projectWithdrawalRecovery(draft.context, projectGeneration, draft.projectId);
+      return;
     }
     if (error.httpStatus === 409) {
       draft.invalid = true; button.disabled = true; projectNotice('项目已更新，请取消编辑后重新核对。未自动重试或覆盖。'); return;
@@ -441,6 +453,83 @@ async function inviteProjectEditor() {
     editor.append(form); owner.focus();
   } catch (error) { if (current(draft.context) && projectDraft === draft) projectNotice('无法读取可邀请成员：' + error.message); }
 }
+// A creator becoming unavailable must not trap a member's consent. Read only
+// the caller's membership revision after clearing all project contents.
+async function projectWithdrawalRecovery(context, generation, id) {
+  try {
+    const membership = await contactApi(context, projectPath(id) + '/membership');
+    if (!current(context) || generation !== projectGeneration || projectView || projectDraft || membership.status !== 'active') return;
+    const recover = projectButton('退出不可访问的项目', () => {
+      if (!current(context) || generation !== projectGeneration || !recover.isConnected || !$('room').classList.contains('projects-open')) return;
+      const editor = beginProjectEditor('退出不可访问的项目'); if (!editor) return;
+      projectDraft.withdrawalRecoveryId = id; projectDraft.projectId = id; projectDraft.revision = membership.revision; projectDraft.returnToDirectory = true;
+      const form = el('div'); editor.append(form);
+      projectPreview(form, '核对退出', ['项目编号：' + id + ' · 项目版本 ' + membership.revision, '无法读取项目内容，但已核实你仍是成员。退出将撤回你参与的任务关联，并使相关共同状态确认失效。原任务和私聊不受影响。'], '确认退出项目', projectPath(id) + '/membership', { action: 'leave', expected_revision: membership.revision });
+    });
+    projectHost().append(recover);
+  } catch { /* No membership means no recovery authority; do not restore cached data. */ }
+}
+// The selector is scoped by the task API. Never infer a public label from private text.
+async function linkProjectEditor() {
+  const editor = beginProjectEditor('关联我的任务'); if (!editor) return;
+  const draft = projectDraft, view = projectView, project = view.project;
+  editor.append(el('p', 'note', '只列出你参与且双方已加入本项目的任务。选择器中的任务名称仅自己可见，不会自动填入共享标签。提议仅双方可见，另一方确认后才公开协调信息。'), editorCancel());
+  try {
+    const tasks = await contactApi(draft.context, 'tasks');
+    if (!current(draft.context) || projectDraft !== draft || draft.invalid) return;
+    const members = new Set(view.members.filter(m => m.status === 'active').map(m => m.owner));
+    const linked = new Set(view.tasks.map(t => t.task_id));
+    const eligible = tasks.filter(t => (t.requester === draft.context.user || t.owner === draft.context.user) && members.has(t.requester) && members.has(t.owner) && !linked.has(t.id));
+    if (!eligible.length) { editor.append(el('p', 'note', '暂无可关联任务。需要任务双方先加入项目，且该任务没有待确认或已公开的关联。')); return; }
+    const form = el('form');
+    const choice = projectField(form, '我的任务', 'text', '', [['', '选择任务'], ...eligible.map(t => [t.id, t.summary.slice(0, 100) + ' · ' + t.requester + ' / ' + t.owner + ' · ' + t.id])]);
+    const label = projectField(form, '共享协调标签', 'textarea'); label.maxLength = 240;
+    const submit = el('button', 'primary', '预览关联'); submit.type = 'submit'; form.append(submit, editorCancel());
+    editor.querySelector('button')?.remove(); // Move the loading cancel into the replaceable form.
+    form.onsubmit = event => {
+      event.preventDefault(); if (!form.reportValidity()) return;
+      const task = eligible.find(t => t.id === choice.value), text = label.value.trim();
+      if (!task || !ProjectStateModel.boundedText(text, 240)) { projectNotice('共享标签需为 1–240 个字符，且不能含特殊控制字符。'); return; }
+      projectPreview(form, '核对关联提议', projectLinkPreview(project, { ...task, task_id: task.id, label: text }), '确认提议关联', projectPath(project.id) + '/tasks', { task_id: task.id, label: text, expected_revision: project.revision });
+    };
+    editor.append(form); choice.focus();
+  } catch (error) { if (current(draft.context) && projectDraft === draft) projectNotice('无法读取任务：' + error.message + '。请取消后重试。'); }
+}
+function projectLinkPreview(project, task) {
+  return ['项目：' + project.name + ' · ' + project.id + ' · 项目版本 ' + project.revision,
+    '共享标签：' + task.label, '任务编号：' + task.task_id, '任务双方：' + task.requester + ' / ' + task.owner,
+    '双方同意后，所有已加入和今后加入的项目成员可见：以上标签、任务编号、双方账号、实时任务状态和版本。',
+    '不共享任务正文、材料、结果、事件、私聊或私密草稿；项目成员不因此获得打开或操作任务的权限。双方均可撤回关联，重新关联必须重新同意。'];
+}
+function linkProjectActionEditor(task, action) {
+  const editor = beginProjectEditor(action === 'approve' ? '同意公开关联' : '撤回任务关联'); if (!editor) return;
+  const project = projectView.project, form = el('div'); editor.append(form);
+  projectPreview(form, action === 'approve' ? '核对公开范围' : '核对撤回关联',
+    action === 'approve' ? projectLinkPreview(project, task) : ['项目：' + project.name + ' · 项目版本 ' + project.revision, '共享标签：' + task.label, '任务编号：' + task.task_id, '撤回后此项目不再展示关联；不会取消或删除原任务，也无法收回成员此前已看到的信息。'],
+    action === 'approve' ? '确认公开关联' : '确认撤回关联', projectPath(project.id) + '/tasks/' + encodeURIComponent(task.task_id) + '/actions', { action, expected_revision: project.revision });
+}
+function projectLifecycleEditor(action) {
+  const project = projectView.project;
+  const editor = beginProjectEditor(action === 'leave' ? '退出项目' : '归档项目'); if (!editor) return;
+  projectDraft.returnToDirectory = action === 'leave';
+  const form = el('div'); editor.append(form);
+  projectPreview(form, project.name + ' · 项目版本 ' + project.revision,
+    [action === 'leave' ? '退出后立即失去项目访问权限，你参与的任务关联会撤回，相关共同状态确认会失效。再次加入不恢复旧关联同意。原任务及私聊不受影响。' : '归档后停止邀请、加入、发布共同状态和新关联；成员仍可读取现有内容、退出或撤回关联，创建人仍可移除成员。原任务不会取消，任务进度仍会更新。'],
+    action === 'leave' ? '确认退出项目' : '确认归档项目', projectPath(project.id) + (action === 'leave' ? '/membership' : '/archive'),
+    { ...(action === 'leave' ? { action: 'leave' } : {}), expected_revision: project.revision });
+}
+function removeProjectMemberEditor() {
+  const editor = beginProjectEditor('移除成员'); if (!editor) return;
+  const project = projectView.project, form = el('form');
+  const members = projectView.members.filter(m => m.owner !== user && ['active', 'invited'].includes(m.status));
+  const choice = projectField(form, '移除成员', 'text', '', [['', '选择成员'], ...members.map(m => [m.owner, m.owner])]);
+  const submit = el('button', 'primary', '预览移除'); submit.type = 'submit'; form.append(submit, editorCancel());
+  form.onsubmit = event => {
+    event.preventDefault(); if (!form.reportValidity()) return;
+    projectPreview(form, '核对移除成员', ['项目：' + project.name + ' · 项目版本 ' + project.revision, '移除：' + choice.value, '立即撤销项目访问或未接受的邀请，并撤回该成员参与的任务关联、使相关共同状态确认失效。原任务及私聊不受影响，再次加入不恢复旧关联同意。'], '确认移除成员', projectPath(project.id) + '/members/' + encodeURIComponent(choice.value) + '/remove', { expected_revision: project.revision });
+  };
+  editor.append(form); choice.focus();
+}
 async function refreshProjects() {
   if (!$('room').classList.contains('projects-open') || !projectView || projectBusy || projectRead) return;
   const context = session(), generation = projectGeneration, id = projectView.project.id;
@@ -464,6 +553,7 @@ async function refreshProjects() {
       clearProjectAlignment();
       projectDraft = null; projectView = null; projectGeneration++; projectShell(); projectHost().append(projectButton('项目列表', loadProjectDirectory));
       projectNotice('项目访问权限已失效，已清除此页内容。');
+      if (error.httpStatus === 404) void projectWithdrawalRecovery(context, projectGeneration, id);
     } else {
       clearProjectAlignment();
       projectNotice('共同状态暂未同步：' + error.message + '。旧对齐建议已清除，请重新读取后检查。');
