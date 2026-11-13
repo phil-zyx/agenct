@@ -288,7 +288,7 @@ function beginProjectEditor(title) {
 }
 function cancelProjectEditor() {
   if (projectBusy) return;
-  if (projectDraft?.uncertain && !confirm('上次操作结果未知，可能已经保存。取消只会关闭本页编辑，不会撤销已完成的操作。取消后请先刷新核对，不要重复提交。仍要取消编辑吗？')) return;
+  if (projectDraft?.uncertain && !confirm('上次操作结果未知，可能已经保存。取消只会关闭本页编辑，不会撤回已发布内容，也不会撤销已完成的操作。取消后请先刷新核对，不要重复提交。仍要取消编辑吗？')) return;
   const recoveryId = projectDraft?.withdrawalRecoveryId;
   projectDraft?.editor.remove(); projectDraft = null;
   if (recoveryId) { void loadProject(recoveryId); return; }
