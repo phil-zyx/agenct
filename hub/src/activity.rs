@@ -54,6 +54,10 @@ pub(super) async fn activity(State(h): State<Hub>, headers: HeaderMap) -> Result
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (id, requester, owner, summary, status, revision) in rows {
+        let is_self_topic = requester == owner;
+        if is_self_topic && !crate::nodes::is_topic_summary(&summary) && status != "working" {
+            continue;
+        }
         // Same participant/action filter as the shared audit timeline.
         let shared = db
             .query_row(
@@ -96,7 +100,7 @@ pub(super) async fn activity(State(h): State<Hub>, headers: HeaderMap) -> Result
         } else {
             None
         };
-        let latest = match (draft, shared) {
+        let mut latest = match (draft, shared) {
             (Some(d), _) => d,
             (None, Some(s)) => s,
             (None, None) => Latest {
@@ -106,6 +110,9 @@ pub(super) async fn activity(State(h): State<Hub>, headers: HeaderMap) -> Result
                 reason: None,
             },
         };
+        if is_self_topic {
+            latest.action = "topic_turn".into();
+        }
         let (role, counterpart) = if owner == user {
             ("owner", requester)
         } else {

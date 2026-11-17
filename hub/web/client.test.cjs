@@ -13,6 +13,7 @@ class Element {
     this.ownText = '';
     this.children = [];
     this.disabled = false;
+    this.dataset = {};
     const classes = new Set();
     this.classList = { add: value => classes.add(value), remove: value => classes.delete(value), contains: value => classes.has(value) };
   }
@@ -77,7 +78,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       removeItem: key => { if (settings.storageFailure) throw Error('Storage unavailable'); storageFor(key).delete(key); }
     },
     localStorage: { getItem: key => settings.preferences?.get(key) || null, setItem: (key, value) => settings.preferences?.set(key, value) },
-    window: { location: { assign: url => calls.push({ redirect: url }) } },
+    window: { location: { origin: 'http://10.0.0.11:5176', assign: url => calls.push({ redirect: url }) } },
     fetch: async (url, options) => {
       calls.push({ url, options });
       if (url === '/auth/session') {
@@ -117,7 +118,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       });
       if (failReads && options.method === 'GET') throw Object.assign(Error('Read unavailable'), { httpStatus: failReads });
       const identity = (options.headers.Authorization || auth.user || '').endsWith('bob') ? 'bob' : 'alice';
-      let data = url.endsWith('/me') ? { user: identity, runtime: 'mock' } : [];
+      let data = url.endsWith('/me') ? { user: identity, runtime: 'mock', member: { id: identity, display_name: identity, color: 'green', status: 'active', revision: 0 } } : [];
       if (url.endsWith('/proposals') && options.method === 'GET') {
         data = settings.proposals || [{ id: 1, owner: 'bob', summary: 'Exact <summary>\nsecond line', status: 'pending', revision }];
       }
@@ -126,6 +127,59 @@ function fixture(auth = { enabled: false }, settings = {}) {
       }
       if (url === '/api/tasks' && options.method === 'GET') data = tasks;
       if (url === '/api/repositories') data = settings.repositories || [];
+      if (url === '/api/gitlab/config' && options.method === 'GET') {
+        data = settings.gitlabConfig || {
+          configured: false,
+          base_url: 'https://git.example.com',
+          gitlab_username: identity,
+          has_token: false,
+          token_preview: '',
+          auto_poll_todos: true,
+          webhook_url: 'http://10.0.0.11:5176/webhooks/gitlab',
+          updated_at: 0
+        };
+      }
+      if (url === '/api/gitlab/config' && options.method === 'POST') {
+        const body = JSON.parse(options.body);
+        const current = settings.gitlabConfig || { has_token: false, token_preview: '' };
+        const cleared = !!body.clear_token;
+        const hasToken = cleared ? false : (!!body.token || !!current.has_token);
+        const preview = cleared ? '' : (body.token ? 'glpat-***test' : current.token_preview);
+        settings.gitlabConfig = {
+          configured: hasToken,
+          base_url: body.base_url,
+          gitlab_username: body.gitlab_username || '',
+          has_token: hasToken,
+          token_preview: preview,
+          auto_poll_todos: body.auto_poll_todos !== false,
+          webhook_url: 'http://10.0.0.11:5176/webhooks/gitlab',
+          updated_at: 12345
+        };
+        data = settings.gitlabConfig;
+      }
+      if (url === '/api/gitlab/sync' && options.method === 'POST') {
+        data = settings.gitlabSync || { ok: true, fetched: 2, dispatched: 1 };
+      }
+      if (url === '/api/nodes' && options.method === 'GET') data = settings.nodes || [];
+      if (url === '/api/attachments' && options.method === 'POST') {
+        const body = JSON.parse(options.body);
+        const id = 'att_' + '0'.repeat(31) + '1';
+        settings.storedAttachments = settings.storedAttachments || new Map();
+        settings.storedAttachments.set(id, { id, name: body.name, mime_type: body.mime_type, data_base64: body.data_base64 });
+        data = { id, name: body.name, mime_type: body.mime_type, bytes: 68 };
+      }
+      if (url.startsWith('/api/attachments/') && options.method === 'GET') {
+        const id = decodeURIComponent(url.split('/').pop());
+        data = settings.storedAttachments?.get(id) || { id, name: 'screenshot.png', mime_type: 'image/png', data_base64: 'AAAA' };
+      }
+      if (url === '/api/nodes' && options.method === 'POST') {
+        const body = JSON.parse(options.body);
+        const created = { id: body.id || 'pc-1', name: body.name, capabilities: body.capabilities || '', online: false };
+        settings.nodes = [...(settings.nodes || []), created];
+        data = { node: created, token: 'agn_' + 'a'.repeat(64) };
+      }
+      if (url === '/api/profile-suggestions') data = settings.profileSuggestions || [];
+      if (url === '/api/people') data = settings.people || [];
       if (url === '/api/repositories/context') {
         const choice = JSON.parse(options.body);
         repositoryPreview = { ...choice, path: choice.path ?? null, query: choice.query ?? null, snapshot_digest: 'b'.repeat(64), read_only: true, text: 'Private repository source', truncated: false };
@@ -173,6 +227,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
       }
       if (url.endsWith('/profile/catalog')) data = { roles: ['coordinator', 'researcher'], models: [{ id: 'server-default' }], max_agents: 8 };
       if (url.endsWith('/profile')) data = profile;
+      if (url.endsWith('/collaboration-profile')) data = { revision: 0, public: {}, private: {}, permissions: { auto_reply_public: false, auto_prepare_drafts: true } };
       return { ok: true, json: async () => data };
     }
   });
@@ -193,7 +248,7 @@ function fixture(auth = { enabled: false }, settings = {}) {
     key(event) { listeners.get('keydown')?.({ preventDefault() {}, ...event }); },
     profile(value) { profile = value; },
     responseProfile(value) { responseProfileOverride = value; },
-    role(id) { return $('role-options').children.find(button => button.textContent.endsWith(' · ' + id)); },
+    role(id) { return $('role-options').children.find(button => button.agentId === id); },
     async chooseRole(id = 'research') { await $('choose-role').onclick(); this.role(id).onclick(); },
     tasks(value) { tasks = value; },
     responseContext(value) { responseContextOverride = value; },
@@ -1519,7 +1574,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const body = JSON.parse(chatPosts(f)[0].options.body);
     assert.equal(body.agent_id, 'research'); assert.equal(body.expected_profile_revision, 3);
     assert.deepEqual(Object.keys(body).sort(), ['agent_id', 'expected_profile_revision', 'message', 'request_id']);
-    assert.equal(f.storage.size, 0); assert(f.$('status').textContent.includes('researcher'));
+    assert.equal(f.storage.size, 0); assert(f.$('status').textContent.includes('研究（research）'));
     await f.send('next default'); assert(!('agent_id' in JSON.parse(chatPosts(f)[1].options.body)));
   });
   await test('role picker close, repeated reads and stale callbacks never choose a role', async () => {
@@ -1548,7 +1603,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(undefined, { profile: roles(), tasks: [task()] }); await f.login('alice');
     await f.chooseRole(); f.discussion('task-one').onclick(); await f.$('refresh').onclick();
     await f.send('/agents'); await f.send('/delegate bob summary');
-    assert(f.$('role-details').textContent.includes('researcher')); assert.equal(chatPosts(f).length, 0);
+    assert(f.$('role-details').textContent.includes('研究')); assert.equal(chatPosts(f).length, 0);
     await f.send('discuss'); const body = JSON.parse(chatPosts(f)[0].options.body);
     assert.equal(body.agent_id, 'research'); assert.equal(body.selected_task.task_id, 'task-one');
     await f.chooseRole(); f.$('clear-role').onclick(); await f.send('default');
@@ -1619,7 +1674,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
   await test('role read failure or timeout preserves selection and cancelled late results stay closed', async () => {
     const f = fixture(undefined, { profile: roles() }); await f.login('alice'); await f.chooseRole();
     f.failReads(503); await f.$('choose-role').onclick();
-    assert(f.$('role-details').textContent.includes('researcher'));
+    assert(f.$('role-details').textContent.includes('研究'));
     assert(f.$('role-options').children[0].textContent.includes('无法读取'));
     f.failReads(0); f.hold(); const read = f.$('choose-role').onclick();
     const timeout = [...f.timers.values()].find(timer => timer.delay === 15000); timeout.callback();
@@ -1662,7 +1717,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const f = fixture(undefined, { profile: roles(), tasks: [task()] }); await f.login('alice');
     await f.chooseRole(); f.discussion('task-one').onclick();
     f.messageFailure(409, 'selected_task_stale_before_dispatch'); await f.send('question');
-    assert.equal(f.storage.size, 0); assert(f.$('role-details').textContent.includes('researcher'));
+    assert.equal(f.storage.size, 0); assert(f.$('role-details').textContent.includes('研究'));
     assert(!f.$('role-details').textContent.includes('失效'));
     f.tasks([task({ revision: 4 })]); f.messageFailure(null); await f.$('refresh').onclick();
     f.discussion('task-one').onclick(); await f.send('question');
@@ -2159,6 +2214,238 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     f.$('text').value = '写到一半';
     f.tasks([task({ status: 'awaiting_owner', revision: 4 })]); await f.$('refresh').onclick();
     assert(f.$('task-context-title').textContent.includes('已失效'));
+  });
+  await test('rail active states stay mutually exclusive, overlays dismiss on navigation, and display names format cleanly', async () => {
+    const f = fixture(undefined, {
+      profile: roles(),
+      people: [{ id: 'gitlab-42', display_name: '陈工' }],
+      proposals: [{ id: 9, owner: 'gitlab-42', summary: 'Check OIDC', status: 'pending', revision: 0 }],
+      tasks: [task({ requester: 'gitlab-42', owner: 'alice', status: 'working' })]
+    });
+    await f.login('alice');
+    await settle();
+    // Role picker uses localized Chinese labels without raw English role keys, and closes composer-menu.
+    f.$('composer-menu-toggle').onclick();
+    assert.equal(f.$('composer-menu').classList.contains('hide'), false);
+    await f.$('choose-role').onclick();
+    assert.equal(f.$('composer-menu').classList.contains('hide'), true);
+    assert.equal(f.$('role-picker').classList.contains('hide'), false);
+    for (const child of f.$('role-options').children) {
+      assert(!/coordinator|researcher|butler/.test(child.textContent), child.textContent);
+    }
+    // Toggling composer-menu-toggle dismisses the open sub-picker.
+    f.$('composer-menu-toggle').onclick();
+    assert.equal(f.$('role-picker').classList.contains('hide'), true);
+    // Opening a drawer closes floating pickers and highlights only that drawer's rail button.
+    await f.$('choose-role').onclick();
+    assert.equal(f.$('role-picker').classList.contains('hide'), false);
+    await f.$('open-agents').onclick();
+    assert.equal(f.$('role-picker').classList.contains('hide'), true);
+    assert.equal(f.$('open-account').classList.contains('active'), true);
+    assert.equal(f.$('rail-more').classList.contains('active'), true);
+    assert.equal(f.$('open-chat').classList.contains('active'), false);
+    assert.equal(f.$('toggle-tasks').classList.contains('active'), false);
+    f.$('open-chat').onclick();
+    assert.equal(f.$('open-account').classList.contains('active'), false);
+    assert.equal(f.$('rail-more').classList.contains('active'), false);
+    assert.equal(f.$('open-chat').classList.contains('active'), true);
+    assert.equal(f.$('toggle-tasks').classList.contains('active'), false);
+    // Rail menu opens and dismisses via Escape without stealing chat active state.
+    f.$('rail-more').onclick();
+    assert.equal(f.$('rail-menu').classList.contains('hide'), false);
+    assert.equal(f.$('rail-more').classList.contains('active'), true);
+    f.key({ key: 'Escape' });
+    assert.equal(f.$('rail-menu').classList.contains('hide'), true);
+    assert.equal(f.$('rail-more').classList.contains('active'), false);
+    assert.equal(f.$('rail-more').focused, true);
+    // Display names disambiguate opaque GitLab IDs across proposals and tasks.
+    assert.match(f.$('conversation').textContent, /接收人：陈工（gitlab-42）/);
+    assert.match(f.$('tasks').textContent, /陈工（gitlab-42） → alice/);
+  });
+  await test('multi-PC node assignment bar appears on owner working tasks and posts node selection', async () => {
+    const f = fixture(undefined, {
+      nodes: [{ id: 'gpu-box', name: '算力机', online: true }, { id: 'office-pc', name: '办公机', online: false }],
+      tasks: [task({
+        id: 'node-task', requester: 'alice', owner: 'bob', status: 'working', revision: 2,
+        my_node_assignment: { node_id: 'gpu-box', node_name: '算力机', task_revision: 2, instruction: '跑压测', status: 'queued' }
+      })]
+    });
+    await f.login('bob');
+    const bar = walk(f.$('conversation')).find(n => n.className === 'node-assign-bar');
+    assert(bar);
+    assert.match(bar.textContent, /已分配给节点 算力机（gpu-box）：等待该 PC 拉取/);
+    const select = walk(bar).find(n => n.tagName === 'select');
+    const input = walk(bar).find(n => n.tagName === 'input');
+    assert.equal(select.value, 'gpu-box');
+    select.value = 'office-pc';
+    input.value = '用本地 Claude 处理';
+    await findButton(bar, '派给此 PC').onclick();
+    const post = f.calls.find(c => c.url === '/api/tasks/node-task/node-assignment' && c.options.method === 'POST');
+    assert(post);
+    assert.deepEqual(JSON.parse(post.options.body), { node_id: 'office-pc', expected_revision: 2, instruction: '用本地 Claude 处理' });
+    await findButton(bar, '取消指派').onclick();
+    const clearPost = f.calls.filter(c => c.url === '/api/tasks/node-task/node-assignment' && c.options.method === 'POST').at(-1);
+    assert.deepEqual(JSON.parse(clearPost.options.body), { node_id: null, expected_revision: 2 });
+  });
+  await test('one-click PC node onboarding allows preset fill, optional id, and prints Unix + Windows commands', async () => {
+    const f = fixture();
+    await f.login('bob');
+    await f.$('open-account').onclick();
+    await settle();
+    const card = walk(f.$('contacts-view')).find(n => n.className === 'member-card nodes-card');
+    assert(card);
+    await findButton(card, '💻 办公主力机').onclick();
+    await findButton(card, '添加 PC 节点').onclick();
+    const createCall = f.calls.find(c => c.url === '/api/nodes' && c.options.method === 'POST');
+    assert(createCall);
+    assert.deepEqual(JSON.parse(createCall.options.body), { id: '', name: '办公主力机', capabilities: '' });
+    const areas = walk(card).filter(n => n.tagName === 'textarea').map(n => n.value);
+    assert(areas.some(v => v.includes('curl -fsSL http://10.0.0.11:5176/node/install.sh | sh -s -- agn_')));
+    assert(areas.some(v => v.includes('$env:AGENCT_NODE_TOKEN="agn_') && v.includes('irm http://10.0.0.11:5176/node/install.ps1 | iex')));
+  });
+  await test('self-dispatched PC node tasks render as grouped Muse topic cards in sidebar without cluttering chat cards', async () => {
+    const f = fixture(undefined, {
+      nodes: [{ id: 'homelab', name: '办公主力机', online: true }],
+      tasks: [task({
+        id: 'topic-atlas',
+        requester: 'bob',
+        owner: 'bob',
+        summary: '📁 atlas 仓库上下文',
+        status: 'completed',
+        revision: 6,
+        is_topic: true,
+        turn_count: 2,
+        recent_turns: [
+          { seq: 1, question: '看看当前分支', answer: 'dev' },
+          { seq: 2, question: '最近一次commit', answer: 'abc123' }
+        ]
+      })]
+    });
+    await f.login('bob');
+    // Self-topic never renders a delegation card in #conversation or grabs focus automatically.
+    assert(!walk(f.$('conversation')).some(n => (n.className || '').includes('task-chat')));
+    assert.equal(f.$('task-context').classList.contains('hide'), true);
+
+    // Sidebar displays grouped Topic Context card with 2 turns and follow-up action button.
+    const topicCard = walk(f.$('tasks')).find(n => n.taskId === 'topic-atlas');
+    assert(topicCard);
+    assert.match(topicCard.textContent, /同类上下文 · 2 轮对话/);
+    assert.match(topicCard.textContent, /管家自动归并索引/);
+    assert.match(topicCard.textContent, /已归并 2 轮上下文记录/);
+    const followup = findButton(topicCard, '带入此上下文追问');
+    assert(followup);
+    followup.onclick();
+    assert.equal(f.$('task-context').classList.contains('hide'), false);
+    assert.equal(f.$('task-context-label').textContent, '主题上下文');
+  });
+  await test('settled 已记住 cards anchor at their historical timestamp above newer messages and dismiss cleanly', async () => {
+    const f = fixture(undefined, {
+      messages: [
+        { role: 'user', content: 'old question', status: 'complete', created_at: '2026-11-16 06:00:00' },
+        { role: 'assistant', content: 'old reply', status: 'complete', created_at: '2026-11-16 06:01:00' },
+        { role: 'user', content: 'newer question', status: 'complete', created_at: '2026-11-16 11:00:00' },
+        { role: 'assistant', content: 'newer reply', status: 'complete', created_at: '2026-11-16 11:01:00' }
+      ],
+      profileSuggestions: [
+        { id: 'sug-1', expected_revision: 0, status: 'confirmed', created_at: '2026-11-16 06:23:17', changes: { private: { work_context: 'test' } } }
+      ]
+    });
+    await f.login('bob');
+    const items = f.$('conversation').children;
+    const sugIdx = items.findIndex(n => n.dataset?.suggestion === 'sug-1');
+    const newerIdx = items.findIndex(n => n.textContent.includes('newer question'));
+    assert(sugIdx >= 0 && newerIdx > sugIdx, `expected settled suggestion (${sugIdx}) above newer message (${newerIdx})`);
+    const dismiss = findButton(items[sugIdx], '×');
+    assert(dismiss);
+    await dismiss.onclick();
+    await settle();
+    assert(!f.$('conversation').children.some(n => n.dataset?.suggestion === 'sug-1'));
+  });
+  await test('image attachment uploads, previews in composer, sends marker to Hub, and renders in chat bubble', async () => {
+    const attId = 'att_' + '0'.repeat(31) + '1';
+    let postedMessage = null;
+    const f = fixture();
+    await f.login('bob');
+    const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    f.$('chat-image-input').files = [{
+      name: 'bug.png',
+      type: 'image/png',
+      size: pngBytes.byteLength,
+      arrayBuffer: async () => pngBytes.buffer,
+    }];
+    await f.$('chat-image-input').onchange();
+    assert.equal(f.$('chat-attachments').classList.contains('hide'), false);
+    assert(walk(f.$('chat-attachments')).some(n => n.className === 'chat-attachment-chip' && n.textContent.includes('bug.png')));
+
+    await f.send('');
+    const msgCall = f.calls.find(c => c.url === '/api/messages' && c.options.method === 'POST');
+    assert(msgCall);
+    postedMessage = JSON.parse(msgCall.options.body).message;
+    assert.match(postedMessage, new RegExp(`/api/attachments/${attId}`));
+    assert.equal(f.$('chat-attachments').classList.contains('hide'), true);
+
+    f.calls.length = 0;
+    // Simulate Hub persistence returning message with attachment marker.
+    const f2 = fixture(undefined, {
+      messages: [
+        { role: 'user', content: postedMessage, status: 'complete', created_at: '2026-11-16 12:00:00' }
+      ]
+    });
+    await f2.login('bob');
+    await settle();
+    const imgCards = walk(f2.$('conversation')).filter(n => n.className === 'msg-image-card');
+    assert.equal(imgCards.length, 1);
+    assert.match(imgCards[0].textContent, /bug\.png/);
+  });
+  await test('switch-account stays hidden on active browser login and after logout/401 reset, and only appears for restricted sessions', async () => {
+    const active = fixture({ enabled: true, authenticated: true, user: 'bob', csrf_token: 'csrf-1', member_status: 'active' });
+    await active.ready();
+    await settle();
+    assert.equal(active.$('switch-account').classList.contains('hide'), true);
+    await active.$('logout').onclick();
+    assert.equal(active.$('switch-account').classList.contains('hide'), true);
+    assert.equal(active.$('oidc-login').classList.contains('hide'), false);
+
+    const restricted = fixture({ enabled: true, authenticated: true, user: 'guest', csrf_token: 'csrf-2', member_status: 'invited' });
+    await restricted.ready();
+    await settle();
+    assert.equal(restricted.$('oidc-login').classList.contains('hide'), true);
+    assert.equal(restricted.$('switch-account').classList.contains('hide'), false);
+  });
+  await test('GitLab integration card shows webhook URL, saves Personal Access Token, and triggers manual sync', async () => {
+    const f = fixture();
+    await f.login('bob');
+    await f.$('open-account').onclick();
+    await settle();
+    const card = walk(f.$('contacts-view')).find(n => n.className === 'member-card gitlab-card');
+    assert(card);
+    const hookArea = walk(card).find(n => n.tagName === 'textarea');
+    assert.equal(hookArea.value, 'http://10.0.0.11:5176/webhooks/gitlab');
+    const inputs = walk(card).filter(n => n.tagName === 'input');
+    const urlInput = inputs.find(n => n.type === 'url');
+    const userInput = inputs.find(n => !n.type);
+    const tokenInput = inputs.find(n => n.type === 'password');
+    assert.equal(urlInput.value, 'https://git.example.com');
+    assert.equal(userInput.value, 'bob');
+    tokenInput.value = 'glpat-secret-token-1234';
+    await findButton(card, '保存 GitLab 配置').onclick();
+    await settle();
+    const saveCall = f.calls.find(c => c.url === '/api/gitlab/config' && c.options.method === 'POST');
+    assert(saveCall);
+    assert.deepEqual(JSON.parse(saveCall.options.body), {
+      base_url: 'https://git.example.com',
+      gitlab_username: 'bob',
+      auto_poll_todos: true,
+      token: 'glpat-secret-token-1234',
+    });
+    assert.equal(tokenInput.value, '');
+    assert.match(card.textContent, /已连通/);
+
+    await findButton(card, '立即拉取 GitLab 待办').onclick();
+    await settle();
+    const syncCall = f.calls.find(c => c.url === '/api/gitlab/sync' && c.options.method === 'POST');
+    assert(syncCall);
+    assert.match(card.textContent, /已扫描 2 条待办/);
   });
   console.log('Client regression tests passed');
 

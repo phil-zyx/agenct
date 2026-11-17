@@ -122,7 +122,7 @@ function createDraftUI({ api, current, article, conversation }) {
           || response.task_context?.id !== taskId) throw Error('草稿响应无效');
       const stale = receipt.current_stale || tasks.get(taskId).revision !== draft.task_revision || tasks.get(taskId).status !== 'working';
       panel.append(article(`草稿第 ${draft.seq ?? '—'} 版${draft.base_draft_id ? ' · 根据已有草稿修改' : ''}。模型生成文本，未经验证。任务版本 ${draft.task_revision}；角色版本 ${response.runtime_profile?.revision ?? '未知'}。`
-        + (stale ? ' 已过期，仅供查看，不能直接交付。' : ' 请编辑审阅，再点击任务上的「提交人工交付」并确认。')));
+        + (stale ? ' 已过期，仅供查看，不能直接交付。' : ' 请编辑审阅，再点击下方「使用此草稿填入人工交付」，并在对话中确认交付。')));
       const truncated = [
         response.task_context.summary_truncated && '共享摘要',
         response.task_context.details_truncated && '共享材料',

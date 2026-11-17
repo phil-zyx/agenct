@@ -245,6 +245,15 @@ pub(super) async fn proposal_action(
                 params![task, user, details],
             )?;
         }
+        crate::sagent::on_task_delegated(
+            &tx,
+            &h,
+            &task,
+            &user,
+            owner,
+            summary,
+            a.details.as_deref(),
+        )?;
         Some(task)
     } else {
         None

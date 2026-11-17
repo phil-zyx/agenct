@@ -260,7 +260,7 @@ async function freePort() {
     };
     try {
     await button(carol, '刷新共同状态').click(); await bounded(held);
-    await carol.locator('#logout').click();
+    await carol.locator('#rail-more').click(); await carol.locator('#logout').click();
     await carol.locator('#token').fill(tokens.eve); await carol.locator('#enter').click();
     await carol.locator('#room:not(.hide)').waitFor();
     release(); await carol.unroute(detailUrl); await pause(200);
@@ -296,7 +296,7 @@ async function freePort() {
       await button(alice, '确认归档项目').click();
       assert.equal((await saved).status(), 200);
       await alice.waitForFunction(() => globalThis.testSavedLoadHeld);
-      await alice.locator('#logout').click();
+      await alice.locator('#rail-more').click(); await alice.locator('#logout').click();
       await alice.locator('#token').fill(tokens.eve); await alice.locator('#enter').click();
       await alice.locator('#room:not(.hide)').waitFor();
       await openProjects(alice);
@@ -308,7 +308,7 @@ async function freePort() {
       assert.equal(await alice.locator('#project-notice').innerText(), newSessionNotice, 'Old commit must not overwrite new-session notice');
       assert.equal(await panel(alice).locator('.project-title').count(), 0);
     } finally { await alice.evaluate(() => globalThis.releaseSavedLoad()); }
-    await alice.locator('#logout').click();
+    await alice.locator('#rail-more').click(); await alice.locator('#logout').click();
     await login(alice, 'alice'); await openProject(alice, name);
     console.log('PASS post-success read and notice cannot cross account switch');
     assert.equal((await ok('alice', route)).project.status, 'archived');

@@ -449,7 +449,7 @@ async function freePort() {
     await prepare(alice, '切换账号必须丢弃此候选');
     await review(alice).check();
     const priorIdentityPreview = await button(alice, '确认发布给项目成员').elementHandle();
-    await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
+    await alice.locator('#rail-more').click(); await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
     await invokeStale(priorIdentityPreview);
     // Sign in without navigation to retain and exercise the old DOM closure.
     await alice.locator('#token').fill(tokens.eve); await alice.locator('#enter').click();

@@ -8,17 +8,51 @@ const PROFILE_CHANGE_FIELDS = {
 function editPersonalInfo(prefix = '记住：') {
   const context = session(); if (!current(context)) return;
   restorePrivateChat();
-  if (!$('text').value.trim()) { $('text').value = prefix; $('text').oninput?.(); }
-  else status('已保留输入框里的内容。可以直接告诉我想记住或修改什么。');
-  $('text').focus?.();
+  if (!$('text').value.trim()) {
+    $('text').value = prefix; $('text').oninput?.();
+    $('text').focus?.();
+    if (typeof selectComposerBlank === 'function') selectComposerBlank($('text'));
+  } else {
+    status('已保留输入框里的内容。可以直接告诉我想记住或修改什么。');
+    $('text').focus?.();
+  }
+}
+const DISMISSED_SUGGESTIONS_KEY = 'agenct.dismissed-suggestions';
+function loadDismissedSuggestions() {
+  try {
+    const raw = localStorage.getItem(DISMISSED_SUGGESTIONS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(parsed) ? parsed : []);
+  } catch { return new Set(); }
+}
+const dismissedSuggestions = loadDismissedSuggestions();
+function saveDismissedSuggestions() {
+  try { localStorage.setItem(DISMISSED_SUGGESTIONS_KEY, JSON.stringify([...dismissedSuggestions].slice(-100))); } catch {}
 }
 function resetProfileSuggestions() { profileSuggestionActions.clear(); }
 function renderProfileSuggestions(context, suggestions) {
   if (!Array.isArray(suggestions)) return [];
-  return [...suggestions].reverse().filter(item => item && ['pending', 'confirmed', 'rejected'].includes(item.status)).map(item => {
+  return [...suggestions].reverse().filter(item => item && ['pending', 'confirmed', 'rejected'].includes(item.status)
+      && (item.status === 'pending' || !dismissedSuggestions.has(item.id))).map(item => {
     const card = el('article', 'profile-suggestion' + (item.status === 'pending' ? '' : ' settled'));
     card.dataset.suggestion = item.id;
-    card.append(el('h3', null, item.status === 'confirmed' ? '已记住' : item.status === 'rejected' ? '这次没有保存' : '这样记住，可以吗？'));
+    const title = el('h3', null, item.status === 'confirmed' ? '已记住' : item.status === 'rejected' ? '这次没有保存' : '这样记住，可以吗？');
+    if (item.status !== 'pending') {
+      const head = el('header', 'card-head');
+      const dismiss = el('button', 'icon-btn small', '×');
+      dismiss.type = 'button';
+      dismiss.setAttribute('aria-label', '收起这条记录');
+      dismiss.onclick = () => {
+        dismissedSuggestions.add(item.id);
+        saveDismissedSuggestions();
+        card.remove?.();
+        void refresh(context);
+      };
+      head.append(title, dismiss);
+      card.append(head);
+    } else {
+      card.append(title);
+    }
     const values = el('dl', 'profile-change-list');
     for (const [group, names] of Object.entries(PROFILE_CHANGE_FIELDS)) {
       for (const [key, value] of Object.entries(item.changes?.[group] || {})) {
@@ -54,7 +88,7 @@ function renderProfileSuggestions(context, suggestions) {
         await contactApi(context, 'profile-suggestions/' + encodeURIComponent(item.id) + '/actions', 'POST', { action });
         if (!current(context)) return;
         profileSuggestionActions.delete(item.id);
-        status(action === 'confirm' ? '已记住。' : '这次没有保存。');
+        status(action === 'confirm' ? '已记住。' : '这次没有保存。', { transient: true });
         await refresh(context);
       } catch (error) {
         if (!current(context)) return;
@@ -70,5 +104,14 @@ function renderProfileSuggestions(context, suggestions) {
     }
     confirm.onclick = () => act('confirm'); reject.onclick = () => act('reject');
     actions.append(confirm, reject, revise); card.append(actions); return card;
+  });
+}
+function profileSuggestionMoments(context, suggestions) {
+  if (!Array.isArray(suggestions)) return [];
+  const cards = renderProfileSuggestions(context, suggestions);
+  return cards.map(card => {
+    const item = suggestions.find(entry => entry && entry.id === card.dataset.suggestion);
+    const settled = item && item.status !== 'pending';
+    return { at: settled && typeof parseUtc === 'function' ? parseUtc(item.created_at) : null, element: card };
   });
 }

@@ -66,7 +66,7 @@ function addMessageActions(bubble, context, message) {
   const copy = el('button', 'text-btn', '复制'); copy.type = 'button';
   copy.onclick = async () => {
     if (!current(context)) return;
-    try { await navigator.clipboard.writeText(message.content); if (current(context)) status('已复制消息。'); }
+    try { await navigator.clipboard.writeText(message.content); if (current(context)) status('已复制消息。', { transient: true }); }
     catch { if (current(context)) status('无法复制，请选择消息文本后复制。'); }
   };
   const delegate = el('button', 'text-btn', '把这段交给某人'); delegate.type = 'button';
@@ -115,18 +115,83 @@ function addMessageActions(bubble, context, message) {
   if (messagePanels.has(messageKey)) bubble.append(messagePanels.get(messageKey));
 }
 
+function selectComposerBlank(box) {
+  const blank = /\[[^\]]+\]/.exec(box?.value || '');
+  if (blank) box.setSelectionRange?.(blank.index, blank.index + blank[0].length);
+}
+
 function renderChatExamples() {
   const box = el('section', 'chat-examples');
   box.append(el('h2', null, '有什么需要帮忙的？'), el('p', 'muted', '直接告诉我就好。需要请同事帮忙时，会先由你确认。'));
+  const fill = text => {
+    if ($('text').value.trim()) { status('输入框里还有没发送的内容，请先发送或清空，再选择示例。'); return; }
+    $('text').value = text; $('text').oninput?.(); $('text').focus?.();
+    selectComposerBlank($('text'));
+  };
   for (const text of ['帮我梳理今天的工作重点', '帮我检查这份文档', '把我的想法整理成待办事项']) {
     const button = el('button', 'example-prompt', text); button.type = 'button';
-    button.onclick = () => {
-      if ($('text').value.trim()) { status('输入框里还有没发送的内容，请先发送或清空，再选择示例。'); return; }
-      $('text').value = text; $('text').oninput?.(); $('text').focus?.();
-    };
+    button.onclick = () => fill(text);
     box.append(button);
   }
+  const onboarding = el('div', 'chat-onboarding');
+  onboarding.append(el('p', 'muted', '或者花 10 秒让管家认识你（确认后才生效）：'));
+  for (const [label, template] of [
+    ['👋 告诉管家我的工作背景与回复偏好', '记住：我在 [所属团队] 负责 [核心工作]，回复我时请先给结论、简洁直接。'],
+    ['🪪 设置向同事公开的协作名片', '把我的公开资料设为：团队是 [所属团队]，负责 [主要职责]，同事可以找我帮忙 [可协助事项]，发起请求时请提供 [所需背景与期望时间]。']
+  ]) {
+    const button = el('button', 'example-prompt', label); button.type = 'button';
+    button.onclick = () => fill(template);
+    onboarding.append(button);
+  }
+  box.append(onboarding);
   return box;
+}
+
+const ATTACHMENT_LINE_RE = /\[图片附件:\s*([^\]]+?)\s*\(\/api\/attachments\/(att_[0-9a-f]{32})\)\]/g;
+
+function extractMessageAttachments(content) {
+  const raw = String(content ?? '');
+  const attachments = [];
+  let hasMatch = false;
+  const stripped = raw.replace(ATTACHMENT_LINE_RE, (_, name, id) => {
+    hasMatch = true;
+    attachments.push({ name: name.trim(), id });
+    return '';
+  });
+  return {
+    cleanText: hasMatch ? stripped.replace(/\n{3,}/g, '\n\n').trim() : raw,
+    attachments,
+  };
+}
+
+function renderMessageAttachments(context, attachments) {
+  const wrap = el('div', 'msg-attachments');
+  for (const att of attachments) {
+    const card = el('div', 'msg-image-card');
+    const img = el('img', 'msg-image');
+    img.alt = att.name || '图片附件';
+    img.loading = 'lazy';
+    img.onclick = () => card.classList.toggle('expanded');
+    const cached = typeof attachmentDataUrls !== 'undefined' ? attachmentDataUrls.get(att.id) : null;
+    if (cached) {
+      img.src = cached;
+    } else if (context && typeof api === 'function') {
+      api(context, 'attachments/' + encodeURIComponent(att.id))
+        .then(data => {
+          if (!current(context) || !data?.data_base64 || !data?.mime_type) return;
+          const url = `data:${data.mime_type};base64,${data.data_base64}`;
+          if (typeof attachmentDataUrls !== 'undefined') attachmentDataUrls.set(att.id, url);
+          img.src = url;
+        })
+        .catch(() => {
+          img.alt = `${att.name || '图片'}（加载失败）`;
+        });
+    }
+    const caption = el('span', 'msg-image-caption', att.name || '图片');
+    card.append(img, caption);
+    wrap.append(card);
+  }
+  return wrap;
 }
 
 function renderConversation(context, messages, proposals, moments = []) {
@@ -144,7 +209,13 @@ function renderConversation(context, messages, proposals, moments = []) {
     const notice = message.role !== 'user' && /^\[(系统提示|MOCK)/.test(message.content);
     const bubble = el('article', 'msg ' + (message.role === 'user' ? 'msg-user' : notice ? 'msg-notice' : 'msg-assistant')
       + (message.status === 'failed' ? ' msg-failed' : message.status === 'pending' ? ' msg-sending' : ''));
-    bubble.append(message.role === 'assistant' && !notice ? renderMarkdown(message.content) : el('div', 'msg-body', message.content));
+    const { cleanText, attachments } = extractMessageAttachments(message.content);
+    if (cleanText || !attachments.length) {
+      bubble.append(message.role === 'assistant' && !notice ? renderMarkdown(cleanText) : el('div', 'msg-body', cleanText));
+    }
+    if (attachments.length) {
+      bubble.append(renderMessageAttachments(context, attachments));
+    }
     addMessageActions(bubble, context, message);
     // In flight is shown by the typing dots; only outcomes needing attention get words.
     if (!['complete', 'pending'].includes(message.status)) bubble.append(el('div', 'msg-status', MESSAGE_STATUS[message.status] || message.status));
@@ -222,7 +293,7 @@ function renderConversation(context, messages, proposals, moments = []) {
     element.proposalId = proposal.id;
     const head = el('header', 'card-head');
     head.append(el('span', 'card-kicker', '委派提案'), badge(PROPOSAL_STATUS, proposal.status));
-    element.append(head, el('div', 'field', '接收人：' + proposal.owner), el('blockquote', 'summary-quote', proposal.summary));
+    element.append(head, el('div', 'field', '接收人：' + memberLabel(proposal.owner)), el('blockquote', 'summary-quote', proposal.summary));
     if (proposal.task_id) element.append(el('div', 'meta', '已创建任务 #' + String(proposal.task_id).slice(0, 8)));
     if (proposal.status === 'pending') {
       element.append(el('p', 'note', '确认后才会创建任务，并将接收人、这份摘要和附带材料共享给对方。你的私聊不会发送。'));
@@ -277,7 +348,7 @@ function renderConversation(context, messages, proposals, moments = []) {
     group.append(reject);
     for (const proposal of oldProposals) {
       const row = el('article', 'old-proposal'); row.proposalId = proposal.id;
-      row.append(el('p', null, proposal.owner + '：' + proposal.summary));
+      row.append(el('p', null, memberLabel(proposal.owner) + '：' + proposal.summary));
       addActions(row, context, 'proposals', proposal, [['confirm', '确认共享并委派'], ['edit', '修改后确认'], ['reject', '拒绝，不共享']]);
       const editor = actionEditors.get('proposals:' + proposal.id);
       if (editor) {

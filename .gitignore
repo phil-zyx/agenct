@@ -21,3 +21,6 @@ __pycache__/
 
 /playwright-report/
 /test-results/
+
+/deploy/docker/agenct.env
+/deploy/docker/data/

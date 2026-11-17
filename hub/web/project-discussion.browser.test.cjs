@@ -228,7 +228,7 @@ async function freePort() {
     try {
       await button(alice, '与我的 Agent 讨论').click();
       await bounded(readReady, 'Discussion did not freshly read project');
-      await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
+      await alice.locator('#rail-more').click(); await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
       loggedOut = true;
     } finally {
       releaseRead();

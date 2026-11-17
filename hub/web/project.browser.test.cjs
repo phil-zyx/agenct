@@ -337,7 +337,7 @@ async function freePort() {
     await alice.emulateMedia({ colorScheme: 'light' });
     await carol.emulateMedia({ colorScheme: 'light' });
     console.log('PASS mobile panel isolates focus, restores private composer, and preserves unsent text');
-    await carol.locator('#logout').click();
+    await carol.locator('#rail-more').click(); await carol.locator('#logout').click();
     await carol.locator('#token').waitFor();
     await login(carol, 'eve');
     await openProjects(carol);

@@ -15,6 +15,7 @@ pub mod gitlab;
 mod materials;
 mod members;
 mod messages;
+mod nodes;
 pub mod oidc;
 mod policy;
 mod private_staging;
@@ -29,6 +30,7 @@ mod proposals;
 pub mod publication;
 mod repo_context;
 mod runtime;
+mod sagent;
 mod schema;
 mod task_context;
 mod tasks;
@@ -153,6 +155,11 @@ pub struct Hub {
     /// Summaries of large, append-only shared task material, so a turn that
     /// references the same material does not re-summarize it every time.
     material_summaries: Arc<Mutex<HashMap<String, String>>>,
+    attachments_dir: Option<PathBuf>,
+    attachments: Arc<Mutex<HashMap<String, materials::StoredAttachment>>>,
+    automation_path: Option<PathBuf>,
+    automation: Arc<Mutex<sagent::AutomationStore>>,
+    automation_notify: Arc<tokio::sync::Notify>,
     /// Start the owner's private draft when a task enters `working`.
     auto_draft: bool,
     auto_draft_slots: Arc<tokio::sync::Semaphore>,
@@ -235,6 +242,21 @@ impl Hub {
         } else {
             None
         };
+        let attachments_dir = (config.database.to_str() != Some(":memory:")).then(|| {
+            config
+                .database
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("attachments")
+        });
+        let automation_path = (config.database.to_str() != Some(":memory:")).then(|| {
+            config
+                .database
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join("automation_state.json")
+        });
+        let automation_store = sagent::load_automation(automation_path.as_deref());
         let mut db = Connection::open(config.database)?;
         // Reject newer databases before WAL mode, schema changes or recovery writes.
         schema::migrate(&mut db)?;
@@ -259,6 +281,11 @@ impl Hub {
             private_users: Arc::new(Mutex::new(None)),
             startup_ok: None,
             material_summaries: Arc::new(Mutex::new(HashMap::new())),
+            attachments_dir,
+            attachments: Arc::new(Mutex::new(HashMap::new())),
+            automation_path,
+            automation: Arc::new(Mutex::new(automation_store)),
+            automation_notify: Arc::new(tokio::sync::Notify::new()),
             auto_draft: false,
             auto_draft_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             auto_draft_notify: Arc::new(tokio::sync::Notify::new()),
@@ -268,6 +295,7 @@ impl Hub {
             runtime: config.runtime,
             client: reqwest::Client::builder()
                 .no_proxy()
+                .user_agent("agenct-hub/0.2")
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(75))
                 .build()?,
@@ -477,6 +505,11 @@ pub fn app(mut hub: Hub) -> Router {
             post(materials::extract).layer(DefaultBodyLimit::max(3 * 1024 * 1024)),
         )
         .route(
+            "/api/attachments",
+            post(materials::upload_attachment).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),
+        )
+        .route("/api/attachments/{id}", get(materials::get_attachment))
+        .route(
             "/api/profile",
             get(profiles::get_profile).put(profiles::update_profile),
         )
@@ -506,6 +539,30 @@ pub fn app(mut hub: Hub) -> Router {
             get(drafts::status),
         )
         .route("/api/tasks/{id}/actions", post(tasks::action))
+        .route("/api/nodes", get(nodes::list).post(nodes::create))
+        .route("/api/nodes/{id}/token", post(nodes::rotate_token))
+        .route("/api/nodes/{id}/remove", post(nodes::remove))
+        .route("/api/tasks/{id}/node-assignment", post(nodes::assign_task))
+        .route("/node/agenct-node.py", get(nodes::agent_script))
+        .route("/node/install.sh", get(nodes::install_sh))
+        .route("/node/install.ps1", get(nodes::install_ps1))
+        .route("/node/v1/work", get(nodes::work))
+        .route(
+            "/node/v1/tasks/{id}/drafts",
+            post(nodes::submit_draft).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
+        .route("/api/pulse", get(sagent::pulse))
+        .route("/api/automation", get(sagent::get_automation))
+        .route("/api/automation/rules", post(sagent::create_rule))
+        .route("/api/automation/crons", post(sagent::create_cron))
+        .route("/api/automation/tick", post(sagent::tick_crons))
+        .route("/api/webhooks/gitlab", post(sagent::gitlab_webhook))
+        .route("/webhooks/gitlab", post(sagent::gitlab_webhook))
+        .route(
+            "/api/gitlab/config",
+            get(sagent::get_gitlab_config).post(sagent::save_gitlab_config),
+        )
+        .route("/api/gitlab/sync", post(sagent::sync_gitlab_now))
         .route(
             "/api/tasks/{id}/worker",
             get(worker_api::status).post(worker_api::enqueue),

@@ -15,13 +15,16 @@ function rememberDevToken(value) {
   try { if (value) sessionStorage.setItem(DEV_AUTH_KEY, value); else sessionStorage.removeItem(DEV_AUTH_KEY); } catch { /* Login still works when storage is unavailable. */ }
 }
 let token = '', user = '', epoch = 0, refreshVersion = 0;
-let browserMode = null, csrfToken = '', logoutPending = false;
+let browserMode = null, csrfToken = '', logoutPending = false, openSignup = false;
 let controller = new AbortController(), pendingSend = null, pendingTurn = null;
 let displayedMessages = [];
 let turnStorageAvailable = true;
 let selectedAgent = null, roleGeneration = 0, roleRead = null, roleButtons = [];
 let selectedProject = null;
 let selectedTask = null, visibleTasks = new Map(), discussionButtons = [], taskView = 0;
+let userNodes = [];
+let pendingAttachments = [];
+const attachmentDataUrls = new Map();
 const TURN_STORAGE_KEY = 'agenct.pending-chat-turn.v1';
 const actionEditors = new Map();
 let notificationTasks = null, notificationsEnabled = false;
@@ -120,6 +123,8 @@ const TASK_STATUS = {
   awaiting_owner: ['待接手', 'wait'], working: ['进行中', 'work'], ready_for_acceptance: ['待验收', 'review'],
   completed: ['已完成', 'done'], canceled: ['已取消', 'muted']
 };
+const ROLE_LABELS = { coordinator: '管家', researcher: '研究', writer: '写作', reviewer: '审阅' };
+const roleLabel = role => ROLE_LABELS[role] || role;
 const PROPOSAL_STATUS = { pending: ['待你确认', 'review'], confirmed: ['已确认', 'done'], rejected: ['已拒绝', 'muted'] };
 const MESSAGE_STATUS = { pending: '发送中…', failed: '这次没有取得回复，可以重新提问', interrupted: '已中断', uncertain: '未确认' };
 const ACTION_STYLE = { confirm: 'primary', accept: 'primary', deliver: 'primary', approve: 'primary', cancel: 'danger' };
@@ -140,32 +145,25 @@ const draftUI = createDraftUI({ api, current, article, conversation: taskPane })
 
 const profileUI = createProfileUI({ api, current, article, host: () => $('profile-view'), status,
   onVisibility: open => {
-    if (open) { if (typeof closeProjects === 'function') closeProjects(); closeContacts(); collaborationProfileUI.close(); }
+    if (open) {
+      if (typeof closeComposerOverlays === 'function') closeComposerOverlays();
+      if (typeof closeProjects === 'function') closeProjects();
+      if (typeof closePeerConversation === 'function') closePeerConversation();
+      closeContacts(); collaborationProfileUI.close();
+    }
     $('room').classList[open ? 'add' : 'remove']('settings-open');
     $('profile-view').classList[open ? 'remove' : 'add']('hide');
-    $('open-agents').classList[open ? 'add' : 'remove']('active');
-    $('open-chat').classList.add('active');
-    $('open-agents').setAttribute('aria-expanded', String(open));
-    $('toggle-tasks').setAttribute('aria-pressed', String(!open && $('room').classList.contains('tasks-open')));
-    $('open-chat').setAttribute('aria-current', 'page');
+    if (typeof syncRailState === 'function') syncRailState();
   },
   onSaved: revision => {
     if (selectedAgent && selectedAgent.revision !== revision) selectedAgent.invalidated = true;
     closeRolePicker();
     renderRoleSelection();
-  }
+  },
+  onSwitchAccount: () => openAccount()
 });
 
-const collaborationProfileUI = createCollaborationProfileUI({ api: (context, ...args) => contactApi(context, ...args), current, host: () => $('collaboration-profile-view'), status, onEdit: () => editPersonalInfo(),
-  onVisibilityChange: open => {
-    if (open) { if (typeof closeProjects === 'function') closeProjects(); closeContacts(); profileUI.reset(); }
-    $('room').classList[open ? 'add' : 'remove']('collaboration-settings-open');
-    $('collaboration-profile-view').classList[open ? 'remove' : 'add']('hide');
-    $('open-collaboration').classList[open ? 'add' : 'remove']('active');
-    $('open-collaboration').setAttribute('aria-expanded', String(open));
-  }
-});
-$('open-collaboration').onclick = () => collaborationProfileUI.open(session());
+const collaborationProfileUI = createCollaborationProfileUI({ api: (context, ...args) => contactApi(context, ...args), current, host: () => $('collaboration-profile-view'), status, embedded: true, onEdit: prefix => editPersonalInfo(prefix) });
 
 const validAgentBinding = agent => agent && typeof agent.id === 'string'
   && /^[A-Za-z0-9_-]{1,32}$/.test(agent.id)
@@ -185,7 +183,7 @@ function renderRoleSelection() {
   $('clear-role').disabled = roleLocked() || !selectedAgent;
   roleButtons.forEach(button => { button.disabled = roleLocked(); });
   $('role-details').textContent = agent
-    ? `本次角色：${agent.name || agent.id} · ${agent.role || '以原始回执为准'} · 角色版本 ${agent.revision}`
+    ? `本次角色：${agent.name || agent.id} · ${agent.role ? roleLabel(agent.role) : '以原始回执为准'} · 角色版本 ${agent.revision}`
       + (pendingTurn ? '\n发送角色已锁定；核对结果前不能切换。'
         : agent.invalidated ? '\n所选配置已变更，选择已失效。请重新选择或明确恢复默认管家。'
           : '\n仅用于下一条普通聊天。')
@@ -195,6 +193,7 @@ function renderRoleSelection() {
 $('choose-role').onclick = async () => {
   const context = session();
   if (!current(context) || roleLocked()) return;
+  if (typeof setMenuOpen === 'function') setMenuOpen(false);
   closeRolePicker();
   const generation = roleGeneration;
   const reads = new AbortController();
@@ -225,7 +224,9 @@ $('choose-role').onclick = async () => {
     for (const agent of profile.agents.filter(agent => agent.enabled)) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.textContent = `${agent.name} · ${agent.role} · ${agent.id}`;
+      button.agentId = agent.id;
+      const label = roleLabel(agent.role);
+      button.textContent = agent.name === label ? agent.name : `${agent.name} · ${label}`;
       button.onclick = () => {
         if (!valid()) return;
         selectedAgent = { id: agent.id, name: agent.name, role: agent.role,
@@ -297,12 +298,12 @@ function renderTaskContext() {
   // Unchanged polling must not repeat live announcements.
   if ($('task-context-status').textContent !== contextNotice) $('task-context-status').textContent = contextNotice;
   $('task-context-title').textContent = task ? (task.invalidated ? '（已失效）' : '') + task.summary : '';
-  $('task-context-label').textContent = task?.auto ? '回复给任务' : '讨论';
+  $('task-context-label').textContent = task?.auto ? '回复给任务' : (task?.is_topic || (task && task.requester === task.owner)) ? '主题上下文' : '讨论';
   $('task-context-details').textContent = task
     ? (pendingTurn ? '本次发送的任务上下文已锁定，核对结果前不能更换。'
       : task.invalidated ? '所选任务已变更或不再可见，此选择已失效。请重新选择任务，或清除后再发送。'
         : '仅用于下一条普通聊天；选择本身不会发送消息。')
-      + `\n任务编号：${task.id}\n版本：${task.revision}\n${task.requester} → ${task.owner} · ${task.status}`
+      + `\n任务编号：${task.id}\n版本：${task.revision}\n${memberLabel(task.requester)} → ${memberLabel(task.owner)} · ${task.status}`
       + '\n上下文范围：仅此任务的参与人、状态、共享摘要、共享材料和交付结果；服务端核实后提供，长文本可能截断。不包含其他任务或完整私聊，不授权任何任务操作或执行。'
       + `\n共享摘要：\n${task.summary}`
       + (task.details ? `\n共享材料：\n${task.details}` : '')
@@ -330,7 +331,9 @@ function addDiscussion(element, context, task) {
   const view = taskView;
   const button = document.createElement('button');
   button.type = 'button';
-  button.textContent = '讨论此任务';
+  const isTopic = Boolean(task.is_topic || task.requester === task.owner);
+  if (isTopic) button.className = 'primary';
+  button.textContent = isTopic ? '带入此上下文追问' : '讨论此任务';
   button.onclick = () => {
     if (!current(context) || view !== taskView || pendingTurn || busy.has('send') || busy.has('turn-check')) return;
     if (selectedProject) { status('请先清除项目上下文，再选择任务。'); return; }
@@ -394,6 +397,134 @@ function restoreTurn(context) {
   }
 }
 
+const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_CHAT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+
+function arrayBufferToBase64(bytes) {
+  const data = new Uint8Array(bytes);
+  let binary = '';
+  for (let at = 0; at < data.length; at += 8192) {
+    binary += String.fromCharCode(...data.subarray(at, at + 8192));
+  }
+  return btoa(binary);
+}
+
+function renderPendingAttachments() {
+  const box = $('chat-attachments');
+  if (!box) return;
+  box.replaceChildren();
+  box.classList[pendingAttachments.length ? 'remove' : 'add']('hide');
+  for (const item of pendingAttachments) {
+    const chip = el('div', 'chat-attachment-chip');
+    const thumb = el('img', 'chat-attachment-thumb');
+    thumb.src = item.dataUrl;
+    thumb.alt = item.name || '图片附件';
+    const label = el('span', 'chat-attachment-name', item.name || '图片');
+    chip.append(thumb, label);
+    if (item.uploading) {
+      chip.append(el('span', 'chat-attachment-status', '上传中…'));
+    }
+    const remove = el('button', 'text-btn chat-attachment-remove', '×');
+    remove.type = 'button';
+    remove.title = '移除图片';
+    remove.setAttribute('aria-label', '移除图片 ' + (item.name || ''));
+    remove.onclick = () => {
+      pendingAttachments = pendingAttachments.filter(x => x !== item);
+      renderPendingAttachments();
+    };
+    chip.append(remove);
+    box.append(chip);
+  }
+}
+
+async function uploadChatImageFile(file) {
+  const context = session();
+  if (!file || !current(context)) return;
+  if (!ALLOWED_CHAT_IMAGE_TYPES.has(file.type)) {
+    status('暂仅支持 PNG、JPEG、WEBP 或 GIF 格式图片。');
+    return;
+  }
+  if (file.size > MAX_CHAT_IMAGE_BYTES) {
+    status('图片大小不能超过 5 MiB。');
+    return;
+  }
+  if (pendingAttachments.length >= 4) {
+    status('单条消息最多附带 4 张图片。');
+    return;
+  }
+  let bytes;
+  try {
+    bytes = await file.arrayBuffer();
+  } catch {
+    if (current(context)) status('读取图片失败，请重试。');
+    return;
+  }
+  if (!current(context)) return;
+  if (!bytes?.byteLength || bytes.byteLength > MAX_CHAT_IMAGE_BYTES) {
+    status('图片内容为空或超过 5 MiB。');
+    return;
+  }
+  const data_base64 = arrayBufferToBase64(bytes);
+  const dataUrl = `data:${file.type};base64,${data_base64}`;
+  const item = {
+    id: null,
+    name: file.name || ('screenshot.' + (file.type === 'image/jpeg' ? 'jpg' : file.type.split('/')[1] || 'png')),
+    mime_type: file.type,
+    dataUrl,
+    uploading: true,
+  };
+  pendingAttachments = [...pendingAttachments, item];
+  renderPendingAttachments();
+  try {
+    const uploaded = await api(context, 'attachments', 'POST', {
+      name: item.name,
+      mime_type: item.mime_type,
+      data_base64,
+    });
+    if (!current(context)) return;
+    item.id = uploaded.id;
+    item.name = uploaded.name || item.name;
+    item.uploading = false;
+    attachmentDataUrls.set(uploaded.id, dataUrl);
+    renderPendingAttachments();
+  } catch (error) {
+    if (!current(context)) return;
+    pendingAttachments = pendingAttachments.filter(x => x !== item);
+    renderPendingAttachments();
+    status('图片上传失败：' + error.message);
+  }
+}
+
+if ($('attach-image')) {
+  $('attach-image').onclick = () => $('chat-image-input')?.click?.();
+}
+if ($('chat-image-input')) {
+  $('chat-image-input').onchange = async () => {
+    const files = [...($('chat-image-input').files || [])];
+    $('chat-image-input').value = '';
+    for (const file of files) await uploadChatImageFile(file);
+  };
+}
+if ($('text')) {
+  $('text').onpaste = event => {
+    const files = [...(event.clipboardData?.files || [])].filter(f => /^image\//.test(f.type));
+    if (!files.length) return;
+    event.preventDefault?.();
+    for (const file of files) void uploadChatImageFile(file);
+  };
+}
+if ($('form')) {
+  $('form').ondragover = event => {
+    if ([...(event.dataTransfer?.types || [])].includes('Files')) event.preventDefault?.();
+  };
+  $('form').ondrop = event => {
+    const files = [...(event.dataTransfer?.files || [])].filter(f => /^image\//.test(f.type));
+    if (!files.length) return;
+    event.preventDefault?.();
+    for (const file of files) void uploadChatImageFile(file);
+  };
+}
+
 function renderTurn() {
   const outgoing = $('outgoing-message');
   outgoing.replaceChildren();
@@ -401,6 +532,9 @@ function renderTurn() {
   if (pendingTurn?.text) {
     const bubble = el('article', 'msg msg-user');
     bubble.append(el('div', 'msg-body', pendingTurn.text));
+    if (pendingTurn.attachments?.length && typeof renderMessageAttachments === 'function') {
+      bubble.append(renderMessageAttachments(session(), pendingTurn.attachments));
+    }
     bubble.append(el('div', 'msg-status', pendingTurn.status === 'sending' ? '发送中…' : '等待确认发送结果'));
     outgoing.append(bubble);
   }
@@ -464,7 +598,7 @@ async function completeTurn(context, response) {
       || (expectedAgent.model_ref && profile.model_ref !== expectedAgent.model_ref)))) {
     throw Error('角色回执与本次选择不符，保留恢复凭据');
   }
-  const receiptRole = profile ? `\n本次角色：${profile.agent_id} · ${profile.role} · 角色版本 ${profile.revision}` : '';
+  const receiptRole = profile ? `\n本次角色：${roleLabel(profile.role)}（${profile.agent_id}） · 角色版本 ${profile.revision}` : '';
   const task = response.task_context;
   if (text !== null && (expectedTask
     ? !task || task.id !== expectedTask.id || task.revision !== expectedTask.revision
@@ -496,8 +630,10 @@ async function completeTurn(context, response) {
 }
 
 function resetIdentity({ preserveRecovery = false } = {}) {
+  if (typeof setRailMenuOpen === 'function') setRailMenuOpen(false);
   if (typeof resetProjects === 'function') resetProjects();
   collaborationProfileUI.reset({ discard: true });
+  clearPeopleNames();
   clearPeerSession();
   resetProfileSuggestions();
   closeContacts();
@@ -529,6 +665,10 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   selectedTask = null;
   selectedProject = null;
   selectedAgent = null;
+  userNodes = [];
+  pendingAttachments = [];
+  attachmentDataUrls.clear();
+  renderPendingAttachments();
   closeRolePicker();
   resetRepositoryUI();
   visibleTasks = new Map();
@@ -558,6 +698,8 @@ function resetIdentity({ preserveRecovery = false } = {}) {
   $('send').disabled = false;
   $('room').classList.add('hide');
   $('login').classList.remove('hide');
+  $('switch-account').classList.add('hide');
+  if (browserMode === true) $('oidc-login').classList.remove('hide');
 }
 
 // Only read requests are repeated. Mutations still require an explicit user action.
@@ -626,15 +768,16 @@ async function readSnapshot(context) {
   const abort = () => reads.abort();
   context.signal.addEventListener('abort', abort, { once: true });
   const timeout = setTimeout(abort, READ_TIMEOUT);
-  let messages, proposals, tasks, activity, profileSuggestions;
+  let messages, proposals, tasks, activity, profileSuggestions, nodes;
   try {
-    [messages, proposals, tasks, activity, profileSuggestions] = await Promise.all([
+    [messages, proposals, tasks, activity, profileSuggestions, nodes] = await Promise.all([
       api({ ...context, signal: reads.signal }, 'messages'),
       api({ ...context, signal: reads.signal }, 'proposals'),
       api({ ...context, signal: reads.signal }, 'tasks'),
       // Index is derived and optional: a failure must not block the conversation.
       api({ ...context, signal: reads.signal }, 'activity').catch(() => null),
-      api({ ...context, signal: reads.signal }, 'profile-suggestions')
+      api({ ...context, signal: reads.signal }, 'profile-suggestions'),
+      api({ ...context, signal: reads.signal }, 'nodes').catch(() => null)
     ]);
   } finally {
     clearTimeout(timeout);
@@ -642,6 +785,7 @@ async function readSnapshot(context) {
     reads.abort();
   }
   if (!current(context) || version !== refreshVersion) return;
+  if (Array.isArray(nodes)) userNodes = nodes;
   void refreshPeerContacts(context);
   if (typeof refreshProjects === 'function') void refreshProjects();
   workerUI.update(context, tasks);
@@ -652,7 +796,7 @@ async function readSnapshot(context) {
   updateNotifications(context, tasks);
   if (!Array.isArray(activity)) activity = lastActivity;
   lastActivity = activity;
-  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity, profileSuggestions, proposals.filter(isOldProposal).map(p => p.id), taskChatVersion()]);
+  const nextSnapshot = JSON.stringify([messages, proposals, tasks, activity, profileSuggestions, proposals.filter(isOldProposal).map(p => p.id), taskChatVersion(), [...peopleNames], typeof dismissedSuggestions !== 'undefined' ? [...dismissedSuggestions] : []]);
   const changed = snapshot !== '' && snapshot !== nextSnapshot;
   setSyncError(false);
   if (changed) $('sync-notice').textContent = '会话或任务有更新 · ' + new Date().toLocaleTimeString();
@@ -673,8 +817,10 @@ async function readSnapshot(context) {
   // Keep the pre-send history until the receipt resolves: polling may already
   // contain this user message, while the local sending bubble is still visible.
   displayedMessages = pendingTurn?.history || messages;
-  const entries = renderConversation(context, displayedMessages, proposals, taskMoments(context, tasks, activity));
-  entries.push(...renderProfileSuggestions(context, profileSuggestions));
+  const entries = renderConversation(context, displayedMessages, proposals, [
+    ...taskMoments(context, tasks, activity),
+    ...(typeof profileSuggestionMoments === 'function' ? profileSuggestionMoments(context, profileSuggestions) : [])
+  ]);
   const { taskCards, slots } = renderTaskCards(context, tasks);
 
   // Open panels (draft / timeline / queue) live inside the card they were opened
@@ -691,8 +837,9 @@ async function readSnapshot(context) {
   renderActivity(context, activity);
   $('task-count').textContent = tasks.length ? String(tasks.length) : '';
   // The rail badge counts tasks waiting on *this* user, not all tasks.
-  const waiting = tasks.filter(task => (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
-    || (task.requester === context.user && task.status === 'ready_for_acceptance')).length;
+  const waiting = tasks.filter(task => task.requester !== task.owner
+    && ((task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+      || (task.requester === context.user && task.status === 'ready_for_acceptance'))).length;
   $('rail-badge').textContent = waiting ? String(waiting) : '';
   if (stick) scroller.scrollTop = scroller.scrollHeight;
   renderTaskContext();
@@ -707,6 +854,7 @@ async function enterRoom(context) {
   user = me.user;
   context.user = user;
   if (!context.browserMode) rememberDevToken(context.token);
+  if (me.member) rememberPerson(me.user, me.member.display_name);
   restoreTurn(context);
   const mode = me.runtime === 'dsh' ? '真实模型' : me.runtime === 'mock' ? '离线演示' : '服务模式 ' + me.runtime;
   $('identity').replaceChildren(el('b', null, `${me.member?.display_name || user} 的管家`), el('span', 'muted', ` · ${mode}`), el('span', 'sr-only', ' · 已验证身份'));
@@ -739,11 +887,20 @@ const loginError = (() => {
   } catch { return null; }
 })();
 
+function showLoginError(message) {
+  const banner = $('login-error');
+  if (banner) {
+    banner.textContent = message || '';
+    banner.classList[message ? 'remove' : 'add']('hide');
+  } else if (message) status(message);
+}
+
 async function checkSession() {
   pendingInvitation();
   resetIdentity({ preserveRecovery: true });
   const checkEpoch = epoch;
   browserMode = null;
+  showLoginError('');
   $('dev-login').classList.add('hide');
   $('switch-account').classList.add('hide');
   $('oidc-login').classList.add('hide');
@@ -770,20 +927,21 @@ async function checkSession() {
     }
     rememberDevToken('');
     $('oidc-login').classList.remove('hide');
-    if (!data.authenticated && loginError) status(LOGIN_ERRORS[loginError] || LOGIN_ERRORS.failed);
+    if (!data.authenticated && loginError) showLoginError(LOGIN_ERRORS[loginError] || LOGIN_ERRORS.failed);
     if (data.authenticated) {
       if (typeof data.user !== 'string' || !data.user || typeof data.csrf_token !== 'string' || !data.csrf_token) {
         throw Error('登录会话响应无效');
       }
       user = data.user;
       csrfToken = data.csrf_token;
-      $('switch-account').classList.remove('hide');
+      openSignup = data.open_signup === true;
       const invitation = pendingInvitation();
       if (invitation) {
         await api(session(), 'invitations/accept', 'POST', { token: invitation });
         try { sessionStorage.removeItem('agenct.invitation'); } catch { /* unavailable */ }
       } else if (data.member_status && data.member_status !== 'active') {
         $('oidc-login').classList.add('hide');
+        $('switch-account').classList.remove('hide');
         status(data.member_status === 'invited' ? '请使用管理员提供的邀请链接加入。' : '账号已停用，请联系管理员。');
         return;
       }
@@ -923,9 +1081,18 @@ $('form').onsubmit = async event => {
   event.preventDefault();
   const context = session();
   const text = $('text').value.trim();
-  if (!text || !current(context) || busy.has('send')) return;
+  const uploading = pendingAttachments.some(a => a.uploading);
+  const readyAttachments = pendingAttachments.filter(a => a.id);
+  if ((!text && !readyAttachments.length) || !current(context) || busy.has('send')) {
+    if (uploading && current(context) && !busy.has('send')) status('图片正在上传中，请稍候再发送。');
+    return;
+  }
+  if (uploading) {
+    status('图片正在上传中，请稍候再发送。');
+    return;
+  }
   // Project discussion is read-only: never reinterpret its question as a task action.
-  if (!selectedProject && await replyToPendingAction(context, text)) return;
+  if (!selectedProject && !readyAttachments.length && text && await replyToPendingAction(context, text)) return;
   if (pendingTurn) {
     status('上次发送结果尚未确认。请先核对发送状态，或明确选择开始新尝试。');
     return;
@@ -937,14 +1104,14 @@ $('form').onsubmit = async event => {
   let chatTurn = null;
   try {
     if (selectedProject) {
-      if (selectedProject.invalidated || selectedTask || selectedRepository || /^\//.test(text)) {
-        status('项目讨论仅接受普通问题。请重新选择失效的项目，并清除任务或仓库选择；如需执行命令，先清除项目上下文。');
+      if (selectedProject.invalidated || selectedTask || selectedRepository || /^\//.test(text) || readyAttachments.length) {
+        status('项目讨论仅接受普通问题，暂不支持图片附件。请移除图片、重新选择失效的项目，并清除任务或仓库选择；如需执行命令，先清除项目上下文。');
         return;
       }
       if (!await validateSelectedProject(context)) return;
       if (!current(context) || !selectedProject || selectedProject.invalidated) return;
     }
-    if (!selectedProject && await profileUI.handle(context, text)) {
+    if (!selectedProject && !readyAttachments.length && text && await profileUI.handle(context, text)) {
       if (current(context)) {
         if ($('text').value.trim() === text) $('text').value = '';
         pendingSend = null;
@@ -953,7 +1120,7 @@ $('form').onsubmit = async event => {
     }
     // A profile read may finish after logout or a different login.
     if (!current(context)) return;
-    const delegation = text.match(/^\/delegate\s+([a-zA-Z0-9_-]+)\s+([\s\S]+)$/);
+    const delegation = !readyAttachments.length && text ? text.match(/^\/delegate\s+([a-zA-Z0-9_-]+)\s+([\s\S]+)$/) : null;
     if (delegation) {
       // Proposal creation retains its existing, explicit idempotent retry behavior.
       if (!pendingSend || pendingSend.text !== text) pendingSend = { text, id: crypto.randomUUID() };
@@ -975,9 +1142,14 @@ $('form').onsubmit = async event => {
         status('任务上下文已失效，未发送消息。请重新选择任务，或清除任务上下文后再发送。');
         return;
       }
-      const message = repositoryChatMessage(text, selectedRepository);
+      const effectiveText = text || '请帮我查看并分析这张图片';
+      const attachmentSuffix = readyAttachments.map(a => `[图片附件: ${a.name} (/api/attachments/${a.id})]`).join('\n');
+      const outgoingText = attachmentSuffix ? `${effectiveText}\n${attachmentSuffix}` : effectiveText;
+      const message = repositoryChatMessage(outgoingText, selectedRepository);
       closeRepositoryPicker();
-      chatTurn = { text, message, history: displayedMessages, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent, selectedRepository, selectedProject };
+      chatTurn = { text: effectiveText, message, attachments: readyAttachments, history: displayedMessages, id: crypto.randomUUID(), status: 'sending', selectedTask, selectedAgent, selectedRepository, selectedProject };
+      pendingAttachments = [];
+      renderPendingAttachments();
       selectedRepository = null;
       selectedAgent = null;
       selectedTask = null;
@@ -1022,6 +1194,10 @@ $('form').onsubmit = async event => {
           || (error.httpStatus === 400 && error.code === 'selected_agent_unavailable_before_dispatch'));
       if (rejectedAgent || rejectedSelection) {
         if (!$('text').value) $('text').value = chatTurn.text;
+        if (!pendingAttachments.length && chatTurn.attachments?.length) {
+          pendingAttachments = chatTurn.attachments;
+          renderPendingAttachments();
+        }
         selectedRepository = chatTurn.selectedRepository;
         selectedProject = chatTurn.selectedProject ? { ...chatTurn.selectedProject, invalidated: true, sources: null } : null;
         selectedAgent = chatTurn.selectedAgent ? { ...chatTurn.selectedAgent,
@@ -1059,8 +1235,9 @@ function isOldProposal(proposal) {
 }
 
 function updateNotifications(context, tasks) {
-  const waiting = tasks.filter(task => (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
-    || (task.requester === context.user && task.status === 'ready_for_acceptance'));
+  const waiting = tasks.filter(task => task.requester !== task.owner
+    && ((task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+      || (task.requester === context.user && task.status === 'ready_for_acceptance')));
   document.title = waiting.length ? `(${waiting.length}) Agenct` : 'Agenct';
   const incoming = new Set(waiting.map(task => task.id + ':' + task.status));
   if (notificationTasks && notificationsEnabled && typeof Notification !== 'undefined' && Notification.permission === 'granted') {

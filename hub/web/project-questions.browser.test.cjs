@@ -260,7 +260,7 @@ async function freePort() {
     try {
       await panel(alice).locator('.project-state-card[data-item="' + item.id + '"]').getByRole('button', { name: '共享问答', exact: true }).click();
       await bounded(readyRead, 'Question read did not start');
-      await alice.locator('#logout').click(); await alice.locator('#token').waitFor(); loggedOut = true;
+      await alice.locator('#rail-more').click(); await alice.locator('#logout').click(); await alice.locator('#token').waitFor(); loggedOut = true;
     } finally {
       release(); if (held) await bounded(done, 'Held read did not settle');
       await alice.unroute(origin + '/api/' + questionRoute, holdRead);

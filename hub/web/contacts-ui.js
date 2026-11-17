@@ -10,12 +10,13 @@ async function contactApi(context, path, method = 'GET', body) {
   finally { clearTimeout(timeout); context.signal.removeEventListener('abort', abort); }
 }
 const peerDrafts = new Map();
-function peerName(id) { return directoryState?.people.get(id)?.display_name || id; }
+function peerName(id) { return directoryState?.people.get(id)?.display_name || peopleNames.get(id) || id; }
 function clearPeerSession() {
-  closePeerConversation(); peerDrafts.clear(); directoryState = null; peerIndexFlight = null;
+  closePeerConversation(); peerDrafts.clear(); directoryState = null; peerIndexFlight = null; clearPeopleNames();
   $('contact-sidebar').replaceChildren(); $('contact-sidebar').classList.add('hide');
   $('room').classList.remove('contact-mode', 'contact-list-open');
   $('contacts-badge').textContent = '';
+  if (typeof syncRailState === 'function') syncRailState();
 }
 function closePeerConversation() {
   peerGeneration++; peerState = null; peerReadFlight = null;
@@ -23,23 +24,29 @@ function closePeerConversation() {
   $('peer-message-input').value = ''; $('peer-send-status').textContent = '';
   $('room').classList.remove('peer-active', 'contact-mode', 'contact-list-open');
   $('contact-sidebar').classList.add('hide');
+  if (typeof syncRailState === 'function') syncRailState();
 }
 function hideCollaborationSettings() { collaborationProfileUI.close(); }
 function restorePrivateChat() {
+  if (typeof setRailMenuOpen === 'function') setRailMenuOpen(false);
+  if (typeof closeComposerOverlays === 'function') closeComposerOverlays();
   if (typeof closeProjects === 'function') closeProjects();
-  closeContacts(); closePeerConversation(); profileUI.reset(); hideCollaborationSettings();
-  setTasksOpen(false); $('open-chat').classList.add('active');
-  $('open-chat').setAttribute('aria-current', 'page'); $('text').focus?.();
+  closePeerConversation(); closeContacts(); profileUI.reset(); hideCollaborationSettings();
+  setTasksOpen(false);
+  if (typeof syncRailState === 'function') syncRailState();
+  $('text').focus?.();
 }
 async function openContactDirectory() {
+  if (typeof setRailMenuOpen === 'function') setRailMenuOpen(false);
+  if (typeof closeComposerOverlays === 'function') closeComposerOverlays();
   if (typeof closeProjects === 'function') closeProjects();
   const context = session(); if (!current(context)) return;
   const owner = context.epoch + ':' + context.user;
   if (contactDraftOwner !== owner) { clearContactDrafts(); contactDraftOwner = owner; }
   profileUI.reset(); hideCollaborationSettings(); closeContacts(); setTasksOpen(false);
   $('room').classList.add('contact-mode', 'contact-list-open');
-  $('contact-sidebar').classList.remove('hide'); $('open-contacts').classList.add('active');
-  $('open-contacts').setAttribute('aria-expanded', 'true');
+  $('contact-sidebar').classList.remove('hide');
+  if (typeof syncRailState === 'function') syncRailState();
   const host = $('contact-sidebar');
   const heading = el('header', 'contact-directory-heading');
   const back = el('button', 'text-btn', '返回我的助手'); back.type = 'button'; back.onclick = restorePrivateChat;
@@ -54,6 +61,9 @@ async function openContactDirectory() {
     ]);
     if (!current(context) || version !== peerGeneration) return;
     if (!Array.isArray(contacts) || !Array.isArray(people) || !Array.isArray(conversations)) throw Error('联系人列表格式无效');
+    let namesChanged = false;
+    for (const person of people) if (rememberPerson(person?.id, person?.display_name)) namesChanged = true;
+    if (namesChanged) void refresh(context, false);
     directoryState = { contacts, people: new Map(people.map(p => [p.id, p])), conversations, search, list };
     search.oninput = renderContactDirectory; renderContactDirectory(); search.focus?.();
   } catch (error) {
@@ -84,6 +94,7 @@ function renderContactDirectory() {
   }
 }
 async function openPeerConversation(id) {
+  if (typeof closeComposerOverlays === 'function') closeComposerOverlays();
   if (typeof closeProjects === 'function') closeProjects();
   const context = session(); if (!current(context)) return;
   profileUI.reset(); hideCollaborationSettings(); closeContacts(); setTasksOpen(false);
@@ -94,8 +105,7 @@ async function openPeerConversation(id) {
   peerState = { id, context, generation, draft, messages: [], snapshot: '', loading: true };
   $('room').classList.add('peer-active', 'contact-mode'); $('room').classList.remove('contact-list-open');
   $('contact-sidebar').classList.remove('hide'); $('peer-view').classList.remove('hide');
-  $('open-chat').classList.remove('active'); $('open-chat').removeAttribute('aria-current');
-  $('open-contacts').classList.add('active'); $('open-contacts').setAttribute('aria-expanded', 'true');
+  if (typeof syncRailState === 'function') syncRailState();
   $('peer-name').textContent = peerName(id);
   $('peer-visibility').textContent = '与 ' + peerName(id) + ' 共享 · 助手代答会单独标明';
   $('peer-input-label').textContent = '发给 ' + peerName(id);
@@ -176,8 +186,17 @@ async function refreshPeerContacts(context) {
   const flight = { epoch: context.epoch }; peerIndexFlight = flight;
   flight.promise = (async () => {
     try {
-      const conversations = await contactApi(context, 'conversations');
-      if (!current(context) || !Array.isArray(conversations)) return;
+      const [conversations, people] = await Promise.all([
+        contactApi(context, 'conversations'),
+        contactApi(context, 'people').catch(() => null)
+      ]);
+      if (!current(context)) return;
+      if (Array.isArray(people)) {
+        let namesChanged = false;
+        for (const person of people) if (rememberPerson(person?.id, person?.display_name)) namesChanged = true;
+        if (namesChanged) void refresh(context, false);
+      }
+      if (!Array.isArray(conversations)) return;
       const count = conversations.reduce((total, c) => total + (c.unread_count || 0), 0);
       $('contacts-badge').textContent = count ? String(count) : '';
       if (directoryState) { directoryState.conversations = conversations; renderContactDirectory(); }

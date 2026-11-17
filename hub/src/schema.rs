@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 23;
+pub(super) const VERSION: i64 = 24;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -93,6 +93,8 @@ const TABLES: &[&str] = &[
     "project_resolutions",
     "project_acceptances",
     "project_acceptance_withdrawals",
+    "user_nodes",
+    "node_assignments",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -198,6 +200,7 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
         }
         22 => db.execute_batch(crate::project_questions::SCHEMA)?,
         23 => db.execute_batch(crate::project_completion::SCHEMA)?,
+        24 => db.execute_batch(crate::nodes::SCHEMA)?,
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -282,6 +285,7 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("project_state_items" | "project_state_versions", _) => 19,
         ("project_questions" | "project_question_withdrawals", _) => 22,
         ("project_resolutions" | "project_acceptances" | "project_acceptance_withdrawals", _) => 23,
+        ("user_nodes" | "node_assignments", _) => 24,
         ("messages" | "proposals", "created_at") => 11,
         ("events", "from_status" | "to_status" | "task_revision") => 6,
         ("events", "revision" | "delivery_seq") => 8,
@@ -383,6 +387,7 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 ]
                 .contains(&table)
                     && version < 23)
+                || (["user_nodes", "node_assignments"].contains(&table) && version < 24)
             {
                 continue;
             }
@@ -443,6 +448,8 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 | "project_resolutions"
                 | "project_acceptances"
                 | "project_acceptance_withdrawals"
+                | "user_nodes"
+                | "node_assignments"
         ) {
             let wanted_sql: String = expected.query_row(
                 "SELECT sql FROM sqlite_schema WHERE name=?1",

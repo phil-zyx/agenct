@@ -37,7 +37,8 @@ function forgetAction(id) { if (pendingActions.delete(id)) saveActions(); }
 
 function taskChatVersion() {
   // Re-render when a fetched draft or an open editor changes, not only on API data.
-  return JSON.stringify([[...draftReceipts.keys()], [...deliveryEditors.keys()], [...pendingActions], [...deferredRevisions]]);
+  const nodeKey = typeof userNodes !== 'undefined' ? userNodes.map(n => n.id + ':' + (n.online ? 1 : 0)) : [];
+  return JSON.stringify([[...draftReceipts.keys()], [...deliveryEditors.keys()], [...pendingActions], [...deferredRevisions], nodeKey]);
 }
 
 function resetTaskChat({ preserveRecovery = false } = {}) {
@@ -135,7 +136,7 @@ function deliveryEditor(context, task, card, draft) {
   if (!editor) return;
   if (editor.revision !== task.revision) { deliveryEditors.delete(task.id); return; }
   const panel = el('section', 'action-editor');
-  const label = el('label', null, `交付给 ${task.requester} 的内容（确认后对方可见）`);
+  const label = el('label', null, `交付给 ${memberLabel(task.requester)} 的内容（确认后对方可见）`);
   const input = el('textarea'); input.rows = 8; input.value = editor.text;
   input.setAttribute('aria-label', '交付内容');
   input.oninput = () => { editor.text = input.value; };
@@ -159,7 +160,7 @@ function deliveryEditor(context, task, card, draft) {
       });
       if (!current(context)) return;
       deliveryEditors.delete(task.id); forgetAction(task.id);
-      status(`已交付给 ${task.requester}。`);
+      status(`已交付给 ${memberLabel(task.requester)}。`);
     } catch (error) {
       if (current(context)) note.textContent = error.message + '。内容已保留，刷新核对后再试。';
     } finally {
@@ -177,10 +178,10 @@ function latestDraft(task) {
 }
 
 const ACTION_TEXT = {
-  accept: task => ['确认接手', '接手后 Agent 会自动起草，只有你可见。'],
-  deliver: task => ['确认交付', `将把上面这版草稿交付给 ${task.requester}，对方随即可见。`],
-  approve: task => ['确认验收', `确认 ${task.owner} 的交付已完成。`],
-  return: task => ['确认退回', `退回给 ${task.owner} 修改，可以在聊天里说明原因。`]
+  accept: () => ['确认接手', '接手后 Agent 会自动起草，只有你可见。'],
+  deliver: task => ['确认交付', `将把上面这版草稿交付给 ${memberLabel(task.requester)}，对方随即可见。`],
+  approve: task => ['确认验收', `确认 ${memberLabel(task.owner)} 的交付已完成。`],
+  return: task => ['确认退回', `退回给 ${memberLabel(task.owner)} 修改，可以在聊天里说明原因。`]
 };
 
 /** Carry out the confirmed step. Deliver without a draft opens the editor instead. */
@@ -210,7 +211,7 @@ async function runPendingAction(context, task, pending) {
     if (selectedTask?.id === task.id && selectedTask.revision === task.revision && !$('text').value.trim()) {
       selectedTask = null;
     }
-    status({ accept: '已接手，Agent 正在起草。', deliver: `已交付给 ${task.requester}。`, approve: '已验收。', return: `已退回给 ${task.owner}。` }[pending.action]);
+    status({ accept: '已接手，Agent 正在起草。', deliver: `已交付给 ${memberLabel(task.requester)}。`, approve: '已验收。', return: `已退回给 ${memberLabel(task.owner)}。` }[pending.action]);
   } catch (error) {
     if (current(context)) status(error.message + '。请刷新核对任务状态。');
   } finally {
@@ -297,14 +298,15 @@ function ownerWorking(context, task, card) {
   else if (mine?.status === 'uncertain') card.append(el('p', 'note', '上次起草结果未知，不会自动重发。可以在聊天里让 Agent 重新起草。'));
   if (draft && !drafting) {
     const box = el('section', 'agent-draft');
-    box.append(el('div', 'agent-draft-meta', `Agent 草稿 · 第 ${draft.seq ?? 1} 版 · 仅你可见，模型生成，未经验证`));
+    const sourceLabel = draft.node_id ? `来自节点 ${draft.node_name || draft.node_id} · ` : '';
+    box.append(el('div', 'agent-draft-meta', `Agent 草稿 · ${sourceLabel}第 ${draft.seq ?? 1} 版 · 仅你可见，${draft.node_id ? '未经验证' : '模型生成，未经验证'}`));
     if (draft.instruction) box.append(el('div', 'agent-draft-ask', '按你的补充：' + draft.instruction));
     box.append(renderMarkdown(draft.content));
     card.append(box);
   }
   if (!drafting && !pendingActions.has(task.id) && !deliveryEditors.has(task.id)) {
     card.append(el('p', 'task-hint', draft
-      ? `直接在下面回复补充信息或修改意见；说「交付」就发给 ${task.requester}。`
+      ? `直接在下面回复补充信息或修改意见；说「交付」就发给 ${memberLabel(task.requester)}。`
       : '在下面告诉 Agent 怎么写，它会起草一版只有你可见的草稿。'));
   }
   const deferred = deferredRevisions.get(task.id);
@@ -370,13 +372,82 @@ function ownerWorking(context, task, card) {
     }
     card.append(box);
   }
+  const nodes = typeof userNodes !== 'undefined' ? userNodes : [];
+  const assigned = task.my_node_assignment;
+  if (nodes.length > 0 || assigned) {
+    const bar = el('section', 'node-assign-bar');
+    if (assigned) {
+      const statusText = {
+        queued: '等待该 PC 拉取…',
+        running: '该 PC 正在执行…',
+        completed: '该 PC 已回传草稿',
+        failed: '该 PC 上次执行失败，可重新指派'
+      }[assigned.status] || assigned.status;
+      bar.append(el('p', 'note node-assign-status',
+        `已分配给节点 ${assigned.node_name || assigned.node_id}（${assigned.node_id}）：${statusText}`
+        + (assigned.instruction ? ` · 要求：${assigned.instruction}` : '')));
+    }
+    if (nodes.length > 0) {
+      const controls = el('div', 'node-assign-controls');
+      const select = el('select'); select.setAttribute('aria-label', '选择指派的 PC 节点');
+      for (const node of nodes) {
+        const option = el('option', null, `${node.name} (${node.id}) · ${node.online ? '在线' : '离线'}`);
+        option.value = node.id;
+        select.append(option);
+      }
+      if (assigned && nodes.some(n => n.id === assigned.node_id)) select.value = assigned.node_id;
+      const noteInput = el('input');
+      noteInput.setAttribute('aria-label', '给 PC 节点的补充说明');
+      noteInput.placeholder = '给该 PC 的执行说明（可选）';
+      noteInput.maxLength = 4000;
+      const assignBtn = el('button', null, '派给此 PC'); assignBtn.type = 'button';
+      const busyKey = 'node-assign:' + task.id;
+      assignBtn.disabled = busy.has(busyKey);
+      assignBtn.onclick = async () => {
+        if (!current(context) || busy.has(busyKey) || !select.value) return;
+        busy.add(busyKey); assignBtn.disabled = true;
+        try {
+          await api(context, 'tasks/' + encodeURIComponent(task.id) + '/node-assignment', 'POST', {
+            node_id: select.value, expected_revision: task.revision, instruction: noteInput.value.trim()
+          });
+          if (!current(context)) return;
+          status('已指派给 PC 节点 ' + select.value + '。', { transient: true });
+        } catch (error) {
+          if (current(context)) status('指派失败：' + error.message);
+        } finally {
+          if (current(context)) { busy.delete(busyKey); await refresh(context).catch(() => {}); }
+        }
+      };
+      controls.append(select, noteInput, assignBtn);
+      if (assigned) {
+        const clearBtn = el('button', 'text-btn', '取消指派'); clearBtn.type = 'button';
+        clearBtn.disabled = busy.has(busyKey);
+        clearBtn.onclick = async () => {
+          if (!current(context) || busy.has(busyKey)) return;
+          busy.add(busyKey); clearBtn.disabled = true;
+          try {
+            await api(context, 'tasks/' + encodeURIComponent(task.id) + '/node-assignment', 'POST', {
+              node_id: null, expected_revision: task.revision
+            });
+          } catch (error) {
+            if (current(context)) status('取消指派失败：' + error.message);
+          } finally {
+            if (current(context)) { busy.delete(busyKey); await refresh(context).catch(() => {}); }
+          }
+        };
+        controls.append(clearBtn);
+      }
+      bar.append(controls);
+    }
+    card.append(bar);
+  }
   confirmation(context, task, card);
   deliveryEditor(context, task, card, draft);
 }
 
 function taskMoment(context, task) {
   const owner = task.owner === context.user;
-  const other = owner ? task.requester : task.owner;
+  const other = memberLabel(owner ? task.requester : task.owner);
   switch (task.status) {
     case 'awaiting_owner': {
       if (!owner) return taskLine(`已交给 ${other}：「${task.summary}」，等待对方接手`);
@@ -415,6 +486,7 @@ function taskMoments(context, tasks, activity) {
   loadActions(context);
   const moments = [];
   for (const task of tasks) {
+    if (task.requester === task.owner) continue;
     if (task.owner !== context.user && task.requester !== context.user) continue;
     const element = taskMoment(context, task);
     if (!element) continue;
@@ -448,8 +520,9 @@ function handleTaskAction(context, action, requestId) {
   }
 }
 
-const needsMe = (context, task) => (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
-  || (task.requester === context.user && task.status === 'ready_for_acceptance');
+const needsMe = (context, task) => task.requester !== task.owner
+  && ((task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+    || (task.requester === context.user && task.status === 'ready_for_acceptance'));
 
 /** Keep the composer on the task that is waiting for this user, newest step first,
     so plain replies reach it. An explicit choice or a dismissal (×) wins. */

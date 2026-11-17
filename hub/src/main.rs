@@ -92,6 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let stopped = shutdown.clone();
     let mut dispatcher = Box::pin(hub.run_auto_drafts());
+    let mut sagent_scheduler = Box::pin(hub.run_sagent_scheduler());
     let mut server = Box::pin(
         axum::serve(listener, app(hub.clone()))
             .with_graceful_shutdown(async move { stopped.notified().await })
@@ -100,8 +101,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         result = &mut server => result?,
         () = &mut dispatcher => return Err("automatic draft dispatcher stopped".into()),
+        () = &mut sagent_scheduler => return Err("sagent scheduler stopped".into()),
         _ = tokio::signal::ctrl_c() => {
             drop(dispatcher);
+            drop(sagent_scheduler);
             shutdown.notify_one();
             server.await?;
         }

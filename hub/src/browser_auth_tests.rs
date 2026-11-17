@@ -267,6 +267,7 @@ impl Provider {
                 callback_path: None,
                 gitlab_oauth: false,
                 gitlab_auto_signup: false,
+                session_ttl_seconds: None,
                 issuer: self.origin.clone(),
                 authorization_endpoint: format!("{}/authorize", self.origin),
                 token_endpoint: format!("{}/token", self.origin),
@@ -1023,6 +1024,38 @@ async fn gitlab_oauth_uses_https_user_id_and_imports_name_without_email_binding(
 }
 
 #[tokio::test]
+async fn gitlab_session_ttl_overrides_short_provider_token_lifetime() {
+    let provider = Provider::new();
+    let mut hub = provider.hub();
+    let auth = hub.browser_auth.as_mut().unwrap();
+    auth.gitlab_oauth = true;
+    auth.client = auth.client.clone().disable_openid_scope();
+    auth.subjects = HashMap::from([("7".into(), "alice".into())]);
+    // Default: bounded by the provider token (mock expires_in=300).
+    let (headers, query) = provider.begin(&hub).await;
+    let response = callback_inner(hub.clone(), headers, Query(query))
+        .await
+        .unwrap();
+    let max_age = |response: &Response| {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|v| v.to_str().unwrap().to_owned())
+            .find(|v| v.contains("agenct-session=") && !v.contains("Max-Age=0"))
+            .unwrap()
+    };
+    assert!(max_age(&response).contains("Max-Age=300"));
+    hub.browser_auth.as_mut().unwrap().session_ttl = Some(28_800);
+    let (headers, query) = provider.begin(&hub).await;
+    let response = callback_inner(hub.clone(), headers, Query(query))
+        .await
+        .unwrap();
+    assert!(max_age(&response).contains("Max-Age=28800"));
+    assert_eq!(hub.identity(&session_headers(&response)).unwrap(), "alice");
+}
+
+#[tokio::test]
 async fn gitlab_signup_creates_fresh_identity_and_preserves_disabled_state() {
     let provider = Provider::new();
     let legacy = provider.hub();
@@ -1241,6 +1274,7 @@ fn identity_proxy_must_be_an_explicit_http_url() {
         callback_path: None,
         gitlab_oauth: true,
         gitlab_auto_signup: true,
+        session_ttl_seconds: None,
         issuer: "https://gitlab.example".into(),
         authorization_endpoint: "https://gitlab.example/oauth/authorize".into(),
         token_endpoint: "https://gitlab.example/oauth/token".into(),
@@ -1260,4 +1294,38 @@ fn identity_proxy_must_be_an_explicit_http_url() {
         Some("AGENCT_IDENTITY_PROXY must be an http(s) proxy URL")
     );
     assert_eq!(ok, None);
+}
+
+#[test]
+fn session_ttl_is_gitlab_only_and_bounded() {
+    let config = |gitlab_oauth: bool, ttl: u64| Config {
+        shared_gitlab_login: None,
+        shared_gitlab_callback: None,
+        allow_loopback_http: false,
+        allow_private_http: false,
+        callback_path: None,
+        gitlab_oauth,
+        gitlab_auto_signup: gitlab_oauth,
+        session_ttl_seconds: Some(ttl),
+        issuer: "https://gitlab.example".into(),
+        authorization_endpoint: "https://gitlab.example/oauth/authorize".into(),
+        token_endpoint: "https://gitlab.example/oauth/token".into(),
+        client_id: "client".into(),
+        public_origin: "https://agenct.example".into(),
+        subjects: if gitlab_oauth {
+            HashMap::new()
+        } else {
+            HashMap::from([("s".into(), "alice".into())])
+        },
+        jwks: json!({"keys": []}),
+    };
+    let known = HashSet::from(["alice".to_owned()]);
+    let build = |c| BrowserAuth::with_http(c, &known, reqwest::Client::new());
+    assert!(build(config(true, 28_800)).is_ok());
+    for (gitlab, ttl) in [(true, 299), (true, 86_401), (false, 28_800)] {
+        assert_eq!(
+            build(config(gitlab, ttl)).err(),
+            Some("invalid browser OIDC trust policy")
+        );
+    }
 }

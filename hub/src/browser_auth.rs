@@ -49,6 +49,12 @@ pub struct Config {
     pub callback_path: Option<String>,
     #[serde(default)]
     pub gitlab_auto_signup: bool,
+    /// GitLab OAuth only: fixed Agenct session lifetime (300..=86400 seconds).
+    /// The provider access token is used once for the profile read and then
+    /// discarded, so a trusted intranet deployment may outlive it. Unset keeps
+    /// the default of at most 15 minutes, bounded by the provider token.
+    #[serde(default)]
+    pub session_ttl_seconds: Option<u64>,
     pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
@@ -82,6 +88,7 @@ pub struct BrowserAuth {
     shared_gitlab_login: Option<String>,
     local_http: bool,
     pub(crate) gitlab_auto_signup: bool,
+    session_ttl: Option<u64>,
     client: Client,
     http: reqwest::Client,
     origin: String,
@@ -289,6 +296,9 @@ impl BrowserAuth {
             || (config.subjects.is_empty() && !config.gitlab_auto_signup)
             || (config.gitlab_auto_signup && (!config.gitlab_oauth || !config.subjects.is_empty()))
             || config
+                .session_ttl_seconds
+                .is_some_and(|ttl| !config.gitlab_oauth || !(300..=86_400).contains(&ttl))
+            || config
                 .subjects
                 .iter()
                 .any(|(sub, user)| sub.is_empty() || sub.len() > 255 || !known.contains(user))
@@ -349,6 +359,7 @@ impl BrowserAuth {
             shared_gitlab_login: config.shared_gitlab_login,
             local_http,
             gitlab_auto_signup: config.gitlab_auto_signup,
+            session_ttl: config.session_ttl_seconds,
             client,
             http,
             origin: config.public_origin,
@@ -431,10 +442,13 @@ pub(crate) async fn guard(
         {
             return bad().into_response();
         }
-        if !matches!(
-            *request.method(),
-            axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
-        ) && !auth.mutation_allowed(request.headers())
+        if !request.uri().path().starts_with("/node/v1/")
+            && request.uri().path() != "/webhooks/gitlab"
+            && !matches!(
+                *request.method(),
+                axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+            )
+            && !auth.mutation_allowed(request.headers())
         {
             return Error(
                 StatusCode::FORBIDDEN,
@@ -464,7 +478,7 @@ pub(crate) async fn session(State(h): State<Hub>, headers: HeaderMap) -> Json<se
     };
     match auth.session(&headers) {
         Some(s) => Json(
-            serde_json::json!({"enabled":true,"authenticated":true,"user":s.user,"csrf_token":s.csrf,"member_status":h.member(&s.user).ok().map(|m|m.status)}),
+            serde_json::json!({"enabled":true,"authenticated":true,"user":s.user,"csrf_token":s.csrf,"member_status":h.member(&s.user).ok().map(|m|m.status),"open_signup":auth.gitlab_auto_signup}),
         ),
         None => Json(serde_json::json!({"enabled":true,"authenticated":false})),
     }
@@ -690,10 +704,12 @@ async fn callback_inner(
                 .cloned()
                 .ok_or_else(|| login_failed("account"))?
         };
-        let lifetime = token
-            .expires_in()
-            .map(|value| value.as_secs().min(900))
-            .unwrap_or(900) as i64;
+        let lifetime = auth.session_ttl.unwrap_or_else(|| {
+            token
+                .expires_in()
+                .map(|value| value.as_secs().min(900))
+                .unwrap_or(900)
+        }) as i64;
         if lifetime <= 0 {
             return Err(bad());
         }

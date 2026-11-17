@@ -63,6 +63,16 @@ pub(super) async fn execute_chat(
     {
         return Ok(response);
     }
+    if let Some(response) =
+        crate::sagent::answer_chat(h, id, input, &runtime_profile, task_context.as_ref()).await?
+    {
+        return Ok(response);
+    }
+    if let Some(response) =
+        crate::nodes::answer_chat(h, id, input, &runtime_profile, task_context.as_ref()).await?
+    {
+        return Ok(response);
+    }
     let profile_context = crate::profile_suggestions::context(&*h.db()?, id)?;
     // Reservation already exists: summary model calls cannot be repeated by a
     // replay of this request. Preserve the original snapshot in the reservation.
@@ -177,20 +187,102 @@ pub(super) async fn execute_chat(
         }
         let participant = |owner: &str| h.directory.can_delegate(id, owner);
         if answer.valid(h.runtime.label(), id, &input.message, participant) {
-            Ok(answer)
+            let local_inability = matches!(h.runtime, Runtime::Dsh { .. })
+                && task_context
+                    .as_ref()
+                    .is_none_or(|c| c["requester"] == id && c["owner"] == id)
+                && input.selected_project.is_none()
+                && !input.message.trim_start().starts_with('/')
+                && answer.proposal.is_none()
+                && answer.task_action.is_none()
+                && answer.profile_update.is_none()
+                && [
+                    "无法直接",
+                    "无法访问",
+                    "无法执行",
+                    "不能直接",
+                    "请在本地",
+                    "可在该机器上运行",
+                    "无法查看图片",
+                    "看不到图片",
+                    "无法直接查看图片",
+                    "无法识别图片",
+                    "不支持查看图片",
+                ]
+                .iter()
+                .any(|cue| answer.reply.contains(cue));
+            if local_inability
+                && !crate::sagent::match_dispatch_rule(h, id, &input.message)
+                    .is_some_and(|r| r.target_node_id == "cloud")
+            {
+                if let Some((node_id, node_name, online, _score)) =
+                    crate::nodes::best_online_node(&*h.db()?, id, &input.message)?
+                {
+                    let summary = input.message.trim();
+                    let summary = if summary.len() > 4000 {
+                        let mut end = 4000;
+                        while !summary.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        summary[..end].to_owned()
+                    } else {
+                        summary.to_owned()
+                    };
+                    return Ok((
+                        AdapterReply {
+                            reply: answer.reply,
+                            backend: answer.backend,
+                            proposal: None,
+                            task_action: None,
+                            profile_update: None,
+                        },
+                        Some((node_id, node_name, online, summary)),
+                    ));
+                }
+            }
+            Ok((answer, None))
         } else if let (Runtime::Dsh { .. }, Some(owner)) = (
             &h.runtime,
             answer.unavailable_recipient(h.runtime.label(), id, &input.message, participant),
         ) {
+            if task_context.is_none()
+                && input.selected_project.is_none()
+                && !h.directory.can_delegate(id, owner)
+            {
+                if let Some((node_id, node_name, online)) =
+                    crate::nodes::resolve_user_node(&*h.db()?, id, owner)?
+                {
+                    let summary = answer
+                        .proposal
+                        .as_ref()
+                        .map(|p| p.summary.as_str())
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or(&input.message)
+                        .to_owned();
+                    return Ok((
+                        AdapterReply {
+                            reply: answer.reply,
+                            backend: answer.backend,
+                            proposal: None,
+                            task_action: None,
+                            profile_update: None,
+                        },
+                        Some((node_id, node_name, online, summary)),
+                    ));
+                }
+            }
             // Never show the model's reply here: it presumes a draft exists. Replace it
             // with a Hub-authored correction and persist no proposal.
-            Ok(AdapterReply {
-                reply: recipient_notice(h, id, owner),
-                backend: answer.backend.clone(),
-                proposal: None,
-                task_action: None,
-                profile_update: None,
-            })
+            Ok((
+                AdapterReply {
+                    reply: recipient_notice(h, id, owner),
+                    backend: answer.backend.clone(),
+                    proposal: None,
+                    task_action: None,
+                    profile_update: None,
+                },
+                None,
+            ))
         } else if matches!(h.runtime, Runtime::Mock) {
             Err(invalid(
                 "select another configured participant and bounded summary",
@@ -199,98 +291,129 @@ pub(super) async fn execute_chat(
             Err(adapter_failed())
         }
     });
-    let mut db = h.db()?;
-    let tx = db.transaction()?;
-    match answer {
-        Ok(answer) => {
-            // Model output is untrusted. Only an immutable, sender-private proposal
-            // is persisted here; the existing authenticated confirm action creates tasks.
-            let proposal = match answer
-                .proposal
-                .as_ref()
-                .map(|p| {
-                    save_proposal_tx(
-                        &tx,
-                        id,
-                        &p.owner,
-                        &p.summary,
-                        input.request_id.as_deref(),
-                        &input.message,
-                    )
-                })
-                .transpose()
-            {
-                Ok(p) => p,
-                Err(error) => {
-                    tx.execute(
-                        "UPDATE messages SET status='failed' WHERE id=?1",
-                        [message_id],
-                    )?;
-                    tx.commit()?;
-                    return Err(error);
-                }
-            };
-            // A proposal and a task action never travel together; a delegation wins.
-            let task_action = match (&proposal, &answer.task_action, &task_context) {
-                (None, Some(action), Some(context)) => {
-                    checked_task_action(action, context, task_role)
-                }
-                _ => None,
-            };
-            let suggestion = answer
-                .profile_update
-                .as_ref()
-                .map(|changes| {
-                    let key = input
-                        .request_id
-                        .clone()
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                    crate::profile_suggestions::save(
-                        &tx,
-                        id,
-                        &key,
-                        profile_context["profile"]["revision"]
-                            .as_u64()
-                            .ok_or_else(|| invalid("invalid profile revision"))?,
-                        changes,
-                    )
-                })
-                .transpose()?;
-            // A profile suggestion speaks for itself; a task step the Hub will not
-            // allow must not leave the model's "confirm below" standing.
-            let reply = match (&answer.task_action, &task_action, &task_context) {
-                _ if suggestion.is_some() && task_action.is_none() => {
-                    "准备记住以下内容。请检查后确认；确认前不会修改你的资料或助手权限。".to_string()
-                }
-                (Some(_), None, Some(context)) if proposal.is_none() => {
-                    step_unavailable_notice(context, task_role)
-                }
-                _ => answer.reply.clone(),
-            };
-            tx.execute(
-                "UPDATE messages SET status='complete' WHERE id=?1",
-                [message_id],
-            )?;
-            if message_id.is_some() {
-                tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
+    let (task_id, fallback_reply, online) = {
+        let mut db = h.db()?;
+        let tx = db.transaction()?;
+        match answer {
+            Ok((_, Some((node_id, node_name, online, summary)))) => {
+                let (task_id, fallback_reply) = crate::nodes::dispatch_chat_task(
+                    &tx,
+                    id,
+                    &node_id,
+                    &node_name,
+                    online,
+                    &summary,
+                    input.selected_task.as_ref().map(|s| s.task_id.as_str()),
+                )?;
+                tx.execute(
+                    "UPDATE messages SET status='complete' WHERE id=?1",
+                    [message_id],
+                )?;
+                tx.commit()?;
+                (task_id, fallback_reply, online)
             }
-            let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context,"task_action":task_action});
-            if let Some(suggestion) = suggestion {
-                response["profile_suggestion"] = suggestion;
+            Ok((answer, None)) => {
+                // Model output is untrusted. Only an immutable, sender-private proposal
+                // is persisted here; the existing authenticated confirm action creates tasks.
+                let proposal = match answer
+                    .proposal
+                    .as_ref()
+                    .map(|p| {
+                        save_proposal_tx(
+                            &tx,
+                            id,
+                            &p.owner,
+                            &p.summary,
+                            input.request_id.as_deref(),
+                            &input.message,
+                        )
+                    })
+                    .transpose()
+                {
+                    Ok(p) => p,
+                    Err(error) => {
+                        tx.execute(
+                            "UPDATE messages SET status='failed' WHERE id=?1",
+                            [message_id],
+                        )?;
+                        tx.commit()?;
+                        return Err(error);
+                    }
+                };
+                // A proposal and a task action never travel together; a delegation wins.
+                let task_action = match (&proposal, &answer.task_action, &task_context) {
+                    (None, Some(action), Some(context)) => {
+                        checked_task_action(action, context, task_role)
+                    }
+                    _ => None,
+                };
+                let suggestion = answer
+                    .profile_update
+                    .as_ref()
+                    .map(|changes| {
+                        let key = input
+                            .request_id
+                            .clone()
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                        crate::profile_suggestions::save(
+                            &tx,
+                            id,
+                            &key,
+                            profile_context["profile"]["revision"]
+                                .as_u64()
+                                .ok_or_else(|| invalid("invalid profile revision"))?,
+                            changes,
+                        )
+                    })
+                    .transpose()?;
+                // A profile suggestion speaks for itself; a task step the Hub will not
+                // allow must not leave the model's "confirm below" standing.
+                let reply = match (&answer.task_action, &task_action, &task_context) {
+                    _ if suggestion.is_some() && task_action.is_none() => {
+                        "准备记住以下内容。请检查后确认；确认前不会修改你的资料或助手权限。"
+                            .to_string()
+                    }
+                    (Some(_), None, Some(context)) if proposal.is_none() => {
+                        step_unavailable_notice(context, task_role)
+                    }
+                    _ => answer.reply.clone(),
+                };
+                tx.execute(
+                    "UPDATE messages SET status='complete' WHERE id=?1",
+                    [message_id],
+                )?;
+                if message_id.is_some() {
+                    tx.execute("INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",params![id,reply])?;
+                }
+                let mut response = serde_json::json!({"reply":reply,"backend":h.runtime.label(),"proposal":proposal,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context,"task_action":task_action});
+                if let Some(suggestion) = suggestion {
+                    response["profile_suggestion"] = suggestion;
+                }
+                chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
+                tx.commit()?;
+                return Ok(Json(response));
             }
-            chat_turns::complete(&tx, id, input.request_id.as_deref(), &mut response)?;
-            tx.commit()?;
-            Ok(Json(response))
+            Err(error) => {
+                tx.execute(
+                    "UPDATE messages SET status='failed' WHERE id=?1",
+                    [message_id],
+                )?;
+                tx.commit()?;
+                return Err(error);
+            }
         }
-        Err(error) => {
-            tx.execute(
-                "UPDATE messages SET status='failed' WHERE id=?1",
-                [message_id],
-            )?;
-            tx.commit()?;
-            Err(error)
-        }
-    }
+    };
+    let base_response = serde_json::json!({"reply":null,"backend":h.runtime.label(),"source":"pc-node","proposal":null,"runtime_profile":runtime_profile,"task_context":task_context,"repository_context":repository_context,"task_action":null});
+    crate::nodes::finalize_chat_node_turn(
+        h,
+        id,
+        &task_id,
+        &fallback_reply,
+        input.request_id.as_deref(),
+        online,
+        base_response,
+    )
+    .await
 }
 
 /// The model's suggested task step, kept only if the caller may take it in the

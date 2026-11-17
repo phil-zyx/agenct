@@ -1,4 +1,25 @@
 /* Shared work-index presentation; no writes. */
+const peopleNames = new Map();
+function rememberPerson(id, displayName) {
+  if (typeof id !== 'string' || !id) return false;
+  const trimmed = typeof displayName === 'string' ? displayName.trim() : '';
+  const previous = peopleNames.get(id) || '';
+  if (!trimmed || trimmed === id) {
+    if (!previous) return false;
+    peopleNames.delete(id);
+    return true;
+  }
+  if (previous === trimmed) return false;
+  peopleNames.set(id, trimmed);
+  return true;
+}
+function clearPeopleNames() { peopleNames.clear(); }
+function memberLabel(id) {
+  if (typeof id !== 'string' || !id) return '';
+  const name = peopleNames.get(id);
+  return name && name !== id ? `${name}（${id}）` : id;
+}
+
 // Server times are UTC "YYYY-MM-DD HH:MM:SS"; anything else is treated as unknown.
 function parseUtc(value) {
   if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)) return null;
@@ -31,11 +52,12 @@ function activityIcon(state) {
 }
 function activityLine(item, me) {
   const l = item.latest || {};
-  const who = l.actor === me ? '你' : l.actor + ' ';
+  const who = l.actor === me ? '你' : memberLabel(l.actor) + ' ';
+  const counterpart = memberLabel(item.counterpart);
   switch (l.action) {
-    case 'proposal_pending': return `等你确认 · 委派给 ${item.counterpart}`;
+    case 'proposal_pending': return `等你确认 · 委派给 ${counterpart}`;
     case 'proposal_rejected': return '已拒绝，未共享';
-    case 'created': return item.role === 'owner' ? `${item.counterpart} 委派给你，待接手` : `已委派给 ${item.counterpart}，等对方接手`;
+    case 'created': return item.role === 'owner' ? `${counterpart} 委派给你，待接手` : `已委派给 ${counterpart}，等对方接手`;
     case 'accept': return `${who}已接手`;
     case 'deliver': return `${who}提交了交付内容`;
     case 'approve': return `${who}验收通过`;
@@ -44,6 +66,7 @@ function activityLine(item, me) {
     case 'draft_complete': return '草稿已写好，等你审阅（仅你可见）';
     case 'draft_uncertain': return '暂时无法确认起草结果，请打开草稿查看';
     case 'draft_pending': return '正在为你起草…';
+    case 'topic_turn': return '已归并到该上下文主题';
     default: return String(l.action || '');
   }
 }

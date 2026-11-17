@@ -113,10 +113,13 @@ function applyTaskFilter() {
   for (const card of $('tasks').children) {
     const task = visibleTasks.get(card.taskId);
     if (!task) continue;
+    const isTopic = Boolean(task.is_topic || task.requester === task.owner);
     const finished = ['completed', 'canceled'].includes(task.status);
-    const show = taskFilter === 'completed' ? finished : !finished && (taskFilter === 'mine' ? task.requester === context.user
-      : taskFilter === 'waiting' ? (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
-        || (task.requester === context.user && task.status === 'ready_for_acceptance') : true);
+    const show = isTopic
+      ? (taskFilter === 'active' || taskFilter === 'completed' || (taskFilter === 'waiting' && task.status === 'working'))
+      : (taskFilter === 'completed' ? finished : !finished && (taskFilter === 'mine' ? task.requester === context.user
+        : taskFilter === 'waiting' ? (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+          || (task.requester === context.user && task.status === 'ready_for_acceptance') : true));
     card.classList[show ? 'remove' : 'add']('hide'); if (show) count++;
   }
   $('task-filter-empty').textContent = count ? '' : taskFilter === 'completed' ? '还没有已完成或已取消的任务。' : '这个筛选下暂时没有任务。';
@@ -139,37 +142,54 @@ function renderTaskCards(context, tasks) {
   const taskCards = [];
   const slots = new Map();
   for (const task of tasks) {
-    const element = el('article', 'card task task-' + task.status);
+    const isTopic = Boolean(task.is_topic || task.requester === task.owner);
+    const element = el('article', 'card task task-' + task.status + (isTopic ? ' task-topic' : ''));
     element.taskId = task.id;
     const head = el('header', 'card-head');
-    const mine = task.owner === context.user ? '我负责' : task.requester === context.user ? '我发起' : '';
-    head.append(badge(TASK_STATUS, task.status));
-    if (mine) head.append(el('span', 'badge badge-mine', mine));
+    if (isTopic) {
+      const turnCount = Number.isFinite(task.turn_count) ? task.turn_count : (task.result ? 1 : 0);
+      head.append(el('span', 'badge badge-mine', `同类上下文 · ${turnCount} 轮对话`));
+      if (task.status === 'working') head.append(badge(TASK_STATUS, 'working'));
+    } else {
+      const mine = task.owner === context.user ? '我负责' : task.requester === context.user ? '我发起' : '';
+      head.append(badge(TASK_STATUS, task.status));
+      if (mine) head.append(el('span', 'badge badge-mine', mine));
+    }
     const id = el('span', 'card-id', '#' + String(task.id).slice(0, 8));
     id.title = '任务编号：' + task.id + ' · 版本：' + task.revision;
     head.append(id);
     element.append(head, el('h3', 'task-title', task.summary),
-      el('div', 'meta', `${task.requester} → ${task.owner}`));
+      el('div', 'meta', isTopic ? '管家自动归并索引' : `${memberLabel(task.requester)} → ${memberLabel(task.owner)}`));
     if (task.details) {
       const material = el('details', 'material');
       material.append(el('summary', null, '共享材料'), el('pre', null, task.details));
       element.append(material);
     }
-    if (task.result) {
+    if (isTopic && Array.isArray(task.recent_turns) && task.recent_turns.length) {
+      const history = el('details', 'material');
+      const turnCount = Number.isFinite(task.turn_count) ? task.turn_count : task.recent_turns.length;
+      history.append(el('summary', null, `已归并 ${turnCount} 轮上下文记录`));
+      const text = task.recent_turns.map(t => {
+        const prefix = `[第 ${t.seq} 轮] ` + (t.question ? `问：${t.question}\n` : '');
+        return prefix + `答：${t.answer || ''}`;
+      }).join('\n\n');
+      history.append(el('pre', null, text));
+      element.append(history);
+    } else if (task.result) {
       // Finished tasks keep the delivery one click away instead of filling the list.
       const finished = ['completed', 'canceled'].includes(task.status);
       const delivery = el(finished ? 'details' : 'div', 'delivery');
       delivery.append(el(finished ? 'summary' : 'span', 'delivery-label', '最新交付'), el('pre', null, task.result));
       element.append(delivery);
     }
-    const draftNote = draftUI.status?.(task);
+    const draftNote = isTopic ? '' : draftUI.status?.(task);
     if (draftNote) element.append(el('p', 'draft-status' + (task.my_draft?.status === 'pending' ? ' working' : ''), draftNote));
     // Overview only: accepting, drafting, delivering and accepting results happen
     // in the conversation, where the matching card sits at the time of its last step.
-    const waitingOnMe = (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
-      || (task.requester === context.user && task.status === 'ready_for_acceptance');
-    const canCancel = (task.requester === context.user && ['awaiting_owner', 'working', 'ready_for_acceptance'].includes(task.status))
-      || (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status));
+    const waitingOnMe = !isTopic && ((task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status))
+      || (task.requester === context.user && task.status === 'ready_for_acceptance'));
+    const canCancel = !isTopic && ((task.requester === context.user && ['awaiting_owner', 'working', 'ready_for_acceptance'].includes(task.status))
+      || (task.owner === context.user && ['awaiting_owner', 'working'].includes(task.status)));
     const foot = el('div', 'card-foot');
     const actionRow = el('div', 'actions');
     const tools = el('div', 'tools');
@@ -177,16 +197,20 @@ function renderTaskCards(context, tasks) {
     const menu = el('div', 'more-menu');
     more.append(el('summary', null, '更多'), menu);
     foot.append(actionRow, tools);
-    const open = el('button', waitingOnMe ? 'primary' : null, waitingOnMe ? '在对话中处理' : '在对话中查看');
-    open.type = 'button';
-    open.onclick = () => showTaskInChat(task.id);
-    actionRow.append(open);
-    addDiscussion(tools, context, task);
-    draftUI.attach(menu, context, task);
-    timelineUI.attach(menu, context, task);
-    workerUI.attach(menu, context, task);
-    if (canCancel) addActions(menu, context, 'tasks', task, [['cancel', '取消任务']]);
-    if (menu.children.length) tools.append(more);
+    if (isTopic) {
+      addDiscussion(actionRow, context, task);
+    } else {
+      const open = el('button', waitingOnMe ? 'primary' : null, waitingOnMe ? '在对话中处理' : '在对话中查看');
+      open.type = 'button';
+      open.onclick = () => showTaskInChat(task.id);
+      actionRow.append(open);
+      addDiscussion(tools, context, task);
+      draftUI.attach(menu, context, task);
+      timelineUI.attach(menu, context, task);
+      workerUI.attach(menu, context, task);
+      if (canCancel) addActions(menu, context, 'tasks', task, [['cancel', '取消任务']]);
+      if (menu.children.length) tools.append(more);
+    }
     const slot = el('div', 'card-panels');
     slots.set(task.id, slot);
     element.append(foot, slot);

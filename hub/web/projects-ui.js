@@ -4,6 +4,8 @@ let projectDirectory = [], projectInvitations = [];
 let projectAlignment = null, projectAlignmentGeneration = 0;
 const projectPath = id => 'projects/' + encodeURIComponent(id);
 const projectHost = () => $('project-panel');
+const projectMember = id => typeof memberLabel === 'function' ? memberLabel(id) : id;
+const projectItemStatus = item => item.status === 'confirmed' && item.confirmation_valid ? '已由 ' + projectMember(item.confirmed_by) + ' 确认' : ProjectStateModel.status(item);
 function projectButton(text, action, className = '') {
   const button = el('button', className, text); button.type = 'button'; button.onclick = action; return button;
 }
@@ -26,7 +28,8 @@ function closeProjects() {
     projectDraft.preview?.querySelector('button.primary')?.setAttribute('disabled', '');
   }
   $('room').classList.remove('projects-open'); projectHost().classList.add('hide');
-  $('open-projects').classList.remove('active'); $('open-projects').setAttribute('aria-expanded', 'false');
+  if (typeof syncRailState === 'function') syncRailState();
+  else { $('open-projects').classList.remove('active'); $('open-projects').setAttribute('aria-expanded', 'false'); }
 }
 function clearProjectAlignment() {
   projectAlignment = null; projectAlignmentGeneration++;
@@ -40,12 +43,17 @@ function projectShell() {
   const head = el('header', 'project-heading');
   head.append(el('h2', '', '项目'), projectButton('回到私聊', () => { closeProjects(); $('text').focus(); }));
   const notice = el('p', 'project-notice note'); notice.id = 'project-notice'; notice.setAttribute('role', 'status');
-  projectHost().replaceChildren(head, el('p', 'note', '与助手讨论仍仅自己可见。只有预览并确认发布的内容会成为项目材料。'), notice);
+  const rules = el('details', 'project-rules');
+  rules.append(el('summary', '', '讨论与发布边界'), el('p', 'note', '与助手讨论仍仅自己可见。只有预览并确认发布的内容会成为项目材料。'));
+  projectHost().replaceChildren(head, notice, rules);
 }
 function showProjectPanel() {
-  closeContacts(); closePeerConversation(); profileUI.reset(); hideCollaborationSettings(); setTasksOpen(false);
+  if (typeof setRailMenuOpen === 'function') setRailMenuOpen(false);
+  if (typeof closeComposerOverlays === 'function') closeComposerOverlays();
+  closePeerConversation(); closeContacts(); profileUI.reset(); hideCollaborationSettings(); setTasksOpen(false);
   $('room').classList.add('projects-open'); projectHost().classList.remove('hide');
-  $('open-projects').classList.add('active'); $('open-projects').setAttribute('aria-expanded', 'true');
+  if (typeof syncRailState === 'function') syncRailState();
+  else { $('open-projects').classList.add('active'); $('open-projects').setAttribute('aria-expanded', 'true'); }
 }
 async function openProjects() {
   if (!current(session())) return;
@@ -78,7 +86,7 @@ function renderProjectDirectory() {
   if (projectInvitations.length) projectHost().append(el('h3', '', '待接受的邀请'));
   for (const invitation of projectInvitations) {
     const card = el('article', 'project-card');
-    card.append(el('h3', '', invitation.name), el('p', 'project-copy', invitation.goal), el('p', 'note', '邀请人：' + invitation.creator + ' · 加入后才可读取共同状态。'));
+    card.append(el('h3', '', invitation.name), el('p', 'project-copy', invitation.goal), el('p', 'note', '邀请人：' + projectMember(invitation.creator) + ' · 加入后才可读取共同状态。'));
     card.append(projectButton('加入项目', () => membershipEditor(invitation, 'accept')), projectButton('婉拒邀请', () => membershipEditor(invitation, 'decline')));
     projectHost().append(card);
   }
@@ -126,13 +134,13 @@ async function loadProject(id, checkAlignment = false) {
 function projectCard(item, historical = false) {
   const card = el('article', 'project-state-card'); card.dataset.item = item.id;
   card.tabIndex = -1;
-  card.append(el('p', 'project-item-status', historical ? '历史版本 ' + item.version + ' · ' + (item.status === 'confirmed' ? '当时由 ' + item.confirmed_by + ' 确认' : ProjectStateModel.status(item)) : ProjectStateModel.status(item) + ' · 版本 ' + item.version));
+  card.append(el('p', 'project-item-status', historical ? '历史版本 ' + item.version + ' · ' + (item.status === 'confirmed' ? '当时由 ' + projectMember(item.confirmed_by) + ' 确认' : ProjectStateModel.status(item)) : projectItemStatus(item) + ' · 版本 ' + item.version));
   card.append(el('p', 'project-copy', item.content));
-  if (item.assignee) card.append(el('p', 'note', '负责人：' + item.assignee));
+  if (item.assignee) card.append(el('p', 'note', '负责人：' + projectMember(item.assignee)));
   card.append(el('p', 'note', '来源类型：' + (item.source_kind === 'model_suggestion' ? '模型建议（不是本人承诺）' : '人工陈述')),
     el('p', 'project-copy note', '来源说明（发布人填写）：' + item.source_note),
-    el('p', 'note', '发布人：' + item.created_by + ' · 本次变更：' + item.changed_by + ' · ' + item.created_at));
-  if (!historical && item.status === 'proposed') card.append(el('p', 'note', '等待确认：' + ProjectStateModel.confirmer(projectView.project, item) + '。其他成员不能代替本人确认。'));
+    el('p', 'note', '发布人：' + projectMember(item.created_by) + ' · 本次变更：' + projectMember(item.changed_by) + ' · ' + item.created_at));
+  if (!historical && item.status === 'proposed') card.append(el('p', 'note', '等待确认：' + projectMember(ProjectStateModel.confirmer(projectView.project, item)) + '。其他成员不能代替本人确认。'));
   if (historical) return card;
   const actions = el('div', 'actions');
   const permissions = ProjectStateModel.permissions(projectView.project, item, user);
@@ -146,25 +154,29 @@ function projectCard(item, historical = false) {
 function renderProject() {
   if (!projectView || projectDraft) return;
   projectShell(); const { project, members, items, tasks } = projectView;
-  projectHost().append(projectButton('项目列表', loadProjectDirectory));
+  const nav = el('div', 'project-toolbar-top');
+  nav.append(projectButton('项目列表', loadProjectDirectory));
+  projectHost().append(nav);
   projectHost().append(el('h3', 'project-title', project.name), el('p', 'note', (project.kind === 'ongoing' ? '持续项目' : '临时项目') + ' · ' + (project.status === 'archived' ? '已归档，仍可退出或撤回本人声明及关联' : '未归档') + ' · 项目版本 ' + project.revision));
   const description = el('details', 'project-description'); description.append(el('summary', '', '项目说明（创建人提供，不代表全员确认）'), el('p', 'project-copy', project.goal)); projectHost().append(description);
-  projectHost().append(el('p', 'project-members note', '成员：' + members.filter(m => ['active', 'invited'].includes(m.status)).map(m => m.owner + (m.status === 'invited' ? '（待加入）' : '')).join('、')));
-  const actions = el('div', 'actions');
-  if (project.status === 'active') actions.append(projectButton('与我的 Agent 讨论', discussProject));
+  projectHost().append(el('p', 'project-members note', '成员：' + members.filter(m => ['active', 'invited'].includes(m.status)).map(m => projectMember(m.owner) + (m.status === 'invited' ? '（待加入）' : '')).join('、')));
+  const primaryActions = el('div', 'actions project-primary-actions');
+  const secondaryActions = el('div', 'actions project-secondary-actions');
   if (project.status === 'active') {
     const view = projectView, context = session(), generation = projectGeneration;
+    primaryActions.append(projectButton('发布共同状态', () => stateEditor(), 'primary'));
+    primaryActions.append(projectButton('与我的 Agent 讨论', discussProject));
     const check = projectButton('检查对齐', () => checkProjectAlignment(view, context, generation, check));
-    actions.append(check);
-    actions.append(projectButton('发布共同状态', () => stateEditor(), 'primary'));
-    actions.append(projectButton('关联我的任务', linkProjectEditor));
-    if (project.creator === user) actions.append(projectButton('邀请成员', inviteProjectEditor), projectButton('归档项目', () => projectLifecycleEditor('archive')));
+    primaryActions.append(check);
+    secondaryActions.append(projectButton('关联我的任务', linkProjectEditor));
+    if (project.creator === user) secondaryActions.append(projectButton('邀请成员', inviteProjectEditor), projectButton('归档项目', () => projectLifecycleEditor('archive')));
   }
   if (project.creator === user) {
-    if (members.some(m => m.owner !== user && ['active', 'invited'].includes(m.status))) actions.append(projectButton('移除成员', removeProjectMemberEditor));
-  } else actions.append(projectButton('退出项目', () => projectLifecycleEditor('leave')));
-  actions.append(projectButton('刷新共同状态', () => loadProject(project.id))); projectHost().append(actions);
-  renderProjectCompletion();
+    if (members.some(m => m.owner !== user && ['active', 'invited'].includes(m.status))) secondaryActions.append(projectButton('移除成员', removeProjectMemberEditor));
+  } else secondaryActions.append(projectButton('退出项目', () => projectLifecycleEditor('leave')));
+  secondaryActions.append(projectButton('刷新共同状态', () => loadProject(project.id)));
+  if (primaryActions.children.length) projectHost().append(primaryActions);
+  if (secondaryActions.children.length) projectHost().append(secondaryActions);
   renderProjectAlignment();
   for (const [kind, name] of Object.entries(ProjectStateModel.kinds)) {
     const section = el('section', 'project-state-group'); section.setAttribute('aria-label', name);
@@ -175,13 +187,13 @@ function renderProject() {
     projectHost().append(section);
   }
   const withdrawn = items.filter(item => item.status === 'withdrawn');
-  if (withdrawn.length) { const history = el('details'); history.append(el('summary', '', '已撤回（' + withdrawn.length + '）')); for (const item of withdrawn) history.append(projectCard(item)); projectHost().append(history); }
+  if (withdrawn.length) { const history = el('details', 'project-withdrawn'); history.append(el('summary', '', '已撤回（' + withdrawn.length + '）')); for (const item of withdrawn) history.append(projectCard(item)); projectHost().append(history); }
   if (tasks.length) {
     const links = el('section', 'project-state-group'); links.append(el('h3', '', '关联任务'), el('p', 'note', '这里只展示经任务双方同意公开的标签和进度。任务正文与私密草稿仍仅双方可见。'));
     for (const task of tasks) {
       const card = el('article', 'project-card project-task-card'); card.dataset.task = task.task_id;
       const participant = task.requester === user || task.owner === user;
-      card.append(el('p', 'note', '任务：' + task.task_id + ' · 双方：' + task.requester + ' / ' + task.owner), el('p', 'project-copy', task.label), el('p', 'note', task.status === 'pending' ? '等待另一方同意公开' : (TASK_STATUS[task.task_status]?.[0] || task.task_status)));
+      card.append(el('p', 'note', '任务：' + task.task_id + ' · 双方：' + projectMember(task.requester) + ' / ' + projectMember(task.owner)), el('p', 'project-copy', task.label), el('p', 'note', task.status === 'pending' ? '等待另一方同意公开' : (TASK_STATUS[task.task_status]?.[0] || task.task_status)));
       if (participant && task.status === 'pending' && task.proposed_by !== user && project.status === 'active') card.append(projectButton('同意公开关联', () => linkProjectActionEditor(task, 'approve')));
       if (participant || (project.creator === user && task.status === 'active')) card.append(projectButton('撤回任务关联', () => linkProjectActionEditor(task, 'revoke')));
       if (task.can_open_task) card.append(projectButton('打开我的任务', () => { closeProjects(); showTaskInChat(task.task_id); }));
@@ -189,6 +201,7 @@ function renderProject() {
     }
     projectHost().append(links);
   }
+  renderProjectCompletion();
 }
 function renderBlockerResolution(card, actions, item) {
   const blocker = projectView.completion?.blockers.find(b => b.item_id === item.id && b.item_version === item.version);
@@ -197,7 +210,7 @@ function renderBlockerResolution(card, actions, item) {
   }
   card.append(el('p', 'project-blocker-resolution note', blocker?.resolved ? '已由原报告人明确解除阻塞' : '尚未解除阻塞；确认报告不等于解决'));
   if (blocker?.resolution) {
-    card.append(el('p', 'project-copy note', '最近记录（是否生效以上述状态为准）：' + blocker.resolution.author + ' · ' + (blocker.resolution.action === 'resolve' ? '解除' : '重新打开') + ' · ' + blocker.resolution.note));
+    card.append(el('p', 'project-copy note', '最近记录（是否生效以上述状态为准）：' + projectMember(blocker.resolution.author) + ' · ' + (blocker.resolution.action === 'resolve' ? '解除' : '重新打开') + ' · ' + blocker.resolution.note));
   }
   if (projectView.project.status === 'active' && item.created_by === user && item.status === 'confirmed' && item.confirmation_valid && blocker) {
     actions.append(projectButton(blocker.resolved ? '重新打开阻塞' : '解除阻塞', () => blockerResolutionEditor(item, blocker.resolved ? 'reopen' : 'resolve')));
@@ -210,8 +223,8 @@ function renderProjectCompletion() {
   section.append(el('h3', '', '项目最终验收'), el('p', 'note', '由创建人针对明确目标版本作出本人验收声明，不代表全体成员共识。单个任务验收、阻塞撤回和项目归档均不等于项目完成。'));
   const acceptance = completion.acceptance;
   if (acceptance) {
-    section.append(el('p', 'project-acceptance-status', acceptance.withdrawn ? '本人已撤回项目验收，历史记录保留' : acceptance.valid ? '当前项目版本已由 ' + acceptance.author + ' 最终验收' : '历史验收不再代表当前项目已完成'),
-      el('p', 'note', '验收人：' + acceptance.author + ' · 目标项目版本 ' + acceptance.target_revision + ' · 验收记录版本 ' + acceptance.accepted_revision),
+    section.append(el('p', 'project-acceptance-status', acceptance.withdrawn ? '本人已撤回项目验收，历史记录保留' : acceptance.valid ? '当前项目版本已由 ' + projectMember(acceptance.author) + ' 最终验收' : '历史验收不再代表当前项目已完成'),
+      el('p', 'note', '验收人：' + projectMember(acceptance.author) + ' · 目标项目版本 ' + acceptance.target_revision + ' · 验收记录版本 ' + acceptance.accepted_revision),
       el('p', 'project-copy', acceptance.note));
     for (const goal of acceptance.goals || []) section.append(el('p', 'note', '已验收目标：' + goal.item_id + ' · 版本 ' + goal.item_version));
     if (!acceptance.withdrawn && project.creator === user) section.append(projectButton('撤回项目验收', () => withdrawProjectAcceptanceEditor(acceptance)));
@@ -309,8 +322,8 @@ function renderProjectAlignment() {
         if (!item) continue;
         const reference = el('div', 'project-alignment-source');
         reference.append(el('p', 'note', ProjectStateModel.kinds[item.kind] + ' · ' + item.id + ' · 版本 ' + item.version),
-          el('p', 'note', ProjectStateModel.status(item) + ' · ' + (item.source_kind === 'model_suggestion' ? '模型建议（不是本人承诺）' : '人工陈述') + ' · 发布人：' + item.created_by));
-        if (item.status === 'proposed') reference.append(el('p', 'note', '等待确认：' + ProjectStateModel.confirmer(view.project, item)));
+          el('p', 'note', projectItemStatus(item) + ' · ' + (item.source_kind === 'model_suggestion' ? '模型建议（不是本人承诺）' : '人工陈述') + ' · 发布人：' + projectMember(item.created_by)));
+        if (item.status === 'proposed') reference.append(el('p', 'note', '等待确认：' + projectMember(ProjectStateModel.confirmer(view.project, item))));
         reference.append(projectButton('查看共享条目', () => {
           if (!current(context) || generation !== projectGeneration || projectAlignment !== snapshot || projectView !== view
               || !section.isConnected || !$('room').classList.contains('projects-open')) return;
@@ -543,7 +556,7 @@ function stateEditor(item, candidate = null) {
   const note = projectField(form, '来源说明', 'textarea', candidate?.source_note || item?.source_note || '');
   if (candidate) { note.readOnly = true; form.append(el('p', 'note', '来源保留所选消息的类型与时间，不证明内容真实。请在上方编辑要共享的内容。')); }
   const members = projectView.members.filter(member => member.status === 'active');
-  const assignee = projectField(form, '负责人', 'text', item?.assignee || '', [['', '选择需本人确认的成员'], ...members.map(m => [m.owner, m.owner])]);
+  const assignee = projectField(form, '负责人', 'text', item?.assignee || '', [['', '选择需本人确认的成员'], ...members.map(m => [m.owner, projectMember(m.owner)])]);
   const updateKind = () => { assignee.parentElement.classList.toggle('hide', kind.value !== 'assignment'); assignee.required = kind.value === 'assignment'; }; kind.onchange = updateKind; updateKind();
   form.append(el('p', 'note', '请只填准备向全体项目成员公开的内容和来源说明。模型建议保持建议标记；分工需要负责人本人确认。修订会清除原有确认。'));
   const preview = el('button', 'primary', '预览发布'); preview.type = 'submit'; form.append(preview, editorCancel());
@@ -606,7 +619,7 @@ async function stateQuestions(item) {
     if (!result.messages.length) editor.append(el('p', 'note', '还没有共享问题。'));
     const renderMessage = (message, root) => {
       const card = el('article', 'project-card project-question-message'); card.dataset.question = message.id; card.classList.toggle('project-question-reply', !!message.reply_to);
-      card.append(el('p', 'note', (message.reply_to ? '回复' : '问题') + ' · ' + message.author + ' · ' + message.created_at + ' · 依据条目版本 ' + message.item_version),
+      card.append(el('p', 'note', (message.reply_to ? '回复' : '问题') + ' · ' + projectMember(message.author) + ' · ' + message.created_at + ' · 依据条目版本 ' + message.item_version),
         el('p', 'project-copy', message.withdrawn ? '作者已撤回此反馈，正文不再展示。' : message.content));
       if (message.item_version !== item.version) card.append(el('p', 'note', '旧版本反馈，仅供历史参考，不能继续回复；新版本请重新提出问题。'));
       const actions = el('div', 'actions');
@@ -635,7 +648,7 @@ function questionEditor(item, reply = null) {
   const draft = projectDraft, project = projectView.project; draft.sharedQuestion = true;
   const form = el('form');
   form.append(el('p', 'project-copy', '依据条目版本 ' + item.version + '：' + item.content));
-  if (reply) form.append(el('p', 'project-copy', '回复 ' + reply.author + ' 的问题：' + reply.content));
+  if (reply) form.append(el('p', 'project-copy', '回复 ' + projectMember(reply.author) + ' 的问题：' + reply.content));
   form.append(el('p', 'note', '仅输入你准备公开的反馈。发布前可预览；不会附带私聊，也不会修改共同状态或替他人确认。'));
   const content = projectField(form, reply ? '共享回复内容' : '共享问题内容', 'textarea'); content.maxLength = 4000;
   const preview = el('button', 'primary', '预览共享反馈'); preview.type = 'submit'; form.append(preview, editorCancel());
@@ -683,7 +696,7 @@ async function inviteProjectEditor() {
     const existing = new Set(projectView.members.filter(m => ['active', 'invited'].includes(m.status)).map(m => m.owner));
     const available = contacts.filter(id => !existing.has(id));
     if (!available.length) { editor.append(el('p', 'note', '没有可邀请的新成员。')); return; }
-    const form = el('form'); const owner = projectField(form, '邀请成员', 'text', '', [['', '选择成员'], ...available.map(id => [id, id])]);
+    const form = el('form'); const owner = projectField(form, '邀请成员', 'text', '', [['', '选择成员'], ...available.map(id => [id, projectMember(id)])]);
     const preview = el('button', 'primary', '预览邀请'); preview.type = 'submit'; form.append(preview);
     form.onsubmit = event => { event.preventDefault(); if (!form.reportValidity()) return;
       projectPreview(form, '核对邀请', ['项目：' + project.name, '项目说明：' + project.goal, '接收人：' + owner.value], '确认邀请', projectPath(project.id) + '/members', { owner: owner.value, expected_revision: project.revision }); };
@@ -719,7 +732,7 @@ async function linkProjectEditor() {
     const eligible = tasks.filter(t => (t.requester === draft.context.user || t.owner === draft.context.user) && members.has(t.requester) && members.has(t.owner) && !linked.has(t.id));
     if (!eligible.length) { editor.append(el('p', 'note', '暂无可关联任务。需要任务双方先加入项目，且该任务没有待确认或已公开的关联。')); return; }
     const form = el('form');
-    const choice = projectField(form, '我的任务', 'text', '', [['', '选择任务'], ...eligible.map(t => [t.id, t.summary.slice(0, 100) + ' · ' + t.requester + ' / ' + t.owner + ' · ' + t.id])]);
+    const choice = projectField(form, '我的任务', 'text', '', [['', '选择任务'], ...eligible.map(t => [t.id, t.summary.slice(0, 100) + ' · ' + projectMember(t.requester) + ' / ' + projectMember(t.owner) + ' · ' + t.id])]);
     const label = projectField(form, '共享协调标签', 'textarea'); label.maxLength = 240;
     const submit = el('button', 'primary', '预览关联'); submit.type = 'submit'; form.append(submit, editorCancel());
     editor.querySelector('button')?.remove(); // Move the loading cancel into the replaceable form.
@@ -759,7 +772,7 @@ function removeProjectMemberEditor() {
   const editor = beginProjectEditor('移除成员'); if (!editor) return;
   const project = projectView.project, form = el('form');
   const members = projectView.members.filter(m => m.owner !== user && ['active', 'invited'].includes(m.status));
-  const choice = projectField(form, '移除成员', 'text', '', [['', '选择成员'], ...members.map(m => [m.owner, m.owner])]);
+  const choice = projectField(form, '移除成员', 'text', '', [['', '选择成员'], ...members.map(m => [m.owner, projectMember(m.owner)])]);
   const submit = el('button', 'primary', '预览移除'); submit.type = 'submit'; form.append(submit, editorCancel());
   form.onsubmit = event => {
     event.preventDefault(); if (!form.reportValidity()) return;

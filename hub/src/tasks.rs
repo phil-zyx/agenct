@@ -54,9 +54,31 @@ pub(super) async fn tasks(
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let mut out = Vec::with_capacity(rows.len());
     for task in rows {
+        let is_self_topic = task.requester == task.owner;
+        if is_self_topic
+            && !crate::nodes::is_topic_summary(&task.summary)
+            && task.status != "working"
+        {
+            continue;
+        }
         let shared = details(&db, &task.id)?;
         let mut value = serde_json::to_value(&task).map_err(|_| invalid("invalid task"))?;
         value["details"] = shared.map_or(serde_json::Value::Null, |d| d["content"].clone());
+        if is_self_topic {
+            let turns = crate::nodes::topic_turns(&db, &task.id)?;
+            let turn_count = turns.len();
+            let recent: Vec<_> = turns
+                .into_iter()
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            value["is_topic"] = serde_json::json!(true);
+            value["turn_count"] = serde_json::json!(turn_count);
+            value["recent_turns"] = serde_json::json!(recent);
+        }
         if task.owner == id {
             // Owner-only: whether a private draft exists for this task version.
             // Status and receipt key only; never content, and never for the requester.
@@ -77,6 +99,11 @@ pub(super) async fn tasks(
                 .optional()?
                 .or(crate::auto_drafts::projection(&db, &id, &task.id, task.revision)?)
                 .unwrap_or(serde_json::Value::Null);
+            if let Some(assigned) =
+                crate::nodes::task_assignment(&db, &id, &task.id, task.revision)?
+            {
+                value["my_node_assignment"] = assigned;
+            }
         }
         out.push(value);
     }
@@ -217,7 +244,13 @@ pub(super) async fn action(
     // Task revision changes revoke queued work and lease capabilities atomically.
     worker::revoke_task(&tx, &id)?;
     crate::auto_drafts::revoke_task(&tx, &id)?;
+    let node_assigned = if next == "working" {
+        crate::nodes::auto_assign_on_accept(&tx, &t.owner, &id, t.revision + 1)?
+    } else {
+        false
+    };
     let auto_prepare = h.auto_draft
+        && !node_assigned
         && next == "working"
         && crate::collaboration::read(&tx, &t.owner)?
             .permissions

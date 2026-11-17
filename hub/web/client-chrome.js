@@ -14,14 +14,62 @@ const preference = {
   set(key, value) { try { localStorage.setItem(key, value); } catch { /* storage unavailable */ } }
 };
 let contactsGeneration = 0;
+let accountOpen = false;
 const contactDrafts = new Map();
 let contactDraftOwner = '';
 function clearContactDrafts() { contactDrafts.clear(); contactDraftOwner = ''; }
+function setRailMenuOpen(open) {
+  const menu = $('rail-menu');
+  if (!menu) return;
+  menu.classList[open ? 'remove' : 'add']('hide');
+  syncRailState();
+}
+function syncRailState() {
+  const room = $('room');
+  if (!room) return;
+  const narrow = globalThis.innerWidth <= 900 && !room.classList.contains('hide');
+  const projects = room.classList.contains('projects-open');
+  const settings = room.classList.contains('settings-open');
+  const account = room.classList.contains('contacts-open') && accountOpen;
+  const contacts = !account && (room.classList.contains('contact-mode') || room.classList.contains('contact-list-open') || room.classList.contains('contacts-open') || !!peerState);
+  const tasks = room.classList.contains('tasks-open') && !projects && !settings && !room.classList.contains('contacts-open');
+  const menuOpen = !$('rail-menu')?.classList.contains('hide');
+  const chat = !projects && !settings && !account && !contacts && !(narrow && tasks);
+  const setRail = (id, active, attr) => {
+    const button = $(id);
+    if (!button) return;
+    button.classList[active ? 'add' : 'remove']('active');
+    if (attr) button.setAttribute(attr, String(active));
+  };
+  setRail('open-chat', chat);
+  if (chat) $('open-chat')?.setAttribute('aria-current', 'page');
+  else $('open-chat')?.removeAttribute?.('aria-current');
+  $('toggle-tasks')?.classList[narrow && tasks ? 'add' : 'remove']('active');
+  $('toggle-tasks')?.setAttribute('aria-pressed', String(tasks));
+  setRail('open-contacts', contacts, 'aria-expanded');
+  setRail('open-projects', projects, 'aria-expanded');
+  setRail('open-account', account || settings, 'aria-expanded');
+  $('rail-more')?.classList[settings || account || menuOpen ? 'add' : 'remove']('active');
+  $('rail-more')?.setAttribute('aria-expanded', String(menuOpen));
+}
+if ($('rail-more')) {
+  $('rail-more').onclick = () => setRailMenuOpen($('rail-menu').classList.contains('hide'));
+}
+setRailMenuOpen(false);
+document.addEventListener('click', event => {
+  if (!$('rail-menu') || $('rail-menu').classList.contains('hide')) return;
+  if (!event.target?.closest?.('.rail-more-wrap')) setRailMenuOpen(false);
+});
 function setTasksOpen(open) {
-  if (open) { if (typeof closeProjects === 'function') closeProjects(); closeContacts(); profileUI.reset(); hideCollaborationSettings(); }
+  if (open) {
+    setRailMenuOpen(false);
+    if (globalThis.innerWidth <= 900) closeComposerOverlays();
+    if (typeof closeProjects === 'function') closeProjects();
+    closeContacts(); profileUI.reset(); hideCollaborationSettings();
+  }
   $('room').classList[open ? 'add' : 'remove']('tasks-open');
-  $('toggle-tasks').setAttribute('aria-pressed', String(open));
   preference.set('agenct.tasksOpen', open ? '1' : '0');
+  syncRailState();
   if (document.querySelector) updatePanelAccessibility();
 }
 $('toggle-tasks').onclick = () => setTasksOpen($('room').classList.contains('contacts-open') || $('room').classList.contains('settings-open') || !$('room').classList.contains('tasks-open'));
@@ -37,10 +85,22 @@ function setMenuOpen(open) {
   $('composer-menu').classList[open ? 'remove' : 'add']('hide');
   $('composer-menu-toggle').setAttribute('aria-expanded', String(open));
 }
+function closeComposerOverlays() {
+  setMenuOpen(false);
+  if (typeof closeRolePicker === 'function' && !roleLocked()) closeRolePicker();
+  if (typeof closeRepositoryPicker === 'function' && !repositoryLocked()) closeRepositoryPicker();
+}
 setMenuOpen(false);
-$('composer-menu-toggle').onclick = () => setMenuOpen($('composer-menu').classList.contains('hide'));
+$('composer-menu-toggle').onclick = () => {
+  const anyOpen = !$('composer-menu').classList.contains('hide')
+    || !$('role-picker').classList.contains('hide')
+    || !$('repository-picker').classList.contains('hide');
+  if (anyOpen) closeComposerOverlays();
+  else setMenuOpen(true);
+};
 // Same path as typing /agents: handled locally by the profile UI, never sent to a model.
 $('open-agents').onclick = async () => {
+  setRailMenuOpen(false);
   const context = session();
   if (!current(context) || $('send').disabled || $('open-agents').disabled) return;
   returnToChatOnNarrowScreen();
@@ -53,6 +113,7 @@ $('open-agents').onclick = async () => {
     if (current(context)) $('open-agents').disabled = false;
   }
 };
+if ($('manage-roles')) $('manage-roles').onclick = () => $('open-agents')?.onclick?.();
 $('status').onclick = () => status('');
 $('status').onkeydown = event => { if (event.key === 'Escape') { event.preventDefault(); status(''); } };
 $('text').oninput = () => {
@@ -77,9 +138,14 @@ document.addEventListener('keydown', event => {
     (open ? $('tab-activity') : $('text')).focus?.(); return;
   }
   if (event.key !== 'Escape' || event.defaultPrevented) return;
+  if (!$('rail-menu').classList.contains('hide')) { setRailMenuOpen(false); $('rail-more')?.focus?.(); return; }
   if ($('room').classList.contains('projects-open')) { closeProjects(); $('open-projects').focus?.(); return; }
-  if ($('room').classList.contains('collaboration-settings-open')) { collaborationProfileUI.close(); $('open-collaboration').focus?.(); return; }
-  if ($('room').classList.contains('contacts-open')) { closeContacts(); $('open-contacts').focus?.(); return; }
+  if ($('room').classList.contains('contacts-open')) {
+    const wasAccount = accountOpen;
+    closeContacts();
+    (wasAccount ? ($('rail-more') || $('open-account')) : $('open-contacts')).focus?.();
+    return;
+  }
   if ($('room').classList.contains('settings-open')) { profileUI.close(); return; }
   if ($('room').classList.contains('contact-list-open')) { restorePrivateChat(); return; }
   if (!$('repository-picker').classList.contains('hide')) { closeRepositoryPicker(); $('choose-repository').focus?.(); return; }
@@ -113,16 +179,18 @@ $('clear-repository').onclick = () => { if (!current(session()) || repositoryLoc
 
 function closeContacts() {
   // Keep these controls and their handlers alive when the account panel closes.
-  const home = $('account-tools-home'), tools = $('account-tools');
-  if (home && tools && tools.parentElement !== home) home.append(tools);
+  const home = $('account-tools-home');
+  for (const id of ['open-agents', 'collaboration-profile-view', 'account-tools']) {
+    const node = $(id);
+    if (home && node && node.parentElement !== home) home.append(node);
+  }
+  if (typeof collaborationProfileUI !== 'undefined') collaborationProfileUI.reset();
   contactsGeneration++;
+  accountOpen = false;
   $('contacts-view').replaceChildren();
   $('contacts-view').classList.add('hide');
   $('room').classList.remove('contacts-open');
-  if (!peerState) $('open-contacts').classList.remove('active');
-  $('open-account').setAttribute('aria-expanded', 'false');
-  $('open-contacts').setAttribute('aria-expanded', String(!!peerState));
-  $('toggle-tasks').setAttribute('aria-pressed', String($('room').classList.contains('tasks-open') && !$('room').classList.contains('settings-open')));
+  syncRailState();
 }
 async function openContacts() { return openContactDirectory(); }
 $('open-contacts').onclick = openContacts;
@@ -130,11 +198,11 @@ void checkSession();
 
 // Covered mobile content must not remain reachable by keyboard or assistive technology.
 function updatePanelAccessibility() {
+  syncRailState();
   const room = $('room'), chat = document.querySelector('.chat-pane');
   if (!chat) return;
   const narrow = globalThis.innerWidth <= 900 && !room.classList.contains('hide');
   const panel = room.classList.contains('projects-open') ? $('project-panel')
-    : room.classList.contains('collaboration-settings-open') ? $('collaboration-profile-view')
     : room.classList.contains('contact-list-open') ? $('contact-sidebar')
     : room.classList.contains('contacts-open') ? $('contacts-view')
     : room.classList.contains('settings-open') ? $('profile-view')

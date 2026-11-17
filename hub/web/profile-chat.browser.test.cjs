@@ -111,7 +111,7 @@ async function freePort() {
     });
     await login(alice, 'alice'); await login(bob, 'bob');
 
-    await alice.locator('#open-collaboration').click();
+    await alice.locator('#rail-more').click(); await alice.locator('#open-account').click();
     await alice.locator('#collaboration-profile-view').getByRole('button', { name: '通过聊天修改', exact: true }).waitFor();
     assert.equal(await alice.locator('#collaboration-profile-view input, #collaboration-profile-view textarea, #collaboration-profile-view select').count(), 0);
     await alice.locator('#collaboration-profile-view').getByRole('button', { name: '通过聊天修改', exact: true }).click();
@@ -177,7 +177,7 @@ async function freePort() {
     await alice.screenshot({ path: path.join(screenshots, 'permission-suggestion-mobile.png') });
     await confirm(alice, permission.id);
     assert.equal((await ok('alice', 'collaboration-profile')).permissions.auto_reply_public, true);
-    await alice.locator('#open-collaboration').click();
+    await alice.locator('#rail-more').click(); await alice.locator('#open-account').click();
     await alice.locator('#collaboration-profile-view').getByRole('button', { name: '通过聊天修改', exact: true }).waitFor();
     assert.equal(await alice.locator('#collaboration-profile-view input, #collaboration-profile-view textarea, #collaboration-profile-view select').count(), 0);
     assert(await alice.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
@@ -205,7 +205,7 @@ async function freePort() {
     console.log('PASS stale suggestions cannot overwrite newer settings; newly proposed changes can be confirmed');
 
     const pending = await propose(alice, '记住：我负责出海迁移，回复先给风险');
-    await alice.locator('#logout').click();
+    await alice.locator('#rail-more').click(); await alice.locator('#logout').click();
     await login(alice, 'bob');
     assert.equal(await alice.locator('article.profile-suggestion').count(), 0);
     assert(!(await alice.locator('#conversation').innerText()).includes('出海迁移'));
@@ -213,7 +213,7 @@ async function freePort() {
     assert.equal((await ok('bob', 'collaboration-profile')).revision, 0);
     const wrongAccount = await api('bob', 'profile-suggestions/' + pending.id + '/actions', 'POST', { action: 'reject' });
     assert([403, 404].includes(wrongAccount.status));
-    await alice.locator('#open-collaboration').click();
+    await alice.locator('#rail-more').click(); await alice.locator('#open-account').click();
     await alice.locator('#collaboration-profile-view').getByRole('button', { name: '通过聊天修改', exact: true }).waitFor();
     assert(!(await alice.locator('#collaboration-profile-view').innerText()).includes('支付服务'));
     assert.deepEqual(pageErrors, []);

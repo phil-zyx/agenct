@@ -119,7 +119,7 @@ async function contactFixture(browser, origin) {
       await f.sendContact('只属于 Alice 的在途消息');
       const held = await capturedPost.promise;
       await page.locator('#peer-message-input').fill('只属于 Alice 的下一条草稿');
-      await page.locator('#logout').click();
+      await page.locator('#rail-more').click(); await page.locator('#logout').click();
       await page.waitForSelector('#dev-login:not(.hide)');
       assert.equal(await page.evaluate(() => peerDrafts.size), 0);
       assert.equal(await page.evaluate(() => peerState), null);

@@ -72,8 +72,10 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
       await route.fulfill({ status: 405, json: { error: 'Method Not Allowed' } }); return;
     }
     if (pathname === '/api/tasks' && method === 'GET') data = state.tasks;
+    if (pathname === '/api/nodes' && method === 'GET') data = state.nodes || [];
     if (pathname === '/api/profile') data = { revision: 0, agents: [] };
     if (pathname === '/api/profile/catalog') data = { roles: [], models: [] };
+    if (pathname === '/api/collaboration-profile') data = { revision: 0, public: {}, private: {}, permissions: { auto_reply_public: false, auto_prepare_drafts: true } };
     if (pathname === '/api/proposals' && method === 'GET') data = state.proposals;
     if (/^\/api\/proposals\/[^/]+\/actions$/.test(pathname) && method === 'POST') {
       const proposal = state.proposals.find(p => String(p.id) === pathname.split('/')[3]);
@@ -99,7 +101,7 @@ async function fixture(browser, origin, browserMode = false, useClock = false) {
     await page.waitForFunction(() => !document.getElementById('room').classList.contains('hide') || !document.getElementById('dev-login').classList.contains('hide'));
     if (await page.locator('#room').isVisible()) {
       if ((await page.locator('#identity').textContent()).startsWith(user + ' ')) return;
-      await page.locator('#logout').click();
+      await page.locator('#rail-more').click(); await page.locator('#logout').click();
     }
     await page.locator('#token').fill(user); await page.locator('#enter').click();
     await page.waitForFunction(user => document.getElementById('identity').textContent.startsWith(user), user);
@@ -156,7 +158,7 @@ if (require.main === module) (async () => {
         const data = route.request().postDataJSON(); writes.push(data);
         Object.assign(own, data, { revision: own.revision + 1 }); return route.fulfill({ json: own });
       });
-      await f.page.locator('#open-account').click();
+      await f.page.locator('#rail-more').click(); await f.page.locator('#open-account').click();
       await f.page.getByRole('textbox', { name: 'alice 显示姓名', exact: true }).fill('Alice Chen');
       const editedInput = await f.page.getByRole('textbox', { name: 'alice 显示姓名', exact: true }).elementHandle();
       await f.page.getByRole('button', { name: '保存资料', exact: true }).first().click();
@@ -195,7 +197,7 @@ if (require.main === module) (async () => {
       assert.equal(await f.page.locator('#text').inputValue(), 'My unsent draft');
       assert(!f.calls.some(c => c.pathname.endsWith('/actions')));
       await f.page.locator('#open-contacts').click();
-      await f.page.locator('#logout').click();
+      await f.page.locator('#rail-more').click(); await f.page.locator('#logout').click();
       assert.equal(await f.page.locator('#contacts-view').textContent(), '');
       await f.close(); console.log('PASS Chromium contacts search, explicit proposal, preserved draft and logout cleanup');
     }
@@ -206,7 +208,7 @@ if (require.main === module) (async () => {
       assert((await f.page.locator('#identity').textContent()).startsWith('alice'));
       assert.equal(await f.page.locator('#token').inputValue(), '');
       assert.equal(f.posts().length, 0);
-      await f.page.locator('#logout').click();
+      await f.page.locator('#rail-more').click(); await f.page.locator('#logout').click();
       await f.page.reload();
       await f.page.waitForSelector('#dev-login:not(.hide)');
       assert.equal(await f.page.locator('#room').isVisible(), false);
@@ -244,7 +246,7 @@ if (require.main === module) (async () => {
       assert.equal(await f.page.locator('#help').getAttribute('open'), '');
       await f.page.locator('#composer-menu-toggle').click();
       await f.page.locator('#text').fill('Keep my unsent private text');
-      await f.page.locator('#toggle-tasks').click(); await f.page.locator('#open-agents').click();
+      await f.page.locator('#toggle-tasks').click(); await f.page.locator('#rail-more').click(); await f.page.locator('#open-account').click(); await f.page.locator('#open-agents').click();
       await f.page.waitForFunction(() => !document.getElementById('open-agents').disabled);
       assert.equal(await f.page.locator('#profile-view').isVisible(), true);
       assert.equal(await f.page.locator('#conversation .profile-settings').count(), 0);
@@ -273,7 +275,7 @@ if (require.main === module) (async () => {
       const snapshot = await f.page.locator('#turn-status').ariaSnapshot();
       assert.match(snapshot, /正在发送/);
       assert.equal(await f.page.locator('#turn-recovery').evaluate(el => getComputedStyle(el).display === 'none'), false);
-      await f.page.locator('#logout').click(); await f.close();
+      await f.page.locator('#rail-more').click(); await f.page.locator('#logout').click(); await f.close();
       console.log('PASS Chromium accessible in-flight sending status');
     }
     {
@@ -414,7 +416,7 @@ if (require.main === module) (async () => {
     {
       const f = await fixture(browser, origin);
       await showTasks(f, [taskFixture()]); await discussButtons(f).click();
-      await f.page.locator('#logout').click(); await f.login('bob');
+      await f.page.locator('#rail-more').click(); await f.page.locator('#logout').click(); await f.login('bob');
       assert.equal(await f.page.locator('#task-context').isVisible(), false);
       await f.send('New identity question'); await settled(f);
       assert.equal(Object.hasOwn(f.posts()[0].body, 'selected_task'), false);
@@ -472,12 +474,12 @@ if (require.main === module) (async () => {
       if (browserMode) {
         f.state.user = 'bob'; await f.page.reload(); await f.page.waitForSelector('#room:not(.hide)');
       } else {
-        await f.page.locator('#logout').click(); await f.login('bob');
+        await f.page.locator('#rail-more').click(); await f.page.locator('#logout').click(); await f.login('bob');
       }
       assert.equal(await f.stored(), null);
       assert.equal(await f.page.locator('#turn-recovery').isVisible(), false);
       assert.match(await f.page.locator('#identity').textContent(), /^bob/);
-      await f.uncertain('bob question'); await f.page.locator('#logout').click();
+      await f.uncertain('bob question'); await f.page.locator('#rail-more').click(); await f.page.locator('#logout').click();
       assert.equal(await f.stored(), null);
       assert.equal(await f.page.locator('#room').isVisible(), false);
       await f.close(); console.log(`PASS Chromium ${browserMode ? 'cookie' : 'bearer'} refresh/logout/owner isolation`);

@@ -370,7 +370,7 @@ async function freePort() {
     const held = await holdNextDetail(alice, detailUrl);
     try {
       await button(alice, '检查对齐').click(); await held.ready();
-      await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
+      await alice.locator('#rail-more').click(); await alice.locator('#logout').click(); await alice.locator('#token').waitFor();
       // No page reload: exercise the stale closure against the new identity.
       await alice.locator('#token').fill(tokens.eve); await alice.locator('#enter').click();
       await alice.locator('#room:not(.hide)').waitFor();

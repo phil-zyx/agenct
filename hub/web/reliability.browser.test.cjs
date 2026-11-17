@@ -32,20 +32,20 @@ const { fixture, server, showTasks, taskFixture } = require('./client.browser.te
     await page.getByRole('button', { name: /张明/ }).click();
     if (page.viewportSize().width > 1100) await page.getByRole('button', { name: '请他帮忙', exact: true }).click();
     assert.equal(await page.getByLabel('委派摘要').inputValue(), '给张明的未提交摘要');
-    await page.locator('#open-agents').click();
+    await page.locator('#rail-more').click(); await page.locator('#open-account').click(); await page.locator('#open-agents').click();
     await page.getByLabel('名称', { exact: true }).fill('尚未保存的名字');
     await page.locator('#open-chat').click();
-    await page.locator('#open-agents').click();
+    await page.locator('#rail-more').click(); await page.locator('#open-account').click(); await page.locator('#open-agents').click();
     assert.equal(await page.getByLabel('名称', { exact: true }).inputValue(), '尚未保存的名字');
     await page.getByRole('button', { name: '检查更改', exact: true }).click();
     await page.getByRole('button', { name: '确认保存个人配置', exact: true }).click();
     await page.getByText('已保存个人配置', { exact: false }).waitFor();
     await page.locator('#open-chat').click();
-    await page.locator('#open-agents').click();
+    await page.locator('#rail-more').click(); await page.locator('#open-account').click(); await page.locator('#open-agents').click();
     assert.equal(await page.getByLabel('名称', { exact: true }).inputValue(), '尚未保存的名字');
     await page.getByLabel('名称', { exact: true }).fill('应该放弃的名字');
     await page.getByRole('button', { name: '取消，不保存', exact: true }).click();
-    await page.locator('#open-agents').click();
+    await page.locator('#rail-more').click(); await page.locator('#open-account').click(); await page.locator('#open-agents').click();
     assert.equal(await page.getByLabel('名称', { exact: true }).inputValue(), '尚未保存的名字');
     console.log('PASS contact/role drafts survive navigation; explicit cancel discards; save persists');
 
@@ -59,7 +59,7 @@ const { fixture, server, showTasks, taskFixture } = require('./client.browser.te
     }
     await page.keyboard.press('Escape');
     await page.waitForFunction(() => !document.querySelector('.chat-pane').inert);
-    await page.locator('#open-agents').click();
+    await page.locator('#rail-more').click(); await page.locator('#open-account').click(); await page.locator('#open-agents').click();
     await page.getByRole('button', { name: '检查更改', exact: true }).focus();
     for (let i = 0; i < 18; i++) {
       await page.keyboard.press('Tab');
@@ -92,18 +92,18 @@ const { fixture, server, showTasks, taskFixture } = require('./client.browser.te
     assert.equal(await page.locator('.float-pill').count(), 0);
     assert.equal(await page.locator('#refresh').isVisible(), false);
     await page.route('**/api/me', route => route.fulfill({ json: { user: 'alice', runtime: 'mock', member: { id: 'alice', display_name: 'Alice', color: 'green', status: 'active', revision: 0, admin: false } } }));
-    await page.locator('#open-account').click();
+    await page.locator('#rail-more').click(); await page.locator('#open-account').click();
     await page.getByRole('heading', { name: '会话与通知' }).waitFor();
     assert.equal(await page.locator('#enable-notifications').isVisible(), true);
     await page.getByRole('button', { name: '刷新会话与任务', exact: true }).click();
     await page.locator('#open-chat').click();
     assert.equal(await page.locator('#refresh').isVisible(), false);
     await page.screenshot({ path: '/tmp/agenct-clean-chat.png' });
-    await page.locator('#open-account').click();
+    await page.locator('#rail-more').click(); await page.locator('#open-account').click();
     await page.getByRole('heading', { name: '会话与通知' }).waitFor();
     assert.equal(await page.locator('#refresh').count(), 1);
     console.log('PASS chat has no utility pills; account retains usable refresh/notification controls across reopening');
-    await page.locator('#logout').click();
+    await page.locator('#rail-more').click(); await page.locator('#logout').click();
     assert.equal(await page.evaluate(() => contactDrafts.size), 0);
     assert.equal(await page.evaluate(() => profileUI.hasUnsaved()), false);
     console.log('PASS logout clears private form drafts');

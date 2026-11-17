@@ -1,14 +1,16 @@
 /* Personal role controls in a separate settings view, never a model/tool grant. */
-function createProfileUI({ api, current, article, host, status, onVisibility = () => {}, onSaved = () => {} }) {
+function createProfileUI({ api, current, article, host, status, onVisibility = () => {}, onSaved = () => {}, onSwitchAccount = null }) {
   let generation = 0, card = null, draft = null;
   const hasUnsaved = () => !!draft && JSON.stringify(draft.agents) !== draft.original;
-  const notice = '聊天默认由管家回复。点击输入框旁的「+」可为下一条消息选择其他角色，各角色使用同一段聊天记录。每次只使用一个模型，不启动 Agent 团队，也不会增加工具权限。离线演示不调用模型，请勿在这里填写密钥。';
+  const roleLabels = { coordinator: '管家', researcher: '研究', writer: '写作', reviewer: '审阅', 'server-default': '默认模型' };
+  const notice = '聊天默认由管家回复。点击输入框下方的「对话选项」可为下一条消息选择其他角色，各角色使用同一段聊天记录。每次只使用一个模型，不启动 Agent 团队，也不会增加工具权限。离线演示不调用模型，请勿在这里填写密钥。';
   function reset({ discard = false } = {}) { if (discard) draft = null; generation++; card = null; host().replaceChildren(); onVisibility(false); }
-  function close() { reset(); document.getElementById?.('open-agents')?.focus?.(); }
+  function close() { reset(); (document.getElementById?.('rail-more') || document.getElementById?.('open-agents'))?.focus?.(); }
   function discard() { draft = null; close(); }
   async function open(context) {
     if (draft && (draft.user !== context.user || draft.epoch !== context.epoch)) draft = null;
     const version = ++generation;
+    let saving = false;
     if (card) card.replaceChildren(article('已关闭旧配置卡，正在重新读取。'));
     card = null;
     const valid = () => current(context) && generation === version;
@@ -20,8 +22,21 @@ function createProfileUI({ api, current, article, host, status, onVisibility = (
     back.type = 'button'; back.textContent = '×'; back.className = 'icon-btn profile-close';
     back.setAttribute?.('aria-label', '关闭设置'); back.title = '关闭设置'; back.onclick = close;
     const header = document.createElement('header'); header.className = 'profile-header';
-    const heading = document.createElement('h2'); heading.textContent = '个人角色设置';
-    header.append(heading); header.append(back);
+    if (typeof onSwitchAccount === 'function') {
+      const tabs = document.createElement('div'); tabs.className = 'seg';
+      tabs.setAttribute?.('role', 'tablist'); tabs.setAttribute?.('aria-label', '账号与设置');
+      const accountTab = document.createElement('button'); accountTab.type = 'button'; accountTab.textContent = '个人与账号';
+      accountTab.setAttribute?.('role', 'tab'); accountTab.setAttribute?.('aria-selected', 'false');
+      accountTab.onclick = () => { if (!saving) onSwitchAccount(); };
+      const agentsTab = document.createElement('button'); agentsTab.type = 'button'; agentsTab.className = 'on'; agentsTab.textContent = '助手分身';
+      agentsTab.setAttribute?.('role', 'tab'); agentsTab.setAttribute?.('aria-selected', 'true');
+      tabs.append(accountTab); tabs.append(agentsTab);
+      header.append(tabs);
+    } else {
+      const heading = document.createElement('h2'); heading.textContent = '个人角色设置';
+      header.append(heading);
+    }
+    header.append(back);
     host().replaceChildren(header, panel);
     onVisibility(true);
     back.focus?.();
@@ -39,7 +54,7 @@ function createProfileUI({ api, current, article, host, status, onVisibility = (
     }
     if (!valid()) return;
     panel.textContent = '';
-    const introduction = document.createElement('p'); introduction.className = 'profile-intro'; introduction.textContent = '设置你的默认管家，也可添加其他角色。';
+    const introduction = document.createElement('p'); introduction.className = 'profile-intro'; introduction.textContent = '设置你的默认管家，也可添加其他个人角色设置（研究、写作、审阅分身）。';
     const details = document.createElement('details'); details.className = 'profile-help';
     const summary = document.createElement('summary'); summary.textContent = '角色如何使用';
     const explanation = document.createElement('p'); explanation.textContent = notice;
@@ -52,7 +67,6 @@ function createProfileUI({ api, current, article, host, status, onVisibility = (
     if (hasUnsaved()) introduction.textContent = profile.revision !== editing.revision
       ? '服务端配置已有更新。你的未保存更改仍保留；请先核对，或取消更改后读取最新配置。'
       : '已恢复你刚才的修改。检查后保存，或选择取消。';
-    let saving = false;
     const controls = document.createElement('div'); controls.className = 'profile-controls';
     panel.append(controls);
     function button(label, action, disabled = false) {
@@ -115,7 +129,7 @@ function createProfileUI({ api, current, article, host, status, onVisibility = (
         status('请填写名称；名称过长或含特殊控制字符时，请缩短或修改。'); return;
       }
       const snapshot = agents.map(agent => ({ ...agent }));
-      controls.replaceChildren(article('即将替换你自己的配置，不会共享给其他用户：\n' + snapshot.map(agent => `${agent.id} · ${agent.name} · ${agent.role} · ${agent.model_ref} · ${agent.enabled ? '启用' : '停用'}`).join('\n') + '\n\n' + notice));
+      controls.replaceChildren(article('即将替换你自己的配置，不会共享给其他用户：\n' + snapshot.map(agent => `${agent.name} · ${roleLabels[agent.role] || agent.role} · ${roleLabels[agent.model_ref] || agent.model_ref} · ${agent.enabled ? '启用' : '停用'}`).join('\n') + '\n\n' + notice));
       const confirm = button('确认保存个人配置', async () => {
         saving = true; confirm.disabled = true; back.disabled = true; cancel.disabled = true;
         try {
