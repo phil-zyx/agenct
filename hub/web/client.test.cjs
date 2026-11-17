@@ -136,6 +136,20 @@ function fixture(auth = { enabled: false }, settings = {}) {
         }
         data = settings.automationPermissions || saved;
       }
+      if (url === '/api/automation' && options.method === 'GET') {
+        data = { rules: settings.automationRules || [], crons: settings.automationCrons || [] };
+      }
+      if (url === '/api/automation/rules' && options.method === 'POST') {
+        const body = JSON.parse(options.body);
+        const next = { id: 'rule-' + ((settings.automationRules?.length || 0) + 1), owner: identity, ...body };
+        settings.automationRules = [...(settings.automationRules || []), next];
+        data = next;
+      }
+      if (url.startsWith('/api/automation/rules/') && url.endsWith('/remove') && options.method === 'POST') {
+        const ruleId = decodeURIComponent(url.slice('/api/automation/rules/'.length, -'/remove'.length));
+        settings.automationRules = (settings.automationRules || []).filter(r => r.id !== ruleId);
+        data = { ok: true, removed: ruleId };
+      }
       if (url === '/api/gitlab/config' && options.method === 'GET') {
         data = settings.gitlabConfig || {
           configured: false,

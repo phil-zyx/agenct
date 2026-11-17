@@ -567,6 +567,10 @@ pub fn app(mut hub: Hub) -> Router {
             get(automation_policy::get).put(automation_policy::update),
         )
         .route("/api/automation/rules", post(sagent::create_rule))
+        .route(
+            "/api/automation/rules/{id}/remove",
+            post(sagent::remove_rule),
+        )
         .route("/api/automation/crons", post(sagent::create_cron))
         .route("/api/automation/tick", post(sagent::tick_crons))
         .route("/api/webhooks/gitlab", post(sagent::gitlab_webhook))

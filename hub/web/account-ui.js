@@ -33,12 +33,14 @@ async function openAccount() {
   const gitlabSection = el('div', 'gitlab-section');
   const nodesSection = el('div', 'nodes-section');
   const automationSection = el('div', 'automation-section');
+  const rulesSection = el('div', 'rules-section');
   const adminSection = el('div', 'admin-section');
-  content.replaceChildren(...[accountSection, $('collaboration-profile-view'), nodesSection, automationSection, gitlabSection, $('account-tools'), adminSection].filter(Boolean));
+  content.replaceChildren(...[accountSection, $('collaboration-profile-view'), nodesSection, automationSection, rulesSection, gitlabSection, $('account-tools'), adminSection].filter(Boolean));
   host.append(header, content); close.focus?.();
   if (typeof collaborationProfileUI !== 'undefined') void collaborationProfileUI.open(context);
   void renderNodesSection(context, valid, nodesSection);
   void renderAutomationPermissions(context, valid, automationSection);
+  void renderRulesSection(context, valid, rulesSection);
   void renderGitlabSection(context, valid, gitlabSection);
   try {
     const me = await api(context, 'me'); if (!valid()) return;
@@ -437,4 +439,126 @@ async function renderAutomationPermissions(context, valid, container) {
     } finally { pending = false; }
   };
   await load();
+}
+
+async function renderRulesSection(context, valid, container) {
+  const card = el('section', 'member-card rules-card');
+  card.append(
+    el('h3', 'member-title', '🛡️ 个人管家规则与真人接手策略'),
+    el('p', 'note', '内置三层策略管线：① 系统公共护栏（点名「找你本人/真人」、排期与发版承诺、连续退回 ≥ 2 次熔断、节点离线）；② 你的个人定制规则（下方可增删，或在主对话发送「规则：包含 生产数据库 的任务需要真人接手」）；③ 大模型 [NEED_HUMAN] 自检兜底。')
+  );
+  const list = el('div', 'nodes-list', '正在读取个人规则…');
+  const form = el('div', 'node-create-form');
+  const presets = el('div', 'profile-guide-chips');
+  const keywordInput = el('input'); keywordInput.maxLength = 120; keywordInput.placeholder = '如 生产数据库/合同/报价（多个词用 / 分隔，* 代表全部）'; keywordInput.setAttribute('aria-label', '触发关键词');
+  const actionSelect = el('select'); actionSelect.setAttribute('aria-label', '命中动作');
+  for (const [val, label] of [
+    ['human', '🚨 转交我本人接手（暂停自动执行/回复）'],
+    ['clarify', '📋 先向对方追问补充信息'],
+    ['route', '💻 自动路由到指定 PC 节点']
+  ]) {
+    const opt = el('option', null, label); opt.value = val; actionSelect.append(opt);
+  }
+  const paramInput = el('input'); paramInput.maxLength = 120; paramInput.placeholder = '当前为「转交本人接手」，无需额外参数'; paramInput.setAttribute('aria-label', '动作附加参数');
+  actionSelect.onchange = () => {
+    if (actionSelect.value === 'human') paramInput.placeholder = '当前为「转交本人接手」，无需额外参数';
+    else if (actionSelect.value === 'clarify') paramInput.placeholder = '必填：要求对方提供的信息（如 复现步骤与截图）';
+    else paramInput.placeholder = '必填：目标 PC 节点 ID（如 homelab 或 cc-team）';
+  };
+  for (const [chipLabel, kw, mode, param] of [
+    ['🚨 生产数据库/线上配置 → 本人接手', '生产数据库/线上配置', 'human', ''],
+    ['🚨 合同/报价/薪资 → 本人接手', '合同/报价/薪资', 'human', ''],
+    ['📋 前端/UI问题 → 追问截图', '前端/UI/页面', 'clarify', '截图与复现步骤']
+  ]) {
+    const chip = el('button', 'guide-chip', chipLabel); chip.type = 'button';
+    chip.onclick = () => {
+      keywordInput.value = kw;
+      actionSelect.value = mode;
+      actionSelect.onchange();
+      paramInput.value = param;
+    };
+    presets.append(chip);
+  }
+  const kwLabel = el('label', 'member-label', '触发关键词（支持 / 分隔多个词）'); kwLabel.append(keywordInput);
+  const actLabel = el('label', 'member-label', '命中后动作'); actLabel.append(actionSelect);
+  const paramLabel = el('label', 'member-label', '补充说明 / 目标节点 ID（按动作选填）'); paramLabel.append(paramInput);
+  const formNote = el('p', 'note');
+  const addBtn = el('button', 'primary', '添加个人规则'); addBtn.type = 'button';
+  form.append(presets, kwLabel, actLabel, paramLabel, formNote, addBtn);
+  card.append(list, form);
+  container.replaceChildren(card);
+
+  async function loadRules() {
+    try {
+      const data = await api(context, 'automation'); if (!valid()) return;
+      const rules = Array.isArray(data?.rules) ? data.rules : [];
+      if (!rules.length) {
+        list.replaceChildren(el('p', 'note', '暂未配置个人定制规则（当前已启用系统公共护栏）。可点上方快捷标签一键添加。'));
+        return;
+      }
+      const rows = rules.map(rule => {
+        const row = el('div', 'node-row');
+        const head = el('div', 'node-row-head');
+        const summary = [];
+        if (rule.require_human_approval) summary.push('🚨 转交本人接手');
+        if (rule.require_clarification) summary.push('📋 需补充：' + rule.require_clarification);
+        if (rule.target_node_id) summary.push('💻 路由节点：' + rule.target_node_id);
+        head.append(
+          el('strong', null, '关键词：「' + rule.keyword + '」'),
+          el('span', 'node-badge online', summary.join(' · ') || '默认规则')
+        );
+        row.append(head);
+        const actions = el('div', 'actions');
+        const remove = el('button', 'danger', '删除规则'); remove.type = 'button';
+        remove.onclick = async () => {
+          if (!valid() || remove.disabled) return;
+          remove.disabled = true;
+          try {
+            await api(context, 'automation/rules/' + encodeURIComponent(rule.id) + '/remove', 'POST');
+            if (!valid()) return;
+            await loadRules();
+          } catch (error) { if (valid()) formNote.textContent = error.message; }
+          finally { if (valid()) remove.disabled = false; }
+        };
+        actions.append(remove);
+        row.append(actions);
+        return row;
+      });
+      list.replaceChildren(...rows);
+    } catch (error) {
+      if (valid()) list.replaceChildren(el('p', 'note', '无法读取个人规则：' + error.message));
+    }
+  }
+
+  addBtn.onclick = async () => {
+    if (!valid() || addBtn.disabled) return;
+    const keyword = keywordInput.value.trim();
+    const mode = actionSelect.value;
+    const param = paramInput.value.trim();
+    if (!keyword) { formNote.textContent = '请填写触发关键词。'; return; }
+    if ((mode === 'clarify' || mode === 'route') && !param) {
+      formNote.textContent = mode === 'clarify' ? '请填写需要对方补充的信息。' : '请填写目标 PC 节点 ID。';
+      return;
+    }
+    addBtn.disabled = true; formNote.textContent = '';
+    try {
+      const payload = {
+        keyword,
+        require_human_approval: mode === 'human',
+        require_clarification: mode === 'clarify' ? param : null,
+        target_node_id: mode === 'route' ? param : ''
+      };
+      await api(context, 'automation/rules', 'POST', payload);
+      if (!valid()) return;
+      keywordInput.value = ''; paramInput.value = '';
+      formNote.textContent = '✅ 已添加个人规则，实时生效。';
+      await loadRules();
+    } catch (error) {
+      if (valid()) formNote.textContent = error.message;
+    } finally {
+      if (valid()) addBtn.disabled = false;
+    }
+  };
+
+  await loadRules();
 }

@@ -143,16 +143,111 @@ fn with_store_mut<R>(h: &Hub, f: impl FnOnce(&mut AutomationStore) -> R) -> Resu
 
 pub(crate) fn match_dispatch_rule(h: &Hub, owner: &str, message: &str) -> Option<DispatchRule> {
     let guard = h.automation.lock().ok()?;
-    let lower = message.to_ascii_lowercase();
     guard
         .rules
         .iter()
         .filter(|r| r.owner == owner && !r.target_node_id.is_empty())
-        .find(|r| {
-            r.keyword == "*"
-                || (!r.keyword.is_empty() && lower.contains(&r.keyword.to_ascii_lowercase()))
-        })
+        .find(|r| rule_keyword_matches(&r.keyword, message))
         .cloned()
+}
+
+fn rule_keyword_matches(rule_kw: &str, text: &str) -> bool {
+    let kw = rule_kw.trim();
+    if kw.is_empty() {
+        return false;
+    }
+    if kw == "*" {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    kw.split(['/', '、', '或', ',', '，', '|'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .any(|part| lower.contains(&part.to_ascii_lowercase()))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HumanTakeoverReason {
+    pub layer: &'static str,
+    pub reason: String,
+}
+
+/// Evaluates Layer 1 (Built-in System Hard Guardrails) + Layer 2 (Per-User `DispatchRule`s)
+/// to determine whether an incoming message/task MUST be escalated to the human owner.
+pub(crate) fn evaluate_human_takeover_policy(
+    h: &Hub,
+    owner: &str,
+    text: &str,
+) -> Option<HumanTakeoverReason> {
+    let lower = text.to_ascii_lowercase();
+    // Layer 1A: Explicit request for the human owner
+    if [
+        "找你本人",
+        "你本人",
+        "真人",
+        "亲自",
+        "别让管家",
+        "不要管家",
+        "找本人",
+        "本人回",
+        "急事找你",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue))
+    {
+        return Some(HumanTakeoverReason {
+            layer: "system-base",
+            reason: "对方显式要求你本人直接沟通".to_owned(),
+        });
+    }
+
+    // Layer 1B: Schedule commitments, deadlines, or high-risk production actions
+    if [
+        "能发版吗",
+        "能不能发版",
+        "几点发版",
+        "几点上线",
+        "什么时候能好",
+        "什么时候交付",
+        "几点能好",
+        "回滚生产",
+        "删库",
+        "线上回滚",
+        "合入master",
+        "合并到master",
+    ]
+    .iter()
+    .any(|cue| text.contains(cue) || lower.contains(cue))
+    {
+        return Some(HumanTakeoverReason {
+            layer: "system-base",
+            reason: "涉及排期承诺或高危生产决策（系统底线需本人拍板）".to_owned(),
+        });
+    }
+
+    // Layer 2: Per-user custom human-approval rules
+    let Ok(guard) = h.automation.lock() else {
+        return Some(HumanTakeoverReason {
+            layer: "system-base",
+            reason: "规则状态锁异常，默认转交本人确认".to_owned(),
+        });
+    };
+    for r in guard
+        .rules
+        .iter()
+        .filter(|r| r.owner == owner && r.require_human_approval)
+    {
+        if rule_keyword_matches(&r.keyword, text) {
+            return Some(HumanTakeoverReason {
+                layer: "user-rule",
+                reason: format!(
+                    "命中个人规则 `{}`（关键词 `{}` 需本人确认）",
+                    r.id, r.keyword
+                ),
+            });
+        }
+    }
+    None
 }
 
 fn has_rules_for_owner(h: &Hub, owner: &str) -> bool {
@@ -163,15 +258,10 @@ fn has_rules_for_owner(h: &Hub, owner: &str) -> bool {
 }
 
 pub(super) fn requires_human_approval(h: &Hub, owner: &str, summary: &str) -> bool {
-    let Ok(guard) = h.automation.lock() else {
+    if h.automation.lock().is_err() {
         return true;
-    };
-    let lower = summary.to_ascii_lowercase();
-    guard.rules.iter().any(|r| {
-        r.owner == owner
-            && r.require_human_approval
-            && (r.keyword == "*" || lower.contains(&r.keyword.to_ascii_lowercase()))
-    })
+    }
+    evaluate_human_takeover_policy(h, owner, summary).is_some()
 }
 
 fn mark_task_managed(h: &Hub, task_id: &str) -> Result<()> {
@@ -278,7 +368,7 @@ fn requirement_missing_reason(
     let mut reqs: Vec<String> = Vec::new();
     if let Ok(guard) = h.automation.lock() {
         for r in &guard.rules {
-            if r.owner == owner {
+            if r.owner == owner && rule_keyword_matches(&r.keyword, &combined) {
                 if let Some(req) = &r.require_clarification {
                     let trimmed = req.trim();
                     if !trimmed.is_empty() {
@@ -341,15 +431,17 @@ pub(crate) fn on_task_delegated(
     }
     mark_task_managed(h, task_id)?;
 
-    if requires_human_approval(h, owner, summary) {
+    if let Some(takeover) = evaluate_human_takeover_policy(h, owner, summary) {
         let notice = format!(
-            "🤵 管家（需你审核）：收到 {requester} 委派的任务「{summary}」（#{}）。按你的协作规则需先由你确认，请在右侧「任务」点击「接手」或回复调整意见。",
+            "🚨 **[需你本人接手 · {}]**：收到 {requester} 委派的任务「{summary}」（#{}）。管家未自动接手，请在右侧「任务」点击「接手」或直接 `@{requester}` 回复。",
+            takeover.reason,
             short_id(task_id)
         );
         insert_chat_message(tx, owner, "assistant", &notice)?;
         let req_msg = format!(
-            "🤝 [{owner} 的管家 → 你的管家] 已收到委派任务「{summary}」（#{}），{owner} 设置了人工审核规则，已通知本人确认。",
-            short_id(task_id)
+            "🤝 [{owner} 的管家 → 你的管家] 已收到委派任务「{summary}」（#{}），因「{}」需由 {owner} 本人确认，已置顶通知本人接手。",
+            short_id(task_id),
+            takeover.reason
         );
         insert_contact_assistant_msg(tx, owner, requester, &req_msg)?;
         insert_chat_message(tx, requester, "assistant", &req_msg)?;
@@ -894,9 +986,27 @@ fn parse_rule_command(db: &Connection, owner: &str, body: &str) -> Result<Dispat
     let id = format!("rule-{}", &Uuid::new_v4().simple().to_string()[..6]);
     let now = nodes::now_unix();
 
-    // Support human-approval rule: "别人委派任务需要我先审核"
-    if body.contains("审核") || body.contains("人工确认") {
-        let kw = extract_between(body, "包含", "的").unwrap_or("*".to_owned());
+    // Support human-approval / human-takeover rule:
+    // e.g. "别人委派任务需要我先审核" / "规则：包含 数据库迁移 的任务需要真人接手" / "规则：涉及 合同 的消息由我本人确认"
+    if [
+        "审核",
+        "人工确认",
+        "本人确认",
+        "真人接手",
+        "本人接手",
+        "我本人回",
+        "我来回",
+        "找我本人",
+        "需要我确认",
+        "由我拍板",
+    ]
+    .iter()
+    .any(|cue| body.contains(cue))
+    {
+        let kw = extract_between(body, "包含", "的")
+            .or_else(|| extract_between(body, "涉及", "的"))
+            .or_else(|| extract_between(body, "关于", "的"))
+            .unwrap_or_else(|| "*".to_owned());
         return Ok(DispatchRule {
             id,
             owner: owner.to_owned(),
@@ -908,18 +1018,21 @@ fn parse_rule_command(db: &Connection, owner: &str, body: &str) -> Result<Dispat
         });
     }
 
-    // Support clarification rule: "别人委派任务必须提供 <requirement>"
-    for cue in ["必须提供", "需提供", "缺少时询问", "必须附带"] {
+    // Support clarification rule: "别人委派任务必须提供 <requirement>" or "包含 <kw> 的任务必须提供 <requirement>"
+    for cue in ["必须提供", "需提供", "缺少时询问", "必须附带", "要先提供"] {
         if let Some(pos) = body.find(cue) {
             let req = body[pos + cue.len()..]
                 .trim()
                 .trim_start_matches(['：', ':'])
                 .trim();
             if !req.is_empty() {
+                let kw = extract_between(&body[..pos], "包含", "的")
+                    .or_else(|| extract_between(&body[..pos], "涉及", "的"))
+                    .unwrap_or_else(|| "*".to_owned());
                 return Ok(DispatchRule {
                     id,
                     owner: owner.to_owned(),
-                    keyword: "*".to_owned(),
+                    keyword: kw,
                     target_node_id: String::new(),
                     require_clarification: Some(req.to_owned()),
                     require_human_approval: false,
@@ -1400,25 +1513,42 @@ fn try_parse_natural_cron(owner: &str, trimmed: &str) -> Result<Option<CronJob>>
 
 fn format_rules_list(rules: &[DispatchRule], owner: &str) -> String {
     let mine: Vec<&DispatchRule> = rules.iter().filter(|r| r.owner == owner).collect();
-    if mine.is_empty() {
-        return "当前还没有配置个人分发规则。\n\n你可以随时说：\n- `规则：包含 atlas 的任务派给 homelab`\n- `规则：别人委派任务必须提供 复现步骤与截图`\n- `规则：别人委派任务需要我先审核`".to_owned();
-    }
     let mut lines = vec![
-        format!("### ⚙️ 你的个人 sagent 分发规则（{} 条）", mine.len()),
+        "### 🛡️ 管家三层规则引擎（系统底线 + 你的个人定制规则）".to_owned(),
         String::new(),
+        "**Layer 1 · 系统内置底线规则（默认生效）**：".to_owned(),
+        "- 🚨 **点名找本人**：消息含「本人 / 真人 / 亲自 / 急事找你」→ 强制转交你本人接手".to_owned(),
+        "- 🚨 **排期与高危拍板**：消息含「能发版吗 / 几点上线 / 回滚生产 / 合入master」→ 管家不代承诺，转交本人拍板".to_owned(),
+        "- 🚨 **连续退回熔断**：同一任务连续退回 ≥ 2 次 → 自动暂停节点重跑，升级双方真人对齐".to_owned(),
+        "- 🚨 **能力边界升级**：需跑本机环境但无在线 PC 节点，或大模型自检 `[NEED_HUMAN]` → 自动升级本人接手".to_owned(),
+        String::new(),
+        format!("**Layer 2 · 你的个人定制规则（{} 条）**：", mine.len()),
     ];
-    for r in mine {
-        let desc = if r.require_human_approval {
-            format!("关键词 `{}` → 委派先通知本人审核", r.keyword)
-        } else if let Some(req) = &r.require_clarification {
-            format!("他人委派时自动检查必填信息：`{req}`")
-        } else {
-            format!("关键词 `{}` → 优先调度 `{}`", r.keyword, r.target_node_id)
-        };
-        lines.push(format!("- `{}`：{desc}", r.id));
+    if mine.is_empty() {
+        lines.push("- 暂未添加个人定制规则。你可以随时在聊天框发送：".to_owned());
+        lines.push("  - `规则：包含 生产数据库 的任务需要真人接手`".to_owned());
+        lines.push("  - `规则：别人委派任务必须提供 复现步骤与截图`".to_owned());
+        lines.push("  - `规则：包含 atlas 的任务派给 homelab`".to_owned());
+    } else {
+        for r in mine {
+            let desc = if r.require_human_approval {
+                format!(
+                    "🚨 关键词 `{}` → 必须由你本人接手确认（管家不代拍板）",
+                    r.keyword
+                )
+            } else if let Some(req) = &r.require_clarification {
+                format!("📎 关键词 `{}` → 管家先核对必填材料：`{req}`", r.keyword)
+            } else {
+                format!(
+                    "💻 关键词 `{}` → 优先路由至节点 `{}`",
+                    r.keyword, r.target_node_id
+                )
+            };
+            lines.push(format!("- `{}`：{desc}", r.id));
+        }
+        lines.push(String::new());
+        lines.push("回复 `删除规则 <规则ID>` 可移除对应个人规则。".to_owned());
     }
-    lines.push(String::new());
-    lines.push("回复 `删除规则 <规则ID>` 可移除。".to_owned());
     lines.join("\n")
 }
 
@@ -2114,6 +2244,13 @@ pub(crate) async fn answer_chat(
                 )
             } else {
                 let reason = return_reason.unwrap_or("请根据反馈继续修改");
+                let prior_returns: i64 = tx
+                    .query_row(
+                        "SELECT COUNT(*) FROM events WHERE task_id=?1 AND action='return'",
+                        [&tid],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
                 tx.execute(
                     "UPDATE tasks SET status='working', result=NULL, revision=?2 WHERE id=?1",
                     params![tid, next_rev],
@@ -2127,7 +2264,18 @@ pub(crate) async fn answer_chat(
                     "working",
                     next_rev,
                 )?;
-                if let Some(nid) = node_id.filter(|_| {
+                let total_returns = prior_returns + 1;
+                if total_returns >= 2 {
+                    let owner_msg = format!(
+                        "🚨 **[需你本人接手 · 连续退回熔断]**：任务「{summary}」（#{}）已被 @{owner} 第 {total_returns} 次退回（本次意见：「{reason}」）。为防止管家自动重跑陷入死循环，已暂停自动调度节点，请你本人核对或直接在聊天框 `@{owner}` 对齐需求。",
+                        short_id(&tid)
+                    );
+                    insert_chat_message(&tx, &task_owner, "assistant", &owner_msg)?;
+                    format!(
+                        "🤵 管家：已将任务「{summary}」（#{}）退回给 {task_owner}（原因：{reason}）。由于该任务已连续 {total_returns} 次退回，已触发系统底线熔断并升级为 **【🚨 需本人接手】** 通知 {task_owner} 本人直接与你对齐。",
+                        short_id(&tid)
+                    )
+                } else if let Some(nid) = node_id.filter(|_| {
                     crate::automation_policy::read(&tx, &task_owner).is_ok_and(|p| p.auto_accept)
                         && !requires_human_approval(h, &task_owner, &summary)
                 }) {
@@ -2143,11 +2291,21 @@ pub(crate) async fn answer_chat(
                         short_id(&tid)
                     );
                     insert_chat_message(&tx, &task_owner, "assistant", &owner_msg)?;
+                    format!(
+                        "🤵 管家：已将任务「{summary}」（#{}）退回给 {task_owner} 的管家（原因：{reason}），对方可按修改意见继续处理；仅在已授权时自动调度节点。",
+                        short_id(&tid)
+                    )
+                } else {
+                    let owner_msg = format!(
+                        "🚨 **[需你本人接手 · 退回待处理]**：@{owner} 退回了任务「{summary}」（#{}），修改意见：「{reason}」。请你本人查看或调度节点处理。",
+                        short_id(&tid)
+                    );
+                    insert_chat_message(&tx, &task_owner, "assistant", &owner_msg)?;
+                    format!(
+                        "🤵 管家：已将任务「{summary}」（#{}）退回给 {task_owner} 的管家（原因：{reason}），对方可按修改意见继续处理；仅在已授权时自动调度节点。",
+                        short_id(&tid)
+                    )
                 }
-                format!(
-                    "🤵 管家：已将任务「{summary}」（#{}）退回给 {task_owner} 的管家（原因：{reason}），对方可按修改意见继续处理；仅在已授权时自动调度节点。",
-                    short_id(&tid)
-                )
             };
             let msg_id = insert_chat_message(&tx, owner, "user", &input.message)?;
             insert_chat_message(&tx, owner, "assistant", &user_reply)?;
@@ -2435,8 +2593,18 @@ async fn generate_peer_sagent_reply(
     nodes_total: usize,
     active_tasks: usize,
     public_info: &str,
+    user_rules_summary: &str,
+    pre_takeover: Option<&HumanTakeoverReason>,
     target_profile: &crate::profiles::RuntimeProfile,
-) -> String {
+) -> (String, Option<HumanTakeoverReason>) {
+    if let Some(takeover) = pre_takeover {
+        let reply = format!(
+            "已收到来自 @{sender_name} 的消息：「{clean_body}」。\n由于该事项 **{}**，我作为 {target_name} 的管家不越权代为承诺或拍板，已标记为 **【🚨 需本人接手】** 置顶通知 @{target_name} 本人，待其确认后直接回复你。",
+            takeover.reason
+        );
+        return (reply, Some(takeover.clone()));
+    }
+
     let action_context = if let Some(node_name) = auto_node_name {
         format!("已自动接手该协作任务，并调度 {target_name} 的资源节点「{node_name}」开始执行")
     } else if is_task {
@@ -2449,12 +2617,15 @@ async fn generate_peer_sagent_reply(
         let prompt = format!(
             "你是「{target_name}」的 7×24h 专属 Super-Agent（云端管家）。现在同事「@{sender_name}」通过管家向你发来消息：\n\
              「{clean_body}」\n\n\
-             【你主人 {target_name} 的当前公开协作状态】\n\
+             【你主人 {target_name} 的当前公开协作状态與个人规则】\n\
              - 公开协作资料：{public_info}\n\
+             - 个人定制规则：{user_rules_summary}\n\
              - 资源 PC 节点：{nodes_online} 台在线 / 共 {nodes_total} 台\n\
              - 当前进行中任务：{active_tasks} 项\n\
              - 系统已执行动作：{action_context}\n\n\
-             请直接以「{target_name} 的 7×24h 管家」第一人称口吻，向 @{sender_name} 给出自然、礼貌、切题的中文回复（2～4 句话；若对方发来问候或让你收到回复，请明确回应你已收到；若对方发来具体问题或任务，请结合上述状态说明已如何安排或代答）。不要输出多余标题或前缀。"
+             【重要输出协议（Layer 3 置信度与边界自检）】\n\
+             1) 如果该消息是打招呼、连通性测试、状态问询、或可以依据上述公开资料与系统动作直接回应，请直接以「{target_name} 的 7×24h 管家」第一人称口吻给出自然、礼貌、切题的中文回复（2～4 句话）。\n\
+             2) 如果该消息需要 {target_name} 本人做出主观决策、排期/交付承诺、线上变更授权，或依赖你不知道的线下私有信息，你绝不能替主人拍板答应！请必须在回复最开头输出 `[NEED_HUMAN]` 标记，紧接着用 1～2 句话礼貌说明该问题需 {target_name} 本人确认并已为你转交本人。"
         );
         let dsh = crate::runtime::DshRuntime {
             client: &h.client,
@@ -2480,22 +2651,52 @@ async fn generate_peer_sagent_reply(
         {
             let trimmed = ans.reply.trim();
             if !trimmed.is_empty() {
-                return trimmed.to_owned();
+                if let Some(after_tag) = trimmed.strip_prefix("[NEED_HUMAN]") {
+                    let clean_reply = after_tag.trim();
+                    let final_reply = if clean_reply.is_empty() {
+                        format!(
+                            "已收到来自 @{sender_name} 的消息：「{clean_body}」。该事项需 @{target_name} 本人确认，已标记为【🚨 需本人接手】并通知本人。"
+                        )
+                    } else {
+                        clean_reply.to_owned()
+                    };
+                    return (
+                        final_reply,
+                        Some(HumanTakeoverReason {
+                            layer: "llm-self-check",
+                            reason: "管家语义自检判定需本人拍板确认".to_owned(),
+                        }),
+                    );
+                }
+                return (trimmed.to_owned(), None);
             }
         }
     }
     let _ = target_id;
     if let Some(node_name) = auto_node_name {
-        format!(
-            "收到！我是 {target_name} 的 7×24h 管家，已收到来自 @{sender_name} 的协作请求「{clean_body}」，并已自动接手调度至 {target_name} 的节点「{node_name}」执行，完成后会第一时间将结果同步给你。"
+        (
+            format!(
+                "收到！我是 {target_name} 的 7×24h 管家，已收到来自 @{sender_name} 的协作请求「{clean_body}」，并已自动接手调度至 {target_name} 的节点「{node_name}」执行，完成后会第一时间将结果同步给你。"
+            ),
+            None,
         )
     } else if is_task {
-        format!(
-            "收到！我是 {target_name} 的 7×24h 管家，已记录来自 @{sender_name} 的协作请求「{clean_body}」并通知 {target_name}（当前在线 PC 节点 {nodes_online}/{nodes_total} 台，进行中任务 {active_tasks} 项），有进展会立即同步给你。"
+        let takeover = (nodes_online == 0).then(|| HumanTakeoverReason {
+            layer: "system-base",
+            reason: "需要处理协作任务但当前无在线 PC 节点".to_owned(),
+        });
+        (
+            format!(
+                "收到！我是 {target_name} 的 7×24h 管家，已记录来自 @{sender_name} 的协作请求「{clean_body}」并通知 {target_name} 本人跟进（当前在线 PC 节点 {nodes_online}/{nodes_total} 台，进行中任务 {active_tasks} 项），有进展会立即同步给你。"
+            ),
+            takeover,
         )
     } else {
-        format!(
-            "收到！我是 {target_name} 的 7×24h 云端管家，已收到 @{sender_name} 发来的消息：「{clean_body}」，并已同步至 {target_name} 的主聊天窗口（当前在线 PC 节点 {nodes_online}/{nodes_total} 台）。有需要协作的任务或问题随时 @我！"
+        (
+            format!(
+                "收到！我是 {target_name} 的 7×24h 云端管家，已收到 @{sender_name} 发来的消息：「{clean_body}」，并已同步至 {target_name} 的主聊天窗口（当前在线 PC 节点 {nodes_online}/{nodes_total} 台）。有需要协作的任务或问题随时 @我！"
+            ),
+            None,
         )
     }
 }
@@ -2523,6 +2724,34 @@ async fn try_handle_colleague_at_mention(
     }
 
     let is_task = is_colleague_task_request(&input.message, &clean_body);
+    let pre_takeover = evaluate_human_takeover_policy(h, &target_id, &clean_body);
+    let user_rules_summary = h
+        .automation
+        .lock()
+        .ok()
+        .map(|g| {
+            let list: Vec<String> = g
+                .rules
+                .iter()
+                .filter(|r| r.owner == target_id)
+                .map(|r| {
+                    if r.require_human_approval {
+                        format!("关键词 `{}` 必须本人确认", r.keyword)
+                    } else if let Some(req) = &r.require_clarification {
+                        format!("关键词 `{}` 需提供 `{req}`", r.keyword)
+                    } else {
+                        format!("关键词 `{}` 派给 `{}`", r.keyword, r.target_node_id)
+                    }
+                })
+                .collect();
+            if list.is_empty() {
+                "使用系统默认底线规则".to_owned()
+            } else {
+                list.join("；")
+            }
+        })
+        .unwrap_or_else(|| "使用系统默认底线规则".to_owned());
+
     let (
         sender_name,
         nodes_online,
@@ -2556,6 +2785,7 @@ async fn try_handle_colleague_at_mention(
         };
         let t_prof = crate::profiles::route(&db, &target_id, None, None)?;
         let can_auto = is_task
+            && pre_takeover.is_none()
             && crate::automation_policy::read(&db, &target_id).is_ok_and(|p| p.auto_accept)
             && !requires_human_approval(h, &target_id, &clean_body)
             && requirement_missing_reason(h, &db, &target_id, &clean_body, Some(&clean_body))?
@@ -2577,7 +2807,7 @@ async fn try_handle_colleague_at_mention(
         )
     };
 
-    let peer_sagent_reply = generate_peer_sagent_reply(
+    let (peer_sagent_reply, escalated_reason) = generate_peer_sagent_reply(
         h,
         &sender_name,
         &target_id,
@@ -2589,6 +2819,8 @@ async fn try_handle_colleague_at_mention(
         nodes_total,
         active_tasks,
         &public_info,
+        &user_rules_summary,
+        pre_takeover.as_ref(),
         &target_profile,
     )
     .await;
@@ -2640,27 +2872,52 @@ async fn try_handle_colleague_at_mention(
             })?;
         if current_status == "working" {
             format!(
-                "🤵 管家：已直接转达给 **@{target_name}**，对方管家已自动接手任务「{summary_clean}」（#{sid}）并调度节点处理。\n\n---\n\n🤝 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}",
+                "🤵 管家：已直接转达给 **@{target_name}**，对方管家已自动接手任务「{summary_clean}」（#{sid}）并调度节点处理。\n\n---\n\n🤖 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}",
+                sid = short_id(&task_id)
+            )
+        } else if let Some(ref esc) = escalated_reason {
+            // If `on_task_delegated` did not already insert the takeover notice, insert one now
+            if pre_takeover.is_none()
+                || !crate::automation_policy::read(&tx, &target_id).is_ok_and(|p| p.auto_accept)
+            {
+                let notify_target = format!(
+                    "🚨 **[需你本人接手 · {}]** 来自 **@{sender_name}**（任务 #{sid}）：\n> {clean_body}\n\n🤵 **[你的管家回执]**：\n{peer_sagent_reply}\n\n👉 请在下方聊天框直接输入 `@{sender_name} 你的回复` 由你本人拍板或处理。",
+                    esc.reason,
+                    sid = short_id(&task_id)
+                );
+                insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
+            }
+            format!(
+                "🤵 管家：已发给 **@{target_name}** 并创建协作任务「{summary_clean}」（#{sid}）。\n\n---\n\n🚨 **[@{target_name} 的管家 · 已转交本人接手]**：\n{peer_sagent_reply}",
                 sid = short_id(&task_id)
             )
         } else {
             let notify_target = format!(
-                "💬 **[来自 @{sender_name} 的协作消息]**（任务 #{sid}）：\n> {clean_body}\n\n🤵 **[你的管家已自动响应 @{sender_name}]**：\n{peer_sagent_reply}\n\n💡 如需本人补充，可直接在下方聊天框输入 `@{sender_name} 回复内容`。",
+                "🤖 **[管家已代为响应 · 来自 @{sender_name} 的协作消息]**（任务 #{sid}）：\n> {clean_body}\n\n🤵 **[你的管家已代答]**：\n{peer_sagent_reply}\n\n💡 如需本人补充，可直接在下方聊天框输入 `@{sender_name} 回复内容`。",
                 sid = short_id(&task_id)
             );
             insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
             format!(
-                "🤵 管家：已直接发给 **@{target_name}** 并创建协作任务「{summary_clean}」（#{sid}）。\n\n---\n\n🤝 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}",
+                "🤵 管家：已直接发给 **@{target_name}** 并创建协作任务「{summary_clean}」（#{sid}）。\n\n---\n\n🤖 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}",
                 sid = short_id(&task_id)
             )
         }
-    } else {
+    } else if let Some(ref esc) = escalated_reason {
         let notify_target = format!(
-            "💬 **[来自 @{sender_name} 的消息]**：\n> {clean_body}\n\n🤵 **[你的管家已自动响应 @{sender_name}]**：\n{peer_sagent_reply}\n\n💡 如需本人补充，可直接在下方聊天框输入 `@{sender_name} 回复内容`。"
+            "🚨 **[需你本人接手 · {}]** 来自 **@{sender_name}**：\n> {clean_body}\n\n🤵 **[你的管家已挡回越权承诺并通知你]**：\n{peer_sagent_reply}\n\n👉 请直接在下方聊天框输入 `@{sender_name} 你的回复` 由你本人拍板回复。",
+            esc.reason
         );
         insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
         format!(
-            "🤵 管家：已直接把消息发给 **@{target_name}** 的管家。\n\n---\n\n🤝 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}"
+            "🤵 管家：已把消息转达给 **@{target_name}** 的管家。\n\n---\n\n🚨 **[@{target_name} 的管家 · 已转交本人接手]**：\n{peer_sagent_reply}"
+        )
+    } else {
+        let notify_target = format!(
+            "🤖 **[管家已代为响应 · 来自 @{sender_name} 的消息]**：\n> {clean_body}\n\n🤵 **[你的管家已代答]**：\n{peer_sagent_reply}\n\n💡 如需本人补充，可直接在下方聊天框输入 `@{sender_name} 回复内容`。"
+        );
+        insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
+        format!(
+            "🤵 管家：已直接把消息发给 **@{target_name}** 的管家。\n\n---\n\n🤖 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}"
         )
     };
 
@@ -2756,6 +3013,25 @@ pub(super) async fn create_rule(
     };
     with_store_mut(&h, |store| store.rules.push(rule.clone()))?;
     Ok(Json(rule))
+}
+
+pub(super) async fn remove_rule(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    axum::extract::Path(rule_id): axum::extract::Path<String>,
+) -> Result<Json<Value>> {
+    let owner = h.identity(&headers)?;
+    let removed = with_store_mut(&h, |store| {
+        let before = store.rules.len();
+        store
+            .rules
+            .retain(|r| !(r.owner == owner && r.id == rule_id));
+        before != store.rules.len()
+    })?;
+    if !removed {
+        return Err(denied());
+    }
+    Ok(Json(json!({ "ok": true, "removed": rule_id })))
 }
 
 #[derive(Deserialize)]
@@ -4474,5 +4750,194 @@ mod tests {
         assert_eq!(tasks[0]["requester"], "alice");
         assert_eq!(tasks[0]["owner"], "bob");
         assert_eq!(tasks[0]["status"], "working");
+    }
+
+    #[tokio::test]
+    async fn three_layer_human_takeover_rules_and_circuit_breaker_work() {
+        let h = test_hub();
+        enable_automation(&h, "bob");
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "INSERT OR REPLACE INTO member_profiles(owner,display_name,status) VALUES ('alice','zhouyaoxu','active')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT OR REPLACE INTO member_profiles(owner,display_name,status) VALUES ('bob','luojie','active')",
+                [],
+            )
+            .unwrap();
+        }
+        let r = app(h.clone());
+
+        // Bring Bob's PC node online
+        let (s, bob_node) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/nodes",
+            Some(json!({ "id": "bob-pc", "name": "Bob主力机" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let _ = call(
+            &r,
+            bob_node["token"].as_str().unwrap(),
+            "GET",
+            "/node/v1/work",
+            None,
+        )
+        .await;
+
+        // Layer 1A: Explicit human request ("找你本人") triggers human takeover
+        let (s, chat_human) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "@luojie 找你本人聊一下" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reply_human = chat_human["reply"].as_str().unwrap();
+        assert!(reply_human.contains("已转交本人接手"));
+        assert!(reply_human.contains("对方显式要求你本人直接沟通"));
+
+        // Layer 1B: High-risk / schedule commitment ("几点上线") triggers human takeover
+        let (s, chat_sched) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "@luojie 今晚几点上线？" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reply_sched = chat_sched["reply"].as_str().unwrap();
+        assert!(reply_sched.contains("已转交本人接手"));
+        assert!(reply_sched.contains("排期承诺或高危生产决策"));
+
+        // Layer 2: Bob configures personal multi-keyword human-takeover rule via chat + API removal
+        let (s, add_rule_res) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "规则：包含 生产数据库/核心账务 的任务需要真人接手" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(add_rule_res["reply"]
+            .as_str()
+            .unwrap()
+            .contains("已保存个人分发规则"));
+
+        // Alice delegates a task matching Bob's custom rule ("核心账务") -> held in awaiting_owner for Bob's human approval, NOT auto-dispatched to node
+        let (s, chat_custom) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "@luojie 帮我排查核心账务对账异常" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reply_custom = chat_custom["reply"].as_str().unwrap();
+        assert!(reply_custom.contains("已转交本人接手"));
+        assert!(reply_custom.contains("个人规则"));
+
+        let (s, bob_tasks) = call(&r, &token("bob"), "GET", "/api/tasks", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let tasks = bob_tasks.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["status"], "awaiting_owner");
+
+        // Verify rule list & remove_rule endpoint
+        let (s, auto_state) = call(&r, &token("bob"), "GET", "/api/automation", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let rule_id = auto_state["rules"][0]["id"].as_str().unwrap().to_owned();
+        let (s, rm_res) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            &format!("/api/automation/rules/{rule_id}/remove"),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(rm_res["ok"], true);
+
+        // Layer 1C: Repeated return circuit breaker (>= 2 returns pauses auto re-dispatch and escalates to human)
+        let (s, normal_task) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "@luojie 帮我修复导出按钮样式问题" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(normal_task["reply"]
+            .as_str()
+            .unwrap()
+            .contains("自动接手任务"));
+
+        // Simulate node delivery so task is ready_for_acceptance before first return
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "UPDATE tasks SET status='ready_for_acceptance' WHERE summary LIKE '%导出按钮%'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // First return -> re-dispatches automatically
+        let (s, ret1) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "退回：移动端圆角还是不对" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(ret1["reply"]
+            .as_str()
+            .unwrap()
+            .contains("按修改意见继续处理"));
+
+        // Simulate second delivery so task is ready_for_acceptance again
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "UPDATE tasks SET status='ready_for_acceptance' WHERE summary LIKE '%导出按钮%'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Second return -> circuit breaker trips! Escalates to human takeover
+        let (s, ret2) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "退回：暗色模式下边框依然发白" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reply_ret2 = ret2["reply"].as_str().unwrap();
+        assert!(reply_ret2.contains("触发系统底线熔断"));
+        assert!(reply_ret2.contains("需本人接手"));
+
+        let (s, bob_msgs) = call(&r, &token("bob"), "GET", "/api/messages", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(bob_msgs
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| { m["content"].as_str().unwrap_or("").contains("连续退回熔断") }));
     }
 }
