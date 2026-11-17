@@ -310,6 +310,12 @@ fn insert_contact_assistant_msg(
          VALUES (?1,?2,'assistant',?3,?4,CURRENT_TIMESTAMP)",
         params![sender, recipient, body, req_id],
     )?;
+    let msg_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO contact_reads(owner,contact,through_id) VALUES (?1,?2,?3)
+         ON CONFLICT(owner,contact) DO UPDATE SET through_id=MAX(through_id,excluded.through_id)",
+        params![recipient, sender, msg_id],
+    )?;
     Ok(())
 }
 
@@ -2832,6 +2838,12 @@ async fn try_handle_colleague_at_mention(
         "INSERT INTO contact_messages(sender,recipient,author_kind,body,request_id,created_at)
          VALUES (?1,?2,'human',?3,?4,CURRENT_TIMESTAMP)",
         params![owner, target_id, clean_body, contact_req_id],
+    )?;
+    let human_msg_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO contact_reads(owner,contact,through_id) VALUES (?1,?2,?3)
+         ON CONFLICT(owner,contact) DO UPDATE SET through_id=MAX(through_id,excluded.through_id)",
+        params![target_id, owner, human_msg_id],
     )?;
     insert_contact_assistant_msg(&tx, &target_id, owner, &peer_sagent_reply)?;
 

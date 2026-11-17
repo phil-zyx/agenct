@@ -190,8 +190,7 @@ async function refreshPeerContacts(context) {
         if (namesChanged) void refresh(context, false);
       }
       if (!Array.isArray(conversations)) return;
-      const count = conversations.reduce((total, c) => total + (c.unread_count || 0), 0);
-      $('contacts-badge').textContent = count ? String(count) : '';
+      $('contacts-badge').textContent = '';
       if (directoryState) { directoryState.conversations = conversations; renderContactDirectory(); }
     } catch { /* Independent reads must not prevent private chat recovery. */ }
     await refreshPeerMessages();
