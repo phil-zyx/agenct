@@ -2175,7 +2175,7 @@ pub(crate) async fn answer_chat(
     // 6. Direct `@colleague` messaging & cross-sagent task delegation from main chat
     if !trimmed.starts_with('/') && trimmed.contains('@') {
         if let Some(resp) =
-            try_handle_colleague_at_mention(h, owner, input, runtime_profile, task_context)?
+            try_handle_colleague_at_mention(h, owner, input, runtime_profile, task_context).await?
         {
             return Ok(Some(resp));
         }
@@ -2423,7 +2423,84 @@ fn is_colleague_task_request(raw_input: &str, clean_body: &str) -> bool {
             .any(|kw| lower.contains(kw))
 }
 
-fn try_handle_colleague_at_mention(
+async fn generate_peer_sagent_reply(
+    h: &Hub,
+    sender_name: &str,
+    target_id: &str,
+    target_name: &str,
+    clean_body: &str,
+    is_task: bool,
+    auto_node_name: Option<&str>,
+    nodes_online: usize,
+    nodes_total: usize,
+    active_tasks: usize,
+    public_info: &str,
+    target_profile: &crate::profiles::RuntimeProfile,
+) -> String {
+    let action_context = if let Some(node_name) = auto_node_name {
+        format!("已自动接手该协作任务，并调度 {target_name} 的资源节点「{node_name}」开始执行")
+    } else if is_task {
+        format!("已为 {target_name} 创建待办协作任务，并同步通知到 {target_name} 的主对话流")
+    } else {
+        format!("已收到该消息并同步至 {target_name} 的主对话流")
+    };
+
+    if let crate::Runtime::Dsh { url, token } = &h.runtime {
+        let prompt = format!(
+            "你是「{target_name}」的 7×24h 专属 Super-Agent（云端管家）。现在同事「@{sender_name}」通过管家向你发来消息：\n\
+             「{clean_body}」\n\n\
+             【你主人 {target_name} 的当前公开协作状态】\n\
+             - 公开协作资料：{public_info}\n\
+             - 资源 PC 节点：{nodes_online} 台在线 / 共 {nodes_total} 台\n\
+             - 当前进行中任务：{active_tasks} 项\n\
+             - 系统已执行动作：{action_context}\n\n\
+             请直接以「{target_name} 的 7×24h 管家」第一人称口吻，向 @{sender_name} 给出自然、礼貌、切题的中文回复（2～4 句话；若对方发来问候或让你收到回复，请明确回应你已收到；若对方发来具体问题或任务，请结合上述状态说明已如何安排或代答）。不要输出多余标题或前缀。"
+        );
+        let dsh = crate::runtime::DshRuntime {
+            client: &h.client,
+            url,
+            token,
+        };
+        if let Ok(ans) = crate::runtime::Runtime::turn(
+            &dsh,
+            crate::runtime::TurnRequest {
+                kind: crate::runtime::TurnKind::Chat,
+                message: &prompt,
+                session_id: "",
+                history: &[],
+                profile: target_profile,
+                task_context: None,
+                draft_revision: None,
+                task_role: None,
+                owner_context: None,
+                profile_context: None,
+            },
+        )
+        .await
+        {
+            let trimmed = ans.reply.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        }
+    }
+    let _ = target_id;
+    if let Some(node_name) = auto_node_name {
+        format!(
+            "收到！我是 {target_name} 的 7×24h 管家，已收到来自 @{sender_name} 的协作请求「{clean_body}」，并已自动接手调度至 {target_name} 的节点「{node_name}」执行，完成后会第一时间将结果同步给你。"
+        )
+    } else if is_task {
+        format!(
+            "收到！我是 {target_name} 的 7×24h 管家，已记录来自 @{sender_name} 的协作请求「{clean_body}」并通知 {target_name}（当前在线 PC 节点 {nodes_online}/{nodes_total} 台，进行中任务 {active_tasks} 项），有进展会立即同步给你。"
+        )
+    } else {
+        format!(
+            "收到！我是 {target_name} 的 7×24h 云端管家，已收到 @{sender_name} 发来的消息：「{clean_body}」，并已同步至 {target_name} 的主聊天窗口（当前在线 PC 节点 {nodes_online}/{nodes_total} 台）。有需要协作的任务或问题随时 @我！"
+        )
+    }
+}
+
+async fn try_handle_colleague_at_mention(
     h: &Hub,
     owner: &str,
     input: &crate::messages::ChatInput,
@@ -2445,17 +2522,88 @@ fn try_handle_colleague_at_mention(
             .map(Some);
     }
 
+    let is_task = is_colleague_task_request(&input.message, &clean_body);
+    let (
+        sender_name,
+        nodes_online,
+        nodes_total,
+        active_tasks,
+        public_info,
+        target_profile,
+        auto_node_name,
+    ) = {
+        let db = h.db()?;
+        let s_name = member_display_name(&db, owner);
+        let pulse = build_system_pulse(h, &db, &target_id)?;
+        let n_online = pulse["nodes_online"].as_u64().unwrap_or(0) as usize;
+        let n_total = pulse["nodes_total"].as_u64().unwrap_or(0) as usize;
+        let a_tasks = pulse["active_tasks_count"].as_u64().unwrap_or(0) as usize;
+        let collab = crate::collaboration::read(&db, &target_id).unwrap_or_default();
+        let mut pub_parts = Vec::new();
+        if !collab.public.team.trim().is_empty() {
+            pub_parts.push(format!("团队：{}", collab.public.team.trim()));
+        }
+        if !collab.public.responsibilities.trim().is_empty() {
+            pub_parts.push(format!("职责：{}", collab.public.responsibilities.trim()));
+        }
+        if !collab.public.help_with.trim().is_empty() {
+            pub_parts.push(format!("可协助：{}", collab.public.help_with.trim()));
+        }
+        let pub_str = if pub_parts.is_empty() {
+            "未设置公开职责说明".to_owned()
+        } else {
+            pub_parts.join("；")
+        };
+        let t_prof = crate::profiles::route(&db, &target_id, None, None)?;
+        let can_auto = is_task
+            && crate::automation_policy::read(&db, &target_id).is_ok_and(|p| p.auto_accept)
+            && !requires_human_approval(h, &target_id, &clean_body)
+            && requirement_missing_reason(h, &db, &target_id, &clean_body, Some(&clean_body))?
+                .is_none();
+        let picked_name = if can_auto {
+            nodes::select_node_with_rule(h, &db, &target_id, &clean_body)?
+                .map(|(_, n_name, _, _)| n_name)
+        } else {
+            None
+        };
+        (
+            s_name,
+            n_online,
+            n_total,
+            a_tasks,
+            pub_str,
+            t_prof,
+            picked_name,
+        )
+    };
+
+    let peer_sagent_reply = generate_peer_sagent_reply(
+        h,
+        &sender_name,
+        &target_id,
+        &target_name,
+        &clean_body,
+        is_task,
+        auto_node_name.as_deref(),
+        nodes_online,
+        nodes_total,
+        active_tasks,
+        &public_info,
+        &target_profile,
+    )
+    .await;
+
     let mut db = h.db()?;
     let tx = db.transaction()?;
-    let sender_name = member_display_name(&tx, owner);
     let contact_req_id = format!("at-{}", Uuid::new_v4().simple());
     tx.execute(
         "INSERT INTO contact_messages(sender,recipient,author_kind,body,request_id,created_at)
          VALUES (?1,?2,'human',?3,?4,CURRENT_TIMESTAMP)",
         params![owner, target_id, clean_body, contact_req_id],
     )?;
+    insert_contact_assistant_msg(&tx, &target_id, owner, &peer_sagent_reply)?;
 
-    let reply = if is_colleague_task_request(&input.message, &clean_body) {
+    let reply = if is_task {
         let first_line = clean_body
             .lines()
             .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("[图片附件:"))
@@ -2492,27 +2640,27 @@ fn try_handle_colleague_at_mention(
             })?;
         if current_status == "working" {
             format!(
-                "🤵 管家：已直接转达给 **@{target_name}**，对方管家已自动接手任务「{summary_clean}」（#{}）并调度节点处理，进展会直接同步到当前对话。",
-                short_id(&task_id)
+                "🤵 管家：已直接转达给 **@{target_name}**，对方管家已自动接手任务「{summary_clean}」（#{sid}）并调度节点处理。\n\n---\n\n🤝 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}",
+                sid = short_id(&task_id)
             )
         } else {
             let notify_target = format!(
-                "💬 **[来自 @{sender_name} 的协作消息]**（任务 #{sid}）：\n> {clean_body}\n\n💡 已同步生成待处理任务「{summary_clean}」；你也可以直接在聊天框输入 `@{sender_name} 回复内容` 直接回信。",
+                "💬 **[来自 @{sender_name} 的协作消息]**（任务 #{sid}）：\n> {clean_body}\n\n🤵 **[你的管家已自动响应 @{sender_name}]**：\n{peer_sagent_reply}\n\n💡 如需本人补充，可直接在下方聊天框输入 `@{sender_name} 回复内容`。",
                 sid = short_id(&task_id)
             );
             insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
             format!(
-                "🤵 管家：已直接发给 **@{target_name}** 并创建协作任务「{summary_clean}」（#{}）。对方在自己的聊天框即可看到并回复，无需再去联系人列表操作。",
-                short_id(&task_id)
+                "🤵 管家：已直接发给 **@{target_name}** 并创建协作任务「{summary_clean}」（#{sid}）。\n\n---\n\n🤝 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}",
+                sid = short_id(&task_id)
             )
         }
     } else {
         let notify_target = format!(
-            "💬 **[来自 @{sender_name} 的消息]**：\n> {clean_body}\n\n💡 直接在聊天框输入 `@{sender_name} 回复内容` 即可回信。"
+            "💬 **[来自 @{sender_name} 的消息]**：\n> {clean_body}\n\n🤵 **[你的管家已自动响应 @{sender_name}]**：\n{peer_sagent_reply}\n\n💡 如需本人补充，可直接在下方聊天框输入 `@{sender_name} 回复内容`。"
         );
         insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
         format!(
-            "🤵 管家：已直接把消息发给 **@{target_name}**：\n> {clean_body}\n\n对方在主聊天窗口收到后可直接 `@{sender_name}` 回复你。"
+            "🤵 管家：已直接把消息发给 **@{target_name}** 的管家。\n\n---\n\n🤝 **[@{target_name} 的管家 → 你的管家]**：\n{peer_sagent_reply}"
         )
     };
 
@@ -4278,7 +4426,9 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
-        assert!(chat1["reply"].as_str().unwrap().contains("@luojie"));
+        let reply1 = chat1["reply"].as_str().unwrap();
+        assert!(reply1.contains("[@luojie 的管家 → 你的管家]"));
+        assert!(reply1.contains("我是 luojie 的 7×24h 云端管家"));
 
         let (s, bob_msgs) = call(&r, &token("bob"), "GET", "/api/messages", None).await;
         assert_eq!(s, StatusCode::OK);
