@@ -631,6 +631,7 @@ async function completeTurn(context, response) {
 
 function resetIdentity({ preserveRecovery = false } = {}) {
   if (typeof setRailMenuOpen === 'function') setRailMenuOpen(false);
+  if (typeof resetMentionState === 'function') resetMentionState();
   if (typeof resetProjects === 'function') resetProjects();
   collaborationProfileUI.reset({ discard: true });
   clearPeopleNames();

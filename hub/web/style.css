@@ -762,6 +762,12 @@ textarea, input { caret-color: var(--brand); }
 .gitlab-webhook-row { width: 100%; display: grid; gap: 6px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--soft); }
 .gitlab-check { display: flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--text); cursor: pointer; }
 .gitlab-check input { width: auto; flex: none; margin: 0; }
+.mention-picker { margin-bottom: 8px; padding: 6px; border: 1px solid var(--line-strong); border-radius: 12px; background: var(--surface); box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); display: grid; gap: 2px; max-height: 220px; overflow-y: auto; }
+.mention-head { padding: 4px 10px 6px; font-size: 12px; color: var(--muted); }
+.mention-item { display: flex; align-items: center; gap: 8px; width: 100%; padding: 7px 10px; border: 0; border-radius: 8px; background: transparent; color: var(--text); text-align: left; cursor: pointer; font: inherit; font-size: 13.5px; }
+.mention-item:hover, .mention-item.active { background: var(--brand-soft); color: var(--brand); }
+.mention-name { font-weight: 600; }
+.mention-handle { font-size: 12px; color: var(--muted); margin-left: auto; }
 .node-assign-bar { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); display: grid; gap: 8px; }
 .node-assign-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .node-assign-controls select, .node-assign-controls input { flex: 1 1 160px; min-width: 0; font: inherit; font-size: 13.5px; padding: 7px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface); color: var(--text); }

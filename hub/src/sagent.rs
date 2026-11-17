@@ -2172,7 +2172,370 @@ pub(crate) async fn answer_chat(
         }
     }
 
+    // 6. Direct `@colleague` messaging & cross-sagent task delegation from main chat
+    if !trimmed.starts_with('/') && trimmed.contains('@') {
+        if let Some(resp) =
+            try_handle_colleague_at_mention(h, owner, input, runtime_profile, task_context)?
+        {
+            return Ok(Some(resp));
+        }
+    }
+
     Ok(None)
+}
+
+fn member_display_name(db: &Connection, owner: &str) -> String {
+    db.query_row(
+        "SELECT display_name FROM member_profiles WHERE owner=?1 AND status='active'",
+        [owner],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .ok()
+    .flatten()
+    .map(|s| s.trim().to_owned())
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| owner.to_owned())
+}
+
+fn starts_with_ignore_ascii_case_utf8(haystack: &str, needle: &str) -> Option<usize> {
+    let mut h_chars = haystack.chars();
+    for nc in needle.chars() {
+        let hc = h_chars.next()?;
+        if hc != nc && !hc.eq_ignore_ascii_case(&nc) {
+            return None;
+        }
+    }
+    Some(haystack.len() - h_chars.as_str().len())
+}
+
+fn extract_colleague_at_mention(
+    h: &Hub,
+    db: &Connection,
+    sender: &str,
+    text: &str,
+) -> Result<Option<(String, String, String)>> {
+    let mut aliases: Vec<(String, String, String)> = Vec::new();
+    let gl_usernames: HashMap<String, String> = h
+        .automation
+        .lock()
+        .ok()
+        .map(|g| {
+            g.gitlab_configs
+                .iter()
+                .filter_map(|(k, v)| {
+                    let u = v.gitlab_username.trim();
+                    (!u.is_empty()).then(|| (k.clone(), u.to_owned()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for contact in h.directory.contacts(sender) {
+        let active: bool = db
+            .query_row(
+                "SELECT COALESCE((SELECT status='active' FROM member_profiles WHERE owner=?1), 1)",
+                [&contact],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !active {
+            continue;
+        }
+        let disp = member_display_name(db, &contact);
+        if !disp.is_empty() {
+            aliases.push((disp.clone(), contact.clone(), disp.clone()));
+        }
+        if let Some(gl_u) = gl_usernames.get(&contact) {
+            if !gl_u.eq_ignore_ascii_case(&disp) {
+                aliases.push((gl_u.clone(), contact.clone(), disp.clone()));
+            }
+        }
+        if !contact.eq_ignore_ascii_case(&disp) {
+            aliases.push((contact.clone(), contact.clone(), disp));
+        }
+    }
+    if aliases.is_empty() {
+        return Ok(None);
+    }
+    aliases.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+    for (byte_idx, ch) in text.char_indices() {
+        if ch != '@' {
+            continue;
+        }
+        if byte_idx > 0 {
+            if let Some(prev) = text[..byte_idx].chars().next_back() {
+                if prev.is_ascii_alphanumeric() {
+                    continue;
+                }
+            }
+        }
+        let after_at = &text[byte_idx + 1..];
+        for (alias, target_id, target_name) in &aliases {
+            let Some(matched_bytes) = starts_with_ignore_ascii_case_utf8(after_at, alias) else {
+                continue;
+            };
+            let rest = &after_at[matched_bytes..];
+            let alias_ends_ascii = alias
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'));
+            if alias_ends_ascii {
+                if let Some(next_ch) = rest.chars().next() {
+                    if next_ch.is_ascii_alphanumeric() || matches!(next_ch, '_' | '-') {
+                        continue;
+                    }
+                }
+            }
+            let before = text[..byte_idx].trim();
+            let before_stripped = [
+                "帮我发消息给",
+                "帮我转告",
+                "帮我通知",
+                "帮我告诉",
+                "帮我找",
+                "帮我给",
+                "帮我向",
+                "帮我对",
+                "发消息给",
+                "发个消息给",
+                "委派给",
+                "派活给",
+                "转达给",
+                "转告",
+                "通知",
+                "告诉",
+                "交给",
+                "派给",
+                "发给",
+                "麻烦",
+                "给",
+                "找",
+                "向",
+                "对",
+                "跟",
+                "和",
+                "请",
+                "让",
+                "叫",
+            ]
+            .iter()
+            .find_map(|p| before.strip_prefix(p))
+            .unwrap_or(before)
+            .trim();
+
+            let after_trimmed = rest.trim_start();
+            let after_stripped = [
+                "说一声：",
+                "说一声:",
+                "说一声",
+                "说一下：",
+                "说一下:",
+                "说一下",
+                "发个消息：",
+                "发个消息:",
+                "发消息：",
+                "发消息:",
+                "留言：",
+                "留言:",
+                "说：",
+                "说:",
+                "讲：",
+                "讲:",
+            ]
+            .iter()
+            .find_map(|p| after_trimmed.strip_prefix(p))
+            .unwrap_or(after_trimmed)
+            .trim_start_matches(['：', ':', '，', ',', '、', ' '])
+            .trim();
+
+            let cleaned = match (before_stripped.is_empty(), after_stripped.is_empty()) {
+                (true, true) => String::new(),
+                (true, false) => after_stripped.to_owned(),
+                (false, true) => before_stripped.to_owned(),
+                (false, false) => format!("{before_stripped} {after_stripped}"),
+            };
+            return Ok(Some((target_id.clone(), target_name.clone(), cleaned)));
+        }
+    }
+    Ok(None)
+}
+
+fn is_colleague_task_request(raw_input: &str, clean_body: &str) -> bool {
+    let trimmed = clean_body.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    for ack in [
+        "回复",
+        "好的",
+        "收到",
+        "明白",
+        "谢谢",
+        "多谢",
+        "没问题",
+        "知道了",
+        "辛苦",
+        "ok",
+        "OK",
+    ] {
+        if trimmed.starts_with(ack) && trimmed.chars().count() <= 36 {
+            return false;
+        }
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    [
+        "帮",
+        "查",
+        "看",
+        "修",
+        "改",
+        "做",
+        "处理",
+        "排查",
+        "分析",
+        "测试",
+        "确认",
+        "核对",
+        "检查",
+        "解决",
+        "实现",
+        "开发",
+        "部署",
+        "构建",
+        "脚本",
+        "报错",
+        "失败",
+        "问题",
+        "原因",
+        "为什么",
+        "怎么",
+        "任务",
+        "派活",
+        "委派",
+        "[图片附件:",
+    ]
+    .iter()
+    .any(|kw| trimmed.contains(kw) || raw_input.contains(kw))
+        || ["bug", "issue", "mr", "api", "fix", "error", "review"]
+            .iter()
+            .any(|kw| lower.contains(kw))
+}
+
+fn try_handle_colleague_at_mention(
+    h: &Hub,
+    owner: &str,
+    input: &crate::messages::ChatInput,
+    runtime_profile: &crate::profiles::RuntimeProfile,
+    task_context: Option<&Value>,
+) -> Result<Option<Json<Value>>> {
+    let matched = {
+        let db = h.db()?;
+        extract_colleague_at_mention(h, &db, owner, input.message.trim())?
+    };
+    let Some((target_id, target_name, clean_body)) = matched else {
+        return Ok(None);
+    };
+    if clean_body.is_empty() {
+        let hint = format!(
+            "🤵 管家：请在 **@{target_name}** 后面直接输入要发送的消息或要委派的任务，例如：\n- `@{target_name} 帮我看下登录接口报错`\n- `@{target_name} 今晚十点准时发版`"
+        );
+        return complete_chat_reply(h, owner, input, runtime_profile, task_context, &hint)
+            .map(Some);
+    }
+
+    let mut db = h.db()?;
+    let tx = db.transaction()?;
+    let sender_name = member_display_name(&tx, owner);
+    let contact_req_id = format!("at-{}", Uuid::new_v4().simple());
+    tx.execute(
+        "INSERT INTO contact_messages(sender,recipient,author_kind,body,request_id,created_at)
+         VALUES (?1,?2,'human',?3,?4,CURRENT_TIMESTAMP)",
+        params![owner, target_id, clean_body, contact_req_id],
+    )?;
+
+    let reply = if is_colleague_task_request(&input.message, &clean_body) {
+        let first_line = clean_body
+            .lines()
+            .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with("[图片附件:"))
+            .unwrap_or(&clean_body)
+            .trim();
+        let summary_clean = nodes::truncate_bytes(first_line, 240).to_owned();
+        let details_opt = (clean_body.contains('\n') || clean_body.contains("[图片附件:"))
+            .then_some(clean_body.as_str());
+        let task_id = Uuid::new_v4().to_string();
+        tx.execute(
+            "INSERT INTO tasks(id,requester,owner,summary,status,revision)
+             VALUES (?1,?2,?3,?4,'awaiting_owner',0)",
+            params![task_id, owner, target_id, summary_clean],
+        )?;
+        if let Some(det) = details_opt {
+            tx.execute(
+                "INSERT INTO task_details(task_id,author,content) VALUES (?1,?2,?3)",
+                params![task_id, owner, det],
+            )?;
+        }
+        crate::audit::record(&tx, &task_id, owner, "delegate", None, "awaiting_owner", 0)?;
+        on_task_delegated(
+            &tx,
+            h,
+            &task_id,
+            owner,
+            &target_id,
+            &summary_clean,
+            details_opt,
+        )?;
+        let current_status: String =
+            tx.query_row("SELECT status FROM tasks WHERE id=?1", [&task_id], |r| {
+                r.get(0)
+            })?;
+        if current_status == "working" {
+            format!(
+                "🤵 管家：已直接转达给 **@{target_name}**，对方管家已自动接手任务「{summary_clean}」（#{}）并调度节点处理，进展会直接同步到当前对话。",
+                short_id(&task_id)
+            )
+        } else {
+            let notify_target = format!(
+                "💬 **[来自 @{sender_name} 的协作消息]**（任务 #{sid}）：\n> {clean_body}\n\n💡 已同步生成待处理任务「{summary_clean}」；你也可以直接在聊天框输入 `@{sender_name} 回复内容` 直接回信。",
+                sid = short_id(&task_id)
+            );
+            insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
+            format!(
+                "🤵 管家：已直接发给 **@{target_name}** 并创建协作任务「{summary_clean}」（#{}）。对方在自己的聊天框即可看到并回复，无需再去联系人列表操作。",
+                short_id(&task_id)
+            )
+        }
+    } else {
+        let notify_target = format!(
+            "💬 **[来自 @{sender_name} 的消息]**：\n> {clean_body}\n\n💡 直接在聊天框输入 `@{sender_name} 回复内容` 即可回信。"
+        );
+        insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
+        format!(
+            "🤵 管家：已直接把消息发给 **@{target_name}**：\n> {clean_body}\n\n对方在主聊天窗口收到后可直接 `@{sender_name}` 回复你。"
+        )
+    };
+
+    let msg_id = insert_chat_message(&tx, owner, "user", &input.message)?;
+    insert_chat_message(&tx, owner, "assistant", &reply)?;
+    if let Some(key) = input.request_id.as_deref() {
+        tx.execute(
+            "UPDATE chat_turns SET message_id=?3 WHERE owner=?1 AND request_id=?2 AND status='pending'",
+            params![owner, key, msg_id],
+        )?;
+    }
+    let mut response = json!({
+        "reply": reply,
+        "backend": h.runtime.label(),
+        "source": "sagent",
+        "proposal": Value::Null,
+        "runtime_profile": runtime_profile,
+        "task_context": task_context.cloned().unwrap_or(Value::Null),
+        "repository_context": Value::Null,
+    });
+    crate::chat_turns::complete(&tx, owner, input.request_id.as_deref(), &mut response)?;
+    tx.commit()?;
+    Ok(Some(Json(response)))
 }
 
 pub(super) async fn pulse(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
@@ -3884,5 +4247,82 @@ mod tests {
         let (s, tasks) = call(&r, &token("alice"), "GET", "/api/tasks", None).await;
         assert_eq!(s, StatusCode::OK);
         assert_eq!(tasks.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn chat_at_mention_colleague_sends_direct_message_and_delegates_task_by_display_name() {
+        let h = test_hub();
+        enable_automation(&h, "bob");
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "INSERT OR REPLACE INTO member_profiles(owner,display_name,status) VALUES ('alice','zhouyaoxu','active')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT OR REPLACE INTO member_profiles(owner,display_name,status) VALUES ('bob','luojie','active')",
+                [],
+            )
+            .unwrap();
+        }
+        let r = app(h.clone());
+
+        // 1. Pure chat message via `给@luojie ...` delivers directly to Bob's main chat & contact_messages
+        let (s, chat1) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "给@luojie 说一声今晚十点发版" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(chat1["reply"].as_str().unwrap().contains("@luojie"));
+
+        let (s, bob_msgs) = call(&r, &token("bob"), "GET", "/api/messages", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(bob_msgs.as_array().unwrap().iter().any(|m| {
+            let c = m["content"].as_str().unwrap_or("");
+            c.contains("来自 @zhouyaoxu 的消息") && c.contains("今晚十点发版")
+        }));
+
+        // 2. Actionable task via `@luojie 帮我排查登录接口报错` creates task and auto-dispatches to Bob's online node
+        let (s, bob_node) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/nodes",
+            Some(json!({ "id": "bob-pc", "name": "Bob主力机" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let _ = call(
+            &r,
+            bob_node["token"].as_str().unwrap(),
+            "GET",
+            "/node/v1/work",
+            None,
+        )
+        .await;
+
+        let (s, chat2) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "@luojie 帮我排查一下登录接口报错" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(chat2["reply"].as_str().unwrap().contains("自动接手任务"));
+
+        let (s, bob_tasks) = call(&r, &token("bob"), "GET", "/api/tasks", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let tasks = bob_tasks.as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["requester"], "alice");
+        assert_eq!(tasks[0]["owner"], "bob");
+        assert_eq!(tasks[0]["status"], "working");
     }
 }

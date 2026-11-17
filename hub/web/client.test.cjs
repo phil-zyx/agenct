@@ -2479,6 +2479,26 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert(syncCall);
     assert.match(card.textContent, /已扫描 2 条待办/);
   });
+  await test('typing @ in main chat input opens colleague mention picker and completes @display_name', async () => {
+    const f = fixture(undefined, {
+      people: [
+        { id: 'gitlab-5', display_name: 'luojie', color: 'green', status: 'active', revision: 0 },
+        { id: 'gitlab-9', display_name: 'zhangsan', color: 'blue', status: 'active', revision: 0 },
+      ]
+    });
+    await f.login('alice');
+    f.$('text').value = '给@luo';
+    f.$('text').oninput();
+    await settle();
+    const picker = f.$('mention-picker');
+    assert.equal(picker.classList.contains('hide'), false);
+    assert.match(picker.textContent, /@luojie/);
+    assert(!picker.textContent.includes('zhangsan'));
+
+    f.$('text').onkeydown({ key: 'Enter', preventDefault() {} });
+    assert.equal(f.$('text').value, '给@luojie ');
+    assert.equal(picker.classList.contains('hide'), true);
+  });
   console.log('Client regression tests passed');
 
 })().catch(error => {

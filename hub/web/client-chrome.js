@@ -1,7 +1,132 @@
 /* Navigation, keyboard and viewport behavior. */
+let mentionState = { owner: '', people: null, loading: false, items: [], index: 0, start: 0, end: 0 };
+function closeMentionPicker() {
+  const picker = $('mention-picker');
+  if (picker) { picker.classList.add('hide'); picker.replaceChildren(); }
+  mentionState.items = [];
+  mentionState.index = 0;
+}
+function resetMentionState() {
+  closeMentionPicker();
+  mentionState = { owner: '', people: null, loading: false, items: [], index: 0, start: 0, end: 0 };
+}
+function applyMentionSelection(idx) {
+  const person = mentionState.items[idx];
+  if (!person) return false;
+  const name = person.display_name || person.id;
+  const box = $('text');
+  const value = String(box.value || '');
+  const before = value.slice(0, mentionState.start);
+  const after = value.slice(mentionState.end);
+  const inserted = '@' + name + ' ';
+  box.value = before + inserted + after;
+  const caret = before.length + inserted.length;
+  closeMentionPicker();
+  box.focus?.();
+  box.setSelectionRange?.(caret, caret);
+  return true;
+}
+function renderMentionItems() {
+  const picker = $('mention-picker');
+  if (!picker) return;
+  if (!mentionState.items.length) { closeMentionPicker(); return; }
+  const head = el('div', 'mention-head', '选择同事（直接发消息或派发任务，无需打开联系人列表）');
+  const rows = mentionState.items.map((person, idx) => {
+    const active = idx === mentionState.index;
+    const name = person.display_name || person.id;
+    const item = el('button', 'mention-item' + (active ? ' active' : ''));
+    item.type = 'button';
+    item.dataset.mention = name;
+    item.setAttribute('role', 'option');
+    item.setAttribute('aria-selected', String(active));
+    item.append(
+      el('span', 'contact-avatar avatar-' + (person.color || 'green'), name.slice(0, 1).toUpperCase()),
+      el('strong', 'mention-name', name),
+      el('span', 'mention-handle', '@' + name + (person.id !== name ? ' · ' + person.id : ''))
+    );
+    item.onmousedown = event => { event.preventDefault(); applyMentionSelection(idx); };
+    item.onclick = () => applyMentionSelection(idx);
+    return item;
+  });
+  picker.replaceChildren(head, ...rows);
+  picker.classList.remove('hide');
+}
+function updateMentionPicker() {
+  const picker = $('mention-picker'), box = $('text');
+  if (!picker || !box) return;
+  const context = session();
+  if (!current(context)) { closeMentionPicker(); return; }
+  const value = String(box.value || '');
+  const pos = typeof box.selectionStart === 'number' ? box.selectionStart : value.length;
+  const head = value.slice(0, pos);
+  const match = /(?:^|[^A-Za-z0-9])@([A-Za-z0-9_.\u4e00-\u9fa5-]{0,32})$/.exec(head);
+  if (!match) { closeMentionPicker(); return; }
+  const atOffset = match[0].lastIndexOf('@');
+  const start = match.index + atOffset;
+  const query = match[1].toLowerCase();
+  const ownerKey = context.epoch + ':' + context.user;
+  if (mentionState.owner !== ownerKey) {
+    mentionState = { owner: ownerKey, people: null, loading: false, items: [], index: 0, start, end: pos };
+  } else {
+    mentionState.start = start;
+    mentionState.end = pos;
+  }
+  if (!mentionState.people) {
+    if (typeof directoryState !== 'undefined' && directoryState?.contacts?.length) {
+      mentionState.people = directoryState.contacts.map(id => directoryState.people.get(id) || { id, display_name: peerName(id) });
+    } else if (!mentionState.loading) {
+      mentionState.loading = true;
+      api(context, 'people').then(list => {
+        if (!current(context) || mentionState.owner !== ownerKey) return;
+        mentionState.people = Array.isArray(list) ? list : [];
+        for (const p of mentionState.people) if (typeof rememberPerson === 'function') rememberPerson(p?.id, p?.display_name);
+        updateMentionPicker();
+      }).catch(() => {
+        if (mentionState.owner === ownerKey) mentionState.people = [];
+      }).finally(() => {
+        if (mentionState.owner === ownerKey) mentionState.loading = false;
+      });
+      return;
+    } else {
+      return;
+    }
+  }
+  const matches = mentionState.people.filter(p => p && p.id && p.id !== context.user && (
+    (p.display_name || '').toLowerCase().includes(query) || p.id.toLowerCase().includes(query)
+  )).slice(0, 8);
+  mentionState.items = matches;
+  if (mentionState.index >= matches.length) mentionState.index = 0;
+  renderMentionItems();
+}
+
 // Enter sends, Shift+Enter inserts a newline. Never send while an IME is composing
 // (Chinese input confirms candidates with Enter).
 $('text').onkeydown = event => {
+  if (!$('mention-picker')?.classList.contains('hide') && mentionState.items.length) {
+    if (event.key === 'ArrowDown') {
+      event.preventDefault();
+      mentionState.index = (mentionState.index + 1) % mentionState.items.length;
+      renderMentionItems();
+      return;
+    }
+    if (event.key === 'ArrowUp') {
+      event.preventDefault();
+      mentionState.index = (mentionState.index - 1 + mentionState.items.length) % mentionState.items.length;
+      renderMentionItems();
+      return;
+    }
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      closeMentionPicker();
+      return;
+    }
+    if ((event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) && !event.isComposing && event.keyCode !== 229) {
+      event.preventDefault();
+      applyMentionSelection(mentionState.index);
+      return;
+    }
+  }
   if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
   if (!$('send').disabled) $('form').requestSubmit?.();
@@ -87,6 +212,7 @@ function setMenuOpen(open) {
 }
 function closeComposerOverlays() {
   setMenuOpen(false);
+  closeMentionPicker();
   if (typeof closeRolePicker === 'function' && !roleLocked()) closeRolePicker();
   if (typeof closeRepositoryPicker === 'function' && !repositoryLocked()) closeRepositoryPicker();
 }
@@ -117,6 +243,7 @@ if ($('manage-roles')) $('manage-roles').onclick = () => $('open-agents')?.oncli
 $('status').onclick = () => status('');
 $('status').onkeydown = event => { if (event.key === 'Escape') { event.preventDefault(); status(''); } };
 $('text').oninput = () => {
+  updateMentionPicker();
   const box = $('text');
   if (!box.style) return;
   box.style.height = 'auto';

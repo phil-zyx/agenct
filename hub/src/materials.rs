@@ -248,6 +248,14 @@ pub(super) async fn get_attachment(
                     OR EXISTS(SELECT 1 FROM task_details td WHERE td.task_id=t.id AND instr(td.content, ?2) > 0)
                     OR EXISTS(SELECT 1 FROM node_assignments a WHERE a.task_id=t.id AND instr(a.instruction, ?2) > 0)
                   )
+            )
+            OR EXISTS(
+                SELECT 1 FROM contact_messages cm
+                WHERE (cm.sender=?1 OR cm.recipient=?1) AND instr(cm.body, ?2) > 0
+            )
+            OR EXISTS(
+                SELECT 1 FROM messages m
+                WHERE m.owner=?1 AND instr(m.content, ?2) > 0
             )",
             params![user, id],
             |r| r.get(0),

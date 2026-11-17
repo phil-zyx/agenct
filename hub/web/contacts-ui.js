@@ -82,14 +82,12 @@ function renderContactDirectory() {
   list.replaceChildren();
   if (!matches.length) list.append(el('p', 'note', contacts.length ? '没有匹配的联系人。' : '同事登录加入后，就可以在这里联系他。'));
   for (const id of matches) {
-    const person = people.get(id), recent = recents.get(id);
+    const person = people.get(id);
     const row = el('button', 'contact-row'); row.type = 'button'; row.dataset.contact = id;
     if (peerState?.id === id) row.setAttribute('aria-current', 'true');
     const copy = el('span', 'contact-row-copy'); copy.append(el('span', 'contact-name', person?.display_name || id));
-    const last = recent?.last_message;
-    copy.append(el('span', 'contact-preview', last ? (last.author_kind === 'assistant' ? '助手：' : '') + last.body : '查看资料，开始沟通'));
+    copy.append(el('span', 'contact-preview', '查看协作资料 · 在主聊天框直接 @TA'));
     row.append(el('span', 'contact-avatar avatar-' + (person?.color || 'green'), (person?.display_name || id).slice(0, 1).toUpperCase()), copy);
-    if (recent?.unread_count) row.append(el('span', 'contact-unread', String(recent.unread_count)));
     row.onclick = () => openPeerConversation(id); list.append(row);
   }
 }
@@ -102,19 +100,14 @@ async function openPeerConversation(id) {
   const draftKey = context.epoch + ':' + context.user + ':' + id;
   const draft = peerDrafts.get(draftKey) || { value: '', requestId: null, requestValue: null, pending: null, confirmed: [] };
   peerDrafts.set(draftKey, draft);
-  peerState = { id, context, generation, draft, messages: [], snapshot: '', loading: true };
-  $('room').classList.add('peer-active', 'contact-mode'); $('room').classList.remove('contact-list-open');
-  $('contact-sidebar').classList.remove('hide'); $('peer-view').classList.remove('hide');
+  peerState = { id, context, generation, draft, messages: [], snapshot: '', loading: false };
+  $('peer-view').classList.add('hide');
+  $('room').classList.remove('peer-active');
+  $('room').classList.add('contact-mode', 'contact-list-open');
+  $('contact-sidebar').classList.remove('hide');
   if (typeof syncRailState === 'function') syncRailState();
-  $('peer-name').textContent = peerName(id);
-  $('peer-visibility').textContent = '与 ' + peerName(id) + ' 共享 · 助手代答会单独标明';
-  $('peer-input-label').textContent = '发给 ' + peerName(id);
-  $('peer-message-input').value = draft.value;
-  $('peer-send-status').textContent = '';
-  renderPeerMessages(); renderContactDirectory();
-  if (globalThis.innerWidth > 1100) void showPeerDetails();
-  await refreshPeerMessages();
-  if (peerState?.generation === generation) $('peer-message-input').focus?.();
+  renderContactDirectory();
+  await showPeerDetails();
 }
 function renderPeerMessages() {
   const state = peerState; if (!state) return;
@@ -248,20 +241,30 @@ async function showPeerDetails() {
   const valid = () => peerState === state && current(context) && version === contactsGeneration;
   const host = $('contacts-view'); host.classList.remove('hide'); $('room').classList.add('contacts-open');
   const header = el('header', 'profile-header');
-  const close = el('button', 'text-btn', '关闭资料'); close.type = 'button'; close.onclick = () => { closeContacts(); $('peer-details').focus?.(); };
+  const close = el('button', 'text-btn', '关闭资料'); close.type = 'button'; close.onclick = () => { closeContacts(); $('open-contacts').focus?.(); };
   header.append(el('h2', null, peerName(id)), close);
   const body = el('div', 'contacts-body', '正在读取协作资料…'); host.replaceChildren(header, body);
   if (globalThis.innerWidth <= 900) close.focus?.();
   try {
     const profile = await contactApi(context, 'contacts/' + encodeURIComponent(id) + '/profile'); if (!valid()) return;
-    body.replaceChildren(el('p', 'note', '对方公开的协作资料'));
+    body.replaceChildren(el('p', 'note', '对方公开的协作资料（沟通无需单独私聊窗口，直接在你的主聊天框输入 @' + peerName(id) + ' 即可）'));
     const details = el('dl', 'contact-public-profile');
     for (const [field, label] of [['team','团队'],['responsibilities','负责的工作'],['help_with','可以找我帮忙'],['request_requirements','发请求时请提供']]) {
       details.append(el('dt', null, label), el('dd', null, profile.public?.[field] || '尚未填写'));
     }
     body.append(details);
     const actions = el('div', 'actions');
-    const chat = el('button', null, '发消息'); chat.type = 'button'; chat.onclick = () => { closeContacts(); $('peer-message-input').focus?.(); };
+    const chat = el('button', null, '在对话中 @TA'); chat.type = 'button';
+    chat.onclick = () => {
+      const handle = '@' + peerName(id) + ' ';
+      restorePrivateChat();
+      const box = $('text');
+      if (!box.value.includes('@' + peerName(id))) {
+        box.value = box.value ? box.value.trimEnd() + ' ' + handle : handle;
+      }
+      box.oninput?.();
+      box.focus?.();
+    };
     const delegate = el('button', 'primary', '请他帮忙'); delegate.type = 'button';
     const editor = el('div', 'contact-editor');
     delegate.onclick = () => renderContactProposal(context, id, editor, valid);

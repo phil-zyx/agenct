@@ -69,8 +69,7 @@ const { fixture, server, showTasks, taskFixture } = require('./client.browser.te
     assert.equal(await page.evaluate(() => document.activeElement.id), 'text');
     await page.locator('#open-contacts').click();
     await page.getByRole('button', { name: /张明/ }).click();
-    if (page.viewportSize().width > 1100) await page.getByRole('button', { name: '请他帮忙', exact: true }).click();
-    await page.locator('#peer-details').click();
+    await page.getByRole('button', { name: '请他帮忙', exact: true }).waitFor();
     await page.keyboard.press('Escape');
     assert.equal(await page.evaluate(() => document.activeElement.id), 'open-contacts');
     console.log('PASS mobile overlays isolate background focus; Escape/chat restore focus');
