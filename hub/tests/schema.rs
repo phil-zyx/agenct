@@ -114,3 +114,13 @@ fn repeated_hub_opens_recover_new_pending_work_without_remigrating() {
         .unwrap();
     }
 }
+
+#[test]
+fn incomplete_state_restore_blocks_startup_before_database_changes() {
+    let file = Database::new();
+    let marker = file.0.parent().unwrap().join(".restore-in-progress");
+    std::fs::write(&marker, b"").unwrap();
+    let error = Hub::open(file.config("alice")).err().unwrap().to_string();
+    assert!(error.contains("restore is incomplete"));
+    assert!(!file.0.exists());
+}

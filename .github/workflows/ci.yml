@@ -30,6 +30,8 @@ jobs:
         run: |
           node scripts/durable-draft-acceptance.cjs --self-test
           AGENCT_TEST_HUB_BINARY="$PWD/hub/target/debug/agenct-hub" node scripts/durable-draft-acceptance.cjs
+      - name: Real Hub node receipt replay and complete state restore
+        run: python3 -m unittest discover -s scripts -p 'test_state_node_integration.py' -v
       - run: npm run test:local
       - name: Browser flows against a real Hub (contacts, collaboration, profile chat, chat failures, projects)
         env:
@@ -94,6 +96,11 @@ jobs:
           python-version: '3.12'
       # Standard-library protocol tests only: no provider keys, SDK, or Docker.
       # These are not evidence that real worker execution is enabled or trusted.
+      - name: Test state archives and node execution journal
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_state_backup.py' -v
+          python3 -m unittest discover -s scripts -p 'test_node_journal.py' -v
+          python3 -m unittest discover -s scripts -p 'test_backup_script.py' -v
       - name: Test DSH adapter protocol
         run: python3 -m unittest discover -s adapters/dsh -p 'test*.py' -v
       - name: Test fail-closed sandbox and independent verifier

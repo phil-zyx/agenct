@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 24;
+pub(super) const VERSION: i64 = 26;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -95,6 +95,7 @@ const TABLES: &[&str] = &[
     "project_acceptance_withdrawals",
     "user_nodes",
     "node_assignments",
+    "automation_permissions",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -201,6 +202,21 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
         22 => db.execute_batch(crate::project_questions::SCHEMA)?,
         23 => db.execute_batch(crate::project_completion::SCHEMA)?,
         24 => db.execute_batch(crate::nodes::SCHEMA)?,
+        25 => {
+            db.execute_batch(crate::automation_policy::SCHEMA)?;
+            add_column(db, "node_assignments", "authorization", "TEXT NOT NULL DEFAULT 'manual' CHECK(authorization IN ('manual','delegation','gitlab'))")?;
+            // Legacy jobs have no recorded execution consent. Require a new assignment.
+            db.execute_batch(
+                "UPDATE node_assignments SET status='failed' WHERE status IN ('queued','running')",
+            )?;
+        }
+        26 => {
+            add_column(db, "node_assignments", "lease_hash", "TEXT")?;
+            add_column(db, "node_assignments", "lease_until", "INTEGER")?;
+            add_column(db, "node_assignments", "submission_hash", "TEXT")?;
+            // Never resume legacy running execution without an exclusive lease.
+            db.execute_batch("UPDATE node_assignments SET status='failed' WHERE status='running'")?;
+        }
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -285,6 +301,8 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("project_state_items" | "project_state_versions", _) => 19,
         ("project_questions" | "project_question_withdrawals", _) => 22,
         ("project_resolutions" | "project_acceptances" | "project_acceptance_withdrawals", _) => 23,
+        ("node_assignments", "lease_hash" | "lease_until" | "submission_hash") => 26,
+        ("automation_permissions", _) | ("node_assignments", "authorization") => 25,
         ("user_nodes" | "node_assignments", _) => 24,
         ("messages" | "proposals", "created_at") => 11,
         ("events", "from_status" | "to_status" | "task_revision") => 6,
@@ -388,6 +406,7 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 .contains(&table)
                     && version < 23)
                 || (["user_nodes", "node_assignments"].contains(&table) && version < 24)
+                || (table == "automation_permissions" && version < 25)
             {
                 continue;
             }
@@ -450,8 +469,18 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 | "project_acceptance_withdrawals"
                 | "user_nodes"
                 | "node_assignments"
+                | "automation_permissions"
         ) {
-            let wanted_sql: String = expected.query_row(
+            let legacy_nodes = Connection::open_in_memory()?;
+            let old_nodes = table == "node_assignments" && !actual.contains_key("lease_hash");
+            if old_nodes {
+                legacy_nodes.execute_batch(crate::nodes::SCHEMA)?;
+                if actual.contains_key("authorization") {
+                    add_column(&legacy_nodes, "node_assignments", "authorization", "TEXT NOT NULL DEFAULT 'manual' CHECK(authorization IN ('manual','delegation','gitlab'))")?;
+                }
+            }
+            let definition = if old_nodes { &legacy_nodes } else { &expected };
+            let wanted_sql: String = definition.query_row(
                 "SELECT sql FROM sqlite_schema WHERE name=?1",
                 [table],
                 |r| r.get(0),
@@ -639,6 +668,48 @@ mod tests {
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap();
         rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn automation_upgrade_requires_fresh_consent_and_reassignment() {
+        let mut db = Connection::open_in_memory().unwrap();
+        for version in 1..=24 {
+            step(&db, version).unwrap();
+        }
+        db.execute_batch("PRAGMA user_version=24;
+            INSERT INTO sessions(owner,session_id) VALUES ('bob','session');
+            INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('task','bob','bob','legacy','working',0);
+            INSERT INTO user_nodes(owner,id,name,token_hash) VALUES ('bob','pc','PC','hash');
+            INSERT INTO node_assignments(task_id,owner,node_id,task_revision,status,updated_at) VALUES ('task','bob','pc',0,'running',0);").unwrap();
+        migrate(&mut db).unwrap();
+        assert_eq!(
+            db.query_row("SELECT status FROM node_assignments", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "failed"
+        );
+        assert!(
+            !crate::automation_policy::read(&db, "bob")
+                .unwrap()
+                .auto_accept
+        );
+        db.execute(
+            "INSERT INTO automation_permissions VALUES ('bob',1,1,0,0,0)",
+            [],
+        )
+        .unwrap();
+        migrate(&mut db).unwrap();
+        recover(&mut db).unwrap();
+        assert!(
+            crate::automation_policy::read(&db, "bob")
+                .unwrap()
+                .auto_accept
+        );
+        assert!(
+            !crate::automation_policy::read(&db, "bob")
+                .unwrap()
+                .auto_deliver
+        );
     }
 
     #[test]

@@ -12,6 +12,8 @@ Quick start (usually launched via /node/install.sh or /node/install.ps1):
 from __future__ import annotations
 
 import argparse
+import hashlib
+import threading
 import base64
 import json
 import locale
@@ -60,7 +62,7 @@ def http_json(
     timeout: int = 20,
 ) -> dict:
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "X-Agenct-Node-Protocol": "2"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if data is not None:
@@ -707,52 +709,123 @@ def run_job(
         shutil.rmtree(evidence_dir, ignore_errors=True)
 
 
-def poll_once(
-    hub: str,
-    token: str,
-    cmd_timeout: int,
-    state: dict,
-) -> bool:
-    payload = http_json(
-        f"{hub}/node/v1/work",
-        token=token,
-        extra_headers={"X-Agenct-Node-Env": state["node_env"]},
-    )
+def save_pending(path: str, value: dict) -> None:
+    directory = os.path.dirname(path)
+    fd, temporary = tempfile.mkstemp(prefix=".pending-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if os.name != "nt":
+            directory_fd = os.open(directory, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def archive_pending(path: str, label: str) -> None:
+    target = os.path.join(os.path.dirname(path), f"{label}-{uuid.uuid4().hex}.json")
+    os.rename(path, target)
+    print(f"执行记录已保留：{target}。请人工核对，不会自动重跑。", file=sys.stderr, flush=True)
+
+
+def submit_pending(hub: str, token: str, path: str, pending: dict) -> bool:
+    if pending.get("phase") != "result":
+        archive_pending(path, "uncertain")
+        return False
+    try:
+        http_json(f"{hub}/node/v1/tasks/{pending['task_id']}/drafts", token=token,
+                  method="POST", body=pending["body"])
+    except urllib.error.HTTPError as error:
+        if error.code in (400, 403, 404, 409, 413, 422):
+            archive_pending(path, "rejected-result")
+            return False
+        raise
+    os.unlink(path)
+    print(f"已提交任务 {pending['task_id']} 的执行结果。", flush=True)
+    return True
+
+
+def lock_node_state(directory: str):
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    if os.path.islink(directory) or not os.path.isdir(directory):
+        raise ValueError("node state directory must not be a symlink")
+    if os.name != "nt":
+        os.chmod(directory, 0o700)
+    fd = os.open(os.path.join(directory, "node.lock"), os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    handle = os.fdopen(fd, "r+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if os.fstat(fd).st_size == 0:
+                handle.write(b"0"); handle.flush()
+            handle.seek(0)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise RuntimeError("another node process is using this state directory") from None
+    return handle
+
+
+def poll_once(hub: str, token: str, cmd_timeout: int, state: dict) -> bool:
+    path = state["journal_path"]
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as stream:
+            pending = json.load(stream)
+        return submit_pending(hub, token, path, pending)
+    payload = http_json(f"{hub}/node/v1/work", token=token,
+                        extra_headers={"X-Agenct-Node-Env": state["node_env"]})
     node = payload.get("node") or {}
     if not state["connected"]:
-        node_name = node.get("name") or node.get("id") or "pc"
-        node_id = node.get("id") or ""
-        print(f"✓ 已连接云端 Hub，节点「{node_name} ({node_id})」状态：🟢 在线", flush=True)
+        print(f"已连接节点 {node.get('name') or node.get('id') or 'pc'}", flush=True)
         state["connected"] = True
-
     job = payload.get("job")
     if not job:
         return False
-    task_id = job["task_id"]
-    rev = job["task_revision"]
-    print(f"[{node.get('id', 'node')}] 接到任务 {task_id} (rev {rev}): {job.get('summary', '')}", flush=True)
-    status, content, used_agent, evidence_attachments = run_job(job, state["agent_mode"], cmd_timeout, node=node)
-    if state.get("auto_detect") and used_agent in CLI_AGENTS and used_agent != state["agent_mode"]:
-        state["agent_mode"] = used_agent
-        state["node_env"] = build_node_env(used_agent)
-        print(f"[agenct-node] 已自动切换默认引擎为：{used_agent}（后续任务无需再试失败引擎）", flush=True)
-    request_id = uuid.uuid4().hex
-    draft_body: dict = {
-        "request_id": request_id,
-        "expected_revision": rev,
-        "status": status,
-        "content": content,
-    }
-    if evidence_attachments:
-        draft_body["attachments"] = evidence_attachments
-    res = http_json(
-        f"{hub}/node/v1/tasks/{task_id}/drafts",
-        token=token,
-        method="POST",
-        body=draft_body,
-    )
-    print(f"[{node.get('id', 'node')}] 已交回草稿 ({status}) for {task_id}: {res}", flush=True)
-    return True
+    lease = job.get("lease_token")
+    if not isinstance(lease, str) or len(lease) != 64:
+        raise RuntimeError("Hub did not provide an exclusive execution lease; update the Hub")
+    task_id, revision = job["task_id"], job["task_revision"]
+    body = {"request_id": uuid.uuid4().hex, "expected_revision": revision, "lease_token": lease}
+    pending = {"phase": "executing", "task_id": task_id, "body": body}
+    save_pending(path, pending)  # Before any CLI or model call: a crash must never cause re-execution.
+    def renew():
+        return http_json(f"{hub}/node/v1/tasks/{task_id}/lease", token=token, method="POST",
+                         body={"lease_token": lease, "expected_revision": revision})
+    renew()
+    stopped = threading.Event()
+    def heartbeat():
+        while not stopped.wait(30):
+            try:
+                renew()
+            except Exception:
+                # The Hub remains authoritative: expiration/revocation rejects the result.
+                print("租约续期失败；请检查连接。过期结果会保留供人工核对。", file=sys.stderr, flush=True)
+    worker = threading.Thread(target=heartbeat, daemon=True)
+    worker.start()
+    try:
+        status, content, used_agent, attachments = run_job(job, state["agent_mode"], cmd_timeout, node=node)
+        if state.get("auto_detect") and used_agent in CLI_AGENTS:
+            state["agent_mode"] = used_agent
+            state["node_env"] = build_node_env(used_agent)
+        body.update(status=status, content=content)
+        if attachments:
+            body["attachments"] = attachments
+        pending["phase"] = "result"
+        save_pending(path, pending)
+        return submit_pending(hub, token, path, pending)
+    finally:
+        stopped.set()
+        worker.join(timeout=21)
 
 
 def maybe_reload_self(script_path: str, initial_mtime: float) -> None:
@@ -786,6 +859,7 @@ def main() -> int:
     parser.add_argument("--cmd", default=None, help="Custom shell command to execute when a task arrives")
     parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds")
     parser.add_argument("--timeout", type=int, default=300, help="Local agent timeout in seconds")
+    parser.add_argument("--state-dir", help="Private local execution journal directory")
     parser.add_argument("--once", action="store_true", help="Poll once and exit")
     args = parser.parse_args()
 
@@ -810,7 +884,11 @@ def main() -> int:
     except OSError:
         initial_mtime = 0.0
 
+    identity = hashlib.sha256((hub + "\0" + token).encode()).hexdigest()[:32]
+    journal_dir = os.path.abspath(args.state_dir or os.path.expanduser(f"~/.agenct/nodes/{identity}"))
+    state_guard = lock_node_state(journal_dir)  # Held for the whole process lifetime.
     state = {
+        "journal_path": os.path.join(journal_dir, "pending.json"),
         "connected": False,
         "agent_mode": agent_mode,
         "node_env": node_env,
@@ -823,6 +901,9 @@ def main() -> int:
         except urllib.error.HTTPError as err:
             state["connected"] = False
             print(f"Hub 返回 HTTP {err.code} ({err.reason}).", file=sys.stderr, flush=True)
+            if err.code == 426:
+                print("节点协议已升级，请重新下载安装节点脚本。", file=sys.stderr, flush=True)
+                return 1
             if err.code == 401:
                 print("节点令牌无效或已重置，请回网页重新复制一键命令。", file=sys.stderr, flush=True)
                 return 1

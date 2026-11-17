@@ -2,7 +2,9 @@
 """Container entrypoint for the intranet GitLab-login deployment.
 
   run     first start: generate private config in /data from environment; then start Hub
-  backup  consistent SQLite snapshot: entrypoint.py backup /data/backups/name.sqlite3
+  backup  online SQLite-only snapshot: entrypoint.py backup /data/backups/name.sqlite3
+  backup-state  offline complete state: entrypoint.py backup-state /data/backups/state.zip
+  restore-state archive destination [runtime-dir]  restore into a NEW directory
 
 Never prints credentials. Configuration is generated once; later changes are
 explicit edits of /data/browser-oidc.json or /data/launch.json.
@@ -91,6 +93,13 @@ if __name__ == '__main__':
     action = sys.argv[1] if len(sys.argv) > 1 else 'run'
     if action == 'run':
         run()
+    elif action == 'backup-state' and len(sys.argv) == 3:
+        subprocess.run([sys.executable, str(ROOT / 'scripts/state_backup.py'), 'create',
+                        '--state-dir', str(DATA), '--archive', sys.argv[2]], check=True)
+    elif action == 'restore-state' and len(sys.argv) in (4, 5):
+        subprocess.run([sys.executable, str(ROOT / 'scripts/state_backup.py'), 'restore',
+                        '--state-dir', sys.argv[3], '--archive', sys.argv[2],
+                        *(['--runtime-state-dir', sys.argv[4]] if len(sys.argv) == 5 else [])], check=True)
     elif action == 'backup' and len(sys.argv) == 3:
         backup(sys.argv[2])
     else:

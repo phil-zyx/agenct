@@ -127,6 +127,15 @@ function fixture(auth = { enabled: false }, settings = {}) {
       }
       if (url === '/api/tasks' && options.method === 'GET') data = tasks;
       if (url === '/api/repositories') data = settings.repositories || [];
+      if (url === '/api/automation/permissions') {
+        const saved = settings.automationPermissions || { revision: 0, auto_accept: false, auto_deliver: false, gitlab_execute: false, gitlab_reply: false };
+        if (options.method === 'PUT') {
+          const body = JSON.parse(options.body);
+          if (body.revision !== saved.revision) return { ok: false, status: 409, json: async () => ({ error: '权限已更改' }) };
+          settings.automationPermissions = { ...body, revision: saved.revision + 1 };
+        }
+        data = settings.automationPermissions || saved;
+      }
       if (url === '/api/gitlab/config' && options.method === 'GET') {
         data = settings.gitlabConfig || {
           configured: false,
@@ -2411,6 +2420,29 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     await settle();
     assert.equal(restricted.$('oidc-login').classList.contains('hide'), true);
     assert.equal(restricted.$('switch-account').classList.contains('hide'), false);
+  });
+  await test('automation permissions require an explicit save and reload after conflicting updates', async () => {
+    const settings = {};
+    const f = fixture(undefined, settings);
+    await f.login('bob');
+    await f.$('open-account').onclick(); await settle();
+    const section = walk(f.$('contacts-view')).find(n => n.className === 'automation-section');
+    const checks = walk(section).filter(n => n.tagName === 'input');
+    assert.equal(checks.length, 4);
+    assert(checks.every(n => !n.checked && !n.disabled));
+    checks[0].checked = true;
+    assert(!f.calls.some(c => c.url === '/api/automation/permissions' && c.options.method === 'PUT'));
+    await findButton(section, '保存自动化权限').onclick(); await settle();
+    const saved = f.calls.find(c => c.url === '/api/automation/permissions' && c.options.method === 'PUT');
+    assert.deepEqual(JSON.parse(saved.options.body), { revision: 0, auto_accept: true, auto_deliver: false, gitlab_execute: false, gitlab_reply: false });
+    assert.match(section.textContent, /已保存/);
+    settings.automationPermissions.revision += 1;
+    await findButton(section, '保存自动化权限').onclick(); await settle();
+    assert.match(section.textContent, /重新读取权限/);
+    assert.equal(findButton(section, '保存自动化权限').disabled, true);
+    await findButton(section, '重新读取权限').onclick(); await settle();
+    assert.equal(findButton(section, '保存自动化权限').disabled, false);
+
   });
   await test('GitLab integration card shows webhook URL, saves Personal Access Token, and triggers manual sync', async () => {
     const f = fixture();

@@ -32,11 +32,13 @@ async function openAccount() {
   const accountSection = el('div', 'account-section', '正在读取账号…');
   const gitlabSection = el('div', 'gitlab-section');
   const nodesSection = el('div', 'nodes-section');
+  const automationSection = el('div', 'automation-section');
   const adminSection = el('div', 'admin-section');
-  content.replaceChildren(...[accountSection, $('collaboration-profile-view'), nodesSection, gitlabSection, $('account-tools'), adminSection].filter(Boolean));
+  content.replaceChildren(...[accountSection, $('collaboration-profile-view'), nodesSection, automationSection, gitlabSection, $('account-tools'), adminSection].filter(Boolean));
   host.append(header, content); close.focus?.();
   if (typeof collaborationProfileUI !== 'undefined') void collaborationProfileUI.open(context);
   void renderNodesSection(context, valid, nodesSection);
+  void renderAutomationPermissions(context, valid, automationSection);
   void renderGitlabSection(context, valid, gitlabSection);
   try {
     const me = await api(context, 'me'); if (!valid()) return;
@@ -270,10 +272,10 @@ async function renderGitlabSection(context, valid, container) {
   const head = el('div', 'node-row-head');
   const badge = el('span', 'node-badge offline', '读取中…');
   head.append(el('h3', null, '🦊 GitLab 双向协同'), badge);
-  const intro = el('p', 'note', '在任意 GitLab Issue / MR 中 @你的名字，管家会自动接管并调度你的 PC 节点处理，完成后自动将回执写回原评论区。');
+  const intro = el('p', 'note', '接收 GitLab Issue / MR 中提及你的请求。自动执行与评论回写需在「自动化权限」中分别开启。');
 
   const hookBox = el('div', 'gitlab-webhook-row');
-  const hookNote = el('p', 'note', '方式 A（实时触发）· 仓库 Webhook URL（填入 GitLab 项目 Settings → Webhooks，勾选 Comments / Issues / Merge request events；Secret Token 可留空或填你的任意 PC 节点令牌）：');
+  const hookNote = el('p', 'note', '方式 A（实时触发）· 仓库 Webhook URL（填入 GitLab 项目 Settings → Webhooks，勾选 Comments / Issues / Merge request events；Secret Token 必填：填写你的 PC 节点令牌，仅处理提及你本人的请求；跨成员触发需由管理员配置专用 Webhook 密钥）：');
   const hookArea = el('textarea'); hookArea.readOnly = true; hookArea.rows = 2; hookArea.setAttribute('aria-label', 'GitLab Webhook URL');
   const hookActions = el('div', 'actions');
   const copyHookBtn = el('button', null, '复制 Webhook 地址'); copyHookBtn.type = 'button';
@@ -380,3 +382,59 @@ async function renderGitlabSection(context, valid, container) {
   }
 }
 $('open-account').onclick = openAccount;
+
+async function renderAutomationPermissions(context, valid, container) {
+  const section = el('section', 'member-card');
+  section.append(el('h3', 'member-title', '自动化权限'));
+  const hint = el('p', 'note', '仅在你明确授权后自动执行。关闭执行权限会取消尚未完成的自动派发；已经启动的本机进程仍需在该电脑停止。');
+  const note = el('p', 'note', '正在读取权限…'); note.setAttribute('role', 'status');
+  const fields = [
+    ['auto_accept', '自动接手他人委派并调度我的节点'],
+    ['auto_deliver', '自动将节点草稿交付给委派人（未经我逐次审阅）'],
+    ['gitlab_execute', '收到 GitLab 提及后自动在我的节点执行'],
+    ['gitlab_reply', '自动将完成结果发布为 GitLab 评论']
+  ];
+  const inputs = new Map();
+  section.append(hint);
+  for (const [key, title] of fields) {
+    const label = el('label', 'gitlab-check');
+    const input = el('input'); input.type = 'checkbox'; input.disabled = true;
+    input.setAttribute('aria-label', title); inputs.set(key, input);
+    label.append(input, el('span', null, title)); section.append(label);
+  }
+  const save = el('button', 'primary', '保存自动化权限'); save.type = 'button'; save.disabled = true;
+  const reload = el('button', null, '重新读取权限'); reload.type = 'button';
+  const actions = el('div', 'actions'); actions.append(save, reload);
+  section.append(note, actions); container.replaceChildren(section);
+  let revision = null, pending = false;
+  function lock(value) { save.disabled = value; reload.disabled = value; for (const input of inputs.values()) input.disabled = value; }
+  function apply(value) {
+    if (!value || !Number.isSafeInteger(value.revision) || fields.some(([key]) => typeof value[key] !== 'boolean')) throw Error('权限响应无效，请重新读取');
+    revision = value.revision;
+    for (const [key, input] of inputs) input.checked = value[key];
+  }
+  async function load() {
+    if (!valid() || pending) return;
+    pending = true; lock(true); revision = null;
+    try {
+      const value = await api(context, 'automation/permissions');
+      if (!valid()) return;
+      apply(value); note.textContent = '勾选只修改本页，点击保存后生效。'; lock(false);
+    } catch (error) { if (valid()) { note.textContent = error.message; reload.disabled = false; } }
+    finally { pending = false; }
+  }
+  reload.onclick = load;
+  save.onclick = async () => {
+    if (!valid() || pending || revision === null) return;
+    const body = { revision }; for (const [key, input] of inputs) body[key] = input.checked;
+    pending = true; lock(true);
+    try {
+      const value = await api(context, 'automation/permissions', 'PUT', body);
+      if (!valid()) return;
+      apply(value); note.textContent = '自动化权限已保存。'; lock(false);
+    } catch (error) {
+      if (valid()) { revision = null; note.textContent = error.message + '。请重新读取权限，核对后再保存。'; reload.disabled = false; }
+    } finally { pending = false; }
+  };
+  await load();
+}

@@ -162,9 +162,9 @@ fn has_rules_for_owner(h: &Hub, owner: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn requires_human_approval(h: &Hub, owner: &str, summary: &str) -> bool {
+pub(super) fn requires_human_approval(h: &Hub, owner: &str, summary: &str) -> bool {
     let Ok(guard) = h.automation.lock() else {
-        return false;
+        return true;
     };
     let lower = summary.to_ascii_lowercase();
     guard.rules.iter().any(|r| {
@@ -328,7 +328,7 @@ pub(crate) fn on_task_delegated(
     summary: &str,
     details: Option<&str>,
 ) -> Result<()> {
-    if requester == owner {
+    if requester == owner || !crate::automation_policy::read(tx, owner)?.auto_accept {
         return Ok(());
     }
     let has_node: bool = tx.query_row(
@@ -385,6 +385,11 @@ fn accept_and_assign_owner_node(
     summary: &str,
     instruction: Option<&str>,
 ) -> Result<()> {
+    if !crate::automation_policy::read(tx, owner)?.auto_accept
+        || requires_human_approval(h, owner, summary)
+    {
+        return Err(invalid("automatic acceptance is not authorized"));
+    }
     let next_rev = current_rev + 1;
     tx.execute(
         "UPDATE tasks SET status='working', revision=?2 WHERE id=?1",
@@ -420,9 +425,14 @@ fn accept_and_assign_owner_node(
                task_revision=excluded.task_revision,
                instruction=excluded.instruction,
                status='queued',
+               lease_hash=NULL, lease_until=NULL, submission_hash=NULL,
                draft_request_id=NULL,
                updated_at=excluded.updated_at",
             params![task_id, owner, node_id, next_rev, instr, now],
+        )?;
+        tx.execute(
+            "UPDATE node_assignments SET authorization='delegation' WHERE task_id=?1",
+            [task_id],
         )?;
         let state_hint = if online {
             "节点正在自动执行"
@@ -493,7 +503,10 @@ pub(crate) fn on_node_draft_completed(
     task_revision: i64,
     draft_id: &str,
 ) -> Result<()> {
-    if requester == owner || !is_task_managed(h, task_id) {
+    if requester == owner
+        || !is_task_managed(h, task_id)
+        || !crate::automation_policy::read(tx, owner)?.auto_deliver
+    {
         return Ok(());
     }
     if is_ui_verification_task(summary) && !has_evidence_pack(content) {
@@ -534,14 +547,14 @@ pub(crate) fn on_node_draft_completed(
     )?;
 
     let req_msg = format!(
-        "🤝 [{owner} 的管家 → 你的管家] 任务「{summary}」（#{}）已由节点「{node_name}」完成，【验收证据包】初审通过并已交付：\n\n{content}\n\n---\n💡 手机端快捷闭环：可直接回复「通过」完成验收，或回复「退回：修改意见」让对方管家自动重新调度修改。",
+        "🤝 [{owner} 的管家 → 你的管家] 任务「{summary}」（#{}）已由节点「{node_name}」完成，已按授权自动交付【验收证据包】（尚未经独立核验）：\n\n{content}\n\n---\n💡 手机端快捷闭环：可直接回复「通过」完成验收，或回复「退回：修改意见」让对方管家自动重新调度修改。",
         short_id(task_id)
     );
     insert_contact_assistant_msg(tx, owner, requester, &req_msg)?;
     insert_chat_message(tx, requester, "assistant", &req_msg)?;
 
     let owner_msg = format!(
-        "🤵 管家：节点「{node_name}」已完成 {requester} 委派的「{summary}」（#{}），验收证据初审通过，已自动交付等待 {requester} 验收。",
+        "🤵 管家：节点「{node_name}」已完成 {requester} 委派的「{summary}」（#{}），已按你的授权自动交付，证据尚未经独立核验，等待 {requester} 验收。",
         short_id(task_id)
     );
     insert_chat_message(tx, owner, "assistant", &owner_msg)?;
@@ -554,10 +567,10 @@ pub(crate) fn build_system_pulse(h: &Hub, db: &Connection, caller: &str) -> Resu
     let cutoff = now.saturating_sub(nodes::ONLINE_WINDOW_SECONDS);
 
     let mut node_stmt = db.prepare(
-        "SELECT owner, id, name, capabilities, last_seen_unix FROM user_nodes ORDER BY owner ASC, id ASC",
+        "SELECT owner, id, name, capabilities, last_seen_unix FROM user_nodes WHERE owner=?1 ORDER BY owner ASC, id ASC",
     )?;
     let node_rows = node_stmt
-        .query_map([], |r| {
+        .query_map([caller], |r| {
             let last_seen: Option<i64> = r.get(4)?;
             let online = last_seen.is_some_and(|t| t >= cutoff);
             Ok(json!({
@@ -574,11 +587,12 @@ pub(crate) fn build_system_pulse(h: &Hub, db: &Connection, caller: &str) -> Resu
         "SELECT t.id, t.requester, t.owner, t.summary, t.status, t.revision,
                 a.node_id, a.status
          FROM tasks t
-         LEFT JOIN node_assignments a ON a.task_id = t.id AND a.task_revision = t.revision
+         LEFT JOIN node_assignments a ON a.task_id = t.id AND a.task_revision = t.revision AND a.owner=?1
+         WHERE t.requester=?1 OR t.owner=?1
          ORDER BY t.rowid DESC",
     )?;
     let task_rows = task_stmt
-        .query_map([], |r| {
+        .query_map([caller], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -647,7 +661,15 @@ pub(crate) fn build_system_pulse(h: &Hub, db: &Connection, caller: &str) -> Resu
     let (rules_count, crons_count) = h
         .automation
         .lock()
-        .map(|g| (g.rules.len(), g.crons.iter().filter(|c| c.enabled).count()))
+        .map(|g| {
+            (
+                g.rules.iter().filter(|r| r.owner == caller).count(),
+                g.crons
+                    .iter()
+                    .filter(|c| c.enabled && c.owner == caller)
+                    .count(),
+            )
+        })
         .unwrap_or((0, 0));
 
     let online_nodes = node_rows.iter().filter(|n| n["online"] == true).count();
@@ -684,7 +706,7 @@ pub(crate) fn format_system_pulse(pulse: &Value) -> String {
         .unwrap_or_default();
 
     let mut lines = vec![
-        "### 📊 X 全局系统运转态势总结".to_owned(),
+        "### 📊 我的任务与节点态势".to_owned(),
         String::new(),
         format!(
             "- **资源 PC 节点**：在线 `{}` / 总计 `{}` 台",
@@ -1951,7 +1973,10 @@ pub(crate) async fn answer_chat(
                     [&task_owner],
                     |r| r.get(0),
                 )? || has_rules_for_owner(h, &task_owner);
-                if !participates && !is_task_managed(h, &tid) {
+                if (!participates && !is_task_managed(h, &tid))
+                    || !crate::automation_policy::read(&tx, &task_owner)?.auto_accept
+                    || requires_human_approval(h, &task_owner, &summary)
+                {
                     None
                 } else {
                     mark_task_managed(h, &tid)?;
@@ -2102,11 +2127,14 @@ pub(crate) async fn answer_chat(
                     "working",
                     next_rev,
                 )?;
-                if let Some(nid) = node_id {
+                if let Some(nid) = node_id.filter(|_| {
+                    crate::automation_policy::read(&tx, &task_owner).is_ok_and(|p| p.auto_accept)
+                        && !requires_human_approval(h, &task_owner, &summary)
+                }) {
                     let instr = nodes::truncate_bytes(reason, 4000);
                     tx.execute(
                         "UPDATE node_assignments
-                         SET task_revision=?2, instruction=?3, status='queued', draft_request_id=NULL, updated_at=?4
+                         SET task_revision=?2, instruction=?3, status='queued', authorization='delegation', lease_hash=NULL, lease_until=NULL, submission_hash=NULL, draft_request_id=NULL, updated_at=?4
                          WHERE task_id=?1",
                         params![tid, next_rev, instr, nodes::now_unix()],
                     )?;
@@ -2117,7 +2145,7 @@ pub(crate) async fn answer_chat(
                     insert_chat_message(&tx, &task_owner, "assistant", &owner_msg)?;
                 }
                 format!(
-                    "🤵 管家：已将任务「{summary}」（#{}）退回给 {task_owner} 的管家（原因：{reason}），对方将自动调度节点按修改意见返工。",
+                    "🤵 管家：已将任务「{summary}」（#{}）退回给 {task_owner} 的管家（原因：{reason}），对方可按修改意见继续处理；仅在已授权时自动调度节点。",
                     short_id(&tid)
                 )
             };
@@ -2296,17 +2324,21 @@ fn normalize_gitlab_base_url(raw: &str) -> Option<String> {
     if trimmed.is_empty() || trimmed.len() > 256 {
         return None;
     }
-    let after_scheme = trimmed
-        .strip_prefix("https://")
-        .or_else(|| trimmed.strip_prefix("http://"))?;
-    if after_scheme.is_empty()
+    let url = reqwest::Url::parse(trimmed).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path() != "/"
         || trimmed
             .chars()
-            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '?' | '#'))
+            .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
     {
         return None;
     }
-    Some(trimmed.to_owned())
+    Some(url.origin().ascii_serialization())
 }
 
 fn gitlab_base_url_from_web_url(web_url: &str) -> Option<String> {
@@ -2466,6 +2498,10 @@ pub(super) async fn save_gitlab_config(
 
     with_store_mut(&h, |store| {
         let entry = store.gitlab_configs.entry(owner.clone()).or_default();
+        // Credentials are bound to the configured origin, never carried to a new host.
+        if normalize_gitlab_base_url(&entry.base_url).as_ref() != Some(&base_url) {
+            entry.token.clear();
+        }
         entry.base_url = base_url;
         entry.gitlab_username = gitlab_username;
         if input.clear_token {
@@ -2525,6 +2561,8 @@ fn dispatch_gitlab_event(h: &Hub, ev: IncomingGitLabEvent<'_>) -> Result<Value> 
     };
     let mut db = h.db()?;
     let tx = db.transaction()?;
+    let permissions = crate::automation_policy::read(&tx, ev.target_owner)?;
+    let picked_node = picked_node.filter(|_| permissions.gitlab_execute);
     insert_chat_message(&tx, ev.target_owner, "user", &incoming)?;
 
     let mut registered_task_id: Option<String> = None;
@@ -2542,6 +2580,10 @@ fn dispatch_gitlab_event(h: &Hub, ev: IncomingGitLabEvent<'_>) -> Result<Value> 
             &full_q,
             None,
         )?;
+        tx.execute(
+            "UPDATE node_assignments SET authorization='gitlab' WHERE task_id=?1",
+            [&task_id],
+        )?;
         let reply_msg = format!("🦊 管家已自动响应来自 `{issue_ref}` 的 @ 请求：\n{reply}");
         insert_chat_message(&tx, ev.target_owner, "assistant", &reply_msg)?;
         registered_task_id = Some(task_id.clone());
@@ -2554,7 +2596,7 @@ fn dispatch_gitlab_event(h: &Hub, ev: IncomingGitLabEvent<'_>) -> Result<Value> 
         })
     } else {
         let reply_msg = format!(
-            "🦊 管家（云端已接管）已收到来自 `{issue_ref}`（{}）的 @ 请求：\n「{}」\n\n当前暂无匹配的资源 PC 节点，你可直接在对话中指派或配置规则由云端/节点继续跟进。",
+            "🦊 管家已收到来自 `{issue_ref}`（{}）的 @ 请求：\n「{}」\n\n尚未派发执行。请检查自动化权限及节点，或在对话中明确指派。",
             ev.author, ev.body
         );
         insert_chat_message(&tx, ev.target_owner, "assistant", &reply_msg)?;
@@ -2567,25 +2609,26 @@ fn dispatch_gitlab_event(h: &Hub, ev: IncomingGitLabEvent<'_>) -> Result<Value> 
 
     if let (Some(task_id), Some(iid)) = (registered_task_id, ev.issue_iid.filter(|&n| n > 0)) {
         if !ev.project_path.is_empty() && ev.project_path != "repo" {
-            let base_url = ev
+            let configured = h
+                .automation
+                .lock()
+                .ok()
+                .and_then(|g| g.gitlab_configs.get(ev.target_owner).cloned());
+            let Some(base_url) = configured
+                .as_ref()
+                .and_then(|c| normalize_gitlab_base_url(&c.base_url))
+            else {
+                return Ok(status_label);
+            };
+            // Incoming metadata can restrict a reply, but never choose its destination.
+            if ev
                 .base_url_hint
                 .and_then(normalize_gitlab_base_url)
-                .or_else(|| {
-                    h.automation
-                        .lock()
-                        .ok()
-                        .and_then(|g| {
-                            g.gitlab_configs
-                                .get(ev.target_owner)
-                                .map(|c| c.base_url.clone())
-                        })
-                        .and_then(|u| normalize_gitlab_base_url(&u))
-                })
-                .unwrap_or_else(|| {
-                    h.db()
-                        .map(|d| default_gitlab_base_url(&d, ev.target_owner))
-                        .unwrap_or_else(|_| "https://git.example.com".to_owned())
-                });
+                .as_ref()
+                != Some(&base_url)
+            {
+                return Ok(status_label);
+            }
             let _ = with_store_mut(h, |store| {
                 if store.gitlab_targets.len() >= 500 {
                     if let Some(oldest_key) = store.gitlab_targets.keys().next().cloned() {
@@ -2763,6 +2806,21 @@ pub(crate) fn notify_gitlab_task_completed(
     node_name: &str,
     final_content: &str,
 ) {
+    let authorized_owner = h
+        .automation
+        .lock()
+        .ok()
+        .and_then(|g| g.gitlab_targets.get(task_id).map(|t| t.owner.clone()));
+    let allowed = authorized_owner.as_deref().is_some_and(|owner| {
+        h.member_active(owner).unwrap_or(false)
+            && h.db()
+                .ok()
+                .and_then(|db| crate::automation_policy::read(&db, owner).ok())
+                .is_some_and(|p| p.gitlab_reply)
+    });
+    if !allowed {
+        return;
+    }
     let target_and_token = {
         let Ok(mut guard) = h.automation.lock() else {
             return;
@@ -2774,6 +2832,7 @@ pub(crate) fn notify_gitlab_task_completed(
         let token = guard
             .gitlab_configs
             .get(&target.owner)
+            .filter(|c| reply_target_matches_config(&target, c))
             .map(|c| c.token.clone())
             .unwrap_or_default();
         (target, token)
@@ -2786,6 +2845,15 @@ pub(crate) fn notify_gitlab_task_completed(
     let node = node_name.to_owned();
     let content = final_content.trim().to_owned();
     tokio::spawn(async move {
+        if !hub.member_active(&target.owner).unwrap_or(false)
+            || !hub
+                .db()
+                .ok()
+                .and_then(|db| crate::automation_policy::read(&db, &target.owner).ok())
+                .is_some_and(|p| p.gitlab_reply)
+        {
+            return;
+        }
         let resource = if target.noteable_type == "MergeRequest" {
             "merge_requests"
         } else {
@@ -2884,18 +2952,38 @@ fn resolve_at_mentions(h: &Hub, db: &Connection, text: &str) -> Vec<String> {
     users
 }
 
-fn has_valid_node_gitlab_token(h: &Hub, token: &str) -> Result<bool> {
-    if !token.starts_with("agn_") || token.len() < 16 || token.len() > 128 {
-        return Ok(false);
+fn reply_target_matches_config(target: &GitLabReplyTarget, cfg: &GitLabUserConfig) -> bool {
+    normalize_gitlab_base_url(&cfg.base_url).is_some_and(|base| base == target.base_url)
+}
+
+// A shared operator secret authorizes workspace ingress; user/node credentials
+// authorize only their own mentions. Missing credentials always fail closed.
+fn webhook_scope(h: &Hub, headers: &HeaderMap, secret: Option<&str>) -> Result<Option<String>> {
+    let provided = headers
+        .get("x-gitlab-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if let Some(expected) = secret.filter(|s| !s.trim().is_empty()) {
+        if provided == expected {
+            return Ok(None);
+        }
     }
-    let hashed = nodes::hash_token(token);
-    let db = h.db()?;
-    let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM user_nodes WHERE token_hash=?1)",
-        [hashed],
-        |r| r.get(0),
-    )?;
-    Ok(exists)
+    if !provided.is_empty() {
+        let owner: Option<String> = h
+            .db()?
+            .query_row(
+                "SELECT owner FROM user_nodes WHERE token_hash=?1",
+                [nodes::hash_token(provided)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let owner = owner.ok_or_else(denied)?;
+        if !h.directory.contains(&owner) || !h.member_active(&owner)? {
+            return Err(denied());
+        }
+        return Ok(Some(owner));
+    }
+    Ok(Some(h.identity(headers)?))
 }
 
 /// Module D: GitLab Issue / Comment / IM Webhook ingress.
@@ -2906,20 +2994,8 @@ pub(super) async fn gitlab_webhook(
     headers: HeaderMap,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>> {
-    let provided = headers
-        .get("x-gitlab-token")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let node_token_ok = !provided.is_empty() && has_valid_node_gitlab_token(&h, provided)?;
-    if let Ok(expected) = std::env::var("AGENCT_GITLAB_WEBHOOK_SECRET") {
-        if expected != provided && !node_token_ok && h.identity(&headers).is_err() {
-            return Err(denied());
-        }
-    } else if !provided.is_empty() && !node_token_ok {
-        return Err(denied());
-    } else if headers.get("authorization").is_some() && h.identity(&headers).is_err() {
-        return Err(denied());
-    }
+    let secret = std::env::var("AGENCT_GITLAB_WEBHOOK_SECRET").ok();
+    let scope = webhook_scope(&h, &headers, secret.as_deref())?;
 
     let project = payload["project"]["path_with_namespace"]
         .as_str()
@@ -2971,6 +3047,9 @@ pub(super) async fn gitlab_webhook(
     };
     let mut triggered = Vec::new();
     for target in mentioned {
+        if scope.as_ref().is_some_and(|owner| owner != &target) {
+            continue;
+        }
         if !h.member_active(&target)? {
             continue;
         }
@@ -3023,6 +3102,178 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn webhook_requires_credentials_and_node_credentials_are_owner_scoped() {
+        let h = test_hub();
+        let r = app(h.clone());
+        let body = json!({"body":"@alice @bob inspect this"});
+        let (status, _) = call(&r, "", "POST", "/webhooks/gitlab", Some(body.clone())).await;
+        assert!(!status.is_success());
+        assert_eq!(
+            h.db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM messages", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let (_, node) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/nodes",
+            Some(json!({"id":"private-node","name":"Private"})),
+        )
+        .await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/webhooks/gitlab")
+            .header("content-type", "application/json")
+            .header("x-gitlab-token", node["token"].as_str().unwrap())
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = r.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 100000)
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply["triggered"].as_array().unwrap().len(), 1);
+        assert_eq!(reply["triggered"][0]["user"], "bob");
+        let mut headers = axum::http::HeaderMap::new();
+        assert!(super::webhook_scope(&h, &headers, Some("")).is_err());
+        headers.insert("x-gitlab-token", "wrong".parse().unwrap());
+        assert!(super::webhook_scope(&h, &headers, Some("trusted-secret")).is_err());
+        headers.insert("x-gitlab-token", "trusted-secret".parse().unwrap());
+        assert_eq!(
+            super::webhook_scope(&h, &headers, Some("trusted-secret")).unwrap(),
+            None
+        );
+        headers.insert(
+            "x-gitlab-token",
+            node["token"].as_str().unwrap().parse().unwrap(),
+        );
+        h.db()
+            .unwrap()
+            .execute(
+                "INSERT INTO member_profiles(owner,display_name,status) VALUES ('bob','Bob','disabled')",
+                [],
+            )
+            .unwrap();
+        assert!(super::webhook_scope(&h, &headers, None).is_err());
+    }
+
+    #[tokio::test]
+    async fn pulse_excludes_other_users_private_tasks_nodes_and_automation() {
+        let h = test_hub();
+        let r = app(h.clone());
+        call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/nodes",
+            Some(json!({"id":"secret-node","name":"Secret"})),
+        )
+        .await;
+        {
+            let db = h.db().unwrap();
+            db.execute("INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('hidden','bob','bob','private-topic','working',0)", []).unwrap();
+            db.execute("INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('shared','alice','bob','shared-topic','working',0)", []).unwrap();
+        }
+        call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/messages",
+            Some(json!({"message":"定时任务：每 15 分钟 总结系统运转情况"})),
+        )
+        .await;
+        let (status, pulse) = call(&r, &token("alice"), "GET", "/api/pulse", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(pulse["nodes_total"], 0);
+        assert_eq!(pulse["crons_active"], 0);
+        assert_eq!(pulse["muse_topics_count"], 0);
+        assert_eq!(pulse["active_collaborations"].as_array().unwrap().len(), 1);
+        assert_eq!(pulse["active_collaborations"][0]["summary"], "shared-topic");
+        assert!(!pulse.to_string().contains("private-topic"));
+        assert!(!pulse.to_string().contains("secret-node"));
+    }
+
+    #[tokio::test]
+    async fn untrusted_reply_origin_and_changed_config_cannot_reuse_pat() {
+        let h = test_hub();
+        enable_automation(&h, "bob");
+        let r = app(h.clone());
+        let (_, node) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/nodes",
+            Some(json!({"id":"pc","name":"PC"})),
+        )
+        .await;
+        call(
+            &r,
+            node["token"].as_str().unwrap(),
+            "GET",
+            "/node/v1/work",
+            None,
+        )
+        .await;
+        call(&r, &token("bob"), "POST", "/api/gitlab/config", Some(json!({"base_url":"https://trusted.test", "token":"private-pat", "auto_poll_todos":false}))).await;
+        let (status, hook) = call(&r, &token("bob"), "POST", "/webhooks/gitlab", Some(json!({
+            "project":{"path_with_namespace":"team/app", "web_url":"https://attacker.test/team/app"},
+            "body":"@bob inspect app", "issue_iid":1
+        }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(hook["triggered"].as_array().unwrap().len(), 1);
+        assert!(h.automation.lock().unwrap().gitlab_targets.is_empty());
+        let target = super::GitLabReplyTarget {
+            owner: "bob".into(),
+            base_url: "https://attacker.test".into(),
+            project_path: "team/app".into(),
+            noteable_type: "Issue".into(),
+            noteable_iid: 1,
+        };
+        assert!(!super::reply_target_matches_config(
+            &target,
+            &h.automation.lock().unwrap().gitlab_configs["bob"]
+        ));
+        call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/gitlab/config",
+            Some(json!({"base_url":"https://new.test", "auto_poll_todos":false})),
+        )
+        .await;
+        assert!(h.automation.lock().unwrap().gitlab_configs["bob"]
+            .token
+            .is_empty());
+    }
+
+    #[test]
+    fn gitlab_origins_reject_credentials_paths_and_ambiguous_urls() {
+        for bad in [
+            "https://user:secret@host",
+            "https://host/path",
+            "https://host?query",
+            "https://host#fragment",
+            "https://host\\evil",
+            "file:///tmp/foo",
+            "https://",
+        ] {
+            assert!(super::normalize_gitlab_base_url(bad).is_none(), "{bad}");
+        }
+        assert_eq!(
+            super::normalize_gitlab_base_url("https://HOST:443/"),
+            Some("https://host".into())
+        );
+    }
+
+    fn enable_automation(h: &Hub, owner: &str) {
+        h.db().unwrap().execute("INSERT INTO automation_permissions(owner,revision,auto_accept,auto_deliver,gitlab_execute,gitlab_reply) VALUES (?1,1,1,1,1,1)",[owner]).unwrap();
+    }
+
     fn hash(token: &str) -> String {
         format!("{:x}", Sha256::digest(token.as_bytes()))
     }
@@ -3057,7 +3308,10 @@ mod tests {
         uri: &str,
         body: Option<Value>,
     ) -> (StatusCode, Value) {
-        let mut builder = Request::builder().method(method).uri(uri);
+        let mut builder = Request::builder()
+            .method(method)
+            .header("x-agenct-node-protocol", "2")
+            .uri(uri);
         if !bearer.is_empty() {
             builder = builder.header("authorization", format!("Bearer {bearer}"));
         }
@@ -3081,6 +3335,7 @@ mod tests {
     async fn module_b_cross_user_sagent_negotiation_clarification_evidence_pack_and_mobile_accept()
     {
         let h = test_hub();
+        enable_automation(&h, "bob");
         let r = app(h);
 
         // Bob registers a PC node and brings it online.
@@ -3196,7 +3451,7 @@ mod tests {
             "POST",
             &format!("/node/v1/tasks/{task_id}/drafts"),
             Some(json!({
-                "request_id": "try-1",
+                "lease_token": w1["job"]["lease_token"], "request_id": "try-1",
                 "expected_revision": w1["job"]["task_revision"],
                 "status": "completed",
                 "content": "改了一行CSS"
@@ -3221,13 +3476,14 @@ mod tests {
         )
         .await;
         assert_eq!(s, StatusCode::OK);
+        let (_, retried_work) = call(&r, &node_token, "GET", "/node/v1/work", None).await;
         let (s, _) = call(
             &r,
             &node_token,
             "POST",
             &format!("/node/v1/tasks/{task_id}/drafts"),
             Some(json!({
-                "request_id": "try-2",
+                "lease_token": retried_work["job"]["lease_token"], "request_id": "try-2",
                 "expected_revision": 1,
                 "status": "completed",
                 "content": "### 🔍 验收证据包\n已修复移动端按钮样式，Playwright 实测通过。",
@@ -3300,6 +3556,7 @@ mod tests {
     #[tokio::test]
     async fn modules_a_c_d_pulse_cloud_cron_and_gitlab_webhook_work_end_to_end() {
         let h = test_hub();
+        enable_automation(&h, "bob");
         let r = app(h);
 
         // Module C: Alice (with ZERO PC nodes!) creates a 7x24h cron job and triggers it -> runs in cloud!
@@ -3344,7 +3601,7 @@ mod tests {
 
         let (s, hook_res) = call(
             &r,
-            "",
+            &token("bob"),
             "POST",
             "/webhooks/gitlab",
             Some(json!({
@@ -3360,13 +3617,11 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         let triggered = hook_res["triggered"].as_array().unwrap();
-        assert_eq!(triggered.len(), 2);
+        assert_eq!(triggered.len(), 1);
         assert!(triggered
             .iter()
             .any(|t| t["user"] == "bob" && t["mode"] == "pc-node"));
-        assert!(triggered
-            .iter()
-            .any(|t| t["user"] == "alice" && t["mode"] == "cloud-sagent"));
+        assert!(!triggered.iter().any(|t| t["user"] == "alice"));
 
         // Module A: Asking "现在系统里大家运转情况怎么样" in chat or GET /api/pulse returns live summary.
         let (s, pulse_chat) = call(
@@ -3379,12 +3634,12 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         let reply = pulse_chat["reply"].as_str().unwrap();
-        assert!(reply.contains("全局系统运转态势总结"));
-        assert!(reply.contains("bob-pc"));
+        assert!(reply.contains("我的任务与节点态势"));
+        assert!(!reply.contains("bob-pc"));
 
         let (s, pulse_api) = call(&r, &token("alice"), "GET", "/api/pulse", None).await;
         assert_eq!(s, StatusCode::OK);
-        assert_eq!(pulse_api["nodes_online"], 1);
+        assert_eq!(pulse_api["nodes_online"], 0);
     }
 
     #[tokio::test]
@@ -3394,6 +3649,7 @@ mod tests {
             "team%2Fsub%2Fagenct"
         );
         let h = test_hub();
+        enable_automation(&h, "bob");
         {
             let db = h.db().unwrap();
             db.execute(
@@ -3457,7 +3713,7 @@ mod tests {
 
         let (s, hook) = call(
             &r,
-            "",
+            &token("bob"),
             "POST",
             "/webhooks/gitlab",
             Some(json!({
@@ -3496,7 +3752,7 @@ mod tests {
         // Self-reply guard prevents loops
         let (s, loop_res) = call(
             &r,
-            "",
+            &token("bob"),
             "POST",
             "/webhooks/gitlab",
             Some(json!({

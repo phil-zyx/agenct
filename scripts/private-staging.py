@@ -501,7 +501,7 @@ def environment(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("start", "init", "check", "run", "set-port", "set-runtime", "add-user", "rotate-token", "backup", "restore"),
+    parser.add_argument("action", choices=("start", "init", "check", "run", "set-port", "set-runtime", "add-user", "rotate-token", "backup", "restore", "backup-state", "restore-state"),
                         help="start = init if missing, build, then run (recommended)")
     parser.add_argument("--state-dir", required=True, type=Path)
     parser.add_argument("--users", nargs="+", default=["alice", "bob"])
@@ -516,6 +516,13 @@ def main():
     if args.action in ("add-user", "rotate-token"):
         change_user(directory, args.user, rotate=args.action == "rotate-token")
         print("User credentials updated. Read the owner-only credentials.json; the running Hub applies this on its next authenticated request.")
+        return
+    if args.action in ("backup-state", "restore-state"):
+        if args.backup_file is None:
+            raise ValueError("complete backup/restore requires --backup-file")
+        subprocess.run([sys.executable, str(ROOT / "scripts/state_backup.py"),
+                        "create" if args.action == "backup-state" else "restore",
+                        "--state-dir", str(directory), "--archive", str(args.backup_file)], check=True)
         return
     if args.action in ("backup", "restore"):
         if args.backup_file is None:

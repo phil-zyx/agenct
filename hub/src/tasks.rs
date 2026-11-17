@@ -244,7 +244,9 @@ pub(super) async fn action(
     // Task revision changes revoke queued work and lease capabilities atomically.
     worker::revoke_task(&tx, &id)?;
     crate::auto_drafts::revoke_task(&tx, &id)?;
-    let node_assigned = if next == "working" {
+    let node_assigned = if next == "working"
+        && (user == t.owner || !crate::sagent::requires_human_approval(&h, &t.owner, &t.summary))
+    {
         crate::nodes::auto_assign_on_accept(&tx, &t.owner, &id, t.revision + 1)?
     } else {
         false

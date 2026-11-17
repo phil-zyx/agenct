@@ -289,3 +289,31 @@ Library integrations that use `app(Hub)` must also run `Hub::run_auto_drafts()`
 after all configuration builders and successful startup validation, and cancel
 that future at shutdown. Task actions wake this dispatcher after committing their intent; all automatic
 work, periodic retries and restart recovery belong to this lifecycle-owned future.
+
+## 完整应用状态备份与恢复
+
+原有 `private-staging.py backup` 和 Docker `entrypoint.py backup` 保持在线 SQLite 快照语义，**不包含附件和 JSON 自动化配置**。完整快照使用新的离线命令：先停止 Hub（例如退出前台进程，或停止对应服务），再执行：
+
+```sh
+python3 scripts/private-staging.py backup-state --state-dir /private/agenct --backup-file /private/agenct-state.zip
+python3 scripts/state_backup.py verify --archive /private/agenct-state.zip
+python3 scripts/private-staging.py restore-state --state-dir /private/agenct-restored --backup-file /private/agenct-state.zip
+```
+
+完整快照包含 SQLite 一致副本、`attachments/*.json`、`automation_state.json`、私有身份配置及凭据、GitLab/OIDC 启动配置和本地 client-secret，以及约定文件名的租户、Worker 和仓库配置。清单逐文件记录大小和 SHA-256；恢复前检查路径、重复条目、文件大小、校验和、数据库完整性和外键。文件校验用于检测损坏，不替代可信来源验证。
+
+文件权限为 0600，恢复目录为 0700。备份持有管理锁与 Hub 锁；运行中的 Hub 会使完整备份失败，不会获得跨存储的混合快照。恢复只接受不存在的新目录，不覆盖原数据；失败时清理新目录，进程被强制终止时残留的 `.restore-in-progress` 标记会阻止 Hub 启动。
+
+恢复会保留任务和完成结果，但把未完成节点派发标记为失败，并暂停保存的定时任务及 GitLab 自动轮询。核对状态后再重新指派、重新创建所需定时任务或开启轮询，避免重放快照之后已执行的工作。`launch.json` 中指向原状态目录的路径自动迁移到新目录；容器挂载路径可用 `--runtime-state-dir /data` 指定。
+
+运行环境、虚拟环境、日志、状态目录外的配置／仓库、环境变量中的密钥，以及各 PC 的本地执行记录不在该归档内。`launch.json` 引用的状态目录内配置文件也会纳入归档；目录外的引用路径记录在归档清单 `external_files` 中，仍需单独备份。切换恢复目录前先核对这些依赖；不要让旧实例与恢复实例同时使用同一套身份。
+
+## 本地节点执行租约与结果恢复
+
+数据库 v26 增加租约字段，升级时会停止没有租约的旧版运行中派发；已有任务和结果保留。节点协议 2 要求 `X-Agenct-Node-Protocol: 2`。领取仅返回排队任务，事务内生成一次性执行租约；另一进程不能重复领取正在执行的派发。旧节点脚本收到 426，需重新安装 Hub 提供的脚本后才能继续。
+
+租约有效期 120 秒，节点每 30 秒通过 `POST /node/v1/tasks/{id}/lease` 续期。续期和提交均绑定节点、任务版本和租约令牌。取消、撤销授权、换节点令牌、重新指派或过期后，旧执行者不能提交新的结果。过期不会自动重排，需人工核对后重新指派；显式重派前须确认旧进程已停止。
+
+节点本地在 `~/.agenct/nodes/<身份摘要>/` 保存 0600 的执行记录，支持 `--state-dir` 指定位置，同一目录只允许一个进程运行。执行前先写入记录，完成后先持久化结果，再提交 Hub；提交超时只重传相同请求 ID 和相同结果，不重新调用 Agent。Hub 对完成结果提供幂等回执，同租约改写结果会被拒绝。
+
+重启发现执行中记录时，保存为 `uncertain-*.json`，不自动重跑；过期或被拒绝的结果保存为 `rejected-result-*.json`，供人工核对。租约不能撤销已经发生的文件或外部服务操作，也不能强制杀死已启动的本机 CLI，因此不承诺外部副作用“恰好一次”。

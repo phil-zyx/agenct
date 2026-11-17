@@ -3,6 +3,7 @@ mod activity;
 mod audit;
 mod audit_migration;
 mod auto_drafts;
+mod automation_policy;
 pub mod browser_auth;
 mod chat_failures;
 mod chat_turns;
@@ -210,6 +211,13 @@ fn denied() -> Error {
 }
 impl Hub {
     pub fn open(config: Config) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        if config
+            .database
+            .parent()
+            .is_some_and(|dir| dir.join(".restore-in-progress").exists())
+        {
+            return Err("state restore is incomplete; finish recovery before starting Hub".into());
+        }
         let directory = directory::Directory::new(config.users.iter().map(|user| user.id.clone()))?;
         let gates = directory
             .ids()
@@ -547,12 +555,17 @@ pub fn app(mut hub: Hub) -> Router {
         .route("/node/install.sh", get(nodes::install_sh))
         .route("/node/install.ps1", get(nodes::install_ps1))
         .route("/node/v1/work", get(nodes::work))
+        .route("/node/v1/tasks/{id}/lease", post(nodes::renew_lease))
         .route(
             "/node/v1/tasks/{id}/drafts",
             post(nodes::submit_draft).layer(DefaultBodyLimit::max(16 * 1024 * 1024)),
         )
         .route("/api/pulse", get(sagent::pulse))
         .route("/api/automation", get(sagent::get_automation))
+        .route(
+            "/api/automation/permissions",
+            get(automation_policy::get).put(automation_policy::update),
+        )
         .route("/api/automation/rules", post(sagent::create_rule))
         .route("/api/automation/crons", post(sagent::create_cron))
         .route("/api/automation/tick", post(sagent::tick_crons))

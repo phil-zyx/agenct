@@ -47,3 +47,11 @@ docker compose start
 
 内网 HTTP 明文传输登录 Cookie，仅适用于可信内网；数据库未加密，主机管理员和 docker 组成员可读取全部数据，备份同等敏感。
 自动注册模式不支持管理员和多组织隔离：所有 GitLab active 用户处于同一个工作区。需要限制成员时改用固定成员模式（见 [gitlab-login.md](gitlab-login.md)）。
+
+## 完整快照（短暂停机）
+
+默认 `backup.sh` 仍是在线数据库备份。执行 `./backup.sh --full` 会停止原本正在运行的服务，通过一次性容器创建 `/data/backups/state-*.zip`，结束或失败后恢复原服务；原本已停止的服务不会被自动启动。此模式包含数据库、附件及应用配置，适合维护窗口。
+
+也可先手动停止服务，再使用 `docker compose run --rm --no-deps agenct backup-state /data/backups/state.zip`。恢复应使用新卷目录，并在运行 `scripts/state_backup.py restore` 时通过 `--runtime-state-dir /data` 保留容器最终挂载路径。确认恢复成功、外部 `agenct.env` 等依赖齐备后，再切换 Compose 的数据卷；不要覆盖运行中的数据目录。归档含凭据与私有对话，需按原数据保护。
+
+恢复后的定时任务和 GitLab 自动轮询暂停，未完成节点派发不会自动重跑。完整操作与恢复边界见 [技术参考](reference.md#完整应用状态备份与恢复)。

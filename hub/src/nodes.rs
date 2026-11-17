@@ -7,7 +7,7 @@ use axum::{
     Json,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -58,7 +58,7 @@ pub(super) struct AssignTask {
     instruction: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct DraftAttachment {
     name: String,
@@ -66,9 +66,11 @@ pub(super) struct DraftAttachment {
     data_base64: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SubmitDraft {
+    #[serde(default)]
+    lease_token: String,
     request_id: String,
     expected_revision: i64,
     status: String,
@@ -982,6 +984,8 @@ pub(super) fn dispatch_chat_task(
             task_revision=excluded.task_revision,
             instruction=excluded.instruction,
             status='queued',
+            lease_hash=NULL, lease_until=NULL, submission_hash=NULL,
+            authorization='manual',
             draft_request_id=NULL,
             updated_at=excluded.updated_at",
         params![task_id, owner, final_node_id, target_rev, question, now_unix()],
@@ -1009,6 +1013,9 @@ pub(super) fn auto_assign_on_accept(
     task_id: &str,
     revision: i64,
 ) -> Result<bool> {
+    if !crate::automation_policy::read(tx, owner)?.auto_accept {
+        return Ok(false);
+    }
     let now = now_unix();
     let cutoff = now.saturating_sub(ONLINE_WINDOW_SECONDS);
     let node_id: Option<String> = tx
@@ -1034,9 +1041,15 @@ pub(super) fn auto_assign_on_accept(
             task_revision=excluded.task_revision,
             instruction=excluded.instruction,
             status='queued',
+            lease_hash=NULL, lease_until=NULL, submission_hash=NULL,
+            authorization='manual',
             draft_request_id=NULL,
             updated_at=excluded.updated_at",
         params![task_id, owner, node_id, revision, now],
+    )?;
+    tx.execute(
+        "UPDATE node_assignments SET authorization='delegation' WHERE task_id=?1",
+        [task_id],
     )?;
     Ok(true)
 }
@@ -1377,6 +1390,7 @@ pub(super) async fn rotate_token(
     {
         return Err(denied());
     }
+    db.execute("UPDATE node_assignments SET status='failed', lease_hash=NULL WHERE owner=?1 AND node_id=?2 AND status='running'",params![owner,id])?;
     Ok(Json(json!({ "id": id, "token": token })))
 }
 
@@ -1500,6 +1514,8 @@ pub(super) async fn assign_task(
             task_revision=excluded.task_revision,
             instruction=excluded.instruction,
             status='queued',
+            lease_hash=NULL, lease_until=NULL, submission_hash=NULL,
+            authorization='manual',
             draft_request_id=NULL,
             updated_at=excluded.updated_at",
         params![task_id, owner, node_id, revision, instruction, now],
@@ -1589,8 +1605,20 @@ fn authenticate_node(h: &Hub, headers: &HeaderMap) -> Result<(String, String, St
 
 pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
     let (owner, node_id, node_name) = authenticate_node(&h, &headers)?;
+    if headers
+        .get("x-agenct-node-protocol")
+        .and_then(|v| v.to_str().ok())
+        != Some("2")
+    {
+        return Err(Error(
+            StatusCode::UPGRADE_REQUIRED,
+            "update the node client: exclusive lease protocol 2 required",
+        ));
+    }
     let mut db = h.db()?;
     let tx = db.transaction()?;
+    crate::automation_policy::revoke(&tx, &owner, &crate::automation_policy::read(&tx, &owner)?)?;
+    tx.execute("UPDATE node_assignments SET status='failed' WHERE owner=?1 AND node_id=?2 AND status='running' AND (lease_until IS NULL OR lease_until<=?3)", params![owner,node_id,now_unix()])?;
     let pending: Option<(String, i64, String, String, String)> = tx
         .query_row(
             "SELECT a.task_id, a.task_revision, a.instruction, t.requester, t.summary
@@ -1598,8 +1626,8 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
              JOIN tasks t ON t.id = a.task_id
              WHERE a.owner=?1 AND a.node_id=?2
                AND t.owner=?1 AND t.status='working' AND t.revision=a.task_revision
-               AND a.status IN ('queued','running')
-             ORDER BY CASE WHEN a.status='running' THEN 0 ELSE 1 END, a.updated_at ASC
+               AND a.status='queued'
+             ORDER BY a.updated_at ASC
              LIMIT 1",
             params![owner, node_id],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
@@ -1612,9 +1640,11 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
             "job": Value::Null,
         })));
     };
+    let lease_token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let lease_until = now_unix() + 120;
     tx.execute(
-        "UPDATE node_assignments SET status='running', updated_at=?2 WHERE task_id=?1",
-        params![task_id, now_unix()],
+        "UPDATE node_assignments SET status='running', updated_at=?2, lease_hash=?3, lease_until=?4, submission_hash=NULL WHERE task_id=?1",
+        params![task_id, now_unix(), hash_token(&lease_token), lease_until],
     )?;
     let details = tasks::details(&tx, &task_id)?
         .map(|d| d["content"].clone())
@@ -1702,6 +1732,8 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
         "job": {
             "task_id": task_id,
             "task_revision": task_revision,
+            "lease_token": lease_token,
+            "lease_until": lease_until,
             "requester": requester,
             "summary": summary,
             "details": details,
@@ -1711,6 +1743,33 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
             "attachments": attachments,
         }
     })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RenewLease {
+    lease_token: String,
+    expected_revision: i64,
+}
+
+pub(super) async fn renew_lease(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Path(task_id): Path<String>,
+    Json(input): Json<RenewLease>,
+) -> Result<Json<Value>> {
+    let (owner, node_id, _) = authenticate_node(&h, &headers)?;
+    let db = h.db()?;
+    crate::automation_policy::revoke(&db, &owner, &crate::automation_policy::read(&db, &owner)?)?;
+    let now = now_unix();
+    let changed=db.execute("UPDATE node_assignments SET lease_until=?6 WHERE task_id=?1 AND owner=?2 AND node_id=?3 AND lease_hash=?4 AND task_revision=?5 AND status='running' AND lease_until>?7 AND EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND status='working' AND revision=?5)", params![task_id,owner,node_id,hash_token(&input.lease_token),input.expected_revision,now+120,now])?;
+    if changed != 1 {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "node execution lease is no longer valid",
+        ));
+    }
+    Ok(Json(json!({"lease_until":now+120})))
 }
 
 pub(super) async fn submit_draft(
@@ -1751,6 +1810,34 @@ pub(super) async fn submit_draft(
             "task assignment changed before draft submission",
         ));
     }
+    let (lease_hash, lease_until, submission_hash): (Option<String>, Option<i64>, Option<String>) =
+        tx.query_row(
+            "SELECT lease_hash,lease_until,submission_hash FROM node_assignments WHERE task_id=?1",
+            [&task_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+    if input.lease_token.is_empty()
+        || lease_hash.as_deref() != Some(hash_token(&input.lease_token).as_str())
+    {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "node execution lease does not match",
+        ));
+    }
+    let payload_hash =
+        hash_token(&serde_json::to_string(&input).map_err(|_| invalid("invalid node submission"))?);
+    if submission_hash
+        .as_ref()
+        .is_some_and(|old| old != &payload_hash)
+    {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "lease already submitted different output",
+        ));
+    }
+    if input.status == "failed" && submission_hash.as_ref() == Some(&payload_hash) {
+        return Ok(Json(json!({"status":"failed"})));
+    }
     let (task_status, task_revision, requester, summary): (String, i64, String, String) = tx
         .query_row(
             "SELECT status,revision,requester,summary FROM tasks WHERE id=?1 AND owner=?2",
@@ -1761,18 +1848,21 @@ pub(super) async fn submit_draft(
         .ok_or_else(denied)?;
     let turn_request_id = format!("node-{node_id}-{}", input.request_id);
     if input.status == "completed" {
-        if let Some((existing_task, existing_draft_id)) = tx
+        if let Some((existing_task, existing_draft_id, existing_binding)) = tx
             .query_row(
-                "SELECT task_id, draft_id FROM draft_turns WHERE owner=?1 AND request_id=?2",
+                "SELECT task_id, draft_id, binding FROM draft_turns WHERE owner=?1 AND request_id=?2",
                 params![owner, turn_request_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)),
             )
             .optional()?
         {
-            if existing_task != task_id {
+            let existing_binding: Value = serde_json::from_str(&existing_binding).map_err(|_| invalid("invalid node receipt"))?;
+            if existing_task != task_id
+                || existing_binding["lease_hash"].as_str() != lease_hash.as_deref()
+                || existing_binding["submission_hash"].as_str() != Some(payload_hash.as_str()) {
                 return Err(Error(
                     StatusCode::CONFLICT,
-                    "request_id already bound to another task",
+                    "request_id already bound to another task, lease or output",
                 ));
             }
             let draft_id = existing_draft_id.ok_or_else(denied)?;
@@ -1789,6 +1879,23 @@ pub(super) async fn submit_draft(
             })));
         }
     }
+    if lease_until.is_none_or(|until| until <= now_unix()) {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "node execution lease expired; manual reassignment required",
+        ));
+    }
+    let assignment_active: bool = tx.query_row(
+        "SELECT status='running' FROM node_assignments WHERE task_id=?1",
+        [&task_id],
+        |r| r.get(0),
+    )?;
+    if !assignment_active {
+        return Err(Error(
+            StatusCode::CONFLICT,
+            "node assignment is no longer active",
+        ));
+    }
     if task_status != "working" || task_revision != input.expected_revision {
         return Err(Error(
             StatusCode::CONFLICT,
@@ -1797,8 +1904,8 @@ pub(super) async fn submit_draft(
     }
     if input.status == "failed" {
         tx.execute(
-            "UPDATE node_assignments SET status='failed', updated_at=?2 WHERE task_id=?1",
-            params![task_id, now_unix()],
+            "UPDATE node_assignments SET status='failed', updated_at=?2, submission_hash=?3 WHERE task_id=?1",
+            params![task_id, now_unix(), payload_hash],
         )?;
         if requester == owner {
             let reply = format!(
@@ -1874,6 +1981,8 @@ pub(super) async fn submit_draft(
         "request_id": turn_request_id,
         "expected_revision": input.expected_revision,
         "node_id": node_id,
+        "lease_hash": lease_hash,
+        "submission_hash": payload_hash,
     });
     let response = json!({
         "draft": {
@@ -1910,8 +2019,8 @@ pub(super) async fn submit_draft(
         ],
     )?;
     tx.execute(
-        "UPDATE node_assignments SET status='completed', draft_request_id=?2, updated_at=?3 WHERE task_id=?1",
-        params![task_id, turn_request_id, now_unix()],
+        "UPDATE node_assignments SET status='completed', draft_request_id=?2, updated_at=?3, submission_hash=?4 WHERE task_id=?1",
+        params![task_id, turn_request_id, now_unix(), payload_hash],
     )?;
     if requester == owner {
         tx.execute(
@@ -1974,6 +2083,7 @@ pub(super) async fn submit_draft(
         )?;
     }
     tx.commit()?;
+    drop(db);
     if requester == owner {
         crate::sagent::notify_gitlab_task_completed(&h, &task_id, &node_name, &final_content);
     }
@@ -2196,6 +2306,7 @@ mod tests {
     ) -> (StatusCode, Value) {
         let builder = Request::builder()
             .method(method)
+            .header("x-agenct-node-protocol", "2")
             .uri(path)
             .header("authorization", format!("Bearer {bearer}"))
             .header("content-type", "application/json");
@@ -2210,6 +2321,227 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    async fn assigned_node(h: &Hub) -> (Router, String) {
+        let router = app(h.clone());
+        let (status, node) = call(
+            &router,
+            &token("bob"),
+            "POST",
+            "/api/nodes",
+            Some(json!({"id":"pc","name":"PC"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(
+            &router,
+            &token("bob"),
+            "POST",
+            "/api/tasks/task-1/node-assignment",
+            Some(json!({"node_id":"pc","expected_revision":1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        (router, node["token"].as_str().unwrap().into())
+    }
+
+    #[tokio::test]
+    async fn exclusive_lease_blocks_duplicate_claims_and_binds_replayed_output() {
+        let h = hub();
+        let (r, node) = assigned_node(&h).await;
+        let (first, second) = tokio::join!(
+            call(&r, &node, "GET", "/node/v1/work", None),
+            call(&r, &node, "GET", "/node/v1/work", None)
+        );
+        assert_eq!(first.0, StatusCode::OK);
+        assert_eq!(second.0, StatusCode::OK);
+        assert_ne!(first.1["job"].is_null(), second.1["job"].is_null());
+        let job = if first.1["job"].is_null() {
+            &second.1["job"]
+        } else {
+            &first.1["job"]
+        };
+        let lease = job["lease_token"].as_str().unwrap();
+        assert_eq!(lease.len(), 64);
+        let (status, _) = call(
+            &r,
+            &node,
+            "POST",
+            "/node/v1/tasks/task-1/lease",
+            Some(json!({"lease_token":"wrong","expected_revision":1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(
+            &r,
+            &node,
+            "POST",
+            "/node/v1/tasks/task-1/lease",
+            Some(json!({"lease_token":lease,"expected_revision":1})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body = json!({"lease_token":lease,"request_id":"stable","expected_revision":1,"status":"completed","content":"result"});
+        let (status, done) = call(
+            &r,
+            &node,
+            "POST",
+            "/node/v1/tasks/task-1/drafts",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        h.db()
+            .unwrap()
+            .execute("UPDATE node_assignments SET lease_until=0", [])
+            .unwrap();
+        let (status, replay) = call(
+            &r,
+            &node,
+            "POST",
+            "/node/v1/tasks/task-1/drafts",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["draft_id"], done["draft_id"]);
+        let mut altered = body;
+        altered["content"] = json!("different result");
+        assert_eq!(
+            call(
+                &r,
+                &node,
+                "POST",
+                "/node/v1/tasks/task-1/drafts",
+                Some(altered)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            h.db()
+                .unwrap()
+                .query_row("SELECT count(*) FROM deliveries", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/tasks/task-1/node-assignment",
+            Some(json!({"node_id":"pc","expected_revision":1})),
+        )
+        .await;
+        let (_, next) = call(&r, &node, "GET", "/node/v1/work", None).await;
+        let collision = json!({"lease_token":next["job"]["lease_token"],"request_id":"stable","expected_revision":1,"status":"completed","content":"result"});
+        assert_eq!(
+            call(
+                &r,
+                &node,
+                "POST",
+                "/node/v1/tasks/task-1/drafts",
+                Some(collision)
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_lease_never_requeues_and_reassignment_rejects_the_old_executor() {
+        let h = hub();
+        let (r, node) = assigned_node(&h).await;
+        let (_, first) = call(&r, &node, "GET", "/node/v1/work", None).await;
+        h.db()
+            .unwrap()
+            .execute("UPDATE node_assignments SET lease_until=0", [])
+            .unwrap();
+        let (_, idle) = call(&r, &node, "GET", "/node/v1/work", None).await;
+        assert!(idle["job"].is_null());
+        assert_eq!(
+            h.db()
+                .unwrap()
+                .query_row("SELECT status FROM node_assignments", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "failed"
+        );
+        let old = json!({"lease_token":first["job"]["lease_token"],"request_id":"old","expected_revision":1,"status":"completed","content":"old output"});
+        assert_eq!(
+            call(
+                &r,
+                &node,
+                "POST",
+                "/node/v1/tasks/task-1/drafts",
+                Some(old.clone())
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/tasks/task-1/node-assignment",
+            Some(json!({"node_id":"pc","expected_revision":1})),
+        )
+        .await;
+        let (_, next) = call(&r, &node, "GET", "/node/v1/work", None).await;
+        assert_ne!(next["job"]["lease_token"], first["job"]["lease_token"]);
+        assert_eq!(
+            call(&r, &node, "POST", "/node/v1/tasks/task-1/drafts", Some(old))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn old_clients_cannot_claim_and_rotation_invalidates_claimed_work() {
+        let h = hub();
+        let (r, node) = assigned_node(&h).await;
+        let response = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/node/v1/work")
+                    .header("authorization", format!("Bearer {node}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            h.db()
+                .unwrap()
+                .query_row("SELECT status FROM node_assignments", [], |r| r
+                    .get::<_, String>(0))
+                .unwrap(),
+            "queued"
+        );
+        let (_, claimed) = call(&r, &node, "GET", "/node/v1/work", None).await;
+        let (_, rotated) = call(&r, &token("bob"), "POST", "/api/nodes/pc/token", None).await;
+        let new_token = rotated["token"].as_str().unwrap();
+        assert_eq!(
+            call(
+                &r,
+                new_token,
+                "POST",
+                "/node/v1/tasks/task-1/lease",
+                Some(json!({"lease_token":claimed["job"]["lease_token"],"expected_revision":1}))
+            )
+            .await
+            .0,
+            StatusCode::CONFLICT
+        );
+        assert!(call(&r, new_token, "GET", "/node/v1/work", None).await.1["job"].is_null());
     }
 
     #[tokio::test]
@@ -2301,7 +2633,7 @@ mod tests {
             "POST",
             "/node/v1/tasks/task-1/drafts",
             Some(json!({
-                "request_id": "run-1",
+                "lease_token": work["job"]["lease_token"], "request_id": "run-1",
                 "expected_revision": 1,
                 "status": "completed",
                 "content": "来自 gpu-box 本地军团的压测结论"
@@ -2319,7 +2651,7 @@ mod tests {
             "POST",
             "/node/v1/tasks/task-1/drafts",
             Some(json!({
-                "request_id": "run-1",
+                "lease_token": work["job"]["lease_token"], "request_id": "run-1",
                 "expected_revision": 1,
                 "status": "completed",
                 "content": "来自 gpu-box 本地军团的压测结论"
@@ -2394,6 +2726,7 @@ mod tests {
         let work_req = Request::builder()
             .method("GET")
             .uri("/node/v1/work")
+            .header("x-agenct-node-protocol", "2")
             .header("authorization", format!("Bearer {first_token}"))
             .header(
                 "x-agenct-node-env",
@@ -2566,7 +2899,7 @@ mod tests {
             "POST",
             &format!("/node/v1/tasks/{task_id}/drafts"),
             Some(json!({
-                "request_id": "exec-1",
+                "lease_token": job["lease_token"], "request_id": "exec-1",
                 "expected_revision": job["task_revision"],
                 "status": "completed",
                 "content": "当前分支：dev"
@@ -2583,7 +2916,7 @@ mod tests {
             "POST",
             &format!("/node/v1/tasks/{task_id}/drafts"),
             Some(json!({
-                "request_id": "exec-1",
+                "lease_token": job["lease_token"], "request_id": "exec-1",
                 "expected_revision": job["task_revision"],
                 "status": "completed",
                 "content": "当前分支：dev"
@@ -2647,6 +2980,7 @@ mod tests {
     #[tokio::test]
     async fn accepting_incoming_task_auto_assigns_primary_online_node() {
         let h = hub();
+        h.db().unwrap().execute("INSERT INTO automation_permissions(owner,revision,auto_accept,auto_deliver,gitlab_execute,gitlab_reply) VALUES ('bob',1,1,0,0,0)",[]).unwrap();
         h.db()
             .unwrap()
             .execute(
@@ -2767,6 +3101,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/node/v1/work")
+            .header("x-agenct-node-protocol", "2")
             .header("authorization", format!("Bearer {homelab_token}"))
             .header(
                 "x-agenct-node-env",
@@ -2866,6 +3201,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/node/v1/work")
+            .header("x-agenct-node-protocol", "2")
             .header("authorization", format!("Bearer {homelab_token}"))
             .header(
                 "x-agenct-node-env",
@@ -2900,7 +3236,7 @@ mod tests {
             "POST",
             &format!("/node/v1/tasks/{tid}/drafts"),
             Some(json!({
-                "request_id": "t1",
+                "lease_token": w1["job"]["lease_token"], "request_id": "t1",
                 "expected_revision": w1["job"]["task_revision"],
                 "status": "completed",
                 "content": "当前分支：dev"
@@ -2934,7 +3270,7 @@ mod tests {
             "POST",
             &format!("/node/v1/tasks/{tid}/drafts"),
             Some(json!({
-                "request_id": "t2",
+                "lease_token": w2["job"]["lease_token"], "request_id": "t2",
                 "expected_revision": w2["job"]["task_revision"],
                 "status": "completed",
                 "content": "abc123 feat: muse topic grouping"
@@ -3092,6 +3428,7 @@ mod tests {
             let req = Request::builder()
                 .method("GET")
                 .uri("/node/v1/work")
+                .header("x-agenct-node-protocol", "2")
                 .header("authorization", format!("Bearer {tok}"))
                 .header(
                     "x-agenct-node-env",
@@ -3139,7 +3476,7 @@ mod tests {
             &tok1,
             "POST",
             &format!("/node/v1/tasks/{tid1}/drafts"),
-            Some(json!({ "request_id": "d1", "expected_revision": 1, "status": "completed", "content": "mem 16G" })),
+            Some(json!({ "lease_token": w1["job"]["lease_token"], "request_id": "d1", "expected_revision": 1, "status": "completed", "content": "mem 16G" })),
         )
         .await;
 
@@ -3163,7 +3500,7 @@ mod tests {
             &tok1,
             "POST",
             &format!("/node/v1/tasks/{tid1}/drafts"),
-            Some(json!({ "request_id": "d2", "expected_revision": w2["job"]["task_revision"], "status": "completed", "content": "disk 50%" })),
+            Some(json!({ "lease_token": w2["job"]["lease_token"], "request_id": "d2", "expected_revision": w2["job"]["task_revision"], "status": "completed", "content": "disk 50%" })),
         )
         .await;
 
@@ -3191,7 +3528,7 @@ mod tests {
             &tok2,
             "POST",
             &format!("/node/v1/tasks/{tid_new}/drafts"),
-            Some(json!({ "request_id": "d3", "expected_revision": w_new["job"]["task_revision"], "status": "completed", "content": "data ready" })),
+            Some(json!({ "lease_token": w_new["job"]["lease_token"], "request_id": "d3", "expected_revision": w_new["job"]["task_revision"], "status": "completed", "content": "data ready" })),
         )
         .await;
 
@@ -3213,7 +3550,7 @@ mod tests {
         // 6. Env/process discovery routing: tok2 reports unique proc/repo -> tasks mentioning it route specifically to tok2.
         let env_req = Request::builder()
             .method("GET")
-            .uri("/node/v1/work")
+            .uri("/node/v1/work").header("x-agenct-node-protocol", "2")
             .header("authorization", format!("Bearer {tok2}"))
             .header(
                 "x-agenct-node-env",
