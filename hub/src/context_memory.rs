@@ -260,7 +260,13 @@ pub(super) async fn summarize_with_guard(
                 .await
             }
         }
-        .map_err(|_| failed())?;
+        .map_err(|e| {
+            if crate::chat_failures::code(&e).is_some() {
+                e
+            } else {
+                failed()
+            }
+        })?;
         if answer.backend != h.runtime.label()
             || answer.proposal.is_some()
             || answer.profile_update.is_some()
