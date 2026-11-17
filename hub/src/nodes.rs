@@ -1101,8 +1101,8 @@ fn completed_node_reply(db: &Connection, task_id: &str) -> Result<Option<String>
 }
 
 pub(super) async fn wait_for_node_completion(h: &Hub, task_id: &str) -> Result<Option<String>> {
-    for _ in 0..300 {
-        tokio::time::sleep(Duration::from_millis(150)).await;
+    for _ in 0..25 {
+        tokio::time::sleep(Duration::from_millis(120)).await;
         let reply = {
             let db = h.db()?;
             completed_node_reply(&db, task_id)?

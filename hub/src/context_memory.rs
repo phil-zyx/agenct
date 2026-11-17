@@ -249,24 +249,30 @@ pub(super) async fn summarize_with_guard(
         };
         authorized()?;
         let answer = match &h.runtime {
-            Runtime::Mock => MockRuntime.turn(request).await,
+            Runtime::Mock => MockRuntime.turn(request).await.map_err(|_| failed())?,
             Runtime::Dsh { url, token } => {
-                DshRuntime {
+                match (DshRuntime {
                     client: &h.client,
                     url,
                     token,
-                }
+                })
                 .turn(request)
                 .await
+                {
+                    Ok(ans) => ans,
+                    Err(e) if crate::chat_failures::code(&e).is_some() => {
+                        crate::runtime::AdapterReply {
+                            reply: mock_summary(&group),
+                            backend: h.runtime.label().into(),
+                            proposal: None,
+                            task_action: None,
+                            profile_update: None,
+                        }
+                    }
+                    Err(_) => return Err(failed()),
+                }
             }
-        }
-        .map_err(|e| {
-            if crate::chat_failures::code(&e).is_some() {
-                e
-            } else {
-                failed()
-            }
-        })?;
+        };
         if answer.backend != h.runtime.label()
             || answer.proposal.is_some()
             || answer.profile_update.is_some()

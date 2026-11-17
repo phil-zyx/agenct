@@ -258,7 +258,7 @@ article > button { margin: 10px 6px 0 0; }
 }
 .msg-image-card.expanded .msg-image { max-height: 520px; cursor: zoom-out; }
 .msg-image-caption { font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.composer-options { display: flex; justify-content: flex-end; padding-top: 4px; }
+.composer-options { display: none; justify-content: flex-end; padding-top: 4px; }
 .composer-options button { display: inline-flex; align-items: center; gap: 6px; min-height: 36px; font-size: 13px; }
 .composer-options svg { width: 16px; height: 16px; }
 .composer-options button[aria-expanded="true"] { background: var(--soft); color: var(--text); }
