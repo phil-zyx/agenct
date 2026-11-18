@@ -247,6 +247,10 @@ pub(super) async fn execute_chat(
                     "需要在 homelab",
                     "需要在本机",
                     "需要在节点",
+                    "无法生成委托提案",
+                    "没有点名由谁执行",
+                    "请明确说",
+                    "如果要交给",
                 ]
                 .iter()
                 .any(|cue| answer.reply.contains(cue));

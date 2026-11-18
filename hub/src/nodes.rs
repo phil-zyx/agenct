@@ -247,6 +247,24 @@ pub(super) fn resolve_user_node(
             return Ok(Some((id.clone(), name.clone(), online)));
         }
     }
+    let needle_low = needle.to_ascii_lowercase();
+    let is_local_agent_alias = needle_low.starts_with("agy")
+        || matches!(
+            needle_low.as_str(),
+            "codex" | "claude" | "gemini" | "opencode" | "本机" | "本地" | "线上"
+        );
+    if is_local_agent_alias {
+        if let Some((id, name, _, last_seen)) = rows
+            .iter()
+            .find(|(_, _, _, seen)| {
+                seen.is_some_and(|t| now.saturating_sub(t) <= ONLINE_WINDOW_SECONDS)
+            })
+            .or_else(|| rows.first())
+        {
+            let online = last_seen.is_some_and(|t| now.saturating_sub(t) <= ONLINE_WINDOW_SECONDS);
+            return Ok(Some((id.clone(), name.clone(), online)));
+        }
+    }
     Ok(None)
 }
 
@@ -679,6 +697,22 @@ fn should_auto_route_to_node(
         "活跃",
         "挂了",
         "报错",
+        "更新",
+        "部署",
+        "上线",
+        "同步",
+        "发布",
+        "推送",
+        "重启",
+        "构建",
+        "打包",
+        "发版",
+        "deploy",
+        "push",
+        "agy",
+        "agy1",
+        "codex",
+        "claude",
     ];
     if LOCAL_INTENT_KEYWORDS
         .iter()
@@ -694,31 +728,32 @@ fn should_auto_route_to_node(
         )
         .unwrap_or(false);
     if recent_node_active {
-        let is_followup_or_confirm = [
-            "哪些",
-            "哪个",
-            "那",
-            "再",
-            "它",
-            "这个",
-            "刚才",
-            "继续",
-            "还有",
-            "顺便",
-            "为什么",
-            "怎么",
-            "多少",
-            "什么",
-            "要",
-            "好",
-            "好的",
-            "可以",
-            "行",
-            "去查",
-            "试试",
-        ]
-        .iter()
-        .any(|cue| message.contains(cue));
+        let is_followup_or_confirm = message.trim().chars().count() <= 24
+            || [
+                "哪些",
+                "哪个",
+                "那",
+                "再",
+                "它",
+                "这个",
+                "刚才",
+                "继续",
+                "还有",
+                "顺便",
+                "为什么",
+                "怎么",
+                "多少",
+                "什么",
+                "要",
+                "好",
+                "好的",
+                "可以",
+                "行",
+                "去查",
+                "试试",
+            ]
+            .iter()
+            .any(|cue| message.contains(cue));
         if is_followup_or_confirm {
             return Ok(true);
         }
