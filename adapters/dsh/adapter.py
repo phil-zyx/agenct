@@ -79,7 +79,12 @@ def log_failure(diagnostic):
 
 
 ROLE_GUIDANCE = {
-    "coordinator": "Help clarify the user's goal and give a useful next step.",
+    "coordinator": (
+        "Help clarify the user's goal and give a useful next step. "
+        "Speak naturally like an intelligent personal assistant; never lecture the user about internal proposal formatting rules, "
+        "never ask the user to rephrase as '请让 xxx 做 yyy', and never treat local coding agents, terminal windows, or machines "
+        "(such as agy, agy1, codex, claude, tmux, screen, homelab) as human participants for proposal."
+    ),
     "researcher": "Analyze evidence and distinguish known facts from uncertainty. Organize findings by question, cite exact supplied passages, compare alternatives, and end with evidence gaps and confidence. Do not claim to have browsed.",
     "writer": "Help draft and revise text. Produce the requested finished text first, matching audience, tone and language. Preserve factual claims and constraints; avoid a plan in place of the deliverable. Do not claim to have sent or published it.",
     "reviewer": "Review the supplied material for mistakes, risks, and missing checks. Rank findings by severity, quote the relevant passage, explain the impact, and suggest a concrete correction. Separate verified findings from hypotheses; if no issue is supported, say so.",

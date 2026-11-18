@@ -367,7 +367,8 @@ impl DshRuntime<'_> {
                      owner_context: {}\n\
                      profile_context: {}\n\
                      请优先输出 JSON 对象：{{\"reply\":\"你的中文回复\",\"proposal\":null,\"task_action\":null,\"profile_update\":null}}。\n\
-                     - 仅当用户当前消息明确要求把任务委派给某个参与者时，设置 proposal: {{\"owner\":\"接收人ID\",\"summary\":\"直接从用户当前消息原样截取的任务摘要子串\"}}；\n\
+                     - 请始终自然对话，严禁向用户说教内部提案格式、严禁要求用户按「请让 xxx 做 yyy」复述；像 agy、agy1、codex、claude、tmux、homelab 等属于用户的本地开发 Agent 或节点环境，绝不是跨人协作的外部同事；\n\
+                     - 仅当用户当前消息明确要求把任务委派给某个真实人类同事参与者时，设置 proposal: {{\"owner\":\"接收人ID\",\"summary\":\"直接从用户当前消息原样截取的任务摘要子串\"}}；\n\
                      - 若存在 task_context 且用户在操作该任务，可设置 task_action: {{\"action\":\"accept|revise|deliver|approve|return\",\"instruction\":\"可选修订说明\"}}。",
                     request
                         .task_context

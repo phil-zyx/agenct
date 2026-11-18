@@ -261,7 +261,25 @@ pub(super) async fn execute_chat(
                 if let Some((node_id, node_name, online, _score)) =
                     crate::nodes::best_online_node(&*h.db()?, id, &input.message)?
                 {
-                    let summary = input.message.trim();
+                    let raw_msg = input.message.trim();
+                    let summary = if raw_msg.chars().count() <= 32 {
+                        let first_clause = answer
+                            .reply
+                            .split(['\n', '。', '；'])
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !first_clause.is_empty()
+                            && !first_clause.contains("没有工具")
+                            && !first_clause.contains("无法直接")
+                        {
+                            format!("{raw_msg}（上下文补充：{first_clause}）")
+                        } else {
+                            raw_msg.to_owned()
+                        }
+                    } else {
+                        raw_msg.to_owned()
+                    };
                     let summary = if summary.len() > 4000 {
                         let mut end = 4000;
                         while !summary.is_char_boundary(end) {
@@ -269,7 +287,7 @@ pub(super) async fn execute_chat(
                         }
                         summary[..end].to_owned()
                     } else {
-                        summary.to_owned()
+                        summary
                     };
                     return Ok((
                         AdapterReply {

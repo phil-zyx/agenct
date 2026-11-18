@@ -1344,6 +1344,377 @@ pub(crate) async fn llm_resolve_topic_hint(
     (matched_id, suggested_title)
 }
 
+#[derive(Debug)]
+pub(crate) enum LlmNodeDecision {
+    RouteToNode {
+        node_id: String,
+        node_name: String,
+        online: bool,
+        instruction: String,
+        topic_id: Option<String>,
+        topic_title: Option<String>,
+    },
+    RouteToCloud,
+    FallbackHeuristic,
+}
+
+pub(super) fn preserve_attachment_markers(original: &str, expanded: &str) -> String {
+    let mut out = expanded.trim().to_owned();
+    for prefix in ["[图片附件:", "[文件附件:"] {
+        let mut search = original;
+        while let Some(start) = search.find(prefix) {
+            let tail = &search[start..];
+            let token_end = tail
+                .find(')')
+                .map(|idx| idx + 1)
+                .or_else(|| tail.find(']').map(|idx| idx + 1))
+                .unwrap_or(tail.len());
+            let marker = &tail[..token_end];
+            if !out.contains(marker) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(marker);
+            }
+            search = &tail[token_end..];
+        }
+    }
+    truncate_bytes(out.trim(), 4000)
+}
+
+pub(crate) async fn llm_orchestrate_node_turn(
+    h: &Hub,
+    owner: &str,
+    message: &str,
+    selected_task_id: Option<&str>,
+    force_node: Option<(String, String, bool, String)>,
+) -> LlmNodeDecision {
+    let crate::Runtime::Dsh { url, token } = &h.runtime else {
+        return LlmNodeDecision::FallbackHeuristic;
+    };
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return LlmNodeDecision::FallbackHeuristic;
+    }
+    if [
+        "记住：",
+        "记住:",
+        "把我的职责公开为",
+        "允许助手用公开资料答复",
+        "关闭公开自动答复",
+        "关闭自动起草",
+        "开启自动起草",
+        "回复改为",
+    ]
+    .iter()
+    .any(|kw| trimmed.starts_with(kw))
+    {
+        return LlmNodeDecision::RouteToCloud;
+    }
+    if crate::sagent::match_dispatch_rule(h, owner, trimmed)
+        .is_some_and(|r| r.target_node_id == "cloud")
+    {
+        return LlmNodeDecision::RouteToCloud;
+    }
+
+    let Ok((nodes, contacts, recent_msgs, topics, default_best, runtime_profile)) = ({
+        let db = match h.db() {
+            Ok(db) => db,
+            Err(_) => return LlmNodeDecision::FallbackHeuristic,
+        };
+        let now = now_unix();
+        let mut n_stmt = match db.prepare(
+            "SELECT id, name, capabilities, last_seen_unix FROM user_nodes WHERE owner=?1 ORDER BY rowid ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return LlmNodeDecision::FallbackHeuristic,
+        };
+        let nodes: Vec<(String, String, String, bool)> = n_stmt
+            .query_map([owner], |r| {
+                let seen: Option<i64> = r.get(3)?;
+                let online = seen.is_some_and(|t| now.saturating_sub(t) <= ONLINE_WINDOW_SECONDS);
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, online))
+            })
+            .ok()
+            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>().ok())
+            .unwrap_or_default();
+        if nodes.is_empty() {
+            return LlmNodeDecision::FallbackHeuristic;
+        }
+        let any_online = nodes.iter().any(|(_, _, _, online)| *online);
+        if !any_online && force_node.is_none() && selected_task_id.is_none() {
+            return LlmNodeDecision::RouteToCloud;
+        }
+
+        let mut contacts = Vec::new();
+        for c in h.directory.contacts(owner) {
+            let display: Option<String> = db
+                .query_row(
+                    "SELECT display_name FROM member_profiles WHERE owner=?1 AND status='active'",
+                    [&c],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            match display.filter(|d| !d.trim().is_empty()) {
+                Some(d) => contacts.push(format!("{c}（{d}）")),
+                None => contacts.push(c),
+            }
+        }
+
+        let mut m_stmt = match db.prepare(
+            "SELECT role, content FROM (
+                SELECT id, role, content FROM messages
+                WHERE owner=?1 AND status='complete'
+                ORDER BY id DESC LIMIT 8
+             ) ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return LlmNodeDecision::FallbackHeuristic,
+        };
+        let recent_msgs: Vec<(String, String)> = m_stmt
+            .query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>().ok())
+            .unwrap_or_default();
+
+        let mut t_stmt = match db.prepare(
+            "SELECT id, summary, COALESCE(result, '') FROM tasks
+             WHERE requester=?1 AND owner=?1
+             ORDER BY rowid DESC LIMIT 20",
+        ) {
+            Ok(s) => s,
+            Err(_) => return LlmNodeDecision::FallbackHeuristic,
+        };
+        let topics: Vec<(String, String, String)> = t_stmt
+            .query_map([owner], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .ok()
+            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(_, sum, _)| is_topic_summary(sum))
+            .collect();
+
+        let default_best = select_node_with_rule(h, &db, owner, trimmed)
+            .ok()
+            .flatten();
+        crate::profiles::route(&db, owner, None, None)
+            .map(|prof| (nodes, contacts, recent_msgs, topics, default_best, prof))
+    }) else {
+        return LlmNodeDecision::FallbackHeuristic;
+    };
+
+    let nodes_block = nodes
+        .iter()
+        .map(|(id, name, caps, online)| {
+            format!(
+                "- node_id=`{id}`, 名称=「{name}」, 状态={}, 能力=`{caps}`",
+                if *online { "在线" } else { "离线" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let contacts_block = if contacts.is_empty() {
+        "（当前通讯录无其他外部人类同事）".to_owned()
+    } else {
+        contacts.join("、")
+    };
+    let history_block = if recent_msgs.is_empty() {
+        "（暂无历史对话）".to_owned()
+    } else {
+        recent_msgs
+            .iter()
+            .map(|(role, content)| {
+                let speaker = if role == "user" { "用户" } else { "管家" };
+                let snippet: String = strip_attachment_markers(content)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(260)
+                    .collect();
+                format!("[{speaker}] {snippet}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let topics_block = if topics.is_empty() {
+        "（当前尚无历史任务脉络）".to_owned()
+    } else {
+        topics
+            .iter()
+            .map(|(id, sum, res)| {
+                let short_res: String = res
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(60)
+                    .collect();
+                if short_res.is_empty() {
+                    format!("- `{id}`：{sum}")
+                } else {
+                    format!("- `{id}`：{sum}（最近结果：{short_res}）")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let clean_msg = strip_attachment_markers(trimmed);
+    let msg_for_prompt = if clean_msg.is_empty() {
+        trimmed
+    } else {
+        clean_msg.as_str()
+    };
+
+    let prompt = format!(
+        "你是用户的 7×24h 个人超级管家统一意图与上下文路由器（LLM Unified Butler Router）。\n\
+         请结合【最近对话历史】、【用户绑定的 PC 节点】、【通讯录人类同事】与【已有任务脉络】，对【用户最新消息】做出一步到位的路由、上下文指代补全与脉络归类决策。\n\n\
+         【用户绑定的 PC 节点（本机与服务器执行环境）】\n{nodes_block}\n\
+         （重要说明：像 agy、agy1、agy2、codex、claude、tmux、screen 等均是运行在用户 PC 节点上的本地开发 Agent 或终端会话窗口，绝不是外部人类同事，提到它们时一律归为 `node` 路由！）\n\n\
+         【通讯录人类同事】\n{contacts_block}\n\n\
+         【最近对话历史】\n{history_block}\n\n\
+         【已有任务脉络列表】\n{topics_block}\n\n\
+         【用户最新消息】\n「{msg_for_prompt}」\n\n\
+         【决策准则】\n\
+         1. 何时选择 `\"route\": \"node\"`（交由用户的 PC 节点执行）：\n\
+            - 用户要求查看、检查、操作、运行、测试、修改、构建、更新、同步、发布或部署本机/线上服务/代码仓库/终端窗口（tmux/screen）/本地 Agent（agy/agy1/codex/claude）/进程/容器/日志/文件/附件；\n\
+            - **上下文连续追问或简短动作指令**：当用户在最近对话中刚讨论过某项本地改动、代码提交（commit）、终端窗口、线上部署或节点任务，紧接着发出简短指令或追问（例如「更新」「部署到线上」「让 agy1 部署到线上」「继续」「哪些是活跃窗口」「帮我修一下」「去看看」），必须结合对话历史判定为 `\"route\": \"node\"`！\n\
+         2. 何时选择 `\"route\": \"cloud\"`（交由云端直接答复或人类同事协作）：\n\
+            - 纯概念/知识问答、通用技术原理探讨（不需要检查或操作用户机器上的实际仓库/环境）、日常闲聊；\n\
+            - 明确要求把任务委派给【通讯录人类同事】中的某个人。\n\
+         3. **指令上下文自动补全（`instruction` 字段，极其重要）**：\n\
+            - 当 `\"route\": \"node\"` 时，如果【用户最新消息】存在省略、代词指代或依赖上文（如「更新」「部署到线上」「让 agy1 部署到线上」「哪些是活跃窗口」「把刚才那个改掉」），你**必须**结合【最近对话历史】把指代的具体对象（如涉及的仓库名、提交号如 13dba7c、目标环境、终端会话或本地 Agent 名称）补全进 `instruction`，生成一条自包含、可直接执行的完整中文指令（格式如：`用户原话（上下文补充：...）`）。\n\
+            - 如果【用户最新消息】本身已经足够完整清晰，则保留原句即可。\n\
+         4. **脉络归并（`topic_id` 与 `topic_title`）**：\n\
+            - 涉及本机系统状态、终端窗口（tmux/screen）、后台进程/容器或机器环境检查的，优先归入 `🖥️ ... 系统与环境` 脉络；\n\
+            - 与【已有任务脉络列表】中某条脉络围绕同一仓库/同一事项/连续追问的，返回其 `topic_id` 与标题；\n\
+            - 若属全新事项，返回 `\"topic_id\": null`，并在 `topic_title` 提炼 6~14 字干净主题名（以 `📁 `、`🖥️ ` 或 `💬 ` 开头）。\n\n\
+         请只输出一行严格合法的 JSON（不要代码块）：\n\
+         `{{\"route\":\"node或cloud\",\"node_id\":\"匹配的节点ID或null\",\"instruction\":\"补全上下文后的完整节点指令或null\",\"topic_id\":\"已有脉络ID或null\",\"topic_title\":\"脉络标题或null\"}}`"
+    );
+
+    let dsh = crate::runtime::DshRuntime {
+        client: &h.client,
+        url,
+        token,
+    };
+    let sid = Uuid::new_v4().to_string();
+    let Ok(ans) = crate::runtime::Runtime::turn(
+        &dsh,
+        crate::runtime::TurnRequest {
+            kind: crate::runtime::TurnKind::Chat,
+            message: &prompt,
+            session_id: &sid,
+            history: &[],
+            profile: &runtime_profile,
+            task_context: None,
+            draft_revision: None,
+            task_role: None,
+            owner_context: None,
+            profile_context: None,
+        },
+    )
+    .await
+    else {
+        return LlmNodeDecision::FallbackHeuristic;
+    };
+
+    let raw = ans.reply.trim();
+    let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) else {
+        return LlmNodeDecision::FallbackHeuristic;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&raw[s..=e]) else {
+        return LlmNodeDecision::FallbackHeuristic;
+    };
+    let Some(route) = val["route"].as_str().map(str::trim) else {
+        return LlmNodeDecision::FallbackHeuristic;
+    };
+
+    if route.eq_ignore_ascii_case("cloud") && force_node.is_none() && selected_task_id.is_none() {
+        return LlmNodeDecision::RouteToCloud;
+    }
+    if !route.eq_ignore_ascii_case("node") && force_node.is_none() && selected_task_id.is_none() {
+        return LlmNodeDecision::FallbackHeuristic;
+    }
+
+    let picked_node = val["node_id"]
+        .as_str()
+        .map(str::trim)
+        .and_then(|nid| {
+            nodes
+                .iter()
+                .find(|(id, name, _, _)| id.eq_ignore_ascii_case(nid) || name == nid)
+                .map(|(id, name, _, online)| (id.clone(), name.clone(), *online))
+        })
+        .or_else(|| {
+            force_node
+                .as_ref()
+                .map(|(id, name, online, _)| (id.clone(), name.clone(), *online))
+        })
+        .or_else(|| {
+            default_best
+                .as_ref()
+                .map(|(id, name, online, _)| (id.clone(), name.clone(), *online))
+        })
+        .or_else(|| {
+            nodes
+                .iter()
+                .find(|(_, _, _, online)| *online)
+                .or_else(|| nodes.first())
+                .map(|(id, name, _, online)| (id.clone(), name.clone(), *online))
+        });
+
+    let Some((node_id, node_name, online)) = picked_node else {
+        return LlmNodeDecision::FallbackHeuristic;
+    };
+
+    let base_instruction = val["instruction"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "null")
+        .or_else(|| force_node.as_ref().map(|(_, _, _, sum)| sum.as_str()))
+        .unwrap_or(trimmed);
+    let instruction = preserve_attachment_markers(trimmed, base_instruction);
+
+    let topic_id = selected_task_id.map(str::to_owned).or_else(|| {
+        val["topic_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && *id != "null" && topics.iter().any(|(tid, _, _)| tid == id))
+            .map(str::to_owned)
+    });
+    let topic_title = val["topic_title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "null")
+        .map(|t| {
+            let clean: String = t.chars().take(28).collect();
+            if is_topic_summary(&clean) {
+                clean
+            } else {
+                format!("💬 {clean}")
+            }
+        });
+
+    LlmNodeDecision::RouteToNode {
+        node_id,
+        node_name,
+        online,
+        instruction,
+        topic_id,
+        topic_title,
+    }
+}
+
 fn explicit_named_repo(message: &str) -> Option<String> {
     for suffix in ["仓库", "项目"] {
         if let Some(pos) = message.find(suffix) {
@@ -1920,12 +2291,16 @@ pub(super) async fn answer_chat(
     {
         return Ok(None);
     }
-    let matched = {
+    let explicit_sel = selected_self_topic.map(|s| s.task_id.as_str());
+    let has_attachment = input.message.contains("/api/attachments/att_")
+        || input.message.contains("[图片附件:")
+        || input.message.contains("[文件附件:");
+
+    let forced = {
         let db = h.db()?;
         if let Some(explicit) = match_chat_command(&db, owner, &input.message)? {
             Some(explicit)
         } else if let Some(sel) = selected_self_topic {
-            // Continuing an explicit self-topic routes directly to its last node or best node.
             let assigned_node: Option<(String, String, Option<i64>)> = db
                 .query_row(
                     "SELECT n.id, n.name, n.last_seen_unix
@@ -1957,33 +2332,76 @@ pub(super) async fn answer_chat(
             } else {
                 None
             }
-        } else if let Some((node_id, node_name, online, score)) =
-            select_node_with_rule(h, &db, owner, &input.message)?
-        {
-            if should_auto_route_to_node(h, &db, owner, &input.message, score, online)? {
-                Some((
-                    node_id,
-                    node_name,
-                    online,
-                    truncate_bytes(input.message.trim(), 4000),
-                ))
-            } else {
-                None
-            }
+        } else if has_attachment {
+            select_node_with_rule(h, &db, owner, &input.message)?.map(
+                |(node_id, node_name, online, _)| {
+                    (
+                        node_id,
+                        node_name,
+                        online,
+                        truncate_bytes(input.message.trim(), 4000),
+                    )
+                },
+            )
         } else {
             None
         }
     };
-    let Some((node_id, node_name, online, summary)) = matched else {
-        return Ok(None);
-    };
+
+    let (node_id, node_name, online, summary, llm_tid, llm_title) =
+        match llm_orchestrate_node_turn(h, owner, &input.message, explicit_sel, forced.clone())
+            .await
+        {
+            LlmNodeDecision::RouteToCloud => return Ok(None),
+            LlmNodeDecision::RouteToNode {
+                node_id,
+                node_name,
+                online,
+                instruction,
+                topic_id,
+                topic_title,
+            } => (node_id, node_name, online, instruction, topic_id, topic_title),
+            LlmNodeDecision::FallbackHeuristic => {
+                let matched = if let Some(f) = forced {
+                    Some(f)
+                } else {
+                    let db = h.db()?;
+                    if let Some((node_id, node_name, online, score)) =
+                        select_node_with_rule(h, &db, owner, &input.message)?
+                    {
+                        if should_auto_route_to_node(
+                            h,
+                            &db,
+                            owner,
+                            &input.message,
+                            score,
+                            online,
+                        )? {
+                            Some((
+                                node_id,
+                                node_name,
+                                online,
+                                truncate_bytes(input.message.trim(), 4000),
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let Some((node_id, node_name, online, summary)) = matched else {
+                    return Ok(None);
+                };
+                let (tid, title) =
+                    llm_resolve_topic_hint(h, owner, &node_name, &summary, explicit_sel).await;
+                (node_id, node_name, online, summary, tid, title)
+            }
+        };
+
     if h.directory.can_delegate(owner, &node_id) {
         return Ok(None);
     }
-
-    let explicit_sel = selected_self_topic.map(|s| s.task_id.as_str());
-    let (llm_tid, llm_title) =
-        llm_resolve_topic_hint(h, owner, &node_name, &summary, explicit_sel).await;
 
     let (task_id, fallback_reply) = {
         let mut db = h.db()?;
@@ -4540,5 +4958,94 @@ mod tests {
             llm_resolve_topic_hint(&h, "bob", "homelab", "把重试次数调成 2 次再观察下", None).await;
         assert_eq!(matched_id.as_deref(), Some("t-frag1"));
         assert_eq!(suggested_title.as_deref(), Some("💬 鉴权网关超时排查"));
+    }
+
+    #[tokio::test]
+    async fn llm_unified_butler_router_expands_contextual_commands_and_filters_cloud_qa() {
+        let adapter = axum::Router::new().route(
+            "/v1/turn",
+            axum::routing::post(|Json(body): Json<Value>| async move {
+                let msg = body["message"].as_str().unwrap_or("");
+                let reply = if msg.contains("LLM Unified Butler Router") {
+                    assert!(
+                        msg.contains("agy1 已在本地完成提交 13dba7c"),
+                        "router prompt must include recent conversation history"
+                    );
+                    assert!(
+                        msg.contains("node_id=`homelab`"),
+                        "router prompt must include online PC node metadata"
+                    );
+                    if msg.contains("【用户最新消息】\n「部署到线上」")
+                        || msg.contains("【用户最新消息】\n「让 agy1 部署到线上」")
+                    {
+                        r#"{"route":"node","node_id":"homelab","instruction":"部署到线上（上下文补充：将 agy1 刚在本地完成的提交 13dba7c 同步部署到线上运行的 Hub 服务）","topic_id":"t-agenct","topic_title":"📁 agenct 仓库上下文"}"#
+                    } else if msg.contains("【用户最新消息】\n「为什么前端会出现跨域状态问题？」")
+                    {
+                        r#"{"route":"cloud","node_id":null,"instruction":null,"topic_id":null,"topic_title":null}"#
+                    } else {
+                        "ok"
+                    }
+                } else {
+                    "ok"
+                };
+                Json(json!({ "reply": reply, "backend": "dsh", "proposal": Value::Null }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/turn", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+
+        let mut h = hub();
+        h.runtime = crate::Runtime::Dsh {
+            url,
+            token: "test-token".into(),
+        };
+        let db = h.db().unwrap();
+        db.execute(
+            "INSERT INTO user_nodes (id, owner, name, token_hash, capabilities, last_seen_unix, created_at)
+             VALUES ('homelab', 'alice', '办公主力机', 'h1', 'cli:codex,agy | repos:agenct', ?1, '2026-11-18')",
+            [now_unix()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tasks (id, requester, owner, summary, status, result, revision)
+             VALUES ('t-agenct', 'alice', 'alice', '📁 agenct 仓库上下文', 'completed', '已完成附件按钮改造', 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO messages (owner, role, content, status)
+             VALUES ('alice', 'assistant', 'agy1 已在本地完成提交 13dba7c（手机聊天附件入口与 ZIP 支持）。', 'complete')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        match llm_orchestrate_node_turn(&h, "alice", "部署到线上", None, None).await {
+            LlmNodeDecision::RouteToNode {
+                node_id,
+                instruction,
+                topic_id,
+                ..
+            } => {
+                assert_eq!(node_id, "homelab");
+                assert!(instruction.contains("13dba7c"));
+                assert_eq!(topic_id.as_deref(), Some("t-agenct"));
+            }
+            other => panic!("expected RouteToNode, got {other:?}"),
+        }
+
+        match llm_orchestrate_node_turn(
+            &h,
+            "alice",
+            "为什么前端会出现跨域状态问题？",
+            None,
+            None,
+        )
+        .await
+        {
+            LlmNodeDecision::RouteToCloud => {}
+            other => panic!("expected RouteToCloud for conceptual QA, got {other:?}"),
+        }
     }
 }
