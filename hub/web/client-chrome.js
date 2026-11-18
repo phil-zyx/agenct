@@ -289,6 +289,10 @@ function updateVisualViewport() {
   if (!document.documentElement?.style) return;
   const height = viewport && viewport.scale === 1 ? viewport.height : globalThis.innerHeight;
   if (height) document.documentElement.style.setProperty('--viewport-height', height + 'px');
+  if (document.body?.classList && globalThis.innerWidth <= 900 && globalThis.innerHeight > 400) {
+    const keyboardOpen = Boolean(viewport && viewport.height < globalThis.innerHeight * 0.78);
+    document.body.classList[keyboardOpen ? 'add' : 'remove']('keyboard-open');
+  }
 }
 globalThis.visualViewport?.addEventListener('resize', updateVisualViewport);
 globalThis.addEventListener?.('resize', updateVisualViewport);
