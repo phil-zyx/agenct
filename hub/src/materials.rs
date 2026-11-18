@@ -79,12 +79,18 @@ fn valid_attachment_id(id: &str) -> bool {
     id.starts_with("att_") && id.len() == 36 && id[4..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn valid_image_bytes(mime_type: &str, bytes: &[u8]) -> bool {
+fn valid_attachment_bytes(mime_type: &str, bytes: &[u8]) -> bool {
     match mime_type {
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
         "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
         "image/webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "application/pdf" => bytes.starts_with(b"%PDF-"),
+        "text/plain" | "text/markdown" | "text/csv" | "application/json" => {
+            !bytes.contains(&0)
+                && std::str::from_utf8(bytes).is_ok()
+                && !bytes.iter().all(u8::is_ascii_whitespace)
+        }
         _ => false,
     }
 }
@@ -112,6 +118,11 @@ fn sanitize_filename(name: &str, mime_type: &str) -> String {
         "image/jpeg" => "image.jpg".into(),
         "image/webp" => "image.webp".into(),
         "image/gif" => "image.gif".into(),
+        "application/pdf" => "document.pdf".into(),
+        "text/markdown" => "notes.md".into(),
+        "text/csv" => "data.csv".into(),
+        "application/json" => "data.json".into(),
+        "text/plain" => "notes.txt".into(),
         _ => "image.png".into(),
     }
 }
@@ -124,17 +135,17 @@ pub(crate) fn store_attachment_raw(
     data_base64: &str,
 ) -> Result<(StoredAttachment, usize)> {
     if data_base64.len() > MAX_ATTACHMENT_BASE64_LEN {
-        return Err(invalid("image attachment must be at most 5 MiB"));
+        return Err(invalid("attachment must be at most 5 MiB"));
     }
     let bytes = STANDARD
         .decode(data_base64.trim())
-        .map_err(|_| invalid("invalid image attachment encoding"))?;
+        .map_err(|_| invalid("invalid attachment encoding"))?;
     if bytes.is_empty()
         || bytes.len() > MAX_ATTACHMENT_BYTES
-        || !valid_image_bytes(mime_type, &bytes)
+        || !valid_attachment_bytes(mime_type, &bytes)
     {
         return Err(invalid(
-            "image attachment must be a valid PNG, JPEG, WEBP, or GIF up to 5 MiB",
+            "attachment must be a valid PNG, JPEG, WEBP, GIF, PDF, or UTF-8 text file up to 5 MiB",
         ));
     }
     let canonical_b64 = STANDARD.encode(&bytes);

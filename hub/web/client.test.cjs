@@ -2449,6 +2449,23 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     const imgCards = walk(f2.$('conversation')).filter(n => n.className === 'msg-image-card');
     assert.equal(imgCards.length, 1);
     assert.match(imgCards[0].textContent, /bug\.png/);
+
+    // Non-image file attachment (TXT/PDF) uploads, renders file badge chip, sends [文件附件: ...] marker, and renders .msg-file-card.
+    const txtBytes = new TextEncoder().encode('Hello attachment notes');
+    f2.$('chat-image-input').files = [{
+      name: 'notes.txt',
+      type: 'text/plain',
+      size: txtBytes.byteLength,
+      arrayBuffer: async () => txtBytes.buffer,
+    }];
+    await f2.$('chat-image-input').onchange();
+    assert.equal(f2.$('chat-attachments').classList.contains('hide'), false);
+    assert(walk(f2.$('chat-attachments')).some(n => n.className === 'chat-attachment-file-badge' && n.textContent === 'TXT'));
+    await f2.send('');
+    const fileMsgCall = f2.calls.filter(c => c.url === '/api/messages' && c.options.method === 'POST').at(-1);
+    assert(fileMsgCall);
+    const filePosted = JSON.parse(fileMsgCall.options.body).message;
+    assert.match(filePosted, /\[文件附件: notes\.txt \(\/api\/attachments\/att_[0-9a-f]{32}\)\]/);
   });
   await test('switch-account stays hidden on active browser login and after logout/401 reset, and only appears for restricted sessions', async () => {
     const active = fixture({ enabled: true, authenticated: true, user: 'bob', csrf_token: 'csrf-1', member_status: 'active' });

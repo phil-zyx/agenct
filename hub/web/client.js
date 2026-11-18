@@ -399,6 +399,28 @@ function restoreTurn(context) {
 
 const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
 const ALLOWED_CHAT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+const ALLOWED_CHAT_FILE_TYPES = new Set(['application/pdf', 'text/plain', 'text/markdown', 'text/csv', 'application/json']);
+
+function inferChatAttachmentMime(file) {
+  const rawType = String(file?.type || '').toLowerCase();
+  const name = String(file?.name || '').toLowerCase();
+  if (ALLOWED_CHAT_IMAGE_TYPES.has(rawType)) return rawType;
+  if (rawType === 'application/pdf' || name.endsWith('.pdf')) return 'application/pdf';
+  if (rawType === 'text/markdown' || name.endsWith('.md') || name.endsWith('.markdown')) return 'text/markdown';
+  if (rawType === 'text/csv' || name.endsWith('.csv')) return 'text/csv';
+  if (rawType === 'application/json' || name.endsWith('.json')) return 'application/json';
+  if (ALLOWED_CHAT_FILE_TYPES.has(rawType) || rawType.startsWith('text/') || /\.(txt|log|yaml|yml|toml|ini|conf|py|rs|js|ts|cjs|mjs|sh|sql)$/.test(name)) return 'text/plain';
+  return '';
+}
+
+function attachmentBadgeLabel(name, mime) {
+  const lower = String(name || '').toLowerCase();
+  if (mime === 'application/pdf' || lower.endsWith('.pdf')) return 'PDF';
+  if (mime === 'text/markdown' || lower.endsWith('.md') || lower.endsWith('.markdown')) return 'MD';
+  if (mime === 'text/csv' || lower.endsWith('.csv')) return 'CSV';
+  if (mime === 'application/json' || lower.endsWith('.json')) return 'JSON';
+  return 'TXT';
+}
 
 function arrayBufferToBase64(bytes) {
   const data = new Uint8Array(bytes);
@@ -415,19 +437,26 @@ function renderPendingAttachments() {
   box.replaceChildren();
   box.classList[pendingAttachments.length ? 'remove' : 'add']('hide');
   for (const item of pendingAttachments) {
-    const chip = el('div', 'chat-attachment-chip');
-    const thumb = el('img', 'chat-attachment-thumb');
-    thumb.src = item.dataUrl;
-    thumb.alt = item.name || '图片附件';
-    const label = el('span', 'chat-attachment-name', item.name || '图片');
-    chip.append(thumb, label);
+    const isImage = String(item.mime_type || '').startsWith('image/');
+    const chip = el('div', 'chat-attachment-chip' + (isImage ? '' : ' chat-attachment-file'));
+    if (isImage) {
+      const thumb = el('img', 'chat-attachment-thumb');
+      thumb.src = item.dataUrl;
+      thumb.alt = item.name || '图片附件';
+      chip.append(thumb);
+    } else {
+      const badge = el('span', 'chat-attachment-file-badge', attachmentBadgeLabel(item.name, item.mime_type));
+      chip.append(badge);
+    }
+    const label = el('span', 'chat-attachment-name', item.name || (isImage ? '图片' : '文件'));
+    chip.append(label);
     if (item.uploading) {
       chip.append(el('span', 'chat-attachment-status', '上传中…'));
     }
     const remove = el('button', 'text-btn chat-attachment-remove', '×');
     remove.type = 'button';
-    remove.title = '移除图片';
-    remove.setAttribute('aria-label', '移除图片 ' + (item.name || ''));
+    remove.title = '移除附件';
+    remove.setAttribute('aria-label', '移除附件 ' + (item.name || ''));
     remove.onclick = () => {
       pendingAttachments = pendingAttachments.filter(x => x !== item);
       renderPendingAttachments();
@@ -440,36 +469,59 @@ function renderPendingAttachments() {
 async function uploadChatImageFile(file) {
   const context = session();
   if (!file || !current(context)) return;
-  if (!ALLOWED_CHAT_IMAGE_TYPES.has(file.type)) {
-    status('暂仅支持 PNG、JPEG、WEBP 或 GIF 格式图片。');
+  const mimeType = inferChatAttachmentMime(file);
+  if (!mimeType) {
+    status('暂仅支持图片（PNG、JPEG、WEBP、GIF）、PDF 或 UTF-8 文本文件。');
     return;
   }
   if (file.size > MAX_CHAT_IMAGE_BYTES) {
-    status('图片大小不能超过 5 MiB。');
+    status('附件大小不能超过 5 MiB。');
     return;
   }
   if (pendingAttachments.length >= 4) {
-    status('单条消息最多附带 4 张图片。');
+    status('单条消息最多附带 4 个附件。');
     return;
   }
   let bytes;
   try {
     bytes = await file.arrayBuffer();
   } catch {
-    if (current(context)) status('读取图片失败，请重试。');
+    if (current(context)) status('读取附件失败，请重试。');
     return;
   }
   if (!current(context)) return;
   if (!bytes?.byteLength || bytes.byteLength > MAX_CHAT_IMAGE_BYTES) {
-    status('图片内容为空或超过 5 MiB。');
+    status('附件内容为空或超过 5 MiB。');
     return;
   }
+  if (mimeType === 'application/pdf') {
+    const head = new Uint8Array(bytes.slice(0, 5));
+    const magic = String.fromCharCode(...head);
+    if (magic !== '%PDF-') {
+      status('PDF 文件格式无效。');
+      return;
+    }
+  } else if (!mimeType.startsWith('image/')) {
+    try {
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      if (!text.trim() || text.includes('\0')) {
+        status('文本附件为空或包含二进制内容，请使用 UTF-8 文本文件。');
+        return;
+      }
+    } catch {
+      status('文本附件须为 UTF-8 编码。');
+      return;
+    }
+  }
   const data_base64 = arrayBufferToBase64(bytes);
-  const dataUrl = `data:${file.type};base64,${data_base64}`;
+  const dataUrl = `data:${mimeType};base64,${data_base64}`;
+  const defaultName = mimeType.startsWith('image/')
+    ? ('screenshot.' + (mimeType === 'image/jpeg' ? 'jpg' : mimeType.split('/')[1] || 'png'))
+    : (mimeType === 'application/pdf' ? 'document.pdf' : 'notes.txt');
   const item = {
     id: null,
-    name: file.name || ('screenshot.' + (file.type === 'image/jpeg' ? 'jpg' : file.type.split('/')[1] || 'png')),
-    mime_type: file.type,
+    name: file.name || defaultName,
+    mime_type: mimeType,
     dataUrl,
     uploading: true,
   };
@@ -491,7 +543,7 @@ async function uploadChatImageFile(file) {
     if (!current(context)) return;
     pendingAttachments = pendingAttachments.filter(x => x !== item);
     renderPendingAttachments();
-    status('图片上传失败：' + error.message);
+    status('附件上传失败：' + error.message);
   }
 }
 
@@ -507,7 +559,7 @@ if ($('chat-image-input')) {
 }
 if ($('text')) {
   $('text').onpaste = event => {
-    const files = [...(event.clipboardData?.files || [])].filter(f => /^image\//.test(f.type));
+    const files = [...(event.clipboardData?.files || [])].filter(f => Boolean(inferChatAttachmentMime(f)));
     if (!files.length) return;
     event.preventDefault?.();
     for (const file of files) void uploadChatImageFile(file);
@@ -518,7 +570,7 @@ if ($('form')) {
     if ([...(event.dataTransfer?.types || [])].includes('Files')) event.preventDefault?.();
   };
   $('form').ondrop = event => {
-    const files = [...(event.dataTransfer?.files || [])].filter(f => /^image\//.test(f.type));
+    const files = [...(event.dataTransfer?.files || [])].filter(f => Boolean(inferChatAttachmentMime(f)));
     if (!files.length) return;
     event.preventDefault?.();
     for (const file of files) void uploadChatImageFile(file);
@@ -1152,8 +1204,12 @@ $('form').onsubmit = async event => {
         status('任务上下文已失效，未发送消息。请重新选择任务，或清除任务上下文后再发送。');
         return;
       }
-      const effectiveText = text || '请帮我查看并分析这张图片';
-      const attachmentSuffix = readyAttachments.map(a => `[图片附件: ${a.name} (/api/attachments/${a.id})]`).join('\n');
+      const hasNonImage = readyAttachments.some(a => a.mime_type && !String(a.mime_type).startsWith('image/'));
+      const effectiveText = text || (hasNonImage ? '请帮我查看并处理这个文件' : '请帮我查看并分析这张图片');
+      const attachmentSuffix = readyAttachments.map(a => {
+        const tag = a.mime_type && !String(a.mime_type).startsWith('image/') ? '文件附件' : '图片附件';
+        return `[${tag}: ${a.name} (/api/attachments/${a.id})]`;
+      }).join('\n');
       const outgoingText = attachmentSuffix ? `${effectiveText}\n${attachmentSuffix}` : effectiveText;
       const message = repositoryChatMessage(outgoingText, selectedRepository);
       closeRepositoryPicker();

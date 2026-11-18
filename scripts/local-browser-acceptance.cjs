@@ -213,7 +213,51 @@ async function freePort() {
       await alice.locator('#conversation .msg-assistant img[alt="mobile-chat-attachment.png"]').scrollIntoViewIfNeeded();
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-chat-attachment.png') });
     }
-    console.log('PASS mobile image upload, composer preview, user & node assistant bubble images, tap-to-expand, and no routine receipt toast');
+    // Verify non-image file attachments (TXT + PDF) upload, pending chip, send, reload, inline preview, and download.
+    const txtContent = '移动端附件验收文档：支持 UTF-8 文本与 PDF 上传、重载及下载。';
+    const chatPdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n');
+    const txtUpload = alice.waitForResponse(response => response.url() === origin + '/api/attachments' && response.request().method() === 'POST');
+    await alice.locator('#chat-image-input').setInputFiles({
+      name: 'mobile-notes.txt', mimeType: 'text/plain', buffer: Buffer.from(txtContent, 'utf-8')
+    });
+    assert.equal((await txtUpload).status(), 200);
+    const pdfUpload = alice.waitForResponse(response => response.url() === origin + '/api/attachments' && response.request().method() === 'POST');
+    await alice.locator('#chat-image-input').setInputFiles({
+      name: 'mobile-spec.pdf', mimeType: 'application/pdf', buffer: chatPdfBytes
+    });
+    assert.equal((await pdfUpload).status(), 200);
+    await alice.locator('#chat-attachments .chat-attachment-file-badge').first().waitFor({ state: 'visible' });
+    if (evidenceDir) {
+      await alice.screenshot({ path: path.join(evidenceDir, 'mobile-file-preview.png') });
+    }
+    await alice.locator('#text').fill('请查收这两份文档附件。');
+    await alice.locator('#send').click();
+    assert.equal(await alice.locator('#status').textContent(), '', 'Ordinary file chat success must leave no receipt toast');
+    await alice.locator('#conversation .msg-user .msg-file-card').first().waitFor({ state: 'visible' });
+    await alice.reload();
+    const txtCard = alice.locator('#conversation .msg-user .msg-file-card').filter({ hasText: 'mobile-notes.txt' });
+    const pdfCard = alice.locator('#conversation .msg-user .msg-file-card').filter({ hasText: 'mobile-spec.pdf' });
+    await txtCard.waitFor({ state: 'visible' });
+    await pdfCard.waitFor({ state: 'visible' });
+    await alice.waitForFunction(() => {
+      const links = [...document.querySelectorAll('#conversation .msg-user .msg-file-download')];
+      return links.length >= 2 && links.every(a => a.getAttribute('href')?.startsWith('data:'));
+    });
+    await txtCard.locator('.msg-file-info').click();
+    await txtCard.locator('.msg-file-preview:not(.hide)').waitFor({ state: 'visible' });
+    assert.equal((await txtCard.locator('.msg-file-preview').textContent()).trim(), txtContent);
+    const [download] = await Promise.all([
+      alice.waitForEvent('download'),
+      txtCard.locator('.msg-file-download').click()
+    ]);
+    assert.equal(download.suggestedFilename(), 'mobile-notes.txt');
+    const downloadedPath = await download.path();
+    assert.equal(fs.readFileSync(downloadedPath, 'utf-8'), txtContent);
+    if (evidenceDir) {
+      await txtCard.scrollIntoViewIfNeeded();
+      await alice.screenshot({ path: path.join(evidenceDir, 'mobile-file-attachment.png') });
+    }
+    console.log('PASS mobile image & file (TXT/PDF) upload, composer preview, user & node assistant bubbles, tap-to-expand, inline preview, download, and no routine receipt toast');
     if (chatImagesOnly) { assert.deepEqual(errors, []); return; }
     await alice.setViewportSize(originalViewport);
 

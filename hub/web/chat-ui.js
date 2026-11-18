@@ -302,15 +302,15 @@ function renderChatExamples() {
   return box;
 }
 
-const ATTACHMENT_LINE_RE = /\[图片附件:\s*([^\]]+?)\s*\(\/api\/attachments\/(att_[0-9a-f]{32})\)\]/g;
+const ATTACHMENT_LINE_RE = /\[(图片|文件)附件:\s*([^\]]+?)\s*\(\/api\/attachments\/(att_[0-9a-f]{32})\)\]/g;
 
 function extractMessageAttachments(content) {
   const raw = String(content ?? '');
   const attachments = [];
   let hasMatch = false;
-  const stripped = raw.replace(ATTACHMENT_LINE_RE, (_, name, id) => {
+  const stripped = raw.replace(ATTACHMENT_LINE_RE, (_, kindLabel, name, id) => {
     hasMatch = true;
-    attachments.push({ name: name.trim(), id });
+    attachments.push({ kind: kindLabel === '文件' ? 'file' : 'image', name: name.trim(), id });
     return '';
   });
   return {
@@ -319,9 +319,75 @@ function extractMessageAttachments(content) {
   };
 }
 
+function decodeBase64Utf8(b64) {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch {
+    return '';
+  }
+}
+
 function renderMessageAttachments(context, attachments) {
   const wrap = el('div', 'msg-attachments');
   for (const att of attachments) {
+    if (att.kind === 'file') {
+      const card = el('div', 'msg-file-card');
+      const row = el('div', 'msg-file-row');
+      const lowerName = String(att.name || '').toLowerCase();
+      const badgeText = lowerName.endsWith('.pdf') ? 'PDF'
+        : (lowerName.endsWith('.md') || lowerName.endsWith('.markdown')) ? 'MD'
+        : lowerName.endsWith('.csv') ? 'CSV'
+        : lowerName.endsWith('.json') ? 'JSON' : 'TXT';
+      const badgeEl = el('span', 'msg-file-badge', badgeText);
+      const info = el('div', 'msg-file-info');
+      const nameEl = el('span', 'msg-file-name', att.name || '文件附件');
+      const metaEl = el('span', 'msg-file-meta', '已就绪 · 点击打开或下载');
+      info.append(nameEl, metaEl);
+      const downloadLink = el('a', 'msg-file-download', '下载');
+      downloadLink.setAttribute('download', att.name || 'attachment');
+      downloadLink.setAttribute('aria-label', '下载附件 ' + (att.name || ''));
+      const previewPre = el('pre', 'msg-file-preview hide');
+
+      const bindFileUrl = (url, mimeType, b64) => {
+        downloadLink.href = url;
+        if (mimeType && !String(mimeType).startsWith('image/') && mimeType !== 'application/pdf' && b64) {
+          const textPreview = decodeBase64Utf8(b64).trim();
+          if (textPreview) {
+            previewPre.textContent = textPreview.slice(0, 2000);
+            metaEl.textContent = '点击卡片预览内容 · 或直接下载';
+            info.style.cursor = 'pointer';
+            info.onclick = () => previewPre.classList.toggle('hide');
+          }
+        }
+      };
+
+      const cached = typeof attachmentDataUrls !== 'undefined' ? attachmentDataUrls.get(att.id) : null;
+      if (cached) {
+        const commaIdx = cached.indexOf(',');
+        const header = commaIdx > 0 ? cached.slice(5, commaIdx) : '';
+        const mime = header.split(';')[0] || '';
+        const b64 = commaIdx > 0 ? cached.slice(commaIdx + 1) : '';
+        bindFileUrl(cached, mime, b64);
+      } else if (context && typeof api === 'function') {
+        api(context, 'attachments/' + encodeURIComponent(att.id))
+          .then(data => {
+            if (!current(context) || !data?.data_base64 || !data?.mime_type) return;
+            const url = `data:${data.mime_type};base64,${data.data_base64}`;
+            if (typeof attachmentDataUrls !== 'undefined') attachmentDataUrls.set(att.id, url);
+            bindFileUrl(url, data.mime_type, data.data_base64);
+          })
+          .catch(() => {
+            metaEl.textContent = '附件加载失败';
+          });
+      }
+      row.append(badgeEl, info, downloadLink);
+      card.append(row, previewPre);
+      wrap.append(card);
+      continue;
+    }
     const card = el('div', 'msg-image-card');
     const img = el('img', 'msg-image');
     img.alt = att.name || '图片附件';

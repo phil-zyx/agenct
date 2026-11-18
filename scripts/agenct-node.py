@@ -330,6 +330,11 @@ def materialize_attachments(job: dict) -> tuple[list[str], str | None]:
         "image/jpeg": ".jpg",
         "image/webp": ".webp",
         "image/gif": ".gif",
+        "application/pdf": ".pdf",
+        "text/plain": ".txt",
+        "text/markdown": ".md",
+        "text/csv": ".csv",
+        "application/json": ".json",
     }
     temp_dir = tempfile.mkdtemp(prefix="agenct-img-")
     try:
@@ -349,9 +354,9 @@ def materialize_attachments(job: dict) -> tuple[list[str], str | None]:
             continue
         mime = str(att.get("mime_type") or "image/png")
         ext = ext_map.get(mime, ".png")
-        raw_name = str(att.get("name") or f"image{ext}")
-        safe_base = "".join(c if (c.isalnum() or c in "._-") else "_" for c in raw_name)[:48].strip("._") or "image"
-        if not safe_base.lower().endswith(ext):
+        raw_name = str(att.get("name") or f"attachment{ext}")
+        safe_base = "".join(c if (c.isalnum() or c in "._-") else "_" for c in raw_name)[:48].strip("._") or "attachment"
+        if "." not in safe_base or (mime.startswith("image/") and not safe_base.lower().endswith(ext)):
             safe_base = f"{safe_base}{ext}"
         target = os.path.join(temp_dir, f"{idx}_{safe_base}")
         with open(target, "wb") as fh:
@@ -376,6 +381,13 @@ def collect_evidence_attachments(evidence_dir: str | None) -> list[dict]:
         ".jpeg": "image/jpeg",
         ".webp": "image/webp",
         ".gif": "image/gif",
+        ".pdf": "application/pdf",
+        ".txt": "text/plain",
+        ".log": "text/plain",
+        ".md": "text/markdown",
+        ".markdown": "text/markdown",
+        ".csv": "text/csv",
+        ".json": "application/json",
     }
     items: list[dict] = []
     for name in sorted(os.listdir(evidence_dir)):
@@ -628,7 +640,8 @@ def run_cli_agent(
         os.close(fd)
         img_args: list[str] = []
         for img_path in image_paths or []:
-            img_args.extend(["-i", img_path])
+            if img_path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+                img_args.extend(["-i", img_path])
         if image_paths:
             img_args.extend(["--add-dir", os.path.dirname(image_paths[0])])
         if evidence_dir:

@@ -594,7 +594,10 @@ fn should_auto_route_to_node(
             return Ok(false);
         }
     }
-    if message.contains("/api/attachments/att_") || message.contains("[图片附件:") {
+    if message.contains("/api/attachments/att_")
+        || message.contains("[图片附件:")
+        || message.contains("[文件附件:")
+    {
         return Ok(true);
     }
     if score >= 60 {
@@ -1327,19 +1330,23 @@ fn explicit_named_repo(message: &str) -> Option<String> {
 }
 
 pub(super) fn strip_attachment_markers(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = rest.find("[图片附件:") {
-        out.push_str(&rest[..start]);
-        if let Some(end) = rest[start..].find(']') {
-            rest = &rest[start + end + 1..];
-        } else {
-            rest = "";
-            break;
+    let mut current = text.to_owned();
+    for marker in ["[图片附件:", "[文件附件:"] {
+        let mut out = String::with_capacity(current.len());
+        let mut rest = current.as_str();
+        while let Some(start) = rest.find(marker) {
+            out.push_str(&rest[..start]);
+            if let Some(end) = rest[start..].find(']') {
+                rest = &rest[start + end + 1..];
+            } else {
+                rest = "";
+                break;
+            }
         }
+        out.push_str(rest);
+        current = out;
     }
-    out.push_str(rest);
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    current.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn classify_chat_topic(
@@ -2699,8 +2706,13 @@ pub(super) async fn submit_draft(
             &att.mime_type,
             &att.data_base64,
         )?;
+        let kind_label = if stored.mime_type.starts_with("image/") {
+            "图片附件"
+        } else {
+            "文件附件"
+        };
         attachment_markers.push(format!(
-            "[图片附件: {} (/api/attachments/{})]",
+            "[{kind_label}: {} (/api/attachments/{})]",
             stored.name, stored.id
         ));
     }
