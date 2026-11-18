@@ -91,7 +91,13 @@ async function freePort() {
   }
   async function tasks(page) {
     if (await page.locator('#toggle-tasks').getAttribute('aria-pressed') !== 'true') await page.locator('#toggle-tasks').click();
-    await page.locator('#tab-tasks').click();
+    // The unified drawer exposes task details as a keyboard-reachable second tab;
+    // its visible affordance is the "← 返回" activity header, so switch via keys.
+    if (await page.locator('#tab-activity.on').count()) {
+      await page.locator('#tab-activity').focus();
+      await page.keyboard.press('End');
+    }
+    await page.locator('#tab-tasks[aria-selected="true"]').waitFor();
   }
   async function api(identity, route, overrideToken) {
     return fetch(origin + '/api/' + route, { headers: { Authorization: 'Bearer ' + (overrideToken || credentials()[identity]) } });
@@ -139,8 +145,23 @@ async function freePort() {
     const originalViewport = alice.viewportSize();
     await alice.setViewportSize({ width: 390, height: 844 });
     await alice.locator('#open-chat').click();
+    const attachButton = alice.getByRole('button', { name: '添加附件', exact: true });
+    await attachButton.waitFor({ state: 'visible' });
+    assert.equal((await attachButton.textContent()).trim(), '附件');
+    assert.equal(await alice.locator('#chat-image-input').getAttribute('aria-label'), '选择附件');
+    const attachBox = await attachButton.boundingBox();
+    assert(attachBox && attachBox.height >= 40, `Expected mobile attach button height >= 40px, got ${attachBox?.height}`);
+    const evidenceDir = process.env.AGENCT_TEST_SCREENSHOT_DIR;
+    if (evidenceDir) {
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      await alice.screenshot({ path: path.join(evidenceDir, 'mobile-composer-attach-entry.png') });
+    }
     const imageUpload = alice.waitForResponse(response => response.url() === origin + '/api/attachments' && response.request().method() === 'POST');
-    await alice.locator('#chat-image-input').setInputFiles({
+    const [imgChooser] = await Promise.all([
+      alice.waitForEvent('filechooser'),
+      attachButton.click()
+    ]);
+    await imgChooser.setFiles({
       name: 'agenct-preview.png', mimeType: 'image/png', buffer: fs.readFileSync(path.join(root, 'hub/web/brand/agenct-icon-180.png'))
     });
     const uploaded = await imageUpload;
@@ -154,9 +175,7 @@ async function freePort() {
       }), `Expected the uploaded image to render in ${selector}`);
     };
     await expectDecodedImage('#chat-attachments .chat-attachment-thumb');
-    const evidenceDir = process.env.AGENCT_TEST_SCREENSHOT_DIR;
     if (evidenceDir) {
-      fs.mkdirSync(evidenceDir, { recursive: true });
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-image-preview.png') });
     }
     await alice.locator('#text').fill('这是一张图片显示验收截图。');
@@ -213,24 +232,31 @@ async function freePort() {
       await alice.locator('#conversation .msg-assistant img[alt="mobile-chat-attachment.png"]').scrollIntoViewIfNeeded();
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-chat-attachment.png') });
     }
-    // Verify non-image file attachments (TXT + PDF) upload, pending chip, send, reload, inline preview, and download.
-    const txtContent = '移动端附件验收文档：支持 UTF-8 文本与 PDF 上传、重载及下载。';
+    // Verify non-image file attachments (TXT + PDF + ZIP) via button click -> filechooser, pending chip, send, reload, inline preview, and byte-identical download.
+    const txtContent = '移动端附件验收文档：支持 UTF-8 文本、PDF 与 ZIP 上传、重载及下载。';
+    const txtBuffer = Buffer.from(txtContent, 'utf-8');
     const chatPdfBytes = Buffer.from('%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n');
+    const zipBytes = Buffer.from(
+      execFileSync('python3', ['-c', 'import io,zipfile,base64;b=io.BytesIO();\nwith zipfile.ZipFile(b,"w") as z: z.writestr("hello.txt","zip payload")\nprint(base64.b64encode(b.getvalue()).decode())']).toString().trim(),
+      'base64'
+    );
     const txtUpload = alice.waitForResponse(response => response.url() === origin + '/api/attachments' && response.request().method() === 'POST');
-    await alice.locator('#chat-image-input').setInputFiles({
-      name: 'mobile-notes.txt', mimeType: 'text/plain', buffer: Buffer.from(txtContent, 'utf-8')
-    });
+    const [txtChooser] = await Promise.all([alice.waitForEvent('filechooser'), attachButton.click()]);
+    await txtChooser.setFiles({ name: 'mobile-notes.txt', mimeType: 'text/plain', buffer: txtBuffer });
     assert.equal((await txtUpload).status(), 200);
     const pdfUpload = alice.waitForResponse(response => response.url() === origin + '/api/attachments' && response.request().method() === 'POST');
-    await alice.locator('#chat-image-input').setInputFiles({
-      name: 'mobile-spec.pdf', mimeType: 'application/pdf', buffer: chatPdfBytes
-    });
+    const [pdfChooser] = await Promise.all([alice.waitForEvent('filechooser'), attachButton.click()]);
+    await pdfChooser.setFiles({ name: 'mobile-spec.pdf', mimeType: 'application/pdf', buffer: chatPdfBytes });
     assert.equal((await pdfUpload).status(), 200);
-    await alice.locator('#chat-attachments .chat-attachment-file-badge').first().waitFor({ state: 'visible' });
+    const zipUpload = alice.waitForResponse(response => response.url() === origin + '/api/attachments' && response.request().method() === 'POST');
+    const [zipChooser] = await Promise.all([alice.waitForEvent('filechooser'), attachButton.click()]);
+    await zipChooser.setFiles({ name: 'mobile-bundle.zip', mimeType: 'application/zip', buffer: zipBytes });
+    assert.equal((await zipUpload).status(), 200);
+    await alice.locator('#chat-attachments .chat-attachment-file-badge').nth(2).waitFor({ state: 'visible' });
     if (evidenceDir) {
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-file-preview.png') });
     }
-    await alice.locator('#text').fill('请查收这两份文档附件。');
+    await alice.locator('#text').fill('请查收这三份文档与压缩包附件。');
     await alice.locator('#send').click();
     assert.equal(await alice.locator('#status').textContent(), '', 'Ordinary file chat success must leave no receipt toast');
     await alice.locator('#conversation .msg-user .msg-file-card').first().waitFor({ state: 'visible' });
@@ -244,33 +270,44 @@ async function freePort() {
       fileJob.attachments.map(a => ({ name: a.name, mime_type: a.mime_type })),
       [
         { name: 'mobile-notes.txt', mime_type: 'text/plain' },
-        { name: 'mobile-spec.pdf', mime_type: 'application/pdf' }
+        { name: 'mobile-spec.pdf', mime_type: 'application/pdf' },
+        { name: 'mobile-bundle.zip', mime_type: 'application/zip' }
       ]
     );
     await alice.reload();
     const txtCard = alice.locator('#conversation .msg-user .msg-file-card').filter({ hasText: 'mobile-notes.txt' });
     const pdfCard = alice.locator('#conversation .msg-user .msg-file-card').filter({ hasText: 'mobile-spec.pdf' });
+    const zipCard = alice.locator('#conversation .msg-user .msg-file-card').filter({ hasText: 'mobile-bundle.zip' });
     await txtCard.waitFor({ state: 'visible' });
     await pdfCard.waitFor({ state: 'visible' });
+    await zipCard.waitFor({ state: 'visible' });
     await alice.waitForFunction(() => {
       const links = [...document.querySelectorAll('#conversation .msg-user .msg-file-download')];
-      return links.length >= 2 && links.every(a => a.getAttribute('href')?.startsWith('data:'));
+      return links.length >= 3 && links.every(a => a.getAttribute('href')?.startsWith('data:'));
     });
+    assert.equal(await zipCard.locator('.msg-file-preview').textContent(), '', 'ZIP must not be extracted or previewed inline');
+    assert.equal((await zipCard.locator('.msg-file-meta').textContent()).trim(), '已就绪 · 可直接下载');
     await txtCard.locator('.msg-file-info').click();
     await txtCard.locator('.msg-file-preview:not(.hide)').waitFor({ state: 'visible' });
     assert.equal((await txtCard.locator('.msg-file-preview').textContent()).trim(), txtContent);
-    const [download] = await Promise.all([
-      alice.waitForEvent('download'),
-      txtCard.locator('.msg-file-download').click()
-    ]);
-    assert.equal(download.suggestedFilename(), 'mobile-notes.txt');
-    const downloadedPath = await download.path();
-    assert.equal(fs.readFileSync(downloadedPath, 'utf-8'), txtContent);
+    for (const [card, expectedName, expectedBytes] of [
+      [txtCard, 'mobile-notes.txt', txtBuffer],
+      [pdfCard, 'mobile-spec.pdf', chatPdfBytes],
+      [zipCard, 'mobile-bundle.zip', zipBytes]
+    ]) {
+      const [download] = await Promise.all([
+        alice.waitForEvent('download'),
+        card.locator('.msg-file-download').click()
+      ]);
+      assert.equal(download.suggestedFilename(), expectedName);
+      const downloadedPath = await download.path();
+      assert.equal(Buffer.compare(fs.readFileSync(downloadedPath), expectedBytes), 0, `Byte mismatch for ${expectedName}`);
+    }
     if (evidenceDir) {
-      await txtCard.scrollIntoViewIfNeeded();
+      await zipCard.scrollIntoViewIfNeeded();
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-file-attachment.png') });
     }
-    console.log('PASS mobile image & file (TXT/PDF) upload, composer preview, user & node assistant bubbles, tap-to-expand, inline preview, download, and no routine receipt toast');
+    console.log('PASS mobile attachment button, image & file (TXT/PDF/ZIP) upload, composer preview, user & node assistant bubbles, tap-to-expand, inline preview, byte-identical download, and no routine receipt toast');
     if (chatImagesOnly) { assert.deepEqual(errors, []); return; }
     await alice.setViewportSize(originalViewport);
 
@@ -332,10 +369,11 @@ async function freePort() {
     await say(alice, '确认验收');
     await alice.locator('.task-line', { hasText: '已验收完成' }).waitFor();
     await tasks(alice);
-    await alice.locator('.task-completed').waitFor({ state: 'attached' });
+    const completedCard = alice.locator('.task-completed:not(.task-topic)');
+    await completedCard.waitFor({ state: 'attached' });
     await alice.locator('#task-filter').selectOption('completed');
-    await alice.locator('.task-completed').waitFor();
-    assert((await alice.locator('.task-completed').textContent()).includes('人工审阅后的交付'));
+    await completedCard.waitFor();
+    assert((await completedCard.textContent()).includes('人工审阅后的交付'));
     const adoptedSource = execFileSync('python3', ['-c', 'import sqlite3,sys;db=sqlite3.connect(sys.argv[1]);print(db.execute("SELECT source_draft_id FROM deliveries WHERE status=? ORDER BY seq DESC LIMIT 1",("submitted",)).fetchone()[0] or "")', path.join(state,'hub.sqlite3')]).toString().trim();
     assert(adoptedSource, 'Reviewed and edited private draft must record its source for adoption metrics');
     console.log('PASS real local Hub / two Chromium identities: chat, text/Markdown/PDF import, delegation, draft revision, reviewed delivery, approval, archive (mock model)');
@@ -352,7 +390,7 @@ async function freePort() {
     staging('restore', '--backup-file', backup);
     await start();
     await login(alice, 'alice'); await tasks(alice); await alice.locator('#task-filter').selectOption('completed');
-    await alice.locator('.task-completed').waitFor();
+    await alice.locator('.task-completed:not(.task-topic)').waitFor();
     const persisted = await (await api('bob', 'tasks')).json();
     assert.equal(persisted[0].status, 'completed'); assert.equal(persisted[0].details, material);
     assert.equal(Object.hasOwn(persisted[0], 'source_draft_id'), false, 'Private draft provenance must not appear in public task data');

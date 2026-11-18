@@ -238,8 +238,13 @@ article > button { margin: 10px 6px 0 0; }
   line-height: 1.5; font-size: 15.5px; field-sizing: content; box-shadow: none;
 }
 .composer-pill textarea:focus, .composer-pill textarea:focus-visible { outline: none; box-shadow: none; }
-.attach-btn { flex: none; margin-bottom: 2px; color: var(--muted); }
-.attach-btn:hover:not(:disabled) { color: var(--brand); }
+.attach-btn {
+  flex: none; display: inline-flex; align-items: center; gap: 4px; min-height: 40px; height: 40px; padding: 0 12px;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--soft);
+  color: var(--text); font-size: 13px; font-weight: 600; line-height: 1; white-space: nowrap;
+}
+.attach-btn svg { width: 15px; height: 15px; stroke-width: 1.9; color: var(--brand); flex: none; }
+.attach-btn:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); background: var(--brand-soft); }
 .chat-attachments { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; padding: 0 4px; }
 .chat-attachment-chip {
   display: inline-flex; align-items: center; gap: 8px; padding: 5px 8px 5px 5px;

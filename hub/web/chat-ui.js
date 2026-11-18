@@ -338,13 +338,14 @@ function renderMessageAttachments(context, attachments) {
       const row = el('div', 'msg-file-row');
       const lowerName = String(att.name || '').toLowerCase();
       const badgeText = lowerName.endsWith('.pdf') ? 'PDF'
+        : lowerName.endsWith('.zip') ? 'ZIP'
         : (lowerName.endsWith('.md') || lowerName.endsWith('.markdown')) ? 'MD'
         : lowerName.endsWith('.csv') ? 'CSV'
         : lowerName.endsWith('.json') ? 'JSON' : 'TXT';
       const badgeEl = el('span', 'msg-file-badge', badgeText);
       const info = el('div', 'msg-file-info');
       const nameEl = el('span', 'msg-file-name', att.name || '文件附件');
-      const metaEl = el('span', 'msg-file-meta', '已就绪 · 点击打开或下载');
+      const metaEl = el('span', 'msg-file-meta', '已就绪 · 可直接下载');
       info.append(nameEl, metaEl);
       const downloadLink = el('a', 'msg-file-download', '下载');
       downloadLink.setAttribute('download', att.name || 'attachment');
@@ -353,7 +354,11 @@ function renderMessageAttachments(context, attachments) {
 
       const bindFileUrl = (url, mimeType, b64) => {
         downloadLink.href = url;
-        if (mimeType && !String(mimeType).startsWith('image/') && mimeType !== 'application/pdf' && b64) {
+        if (mimeType && !String(mimeType).startsWith('image/')
+            && mimeType !== 'application/pdf'
+            && mimeType !== 'application/zip'
+            && mimeType !== 'application/x-zip-compressed'
+            && b64) {
           const textPreview = decodeBase64Utf8(b64).trim();
           if (textPreview) {
             previewPre.textContent = textPreview.slice(0, 2000);

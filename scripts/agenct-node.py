@@ -331,6 +331,8 @@ def materialize_attachments(job: dict) -> tuple[list[str], str | None]:
         "image/webp": ".webp",
         "image/gif": ".gif",
         "application/pdf": ".pdf",
+        "application/zip": ".zip",
+        "application/x-zip-compressed": ".zip",
         "text/plain": ".txt",
         "text/markdown": ".md",
         "text/csv": ".csv",

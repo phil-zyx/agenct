@@ -399,13 +399,14 @@ function restoreTurn(context) {
 
 const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
 const ALLOWED_CHAT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
-const ALLOWED_CHAT_FILE_TYPES = new Set(['application/pdf', 'text/plain', 'text/markdown', 'text/csv', 'application/json']);
+const ALLOWED_CHAT_FILE_TYPES = new Set(['application/pdf', 'application/zip', 'application/x-zip-compressed', 'text/plain', 'text/markdown', 'text/csv', 'application/json']);
 
 function inferChatAttachmentMime(file) {
   const rawType = String(file?.type || '').toLowerCase();
   const name = String(file?.name || '').toLowerCase();
   if (ALLOWED_CHAT_IMAGE_TYPES.has(rawType)) return rawType;
   if (rawType === 'application/pdf' || name.endsWith('.pdf')) return 'application/pdf';
+  if (rawType === 'application/zip' || rawType === 'application/x-zip-compressed' || name.endsWith('.zip')) return 'application/zip';
   if (rawType === 'text/markdown' || name.endsWith('.md') || name.endsWith('.markdown')) return 'text/markdown';
   if (rawType === 'text/csv' || name.endsWith('.csv')) return 'text/csv';
   if (rawType === 'application/json' || name.endsWith('.json')) return 'application/json';
@@ -416,6 +417,7 @@ function inferChatAttachmentMime(file) {
 function attachmentBadgeLabel(name, mime) {
   const lower = String(name || '').toLowerCase();
   if (mime === 'application/pdf' || lower.endsWith('.pdf')) return 'PDF';
+  if (mime === 'application/zip' || lower.endsWith('.zip')) return 'ZIP';
   if (mime === 'text/markdown' || lower.endsWith('.md') || lower.endsWith('.markdown')) return 'MD';
   if (mime === 'text/csv' || lower.endsWith('.csv')) return 'CSV';
   if (mime === 'application/json' || lower.endsWith('.json')) return 'JSON';
@@ -471,7 +473,7 @@ async function uploadChatImageFile(file) {
   if (!file || !current(context)) return;
   const mimeType = inferChatAttachmentMime(file);
   if (!mimeType) {
-    status('暂仅支持图片（PNG、JPEG、WEBP、GIF）、PDF 或 UTF-8 文本文件。');
+    status('暂仅支持图片（PNG、JPEG、WEBP、GIF）、PDF、ZIP 或 UTF-8 文本文件。');
     return;
   }
   if (file.size > MAX_CHAT_IMAGE_BYTES) {
@@ -501,6 +503,16 @@ async function uploadChatImageFile(file) {
       status('PDF 文件格式无效。');
       return;
     }
+  } else if (mimeType === 'application/zip') {
+    const head = new Uint8Array(bytes.slice(0, 4));
+    const isZip = head.length === 4 && head[0] === 0x50 && head[1] === 0x4b
+      && ((head[2] === 0x03 && head[3] === 0x04)
+        || (head[2] === 0x05 && head[3] === 0x06)
+        || (head[2] === 0x07 && head[3] === 0x08));
+    if (!isZip) {
+      status('ZIP 压缩包格式无效。');
+      return;
+    }
   } else if (!mimeType.startsWith('image/')) {
     try {
       const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
@@ -517,7 +529,7 @@ async function uploadChatImageFile(file) {
   const dataUrl = `data:${mimeType};base64,${data_base64}`;
   const defaultName = mimeType.startsWith('image/')
     ? ('screenshot.' + (mimeType === 'image/jpeg' ? 'jpg' : mimeType.split('/')[1] || 'png'))
-    : (mimeType === 'application/pdf' ? 'document.pdf' : 'notes.txt');
+    : (mimeType === 'application/pdf' ? 'document.pdf' : mimeType === 'application/zip' ? 'archive.zip' : 'notes.txt');
   const item = {
     id: null,
     name: file.name || defaultName,

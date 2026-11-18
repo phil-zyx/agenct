@@ -79,13 +79,25 @@ fn valid_attachment_id(id: &str) -> bool {
     id.starts_with("att_") && id.len() == 36 && id[4..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+fn normalize_attachment_mime(mime_type: &str) -> &str {
+    match mime_type.trim() {
+        "application/x-zip-compressed" => "application/zip",
+        other => other,
+    }
+}
+
 fn valid_attachment_bytes(mime_type: &str, bytes: &[u8]) -> bool {
-    match mime_type {
+    match normalize_attachment_mime(mime_type) {
         "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
         "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
         "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
         "image/webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
         "application/pdf" => bytes.starts_with(b"%PDF-"),
+        "application/zip" => {
+            bytes.starts_with(b"PK\x03\x04")
+                || bytes.starts_with(b"PK\x05\x06")
+                || bytes.starts_with(b"PK\x07\x08")
+        }
         "text/plain" | "text/markdown" | "text/csv" | "application/json" => {
             !bytes.contains(&0)
                 && std::str::from_utf8(bytes).is_ok()
@@ -114,11 +126,12 @@ fn sanitize_filename(name: &str, mime_type: &str) -> String {
     if !cleaned.is_empty() {
         return cleaned.to_owned();
     }
-    match mime_type {
+    match normalize_attachment_mime(mime_type) {
         "image/jpeg" => "image.jpg".into(),
         "image/webp" => "image.webp".into(),
         "image/gif" => "image.gif".into(),
         "application/pdf" => "document.pdf".into(),
+        "application/zip" => "archive.zip".into(),
         "text/markdown" => "notes.md".into(),
         "text/csv" => "data.csv".into(),
         "application/json" => "data.json".into(),
@@ -134,6 +147,7 @@ pub(crate) fn store_attachment_raw(
     mime_type: &str,
     data_base64: &str,
 ) -> Result<(StoredAttachment, usize)> {
+    let canonical_mime = normalize_attachment_mime(mime_type);
     if data_base64.len() > MAX_ATTACHMENT_BASE64_LEN {
         return Err(invalid("attachment must be at most 5 MiB"));
     }
@@ -142,20 +156,20 @@ pub(crate) fn store_attachment_raw(
         .map_err(|_| invalid("invalid attachment encoding"))?;
     if bytes.is_empty()
         || bytes.len() > MAX_ATTACHMENT_BYTES
-        || !valid_attachment_bytes(mime_type, &bytes)
+        || !valid_attachment_bytes(canonical_mime, &bytes)
     {
         return Err(invalid(
-            "attachment must be a valid PNG, JPEG, WEBP, GIF, PDF, or UTF-8 text file up to 5 MiB",
+            "attachment must be a valid PNG, JPEG, WEBP, GIF, PDF, ZIP, or UTF-8 text file up to 5 MiB",
         ));
     }
     let canonical_b64 = STANDARD.encode(&bytes);
     let id = format!("att_{}", Uuid::new_v4().simple());
-    let clean_name = sanitize_filename(name, mime_type);
+    let clean_name = sanitize_filename(name, canonical_mime);
     let stored = StoredAttachment {
         id: id.clone(),
         owner: owner.to_owned(),
         name: clean_name,
-        mime_type: mime_type.to_owned(),
+        mime_type: canonical_mime.to_owned(),
         data_base64: canonical_b64,
     };
     if let Some(dir) = &h.attachments_dir {

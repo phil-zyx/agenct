@@ -79,21 +79,22 @@ class NodeJournalTests(unittest.TestCase):
             'attachments': [
                 {'name': 'spec.pdf', 'mime_type': 'application/pdf', 'data_base64': base64.b64encode(b'%PDF-1.4\n').decode()},
                 {'name': 'notes.txt', 'mime_type': 'text/plain', 'data_base64': base64.b64encode(b'hello txt').decode()},
+                {'name': 'bundle.zip', 'mime_type': 'application/zip', 'data_base64': base64.b64encode(b'PK\x05\x06' + b'\x00'*18).decode()},
                 {'name': 'ui.png', 'mime_type': 'image/png', 'data_base64': base64.b64encode(b'\x89PNG\r\n\x1a\n').decode()},
             ],
         }
         paths, temp_dir = node.materialize_attachments(job)
         try:
-            self.assertEqual(len(paths), 3)
+            self.assertEqual(len(paths), 4)
             self.assertTrue(paths[0].endswith('_spec.pdf'))
             self.assertTrue(paths[1].endswith('_notes.txt'))
-            self.assertTrue(paths[2].endswith('_ui.png'))
+            self.assertTrue(paths[2].endswith('_bundle.zip'))
+            self.assertTrue(paths[3].endswith('_ui.png'))
             prompt = node.build_prompt(job, image_paths=paths)
             self.assertIn('用户在本轮对话中附带了以下图片附件', prompt)
             self.assertIn('用户在本轮对话中附带了以下文件附件', prompt)
-            self.assertIn(paths[0], prompt)
-            self.assertIn(paths[1], prompt)
-            self.assertIn(paths[2], prompt)
+            for p in paths:
+                self.assertIn(p, prompt)
         finally:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
