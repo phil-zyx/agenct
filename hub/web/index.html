@@ -165,13 +165,13 @@
   <aside id="project-panel" class="project-panel hide" aria-label="项目共同状态"></aside>
   <aside class="task-pane" aria-label="任务">
     <div class="pane-head">
-      <div class="seg" role="tablist" aria-label="工作视图">
-        <button type="button" id="tab-activity" aria-controls="activity" class="on" role="tab" aria-selected="true">工作</button>
-        <button type="button" id="tab-tasks" aria-controls="tasks" role="tab" aria-selected="false">任务<span id="task-count" class="count"></span></button>
+      <div class="seg" role="tablist" aria-label="任务视图">
+        <button type="button" id="tab-activity" aria-controls="activity" class="on" role="tab" aria-selected="true">脉络概览</button>
+        <button type="button" id="tab-tasks" aria-controls="tasks" role="tab" aria-selected="false">卡片详情<span id="task-count" class="count"></span></button>
       </div>
       <button type="button" id="close-tasks" class="icon-btn" title="收起" aria-label="收起"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
     </div>
-    <div id="activity" role="tabpanel" aria-labelledby="tab-activity" class="activity-list" aria-label="工作记录：每件事的最近进展"></div>
+    <div id="activity" role="tabpanel" aria-labelledby="tab-activity" class="activity-list" aria-label="任务脉络：每件事的最近进展"></div>
     <div id="task-filters" class="task-filters hide"><label for="task-filter">筛选任务</label><select id="task-filter"><option value="active">进行中的任务</option><option value="waiting">待我处理</option><option value="mine">我发起的</option><option value="completed">已完成 / 已取消</option></select><p id="task-filter-empty" class="note" role="status"></p></div>
     <div id="tasks" role="tabpanel" aria-labelledby="tab-tasks" class="task-list hide" aria-label="与你相关的任务"></div>
   </aside>

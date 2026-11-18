@@ -66,7 +66,18 @@ function activityLine(item, me) {
     case 'draft_complete': return '草稿已写好，等你审阅（仅你可见）';
     case 'draft_uncertain': return '暂时无法确认起草结果，请打开草稿查看';
     case 'draft_pending': return '正在为你起草…';
-    case 'topic_turn': return '已归并到该上下文主题';
+    case 'topic_turn': {
+      const task = typeof visibleTasks !== 'undefined' ? visibleTasks.get(item.id) : null;
+      const turns = Array.isArray(task?.recent_turns) ? task.recent_turns : [];
+      const count = Number.isFinite(task?.turn_count) ? task.turn_count : turns.length;
+      const last = turns.length ? turns[turns.length - 1] : null;
+      const raw = String(last?.answer || last?.question || task?.result || '').replace(/\s+/g, ' ').trim();
+      const preview = raw.length > 36 ? raw.slice(0, 36) + '…' : raw;
+      if (count > 0 && preview) return `共 ${count} 轮对话 · ${preview}`;
+      if (count > 0) return `共 ${count} 轮对话`;
+      if (preview) return preview;
+      return '自动归档的上下文脉络';
+    }
     default: return String(l.action || '');
   }
 }
@@ -99,6 +110,10 @@ function renderActivity(context, items) {
       row.onclick = () => {
         if (!current(context)) return;
         if (item.kind === 'task') {
+          const task = typeof visibleTasks !== 'undefined' ? visibleTasks.get(item.id) : null;
+          if (task?.is_topic && typeof selectMuseTopic === 'function' && activeMuseTopicId !== task.id) {
+            selectMuseTopic(context, task);
+          }
           setPaneTab('tasks');
           revealTask(item.id);
         } else {

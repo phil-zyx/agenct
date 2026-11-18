@@ -36,6 +36,7 @@ pub(super) struct Item {
 pub(super) async fn activity(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<Item>>> {
     let user = h.identity(&headers)?;
     let db = h.db()?;
+    let _ = crate::nodes::consolidate_self_topics(&db, &user);
     let mut items = Vec::new();
 
     let mut tasks = db.prepare(

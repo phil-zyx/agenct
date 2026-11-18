@@ -681,27 +681,170 @@ pub(super) fn is_topic_summary(summary: &str) -> bool {
 }
 
 pub(super) fn topic_turns(db: &Connection, task_id: &str) -> Result<Vec<Value>> {
+    let merged_prefix = format!("[归并:{task_id}]%");
     let mut stmt = db.prepare(
-        "SELECT d.seq,
-                COALESCE(json_extract(t.response, '$.draft.instruction'), ''),
+        "SELECT COALESCE(json_extract(t.response, '$.draft.instruction'), ''),
                 d.content,
                 d.created_at
          FROM deliveries d
          LEFT JOIN draft_turns t ON t.draft_id = d.source_draft_id
-         WHERE d.task_id=?1 AND d.status='submitted'
-         ORDER BY d.seq ASC",
+         WHERE (d.task_id=?1 OR d.task_id IN (SELECT id FROM tasks WHERE summary LIKE ?2))
+           AND d.status='submitted'
+         ORDER BY d.created_at ASC, d.rowid ASC",
     )?;
-    let rows = stmt
-        .query_map([task_id], |r| {
-            Ok(json!({
-                "seq": r.get::<_, i64>(0)?,
-                "question": r.get::<_, String>(1)?,
-                "answer": r.get::<_, String>(2)?,
-                "created_at": r.get::<_, String>(3)?,
-            }))
+    let raw_rows = stmt
+        .query_map(params![task_id, merged_prefix], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows = raw_rows
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (question, answer, created_at))| {
+            json!({
+                "seq": (idx + 1) as i64,
+                "question": question,
+                "answer": answer,
+                "created_at": created_at,
+            })
+        })
+        .collect();
     Ok(rows)
+}
+
+pub(crate) fn consolidate_self_topics(db: &Connection, owner: &str) -> Result<()> {
+    let mut stmt = db.prepare(
+        "SELECT id, summary, result FROM tasks
+         WHERE requester=?1 AND owner=?1 AND summary LIKE '💬 %' AND status != 'working'
+         ORDER BY rowid ASC",
+    )?;
+    let chat_topics = stmt
+        .query_map([owner], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if chat_topics.is_empty() {
+        return Ok(());
+    }
+
+    let mut sys_fragments = Vec::new();
+    let mut cron_fragments = Vec::new();
+    for (id, summary, result) in chat_topics {
+        let body = summary.strip_prefix("💬 ").unwrap_or(&summary).trim();
+        let lower = body.to_ascii_lowercase();
+        let is_cron_setup = [
+            "每天",
+            "每日",
+            "每晚",
+            "每早",
+            "每周",
+            "每小时",
+            "每隔",
+            "定时",
+        ]
+        .iter()
+        .any(|p| body.starts_with(p));
+        let is_sys_fragment = [
+            "tmux",
+            "screen",
+            "窗口",
+            "终端",
+            "会话",
+            "路由",
+            "homelab",
+            "这台pc",
+            "这台机器",
+            "agy",
+            "systemd",
+        ]
+        .iter()
+        .any(|kw| lower.contains(kw) || body.contains(kw));
+        if is_cron_setup {
+            cron_fragments.push((id, summary));
+        } else if is_sys_fragment {
+            sys_fragments.push((id, summary, result));
+        }
+    }
+
+    if !cron_fragments.is_empty() {
+        let canon_cron: Option<String> = db
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE requester=?1 AND owner=?1 AND summary LIKE '⏰ %'
+                 ORDER BY rowid DESC LIMIT 1",
+                [owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let tag = canon_cron.as_deref().unwrap_or("cron");
+        for (frag_id, old_summary) in cron_fragments {
+            let archived = format!("[归并:{tag}] {old_summary}");
+            db.execute(
+                "UPDATE tasks SET summary=?1 WHERE id=?2",
+                params![archived, frag_id],
+            )?;
+        }
+    }
+
+    if !sys_fragments.is_empty() {
+        let existing_sys: Option<String> = db
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE requester=?1 AND owner=?1 AND summary LIKE '🖥️ % 系统与环境'
+                 ORDER BY rowid DESC LIMIT 1",
+                [owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let canon_id = if let Some(cid) = existing_sys {
+            cid
+        } else {
+            let node_name = db
+                .query_row(
+                    "SELECT name FROM user_nodes WHERE owner=?1 ORDER BY online DESC, rowid ASC LIMIT 1",
+                    [owner],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .unwrap_or_else(|| "本机".to_owned());
+            let (first_id, _, _) = &sys_fragments[0];
+            let new_summary = format!("🖥️ {node_name} 系统与环境");
+            db.execute(
+                "UPDATE tasks SET summary=?1 WHERE id=?2",
+                params![new_summary, first_id],
+            )?;
+            first_id.clone()
+        };
+        let mut latest_result: Option<String> = None;
+        for (frag_id, old_summary, frag_result) in sys_fragments {
+            if let Some(res) = frag_result.filter(|s| !s.trim().is_empty()) {
+                latest_result = Some(res);
+            }
+            if frag_id == canon_id {
+                continue;
+            }
+            let archived = format!("[归并:{canon_id}] {old_summary}");
+            db.execute(
+                "UPDATE tasks SET summary=?1 WHERE id=?2",
+                params![archived, frag_id],
+            )?;
+        }
+        if let Some(res) = latest_result {
+            db.execute(
+                "UPDATE tasks SET result=?1 WHERE id=?2",
+                params![res, canon_id],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn explicit_named_repo(message: &str) -> Option<String> {
@@ -820,8 +963,32 @@ fn classify_chat_topic(
     } else if {
         let lower = question_for_match.to_ascii_lowercase();
         [
-            "内存", "磁盘", "cpu", "gpu", "显卡", "负载", "进程", "端口", "容器", "docker", "top",
-            "free", "df", "ps", "状态", "环境",
+            "内存",
+            "磁盘",
+            "cpu",
+            "gpu",
+            "显卡",
+            "负载",
+            "进程",
+            "端口",
+            "容器",
+            "docker",
+            "top",
+            "free",
+            "df",
+            "ps",
+            "状态",
+            "环境",
+            "tmux",
+            "screen",
+            "窗口",
+            "终端",
+            "会话",
+            "路由",
+            "这台pc",
+            "这台机器",
+            "agy",
+            "systemd",
         ]
         .iter()
         .any(|kw| lower.contains(kw) || question_for_match.contains(kw))
@@ -3704,5 +3871,48 @@ mod tests {
         .await;
         assert_eq!(s, StatusCode::OK);
         assert!(q_proc["reply"].as_str().unwrap().contains("cc-team"));
+    }
+
+    #[tokio::test]
+    async fn consolidates_fragmented_tmux_routing_and_cron_chat_topics() {
+        let h = hub();
+        let db = h.db().unwrap();
+        db.execute(
+            "INSERT INTO tasks (id, requester, owner, summary, status, result, revision)
+             VALUES ('t-sys', 'alice', 'alice', '🖥️ homelab 系统与环境', 'completed', 'CPU 正常', 1),
+                    ('t-tmux1', 'alice', 'alice', '💬 看下这台PC上tmux有几个窗口', 'completed', '3 个窗口', 1),
+                    ('t-route', 'alice', 'alice', '💬 你机器路由错了 去homelab', 'completed', '已切到 homelab', 1),
+                    ('t-agy', 'alice', 'alice', '💬 Tmux上有agy的agent 才修改了', 'completed', 'agy 运行中', 1),
+                    ('t-cron', 'alice', 'alice', '⏰ 定时任务：每晚汇总 GitLab', 'completed', '已汇总', 1),
+                    ('t-cron-msg', 'alice', 'alice', '💬 每天晚上10点汇总一下gitlab上的提交总结给', 'completed', '已设置定时任务', 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO deliveries (id, task_id, seq, author, content, status, task_revision, created_at)
+             VALUES ('d-1', 't-sys', 1, 'alice', 'CPU 正常', 'submitted', 1, '2026-11-18 10:00:00'),
+                    ('d-2', 't-tmux1', 1, 'alice', '3 个窗口', 'submitted', 1, '2026-11-18 10:05:00'),
+                    ('d-3', 't-route', 1, 'alice', '已切到 homelab', 'submitted', 1, '2026-11-18 10:10:00'),
+                    ('d-4', 't-agy', 1, 'alice', 'agy 运行中', 'submitted', 1, '2026-11-18 10:15:00')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let r = app(h);
+        let (s, tasks) = call(&r, &token("alice"), "GET", "/api/tasks", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let list = tasks.as_array().unwrap();
+        let summaries: Vec<&str> = list.iter().filter_map(|t| t["summary"].as_str()).collect();
+        assert!(summaries.contains(&"🖥️ homelab 系统与环境"));
+        assert!(summaries.contains(&"⏰ 定时任务：每晚汇总 GitLab"));
+        assert!(!summaries.iter().any(|s| s.starts_with("💬 ")));
+
+        let sys_task = list
+            .iter()
+            .find(|t| t["summary"] == "🖥️ homelab 系统与环境")
+            .unwrap();
+        assert_eq!(sys_task["turn_count"], 4);
+        assert_eq!(sys_task["result"], "agy 运行中");
     }
 }
