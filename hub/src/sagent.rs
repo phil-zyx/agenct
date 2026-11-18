@@ -2750,6 +2750,15 @@ pub(crate) async fn answer_chat(
         return Ok(None);
     }
 
+    // 0. Meta Muse Unified Agent Loop (Single Brain + Combinable Tools in Dsh mode)
+    if !trimmed.starts_with('/') {
+        if let Some(resp) =
+            try_handle_muse_agent_loop(h, owner, input, runtime_profile, task_context).await?
+        {
+            return Ok(Some(resp));
+        }
+    }
+
     // 1. Module C: Personal Dispatch Rules (explicit prefix or natural-language standing rule)
     let parsed_rule = if let Some(body) = strip_prefix_any(
         trimmed,
@@ -3296,6 +3305,626 @@ pub(crate) async fn answer_chat(
     }
 
     Ok(None)
+}
+
+#[derive(Deserialize)]
+struct MuseAgentResponse {
+    reply: String,
+    tools: Vec<MuseToolCall>,
+}
+
+#[derive(Deserialize)]
+struct MuseToolCall {
+    tool: String,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    cron_id: Option<String>,
+    #[serde(default)]
+    daily_time_cst: Option<String>,
+    #[serde(default)]
+    interval_minutes: Option<u64>,
+    #[serde(default)]
+    instruction: Option<String>,
+    #[serde(default)]
+    deduplicate_ids: Vec<String>,
+    #[serde(default)]
+    rule_id: Option<String>,
+    #[serde(default)]
+    rule_body: Option<String>,
+    #[serde(default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    topic_id: Option<String>,
+    #[serde(default)]
+    topic_title: Option<String>,
+}
+
+async fn try_handle_muse_agent_loop(
+    h: &Hub,
+    owner: &str,
+    input: &crate::messages::ChatInput,
+    runtime_profile: &crate::profiles::RuntimeProfile,
+    task_context: Option<&Value>,
+) -> Result<Option<Json<Value>>> {
+    let crate::Runtime::Dsh { url, token } = &h.runtime else {
+        return Ok(None);
+    };
+    let selected_self_topic = input.selected_task.as_ref().filter(|_| {
+        task_context
+            .as_ref()
+            .is_some_and(|c| c["requester"] == owner && c["owner"] == owner)
+    });
+    let blocking_shared_task = task_context
+        .as_ref()
+        .is_some_and(|c| c["requester"] != owner || c["owner"] != owner);
+    if blocking_shared_task || input.selected_project.is_some() {
+        return Ok(None);
+    }
+    let trimmed = input.message.trim();
+    if [
+        "记住：",
+        "记住:",
+        "把我的职责公开为",
+        "允许助手用公开资料答复",
+        "关闭公开自动答复",
+        "关闭自动起草",
+        "开启自动起草",
+        "回复改为",
+    ]
+    .iter()
+    .any(|kw| trimmed.starts_with(kw))
+    {
+        return Ok(None);
+    }
+
+    let (user_crons, user_rules, has_gitlab) = h
+        .automation
+        .lock()
+        .map(|g| {
+            let crons: Vec<CronJob> = g
+                .crons
+                .iter()
+                .filter(|c| c.owner == owner)
+                .cloned()
+                .collect();
+            let rules: Vec<DispatchRule> = g
+                .rules
+                .iter()
+                .filter(|r| r.owner == owner)
+                .cloned()
+                .collect();
+            let gl = g
+                .gitlab_configs
+                .get(owner)
+                .is_some_and(|c| !c.token.is_empty());
+            (crons, rules, gl)
+        })
+        .unwrap_or_default();
+
+    let (nodes, contacts, recent_msgs, topics, default_best_node) = {
+        let db = h.db()?;
+        let now = nodes::now_unix();
+        let mut n_stmt = db.prepare(
+            "SELECT id, name, capabilities, last_seen_unix FROM user_nodes WHERE owner=?1 ORDER BY rowid ASC",
+        )?;
+        let nodes: Vec<(String, String, String, bool)> = n_stmt
+            .query_map([owner], |r| {
+                let seen: Option<i64> = r.get(3)?;
+                let online =
+                    seen.is_some_and(|t| now.saturating_sub(t) <= nodes::ONLINE_WINDOW_SECONDS);
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, online))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        if nodes.is_empty() && user_crons.is_empty() && user_rules.is_empty() && !has_gitlab {
+            return Ok(None);
+        }
+
+        let mut contacts = Vec::new();
+        for c in h.directory.contacts(owner) {
+            let display: Option<String> = db
+                .query_row(
+                    "SELECT display_name FROM member_profiles WHERE owner=?1 AND status='active'",
+                    [&c],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match display.filter(|d| !d.trim().is_empty()) {
+                Some(d) => contacts.push(format!("{c}（{d}）")),
+                None => contacts.push(c),
+            }
+        }
+
+        let mut m_stmt = db.prepare(
+            "SELECT role, content FROM (
+                SELECT id, role, content FROM messages
+                WHERE owner=?1 AND status='complete'
+                ORDER BY id DESC LIMIT 8
+             ) ORDER BY id ASC",
+        )?;
+        let recent_msgs: Vec<(String, String)> = m_stmt
+            .query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut t_stmt = db.prepare(
+            "SELECT id, summary, COALESCE(result, '') FROM tasks
+             WHERE requester=?1 AND owner=?1
+             ORDER BY rowid DESC LIMIT 20",
+        )?;
+        let topics: Vec<(String, String, String)> = t_stmt
+            .query_map([owner], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|(_, sum, _)| nodes::is_topic_summary(sum))
+            .collect();
+
+        let default_best = nodes::select_node_with_rule(h, &db, owner, trimmed)
+            .ok()
+            .flatten();
+        (nodes, contacts, recent_msgs, topics, default_best)
+    };
+
+    let nodes_block = if nodes.is_empty() {
+        "（当前未绑定 PC 节点）".to_owned()
+    } else {
+        nodes
+            .iter()
+            .map(|(id, name, caps, online)| {
+                format!(
+                    "- node_id=`{id}`, 名称=「{name}」, 状态={}, 能力=`{caps}`",
+                    if *online { "在线" } else { "离线" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let crons_block = if user_crons.is_empty() {
+        "（当前无定时任务）".to_owned()
+    } else {
+        user_crons
+            .iter()
+            .map(|c| {
+                let sched = match &c.daily_time_cst {
+                    Some(hhmm) => format!("每天北京时间 {hhmm}"),
+                    None => format!("每 {} 分钟", c.interval_minutes),
+                };
+                format!(
+                    "- cron_id=`{}` | 周期={sched} | target=`{}` | 指令=「{}」",
+                    c.id, c.target, c.instruction
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let rules_block = if user_rules.is_empty() {
+        "（当前无自定义分发规则）".to_owned()
+    } else {
+        user_rules
+            .iter()
+            .map(|r| format!("- rule_id=`{}` | 关键词=`{}` | 目标=`{}`", r.id, r.keyword, r.target_node_id))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let contacts_block = if contacts.is_empty() {
+        "（无外部同事）".to_owned()
+    } else {
+        contacts.join("、")
+    };
+    let history_block = if recent_msgs.is_empty() {
+        "（暂无历史对话）".to_owned()
+    } else {
+        recent_msgs
+            .iter()
+            .map(|(role, content)| {
+                let speaker = if role == "user" { "用户" } else { "Muse" };
+                let snippet: String = nodes::strip_attachment_markers(content)
+                    .chars()
+                    .take(1200)
+                    .collect();
+                format!("[{speaker}]\n{snippet}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    let topics_block = if topics.is_empty() {
+        "（尚无任务脉络）".to_owned()
+    } else {
+        topics
+            .iter()
+            .map(|(id, sum, res)| {
+                let short_res: String = res
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(60)
+                    .collect();
+                if short_res.is_empty() {
+                    format!("- `{id}`：{sum}")
+                } else {
+                    format!("- `{id}`：{sum}（最近：{short_res}）")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let clean_msg = nodes::strip_attachment_markers(trimmed);
+    let msg_for_prompt = if clean_msg.is_empty() {
+        trimmed
+    } else {
+        clean_msg.as_str()
+    };
+
+    let prompt = format!(
+        "[MUSE_AGENT_TURN]\n\
+         你是用户的 7×24h 个人超级智能体（Meta Muse 架构：单一大脑 + 多工具自由组合调用）。\n\
+         你是唯一与用户直接对话的大脑，你的 `reply` 字段会直接展示给用户，请始终用自然、干练、聪明的中文与用户交流，绝不要使用冷冰冰的客服模板，也绝不要要求用户按特定格式复述。\n\
+         你可以根据上下文在单轮思考中调用 0 个、1 个或多个后台工具（放入 `tools` 数组）。\n\n\
+         === 实时环境状态快照 ===\n\
+         【7×24h 定时任务 (crons)】\n{crons_block}\n\n\
+         【个人管家规则 (rules)】\n{rules_block}\n\n\
+         【绑定的 PC 节点与本地 Agent (nodes)】\n{nodes_block}\n\
+         （注：agy、agy1、agy2、codex、claude、tmux、screen 等均是运行在用户 PC 节点上的本地开发 Agent 或终端窗口，不是外部人类同事。）\n\n\
+         【通讯录同事】\n{contacts_block}\n\n\
+         【已有任务脉络 (topics)】\n{topics_block}\n\n\
+         【最近对话历史】\n{history_block}\n\n\
+         【用户最新消息】\n「{msg_for_prompt}」\n\n\
+         === 可自由组合调用的工具列表 (`tools` 数组元素格式) ===\n\
+         1. **管理定时任务 (`manage_cron`)**：\n\
+            `{{\"tool\":\"manage_cron\",\"action\":\"add|update|delete\",\"cron_id\":\"目标cron_id或null\",\"daily_time_cst\":\"HH:MM或null\",\"interval_minutes\":1440,\"instruction\":\"融合用户新要求后的完整定时任务指令\",\"deduplicate_ids\":[\"同时间段重复的cron_id\"]}}`\n\
+            - **复合意图黄金准则**：当用户针对【最近对话历史】中的定时汇总报告说「提交汇总这个简化一下」「只列核心要点」「太长了精简一点」时，你应该在**同一轮**里同时做两件事：\n\
+              (a) 直接在你的 `reply` 中根据历史消息把那份报告浓缩精简好展示给用户，并自然告知已同步更新每晚的定时任务格式；\n\
+              (b) 在 `tools` 中调用 `manage_cron`（`action: \"update\"`）修改定时任务的 `instruction`（并把同时间重复的 cron 填入 `deduplicate_ids` 清理掉），**绝不要**把这种文本精简+改定时配置的需求派给 `dispatch_pc_node`！\n\
+         2. **实时拉取云端 GitLab 提交 (`fetch_gitlab_commits`)**：\n\
+            `{{\"tool\":\"fetch_gitlab_commits\",\"instruction\":\"汇总要求\"}}`\n\
+            - 仅当用户要求现在立刻拉取最新的 GitLab 提交（且对话历史里还没有最新报告）时调用。\n\
+         3. **管理个人分发规则 (`manage_rule`)**：\n\
+            `{{\"tool\":\"manage_rule\",\"action\":\"add|delete\",\"rule_id\":\"要删除的ID或null\",\"rule_body\":\"包含 <关键词> 的任务需要真人接手 | 别人委派任务必须提供 <材料> | 包含 <关键词> 的任务派给 <节点>\"}}`\n\
+         4. **调度 PC 节点执行本机/代码/部署/终端任务 (`dispatch_pc_node`)**：\n\
+            `{{\"tool\":\"dispatch_pc_node\",\"node_id\":\"homelab\",\"instruction\":\"结合对话历史补全指代后的完整自包含本机指令\",\"topic_id\":\"匹配的已有脉络ID或null\",\"topic_title\":\"匹配的脉络标题或新提炼的6~14字标题（以 📁 / 🖥️ / 💬 开头）\"}}`\n\
+            - 当用户要求查看、运行、修改、构建、测试或部署本机/代码仓库/终端窗口（tmux）/本地 Agent（agy/agy1/codex）时调用；\n\
+            - 当用户接着上文说简短的「更新」「部署到线上」「让 agy1 部署到线上」「哪些是活跃窗口」「继续」且上文确实是本机开发/节点任务时，你**必须**从【最近对话历史】中提取指代的具体提交号（如 13dba7c）、仓库名或 Agent 补全进 `instruction`！\n\
+            - 若只是纯问答、闲聊、或对对话历史中已有文本做总结/改写/翻译，请保持 `tools: []` 直接在 `reply` 中回答，不要调用 `dispatch_pc_node`。\n\n\
+         请只输出一个严格合法的 JSON 对象（不要 Markdown 代码块包裹）：\n\
+         `{{\"reply\":\"你直接对用户说的自然中文回复\",\"tools\":[]}}`"
+    );
+
+    let dsh = crate::runtime::DshRuntime {
+        client: &h.client,
+        url,
+        token,
+    };
+    let sid = Uuid::new_v4().to_string();
+    let Ok(ans) = crate::runtime::Runtime::turn(
+        &dsh,
+        crate::runtime::TurnRequest {
+            kind: crate::runtime::TurnKind::Chat,
+            message: &prompt,
+            session_id: &sid,
+            history: &[],
+            profile: runtime_profile,
+            task_context: None,
+            draft_revision: None,
+            task_role: None,
+            owner_context: None,
+            profile_context: None,
+        },
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+
+    let raw = ans.reply.trim();
+    let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) else {
+        return Ok(None);
+    };
+    let Ok(parsed) = serde_json::from_str::<MuseAgentResponse>(&raw[s..=e]) else {
+        return Ok(None);
+    };
+    if parsed.reply.trim().is_empty() {
+        return Ok(None);
+    }
+
+    // If the user explicitly asked to delegate to a configured human colleague in Contacts without tools,
+    // let the colleague delegation handler run if needed.
+    if parsed.tools.is_empty()
+        && contacts
+            .iter()
+            .any(|c| c.split('（').next().is_some_and(|id| trimmed.contains(id)))
+        && (trimmed.contains("请让") || trimmed.contains("委托") || trimmed.contains("交给") || trimmed.contains('@'))
+    {
+        return Ok(None);
+    }
+
+    let mut final_reply = parsed.reply.trim().to_owned();
+    let mut node_dispatch: Option<(String, String, bool, String, Option<String>, Option<String>)> =
+        None;
+
+    for call in &parsed.tools {
+        match call.tool.as_str() {
+            "manage_cron" => {
+                let act = call.action.as_deref().unwrap_or("update").trim();
+                if act == "update" && !user_crons.is_empty() {
+                    let target_id = call
+                        .cron_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| user_crons.iter().any(|c| c.id == *id))
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| user_crons[0].id.clone());
+                    with_store_mut(h, |store| {
+                        let mut updated_job: Option<CronJob> = None;
+                        if let Some(c) = store
+                            .crons
+                            .iter_mut()
+                            .find(|c| c.owner == owner && c.id == target_id)
+                        {
+                            if let Some(instr) = call
+                                .instruction
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty() && *s != "null")
+                            {
+                                c.instruction = nodes::truncate_bytes(instr, 300);
+                            }
+                            if let Some(hhmm) = call
+                                .daily_time_cst
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty() && *s != "null" && s.contains(':'))
+                            {
+                                c.daily_time_cst = Some(hhmm.to_owned());
+                                c.interval_minutes = 1440;
+                            } else if let Some(mins) =
+                                call.interval_minutes.filter(|m| (1..=10080).contains(m))
+                            {
+                                if c.daily_time_cst.is_none() {
+                                    c.interval_minutes = mins;
+                                }
+                            }
+                            if is_gitlab_commit_query(&c.instruction) {
+                                c.target = "cloud".into();
+                            }
+                            updated_job = Some(c.clone());
+                        }
+                        if let Some(ref up) = updated_job {
+                            let is_gl = is_gitlab_commit_query(&up.instruction);
+                            store.crons.retain(|c| {
+                                if c.owner != owner || c.id == up.id {
+                                    return true;
+                                }
+                                let explicit_dup =
+                                    call.deduplicate_ids.iter().any(|d| d.trim() == c.id);
+                                let auto_gl_dup = is_gl
+                                    && is_gitlab_commit_query(&c.instruction)
+                                    && c.daily_time_cst == up.daily_time_cst;
+                                !(explicit_dup || auto_gl_dup)
+                            });
+                        }
+                    })?;
+                    h.automation_notify.notify_one();
+                } else if act == "add" {
+                    if let Some(instr) = call
+                        .instruction
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "null")
+                    {
+                        let hhmm = call
+                            .daily_time_cst
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && *s != "null" && s.contains(':'))
+                            .map(str::to_owned);
+                        let mins = if hhmm.is_some() {
+                            1440
+                        } else {
+                            call.interval_minutes.unwrap_or(60).clamp(1, 10080)
+                        };
+                        let job = build_cron_job(owner, mins, hhmm, instr);
+                        with_store_mut(h, |store| {
+                            let is_gl = is_gitlab_commit_query(&job.instruction);
+                            store.crons.retain(|c| {
+                                !(c.owner == owner
+                                    && c.daily_time_cst == job.daily_time_cst
+                                    && c.interval_minutes == job.interval_minutes
+                                    && (c.instruction == job.instruction
+                                        || (is_gl && is_gitlab_commit_query(&c.instruction))))
+                            });
+                            store.crons.push(job);
+                        })?;
+                        h.automation_notify.notify_one();
+                    }
+                } else if act == "delete" {
+                    let mut to_remove: Vec<String> = call
+                        .deduplicate_ids
+                        .iter()
+                        .map(|s| s.trim().to_owned())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if let Some(cid) = call
+                        .cron_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "null")
+                    {
+                        if !to_remove.iter().any(|x| x == cid) {
+                            to_remove.push(cid.to_owned());
+                        }
+                    }
+                    if !to_remove.is_empty() {
+                        with_store_mut(h, |store| {
+                            store
+                                .crons
+                                .retain(|c| !(c.owner == owner && to_remove.iter().any(|id| id == &c.id)));
+                        })?;
+                    }
+                }
+            }
+            "fetch_gitlab_commits" => {
+                let instr = call
+                    .instruction
+                    .as_deref()
+                    .unwrap_or("汇总最近 24 小时 GitLab 提交");
+                if let Ok(report) = execute_cloud_cron_report(h, owner, instr).await {
+                    if !report.trim().is_empty() && !final_reply.contains(report.trim()) {
+                        final_reply = format!("{final_reply}\n\n---\n\n{}", report.trim());
+                    }
+                }
+            }
+            "manage_rule" => {
+                let act = call.action.as_deref().unwrap_or("add").trim();
+                if act == "add" {
+                    if let Some(body) = call
+                        .rule_body
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        let rule_opt = {
+                            let db = h.db()?;
+                            parse_rule_command(&db, owner, body).ok()
+                        };
+                        if let Some(rule) = rule_opt {
+                            with_store_mut(h, |store| store.rules.push(rule))?;
+                        }
+                    }
+                } else if act == "delete" {
+                    if let Some(rid) = call
+                        .rule_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        with_store_mut(h, |store| {
+                            store.rules.retain(|r| !(r.owner == owner && r.id == rid));
+                        })?;
+                    }
+                }
+            }
+            "dispatch_pc_node" => {
+                let picked_node = call
+                    .node_id
+                    .as_deref()
+                    .map(str::trim)
+                    .and_then(|nid| {
+                        nodes
+                            .iter()
+                            .find(|(id, name, _, _)| id.eq_ignore_ascii_case(nid) || name == nid)
+                            .map(|(id, name, _, online)| (id.clone(), name.clone(), *online))
+                    })
+                    .or_else(|| {
+                        default_best_node
+                            .as_ref()
+                            .map(|(id, name, online, _)| (id.clone(), name.clone(), *online))
+                    })
+                    .or_else(|| {
+                        nodes
+                            .iter()
+                            .find(|(_, _, _, online)| *online)
+                            .or_else(|| nodes.first())
+                            .map(|(id, name, _, online)| (id.clone(), name.clone(), *online))
+                    });
+                if let Some((node_id, node_name, online)) = picked_node {
+                    let base_instr = call
+                        .instruction
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "null")
+                        .unwrap_or(trimmed);
+                    let instr = nodes::preserve_attachment_markers(trimmed, base_instr);
+                    let explicit_sel = selected_self_topic.map(|s| s.task_id.to_owned());
+                    let tid = explicit_sel.or_else(|| {
+                        call.topic_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|id| {
+                                !id.is_empty()
+                                    && *id != "null"
+                                    && topics.iter().any(|(t, _, _)| t == id)
+                            })
+                            .map(str::to_owned)
+                    });
+                    let title = call
+                        .topic_title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty() && *t != "null")
+                        .map(|t| {
+                            let clean: String = t.chars().take(28).collect();
+                            if nodes::is_topic_summary(&clean) {
+                                clean
+                            } else {
+                                format!("💬 {clean}")
+                            }
+                        });
+                    node_dispatch = Some((node_id, node_name, online, instr, tid, title));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some((node_id, node_name, online, summary, tid, title)) = node_dispatch {
+        let task_id = {
+            let mut db = h.db()?;
+            let tx = db.transaction()?;
+            let (task_id, _) = nodes::dispatch_chat_task_with_hint(
+                &tx,
+                owner,
+                &node_id,
+                &node_name,
+                online,
+                &summary,
+                tid.as_deref(),
+                title.as_deref(),
+            )?;
+            tx.execute(
+                "INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'user',?2,'complete',CURRENT_TIMESTAMP)",
+                params![owner, input.message],
+            )?;
+            let message_id = tx.last_insert_rowid();
+            if let Some(key) = input.request_id.as_deref() {
+                tx.execute(
+                    "UPDATE chat_turns SET message_id=?3 WHERE owner=?1 AND request_id=?2 AND status='pending'",
+                    params![owner, key, message_id],
+                )?;
+            }
+            tx.commit()?;
+            task_id
+        };
+        let base_response = json!({
+            "reply": Value::Null,
+            "backend": h.runtime.label(),
+            "source": "pc-node",
+            "proposal": Value::Null,
+            "runtime_profile": runtime_profile,
+            "task_context": task_context.cloned().unwrap_or(Value::Null),
+            "repository_context": Value::Null,
+        });
+        return nodes::finalize_chat_node_turn(
+            h,
+            owner,
+            &task_id,
+            &final_reply,
+            input.request_id.as_deref(),
+            online,
+            base_response,
+        )
+        .await
+        .map(Some);
+    }
+
+    complete_chat_reply(h, owner, input, runtime_profile, task_context, &final_reply).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -7052,5 +7681,136 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("精简速览版"));
+    }
+
+    #[tokio::test]
+    async fn muse_unified_agent_loop_handles_compound_cron_and_node_turns() {
+        let adapter = axum::Router::new().route(
+            "/v1/turn",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                let msg = body["message"].as_str().unwrap_or("");
+                let reply = if msg.starts_with("[MUSE_AGENT_TURN]") {
+                    assert!(msg.contains("cron-7d2629"));
+                    assert!(msg.contains("node_id=`homelab`"));
+                    if msg.contains("【用户最新消息】\n「提交汇总这个简化一下」") {
+                        r#"{"reply":"已经帮你把刚才那份汇总精简成以下 3 点，同时也把每晚 22:00 的定时任务改成了精简速览模式：\n- xixing：完成 A/B 反馈与 0.1.5 部署\n- orbit：注册 lab3 CLI\n- ansible：更新网络配置","tools":[{"tool":"manage_cron","action":"update","cron_id":"cron-7d2629","daily_time_cst":"22:00","instruction":"汇总一下 GitLab 上的提交总结给我（精简速览版：每个项目只列 1~2 条核心进展）","deduplicate_ids":["cron-1f1b46"]}]}"#
+                    } else if msg.contains("【用户最新消息】\n「部署到线上」") {
+                        r#"{"reply":"明白，正在让办公主力机（homelab）把刚完成的本地提交 13dba7c 同步部署到线上 Hub，完成后结果会自动发回这里。","tools":[{"tool":"dispatch_pc_node","node_id":"homelab","instruction":"将 agy1 刚在本地完成的提交 13dba7c 同步部署到线上运行的 Hub 服务","topic_id":"t-agenct","topic_title":"📁 agenct 仓库上下文"}]}"#
+                    } else {
+                        "ok"
+                    }
+                } else {
+                    "ok"
+                };
+                axum::Json(json!({ "reply": reply, "backend": "dsh", "proposal": Value::Null }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/turn", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+
+        let mut h = test_hub();
+        h.runtime = crate::Runtime::Dsh {
+            url,
+            token: "test-token".into(),
+        };
+        super::with_store_mut(&h, |store| {
+            store.crons.push(super::CronJob {
+                id: "cron-7d2629".into(),
+                owner: "alice".into(),
+                interval_minutes: 1440,
+                daily_time_cst: Some("22:00".into()),
+                instruction: "汇总一下gitlab上的提交总结给我".into(),
+                target: "cloud".into(),
+                last_run_unix: Some(1795010404),
+                enabled: true,
+                created_at: 1794886396,
+            });
+            store.crons.push(super::CronJob {
+                id: "cron-1f1b46".into(),
+                owner: "alice".into(),
+                interval_minutes: 1440,
+                daily_time_cst: Some("22:00".into()),
+                instruction: "汇总一下gitlab上的提交给我".into(),
+                target: "cloud".into(),
+                last_run_unix: Some(1795010404),
+                enabled: true,
+                created_at: 1794888996,
+            });
+        })
+        .unwrap();
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "INSERT INTO user_nodes (id, owner, name, token_hash, capabilities, last_seen_unix, created_at)
+                 VALUES ('homelab', 'alice', '办公主力机', 'h-muse', 'cli:codex,agy | repos:agenct', 1, '2026-11-18')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO tasks (id, requester, owner, summary, status, result, revision)
+                 VALUES ('t-agenct', 'alice', 'alice', '📁 agenct 仓库上下文', 'completed', '已完成附件按钮改造', 1)",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO messages (owner, role, content, status)
+                 VALUES ('alice', 'assistant', '⏰ 管家 7×24h 云端定时任务报告：zhq/xixing (6条)...', 'complete')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let r = app(h.clone());
+        // 1. Compound turn: simplify report in natural reply AND update/deduplicate cron in background without PC node dispatch
+        let (s, chat1) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "提交汇总这个简化一下" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reply1 = chat1["reply"].as_str().unwrap();
+        assert!(reply1.contains("已经帮你把刚才那份汇总精简成以下 3 点"));
+        assert!(!reply1.contains("⏰ 已为你更新"));
+
+        let (s, auto_state) = call(&r, &token("alice"), "GET", "/api/automation", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let crons = auto_state["crons"].as_array().unwrap();
+        assert_eq!(crons.len(), 1);
+        assert_eq!(crons[0]["id"], "cron-7d2629");
+        assert!(crons[0]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("精简速览版"));
+
+        // 2. Contextual node dispatch turn: "部署到线上" expands instruction and queues on homelab with Muse's natural reply
+        let (s, chat2) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "部署到线上" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reply2 = chat2["reply"].as_str().unwrap();
+        assert!(reply2.contains("正在让办公主力机（homelab）把刚完成的本地提交 13dba7c 同步部署到线上 Hub"));
+
+        let instr: String = h
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT instruction FROM node_assignments WHERE task_id='t-agenct'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            instr,
+            "将 agy1 刚在本地完成的提交 13dba7c 同步部署到线上运行的 Hub 服务"
+        );
     }
 }
