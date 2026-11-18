@@ -205,11 +205,12 @@ async function freePort() {
     });
     assert.equal(submitDraft.status, 200);
     await alice.reload();
-    await expectDecodedImage('#conversation .msg-assistant .msg-image');
-    await alice.locator('#conversation .msg-assistant .msg-image').first().click();
+    await expectDecodedImage('#conversation .msg-assistant img[alt="mobile-chat-attachment.png"]');
+    await expectDecodedImage('#conversation .msg-assistant img[alt="mobile-image-preview.png"]');
+    await alice.locator('#conversation .msg-assistant img[alt="mobile-chat-attachment.png"]').click();
     await alice.locator('#conversation .msg-assistant .msg-image-card.expanded').waitFor({ state: 'visible' });
     if (evidenceDir) {
-      await alice.locator('#conversation .msg-assistant .msg-image').first().scrollIntoViewIfNeeded();
+      await alice.locator('#conversation .msg-assistant img[alt="mobile-chat-attachment.png"]').scrollIntoViewIfNeeded();
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-chat-attachment.png') });
     }
     console.log('PASS mobile image upload, composer preview, user & node assistant bubble images, tap-to-expand, and no routine receipt toast');
