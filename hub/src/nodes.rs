@@ -666,6 +666,16 @@ fn should_auto_route_to_node(
         "free",
         "df",
         "ps",
+        "tmux",
+        "screen",
+        "窗口",
+        "终端",
+        "会话",
+        "服务",
+        "后台",
+        "活跃",
+        "挂了",
+        "报错",
     ];
     Ok(LOCAL_INTENT_KEYWORDS
         .iter()

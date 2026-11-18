@@ -241,6 +241,12 @@ pub(super) async fn execute_chat(
                     "无法直接查看图片",
                     "无法识别图片",
                     "不支持查看图片",
+                    "无法据此判断",
+                    "现有快照只记录",
+                    "需要我调度",
+                    "需要在 homelab",
+                    "需要在本机",
+                    "需要在节点",
                 ]
                 .iter()
                 .any(|cue| answer.reply.contains(cue));
