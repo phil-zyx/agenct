@@ -485,8 +485,8 @@ select {
 .task-filters select { flex: 1; min-width: 0; }
 select:focus-visible, select:focus { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-ring); outline: none; }
 #task-filter-empty:empty { display: none; }
-.message-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; opacity: 0; transition: opacity .15s; }
-.msg:hover .message-actions, .msg:focus-within .message-actions { opacity: 1; }
+.message-actions { display: none; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.msg-failed .message-actions, .msg:has(.message-delegation) .message-actions { display: flex; }
 .message-delegation { padding-top: 12px; }
 .message-delegation input, .message-delegation textarea { display: block; width: 100%; margin-block: 8px; font-size: 16px; }
 .message-delegation button { margin: 4px; }
@@ -517,7 +517,6 @@ input[type=file] { max-width: 100%; font-size: 14px; }
 ::selection { background: var(--brand-soft); color: var(--text); }
 textarea, input { caret-color: var(--brand); }
 .app, .rail { height: var(--viewport-height, 100dvh); }
-@media (hover: none) { .message-actions { opacity: 1; } }
 @media (max-width: 900px) {
   .rail { height: calc(58px + env(safe-area-inset-bottom)); padding-bottom: calc(4px + env(safe-area-inset-bottom)); }
   .app { height: calc(var(--viewport-height, 100dvh) - 58px - env(safe-area-inset-bottom)); }
@@ -528,7 +527,6 @@ textarea, input { caret-color: var(--brand); }
   .rail-btn, .icon-btn, .send-btn, .action-editor button, .task-pane button, .profile-settings button { min-height: 44px; }
   .icon-btn { min-width: 44px; }
   .composer-pill textarea, .profile-role select, .card-panels textarea, .member-card input, .member-card textarea, .member-card select, .node-assign-controls select, .node-assign-controls input { font-size: 16px; }
-  .message-actions { opacity: 1; gap: 6px; margin-top: 6px; }
   .message-actions button { min-height: 30px; padding: 4px 10px; font-size: 12px; border-radius: 999px; background: var(--soft); }
 }
 .draft-revision-field { display: block; margin-top: 12px; }
