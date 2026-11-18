@@ -553,6 +553,7 @@ function renderTurn() {
       : pendingTurn.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。'
         : '上次发送的结果尚未确认，可能已经处理。')
       + '\n请求编号：' + pendingTurn.id
+      + (pendingTurn.liveStage ? '\n实时进展：' + pendingTurn.liveStage : '')
       + (busy.has('send') ? '\n正在等待响应，请勿重复发送。'
         : '\n不会自动重发。请先核对发送状态。')
       + (turnStorageAvailable ? '' : '\n当前浏览器无法保存恢复凭据，请先记下请求编号，刷新后将无法自动恢复。')
@@ -613,12 +614,15 @@ async function completeTurn(context, response) {
       + (Array.isArray(project.feedback) ? `本轮包含 ${project.feedback.length} 条共享问答记录（含无正文的撤回记录），不代表确认或承诺。` : '')
       + (project.omitted_items > 0 ? `已省略 ${project.omitted_items} 条超出上下文上限的状态条目。` : '')
       + (project.omitted_feedback > 0 ? `已省略 ${project.omitted_feedback} 条共享问答，不能据此判断完整讨论或推断缺失原文。` : '') : '';
+  const routed = response.routed_context;
   const receiptContext = task
     ? `\n本次任务上下文：${task.id} · 版本 ${task.revision}。`
       + (task.summary_truncated ? '共享摘要已截断。' : '')
       + (task.result_truncated ? '交付结果已截断。' : '')
       + (task.details_truncated ? '共享材料已截断。' : '')
-    : '';
+    : routed && typeof routed.task_id === 'string'
+      ? `\n已自动归入历史任务上下文：${routed.summary || routed.task_id}（#${routed.task_id.slice(0, 8)}）。`
+      : '';
   forgetTurn();
   if (current(context) && !project) handleTaskAction(context, response.task_action, requestId);
   status('已核实消息处理完成。' + receiptContext + projectReceipt + receiptRole);
@@ -1049,6 +1053,7 @@ $('check-turn').onclick = async () => {
       await failTurn(context, receipt.failure);
     } else {
       turn.status = receipt.status;
+      turn.liveStage = receipt.status === 'pending' && typeof receipt.live_stage === 'string' ? receipt.live_stage : null;
       status(receipt.status === 'pending' ? '服务端已记录此请求，尚未确认处理完成。稍后可再次核对，未重发消息。' : '服务端无法确认上次处理结果。未重发消息。');
     }
   } catch (error) {

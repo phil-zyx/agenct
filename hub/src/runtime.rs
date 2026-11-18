@@ -252,6 +252,9 @@ pub(super) fn adapter_failed() -> Error {
 impl Runtime for DshRuntime<'_> {
     async fn turn(&self, request: TurnRequest<'_>) -> Result<AdapterReply> {
         validate_request(&request)?;
+        if self.url.ends_with("/chat/completions") {
+            return self.turn_openai_compatible(request).await;
+        }
         let mut payload = serde_json::json!({"session_id":request.session_id,
             "runtime_profile":request.profile,
             "history":request.history.iter().map(|m|serde_json::json!({"role":m.role,"content":m.content})).collect::<Vec<_>>(),
@@ -326,6 +329,125 @@ impl Runtime for DshRuntime<'_> {
             .json::<AdapterReply>()
             .await
             .map_err(|_| adapter_failed())
+    }
+}
+
+impl DshRuntime<'_> {
+    async fn turn_openai_compatible(&self, request: TurnRequest<'_>) -> Result<AdapterReply> {
+        let model = std::env::var("AGENCT_LLM_MODEL")
+            .or_else(|_| std::env::var("OPENAI_MODEL"))
+            .unwrap_or_else(|_| "gpt-4o-mini".into());
+        let sys_prompt = match request.kind {
+            TurnKind::ContextSummary => {
+                "你是用户的私有会话摘要压缩引擎。请将历史对话浓缩为保留关键事实、决定、数字、偏好与待办的连贯中文摘要。\
+                 只输出严格合法的 JSON：{\"reply\":\"摘要正文\",\"proposal\":null}"
+                    .to_owned()
+            }
+            TurnKind::DraftDelivery => {
+                format!(
+                    "你是用户的 7×24h 管家起草助手。请根据 task_context（及可选的 draft_revision 修改要求）为用户起草一版可直接交付的专业中文草稿（不超过 7500 字节）。\n\
+                     task_context: {}\n\
+                     draft_revision: {}\n\
+                     只输出严格合法的 JSON：{{\"reply\":\"草稿正文\",\"proposal\":null}}",
+                    request
+                        .task_context
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                    request
+                        .draft_revision
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                )
+            }
+            TurnKind::Chat => {
+                format!(
+                    "你是用户的 7×24h 个人超级管家（Super-Agent）。\n\
+                     task_context: {}\n\
+                     task_role: {}\n\
+                     owner_context: {}\n\
+                     profile_context: {}\n\
+                     请优先输出 JSON 对象：{{\"reply\":\"你的中文回复\",\"proposal\":null,\"task_action\":null,\"profile_update\":null}}。\n\
+                     - 仅当用户当前消息明确要求把任务委派给某个参与者时，设置 proposal: {{\"owner\":\"接收人ID\",\"summary\":\"直接从用户当前消息原样截取的任务摘要子串\"}}；\n\
+                     - 若存在 task_context 且用户在操作该任务，可设置 task_action: {{\"action\":\"accept|revise|deliver|approve|return\",\"instruction\":\"可选修订说明\"}}。",
+                    request
+                        .task_context
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                    request.task_role.unwrap_or("none"),
+                    request
+                        .owner_context
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                    request
+                        .profile_context
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                )
+            }
+        };
+        let mut messages = vec![serde_json::json!({
+            "role": "system",
+            "content": sys_prompt,
+        })];
+        for m in request.history.iter().take(60) {
+            messages.push(serde_json::json!({
+                "role": if m.role == "user" { "user" } else { "assistant" },
+                "content": m.content,
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": request.message,
+        }));
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+        });
+        let resp = self
+            .client
+            .post(self.url)
+            .bearer_auth(self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|_| adapter_failed())?;
+        if !resp.status().is_success() {
+            return Err(adapter_failed());
+        }
+        let val: serde_json::Value = resp.json().await.map_err(|_| adapter_failed())?;
+        let raw_content = val["choices"]
+            .get(0)
+            .and_then(|c| c["message"]["content"].as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(adapter_failed)?;
+        Ok(parse_openai_content_to_adapter_reply(raw_content))
+    }
+}
+
+pub(crate) fn parse_openai_content_to_adapter_reply(raw_content: &str) -> AdapterReply {
+    let trimmed = raw_content.trim();
+    if let (Some(s), Some(e)) = (trimmed.find('{'), trimmed.rfind('}')) {
+        if let Ok(mut obj) = serde_json::from_str::<serde_json::Value>(&trimmed[s..=e]) {
+            if obj.is_object() && obj.get("reply").and_then(|r| r.as_str()).is_some() {
+                obj["backend"] = serde_json::json!("dsh");
+                if obj.get("proposal").is_none() {
+                    obj["proposal"] = serde_json::Value::Null;
+                }
+                if let Ok(parsed) = serde_json::from_value::<AdapterReply>(obj) {
+                    return parsed;
+                }
+            }
+        }
+    }
+    let clean_reply: String = trimmed.chars().take(7800).collect();
+    AdapterReply {
+        reply: clean_reply,
+        backend: "dsh".into(),
+        proposal: None,
+        task_action: None,
+        profile_update: None,
     }
 }
 

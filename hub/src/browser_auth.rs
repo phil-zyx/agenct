@@ -97,6 +97,13 @@ pub struct BrowserAuth {
     client_id: String,
     subjects: HashMap<String, String>,
     store: Arc<Mutex<Store>>,
+    db: Arc<Mutex<Option<Arc<Mutex<rusqlite::Connection>>>>>,
+}
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 fn bad() -> Error {
     Error(StatusCode::UNAUTHORIZED, "browser authentication failed")
@@ -368,7 +375,52 @@ impl BrowserAuth {
             client_id: config.client_id,
             subjects: config.subjects,
             store: Arc::new(Mutex::new(Store::default())),
+            db: Arc::new(Mutex::new(None)),
         })
+    }
+    pub(crate) fn attach_db(&self, conn: Arc<Mutex<rusqlite::Connection>>) {
+        if let Ok(mut slot) = self.db.lock() {
+            if slot.is_none() {
+                *slot = Some(conn);
+            }
+        }
+    }
+    fn load_db_session(&self, session_hash: &str) -> Option<Session> {
+        let conn = self.db.lock().ok()?.clone()?;
+        let db = conn.try_lock().ok()?;
+        let now = now_unix();
+        let _ = db.execute(
+            "DELETE FROM browser_sessions WHERE expires_unix <= ?1",
+            [now],
+        );
+        let row: (String, String, String, i64) = db
+            .query_row(
+                "SELECT binding_hash, owner, csrf, expires_unix
+                 FROM browser_sessions
+                 WHERE session_hash = ?1 AND expires_unix > ?2",
+                rusqlite::params![session_hash, now],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .ok()?;
+        let remaining = (row.3 - now).max(1) as u64;
+        Some(Session {
+            binding: row.0,
+            user: row.1,
+            csrf: row.2,
+            expires: Instant::now() + Duration::from_secs(remaining),
+        })
+    }
+    fn delete_db_session(&self, session_hash: &str) {
+        if let Ok(slot) = self.db.lock() {
+            if let Some(conn) = slot.as_ref() {
+                if let Ok(db) = conn.try_lock() {
+                    let _ = db.execute(
+                        "DELETE FROM browser_sessions WHERE session_hash = ?1",
+                        [session_hash],
+                    );
+                }
+            }
+        }
     }
     pub(crate) fn has_user(&self, user: &str) -> bool {
         self.subjects.values().any(|id| id == user)
@@ -381,14 +433,43 @@ impl BrowserAuth {
         if let Ok(mut store) = self.store.lock() {
             store.sessions.retain(|_, session| session.user != user);
         }
+        if let Ok(slot) = self.db.lock() {
+            if let Some(conn) = slot.as_ref() {
+                if let Ok(db) = conn.try_lock() {
+                    let _ = db.execute("DELETE FROM browser_sessions WHERE owner = ?1", [user]);
+                }
+            }
+        }
     }
     fn session(&self, headers: &HeaderMap) -> Option<Session> {
         let value = read_cookie(headers, self.cookie_name(SESSION_COOKIE))?;
+        let key = hash(&value);
         let mut store = self.store.lock().ok()?;
+        if let Some(existing) = store.sessions.get(&key) {
+            if existing.expires <= Instant::now() {
+                store.sessions.remove(&key);
+                self.delete_db_session(&key);
+                store
+                    .sessions
+                    .retain(|_, session| session.expires > Instant::now());
+                return None;
+            }
+            let found = existing.clone();
+            store
+                .sessions
+                .retain(|_, session| session.expires > Instant::now());
+            return Some(found);
+        }
         store
             .sessions
             .retain(|_, session| session.expires > Instant::now());
-        store.sessions.get(&hash(&value)).cloned()
+        if let Some(restored) = self.load_db_session(&key) {
+            if store.sessions.len() < MAX_ENTRIES {
+                store.sessions.insert(key, restored.clone());
+            }
+            return Some(restored);
+        }
+        None
     }
     pub(crate) fn identity(&self, headers: &HeaderMap) -> Result<String, Error> {
         if headers.contains_key(header::AUTHORIZATION) {
@@ -428,6 +509,7 @@ pub(crate) async fn guard(
     next: Next,
 ) -> Response {
     if let Some(auth) = &h.browser_auth {
+        auth.attach_db(h.db.clone());
         if request.headers().get_all(header::HOST).iter().count() != 1
             || request
                 .headers()
@@ -444,6 +526,7 @@ pub(crate) async fn guard(
         }
         if !request.uri().path().starts_with("/node/v1/")
             && request.uri().path() != "/webhooks/gitlab"
+            && request.uri().path() != "/webhooks/im"
             && !matches!(
                 *request.method(),
                 axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
@@ -476,6 +559,7 @@ pub(crate) async fn session(State(h): State<Hub>, headers: HeaderMap) -> Json<se
     let Some(ref auth) = h.browser_auth else {
         return Json(serde_json::json!({"enabled":false}));
     };
+    auth.attach_db(h.db.clone());
     match auth.session(&headers) {
         Some(s) => Json(
             serde_json::json!({"enabled":true,"authenticated":true,"user":s.user,"csrf_token":s.csrf,"member_status":h.member(&s.user).ok().map(|m|m.status),"open_signup":auth.gitlab_auto_signup}),
@@ -485,6 +569,7 @@ pub(crate) async fn session(State(h): State<Hub>, headers: HeaderMap) -> Json<se
 }
 pub(crate) async fn login(State(h): State<Hub>, headers: HeaderMap) -> Result<Response, Error> {
     let auth = h.browser_auth.ok_or_else(bad)?;
+    auth.attach_db(h.db.clone());
     if auth.session(&headers).is_some() {
         return Err(Error(
             StatusCode::CONFLICT,
@@ -774,26 +859,51 @@ async fn callback_inner(
             "session capacity reached",
         ));
     }
-    if let Some(old) = read_cookie(&headers, auth.cookie_name(SESSION_COOKIE)) {
-        store.sessions.remove(&hash(&old));
+    let old_cookie_hash =
+        read_cookie(&headers, auth.cookie_name(SESSION_COOKIE)).map(|old| hash(&old));
+    if let Some(ref old_hash) = old_cookie_hash {
+        store.sessions.remove(old_hash);
     }
     if auth.gitlab_auto_signup {
         h.provision_gitlab_user(&auth.issuer, &user)?;
     }
-    if let Some(name) = display_name {
-        if !name.trim().is_empty() && name.len() <= 96 && !name.chars().any(char::is_control) {
-            h.db()?.execute(
-                "INSERT OR IGNORE INTO member_profiles(owner,display_name) VALUES (?1,?2)",
-                rusqlite::params![user, name.trim()],
-            )?;
+    let session_hash = hash(&session);
+    let binding_hash = hash(&binding);
+    let csrf = random();
+    let expires_unix = now_unix() + lifetime;
+    auth.attach_db(h.db.clone());
+    {
+        let db = h.db()?;
+        if let Some(name) = display_name {
+            if !name.trim().is_empty() && name.len() <= 96 && !name.chars().any(char::is_control) {
+                db.execute(
+                    "INSERT OR IGNORE INTO member_profiles(owner,display_name) VALUES (?1,?2)",
+                    rusqlite::params![user, name.trim()],
+                )?;
+            }
         }
+        let _ = db.execute(
+            "DELETE FROM browser_sessions WHERE expires_unix <= ?1",
+            [now_unix()],
+        );
+        if let Some(ref old_hash) = old_cookie_hash {
+            let _ = db.execute(
+                "DELETE FROM browser_sessions WHERE session_hash = ?1",
+                [old_hash],
+            );
+        }
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO browser_sessions(session_hash, binding_hash, owner, csrf, expires_unix)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![session_hash, binding_hash, user, csrf, expires_unix],
+        );
     }
     store.sessions.insert(
-        hash(&session),
+        session_hash,
         Session {
-            binding: hash(&binding),
+            binding: binding_hash,
             user,
-            csrf: random(),
+            csrf,
             expires: Instant::now() + Duration::from_secs(lifetime as u64),
         },
     );
@@ -809,22 +919,30 @@ async fn callback_inner(
     Ok(response)
 }
 pub(crate) async fn logout(State(h): State<Hub>, headers: HeaderMap) -> Result<Response, Error> {
-    let auth = h.browser_auth.ok_or_else(bad)?;
+    let auth = h.browser_auth.clone().ok_or_else(bad)?;
+    auth.attach_db(h.db.clone());
     if !auth.mutation_allowed(&headers) {
         return Err(bad());
     }
     let mut store = auth.store.lock().map_err(|_| bad())?;
-    if let Some(value) = read_cookie(&headers, auth.cookie_name(SESSION_COOKIE)) {
-        store.sessions.remove(&hash(&value));
+    let session_cookie_hash =
+        read_cookie(&headers, auth.cookie_name(SESSION_COOKIE)).map(|v| hash(&v));
+    let login_cookie_hash = read_cookie(&headers, auth.cookie_name(LOGIN_COOKIE)).map(|v| hash(&v));
+    if let Some(ref sh) = session_cookie_hash {
+        store.sessions.remove(sh);
     }
-    if let Some(value) = read_cookie(&headers, auth.cookie_name(LOGIN_COOKIE)) {
-        store.bindings.remove(&hash(&value));
-        store
-            .sessions
-            .retain(|_, session| session.binding != hash(&value));
-        store
-            .pending
-            .retain(|_, pending| pending.binding != hash(&value));
+    if let Some(ref lh) = login_cookie_hash {
+        store.bindings.remove(lh);
+        store.sessions.retain(|_, session| &session.binding != lh);
+        store.pending.retain(|_, pending| &pending.binding != lh);
+    }
+    if let Ok(db) = h.db() {
+        if let Some(ref sh) = session_cookie_hash {
+            let _ = db.execute("DELETE FROM browser_sessions WHERE session_hash = ?1", [sh]);
+        }
+        if let Some(ref lh) = login_cookie_hash {
+            let _ = db.execute("DELETE FROM browser_sessions WHERE binding_hash = ?1", [lh]);
+        }
     }
     let mut response = StatusCode::NO_CONTENT.into_response();
     response.headers_mut().append(

@@ -38,12 +38,14 @@ function forgetAction(id) { if (pendingActions.delete(id)) saveActions(); }
 function taskChatVersion() {
   // Re-render when a fetched draft or an open editor changes, not only on API data.
   const nodeKey = typeof userNodes !== 'undefined' ? userNodes.map(n => n.id + ':' + (n.online ? 1 : 0)) : [];
-  return JSON.stringify([[...draftReceipts.keys()], [...deliveryEditors.keys()], [...pendingActions], [...deferredRevisions], nodeKey]);
+  const topicFilter = typeof activeMuseTopicId !== 'undefined' ? activeMuseTopicId : null;
+  return JSON.stringify([[...draftReceipts.keys()], [...deliveryEditors.keys()], [...pendingActions], [...deferredRevisions], nodeKey, topicFilter]);
 }
 
 function resetTaskChat({ preserveRecovery = false } = {}) {
   draftReceipts.clear(); draftReads.clear(); deliveryEditors.clear(); pendingActions.clear(); deferredRevisions.clear(); dismissedFocus.clear();
   actionsOwner = null;
+  if (typeof resetMuseTopicFilter === 'function') resetMuseTopicFilter();
   if (!preserveRecovery) { try { sessionStorage.removeItem(ACTIONS_KEY); } catch {} }
 }
 
@@ -386,6 +388,15 @@ function ownerWorking(context, task, card) {
       bar.append(el('p', 'note node-assign-status',
         `已分配给节点 ${assigned.node_name || assigned.node_id}（${assigned.node_id}）：${statusText}`
         + (assigned.instruction ? ` · 要求：${assigned.instruction}` : '')));
+      if (assigned.status === 'running' && assigned.progress && typeof assigned.progress === 'object') {
+        const elapsed = Number.isFinite(assigned.progress.elapsed_secs) && assigned.progress.elapsed_secs > 0
+          ? `（已运行 ${assigned.progress.elapsed_secs}s）` : '';
+        const stageText = assigned.progress.stage || '本机 Agent 正在执行…';
+        bar.append(el('p', 'note node-live-stage', `⚡ 实时进度${elapsed}：${stageText}`));
+        if (assigned.progress.log_tail) {
+          bar.append(el('pre', 'node-live-log', assigned.progress.log_tail));
+        }
+      }
     }
     if (nodes.length > 0) {
       const controls = el('div', 'node-assign-controls');

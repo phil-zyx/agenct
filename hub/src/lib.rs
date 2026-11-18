@@ -100,9 +100,54 @@ impl Config {
                 return Err("Non-loopback development bind requires an explicit private IP and browser authentication".into());
             }
         }
-        let users = serde_json::from_str(&std::env::var("AGENCT_USERS_JSON")?)?;
-        let runtime = match std::env::var("AGENCT_RUNTIME")?.as_str() {
+        let users: Vec<UserConfig> = match std::env::var("AGENCT_USERS_JSON") {
+            Ok(raw) => serde_json::from_str(&raw)?,
+            Err(_) if std::env::var("AGENCT_BOOTSTRAP").ok().as_deref() == Some("1") => {
+                let admin_token = format!("admin-bootstrap-{}", Uuid::new_v4().simple());
+                let bob_token = format!("bob-bootstrap-{}", Uuid::new_v4().simple());
+                eprintln!(
+                    "=== Agenct Zero-Config Bootstrap ===\n  Admin user: alice\n  Login token: {admin_token}\n  Colleague user: bob\n  Colleague token: {bob_token}\n===================================="
+                );
+                vec![
+                    UserConfig {
+                        id: "alice".into(),
+                        token_sha256: format!("{:x}", Sha256::digest(admin_token.as_bytes())),
+                    },
+                    UserConfig {
+                        id: "bob".into(),
+                        token_sha256: format!("{:x}", Sha256::digest(bob_token.as_bytes())),
+                    },
+                ]
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let runtime_mode = std::env::var("AGENCT_RUNTIME").unwrap_or_else(|_| {
+            if std::env::var("AGENCT_BOOTSTRAP").ok().as_deref() == Some("1") {
+                "mock".into()
+            } else {
+                String::new()
+            }
+        });
+        let runtime = match runtime_mode.as_str() {
             "mock" => Runtime::Mock,
+            "openai" | "llm" => {
+                let url = std::env::var("AGENCT_LLM_API_URL")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1/chat/completions".into());
+                let parsed = reqwest::Url::parse(&url)?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || !parsed.path().ends_with("/chat/completions")
+                {
+                    return Err(
+                        "AGENCT_LLM_API_URL must be an http(s) .../chat/completions endpoint"
+                            .into(),
+                    );
+                }
+                let token = std::env::var("AGENCT_LLM_API_KEY")
+                    .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                    .or_else(|_| std::env::var("DEEPSEEK_API_KEY"))
+                    .unwrap_or_else(|_| "ollama-local".into());
+                Runtime::Dsh { url, token }
+            }
             "dsh" => {
                 let url = std::env::var("AGENCT_ADAPTER_URL")?;
                 let parsed = reqwest::Url::parse(&url)?;
@@ -122,7 +167,7 @@ impl Config {
                 }
                 Runtime::Dsh { url, token }
             }
-            _ => return Err("Set AGENCT_RUNTIME explicitly to mock or dsh".into()),
+            _ => return Err("Set AGENCT_RUNTIME explicitly to mock, dsh, or openai".into()),
         };
         Ok(Self {
             bind,
@@ -161,6 +206,8 @@ pub struct Hub {
     automation_path: Option<PathBuf>,
     automation: Arc<Mutex<sagent::AutomationStore>>,
     automation_notify: Arc<tokio::sync::Notify>,
+    node_progress: Arc<Mutex<HashMap<String, nodes::NodeLiveProgress>>>,
+    turn_progress: Arc<Mutex<HashMap<(String, String), String>>>,
     /// Start the owner's private draft when a task enters `working`.
     auto_draft: bool,
     auto_draft_slots: Arc<tokio::sync::Semaphore>,
@@ -264,12 +311,13 @@ impl Hub {
                 .unwrap_or_else(|| std::path::Path::new("."))
                 .join("automation_state.json")
         });
-        let automation_store = sagent::load_automation(automation_path.as_deref());
         let mut db = Connection::open(config.database)?;
+        db.busy_timeout(Duration::from_millis(5000))?;
         // Reject newer databases before WAL mode, schema changes or recovery writes.
         schema::migrate(&mut db)?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         schema::recover(&mut db)?;
+        let automation_store = sagent::load_automation_merged(&db, automation_path.as_deref());
         for id in users.values() {
             db.execute(
                 "INSERT OR IGNORE INTO sessions(owner,session_id) VALUES (?1,?2)",
@@ -294,6 +342,8 @@ impl Hub {
             automation_path,
             automation: Arc::new(Mutex::new(automation_store)),
             automation_notify: Arc::new(tokio::sync::Notify::new()),
+            node_progress: Arc::new(Mutex::new(HashMap::new())),
+            turn_progress: Arc::new(Mutex::new(HashMap::new())),
             auto_draft: false,
             auto_draft_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             auto_draft_notify: Arc::new(tokio::sync::Notify::new()),
@@ -343,10 +393,9 @@ impl Hub {
         let auto_signup = config.gitlab_auto_signup;
         let issuer = config.issuer.clone();
         let subjects = config.subjects.clone();
-        self.browser_auth = Some(browser_auth::BrowserAuth::new(
-            config,
-            &self.directory.ids().collect(),
-        )?);
+        let auth = browser_auth::BrowserAuth::new(config, &self.directory.ids().collect())?;
+        auth.attach_db(self.db.clone());
+        self.browser_auth = Some(auth);
         if auto_signup {
             self.restore_gitlab_workspace(&issuer)?;
         } else {
@@ -376,6 +425,7 @@ impl Hub {
             )
         })?;
         if let Some(auth) = &self.browser_auth {
+            auth.attach_db(self.db.clone());
             return auth.identity(headers);
         }
         if headers.get_all("authorization").iter().count() != 1 {
@@ -527,6 +577,7 @@ pub fn app(mut hub: Hub) -> Router {
             get(messages::messages).post(chat_turns::chat),
         )
         .route("/api/turns/{id}", get(chat_turns::status))
+        .route("/api/turns/{id}/stream", get(chat_turns::stream_status))
         .route("/api/activity", get(activity::activity))
         .route(
             "/api/proposals",
@@ -580,6 +631,13 @@ pub fn app(mut hub: Hub) -> Router {
             get(sagent::get_gitlab_config).post(sagent::save_gitlab_config),
         )
         .route("/api/gitlab/sync", post(sagent::sync_gitlab_now))
+        .route(
+            "/api/im/config",
+            get(sagent::get_im_config).post(sagent::save_im_config),
+        )
+        .route("/api/im/test", post(sagent::test_im_webhook))
+        .route("/api/webhooks/im", post(sagent::im_webhook))
+        .route("/webhooks/im", post(sagent::im_webhook))
         .route(
             "/api/tasks/{id}/worker",
             get(worker_api::status).post(worker_api::enqueue),

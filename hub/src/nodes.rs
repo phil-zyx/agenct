@@ -39,6 +39,46 @@ CREATE TABLE IF NOT EXISTS node_assignments (
     FOREIGN KEY(owner, node_id) REFERENCES user_nodes(owner, id) ON DELETE CASCADE
 );";
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct NodeLiveProgress {
+    pub node_id: String,
+    pub task_revision: i64,
+    pub stage: String,
+    pub log_tail: String,
+    pub elapsed_secs: u64,
+    pub updated_at: i64,
+}
+
+pub(crate) fn clear_live_progress(h: &Hub, task_id: &str) {
+    if let Ok(mut guard) = h.node_progress.lock() {
+        guard.remove(task_id);
+    }
+}
+
+pub(crate) fn attach_live_progress(
+    h: &Hub,
+    task_id: &str,
+    task_revision: i64,
+    assigned: &mut Value,
+) {
+    if assigned["status"] != "running" {
+        return;
+    }
+    if let Ok(guard) = h.node_progress.lock() {
+        if let Some(p) = guard
+            .get(task_id)
+            .filter(|p| p.task_revision == task_revision)
+        {
+            assigned["progress"] = json!({
+                "stage": p.stage,
+                "log_tail": p.log_tail,
+                "elapsed_secs": p.elapsed_secs,
+                "updated_at": p.updated_at,
+            });
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CreateNode {
@@ -836,6 +876,11 @@ fn classify_chat_topic(
         ]
         .iter()
         .any(|cue| trimmed.starts_with(cue));
+        if let Some((id, summary, status, revision)) =
+            crate::sagent::match_existing_self_topic(db, owner, trimmed)?
+        {
+            return Ok((Some((id, status, revision)), summary));
+        }
         if is_followup {
             if let Some((id, summary, status, revision)) = db
                 .query_row(
@@ -1506,6 +1551,7 @@ pub(super) async fn assign_task(
             params![task_id, owner],
         )?;
         tx.commit()?;
+        clear_live_progress(&h, &task_id);
         return Ok(Json(json!({ "assigned": Value::Null })));
     };
     let node_exists: bool = tx.query_row(
@@ -1539,6 +1585,7 @@ pub(super) async fn assign_task(
     )?;
     let assigned = task_assignment(&tx, &owner, &task_id, revision)?;
     tx.commit()?;
+    clear_live_progress(&h, &task_id);
     Ok(Json(json!({ "assigned": assigned })))
 }
 
@@ -1767,6 +1814,12 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
 pub(super) struct RenewLease {
     lease_token: String,
     expected_revision: i64,
+    #[serde(default)]
+    stage: String,
+    #[serde(default)]
+    log_tail: String,
+    #[serde(default)]
+    elapsed_secs: u64,
 }
 
 pub(super) async fn renew_lease(
@@ -1781,10 +1834,43 @@ pub(super) async fn renew_lease(
     let now = now_unix();
     let changed=db.execute("UPDATE node_assignments SET lease_until=?6 WHERE task_id=?1 AND owner=?2 AND node_id=?3 AND lease_hash=?4 AND task_revision=?5 AND status='running' AND lease_until>?7 AND EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND status='working' AND revision=?5)", params![task_id,owner,node_id,hash_token(&input.lease_token),input.expected_revision,now+120,now])?;
     if changed != 1 {
+        clear_live_progress(&h, &task_id);
         return Err(Error(
             StatusCode::CONFLICT,
             "node execution lease is no longer valid",
         ));
+    }
+    if !input.stage.trim().is_empty() || !input.log_tail.trim().is_empty() {
+        let clean_stage: String = input
+            .stage
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(120)
+            .collect();
+        let clean_tail: String = input
+            .log_tail
+            .trim()
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .take(500)
+            .collect();
+        if let Ok(mut guard) = h.node_progress.lock() {
+            if guard.len() >= 256 && !guard.contains_key(&task_id) {
+                guard.clear();
+            }
+            guard.insert(
+                task_id,
+                NodeLiveProgress {
+                    node_id,
+                    task_revision: input.expected_revision,
+                    stage: clean_stage,
+                    log_tail: clean_tail,
+                    elapsed_secs: input.elapsed_secs.min(86400),
+                    updated_at: now,
+                },
+            );
+        }
     }
     Ok(Json(json!({"lease_until":now+120})))
 }
@@ -1935,6 +2021,7 @@ pub(super) async fn submit_draft(
             )?;
         }
         tx.commit()?;
+        clear_live_progress(&h, &task_id);
         return Ok(Json(json!({ "status": "failed" })));
     }
     let mut attachment_markers = Vec::new();
@@ -2101,6 +2188,7 @@ pub(super) async fn submit_draft(
     }
     tx.commit()?;
     drop(db);
+    clear_live_progress(&h, &task_id);
     if requester == owner {
         crate::sagent::notify_gitlab_task_completed(&h, &task_id, &node_name, &final_content);
     }
@@ -2209,11 +2297,37 @@ EOF
 printf 'export AGENCT_NODE_TOKEN=%s\n' "'$TOKEN'" >> "$START_SH"
 printf 'export AGENCT_HUB=%s\n' "'$HUB'" >> "$START_SH"
 cat >> "$START_SH" <<'EOF'
+case "${1:-}" in
+  daemon)
+    shift
+    exec python3 "$DIR/agenct-node.py" --hub "$AGENCT_HUB" --daemon "$@"
+    ;;
+  status)
+    if [ -f "$DIR/node.pid" ] && kill -0 "$(cat "$DIR/node.pid")" 2>/dev/null; then
+      echo "Agenct 节点正在后台运行 (PID: $(cat "$DIR/node.pid"))"
+      exit 0
+    else
+      echo "Agenct 节点未在后台运行"
+      exit 1
+    fi
+    ;;
+  logs)
+    exec tail -n 50 -f "$DIR/node.log"
+    ;;
+  stop)
+    if [ -f "$DIR/node.pid" ]; then
+      kill "$(cat "$DIR/node.pid")" 2>/dev/null || true
+      rm -f "$DIR/node.pid"
+      echo "已停止后台节点"
+    fi
+    exit 0
+    ;;
+esac
 exec python3 "$DIR/agenct-node.py" --hub "$AGENCT_HUB" "$@"
 EOF
 chmod 700 "$START_SH"
 
-echo "已保存启动脚本: $START_SH（以后可直接运行重连）"
+echo "已保存启动脚本: $START_SH（支持: $START_SH daemon | status | logs | stop）"
 exec "$START_SH" "$@"
 "##;
 

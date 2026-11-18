@@ -80,6 +80,39 @@ pub(crate) struct GitLabReplyTarget {
     pub noteable_iid: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ImWebhookConfig {
+    #[serde(default = "default_im_provider")]
+    pub provider: String, // "feishu" | "wecom" | "dingtalk" | "generic"
+    #[serde(default)]
+    pub webhook_url: String,
+    #[serde(default = "default_true")]
+    pub notify_takeover: bool,
+    #[serde(default = "default_true")]
+    pub notify_delegation: bool,
+    #[serde(default = "default_true")]
+    pub notify_delivery: bool,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_im_provider() -> String {
+    "feishu".to_owned()
+}
+
+impl Default for ImWebhookConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_im_provider(),
+            webhook_url: String::new(),
+            notify_takeover: true,
+            notify_delegation: true,
+            notify_delivery: true,
+            updated_at: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct AutomationStore {
     #[serde(default)]
@@ -92,19 +125,47 @@ pub(crate) struct AutomationStore {
     pub gitlab_configs: HashMap<String, GitLabUserConfig>,
     #[serde(default)]
     pub gitlab_targets: HashMap<String, GitLabReplyTarget>,
+    #[serde(default)]
+    pub im_configs: HashMap<String, ImWebhookConfig>,
 }
 
-pub(crate) fn load_automation(path: Option<&Path>) -> AutomationStore {
-    let Some(path) = path else {
-        return AutomationStore::default();
+pub(crate) fn persist_automation_db(db: &Connection, store: &AutomationStore) {
+    if let Ok(state_json) = serde_json::to_string(store) {
+        let _ = db.execute(
+            "INSERT OR REPLACE INTO automation_state(id, state_json, updated_at)
+             VALUES (1, ?1, ?2)",
+            params![state_json, nodes::now_unix()],
+        );
+    }
+}
+
+pub(crate) fn load_automation_merged(db: &Connection, path: Option<&Path>) -> AutomationStore {
+    let from_db: Option<AutomationStore> = db
+        .query_row(
+            "SELECT state_json FROM automation_state WHERE id = 1",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .and_then(|raw| serde_json::from_str(&raw).ok());
+    let from_file: Option<AutomationStore> = path
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let store = match (from_file, from_db) {
+        (Some(file_store), _) => file_store,
+        (None, Some(db_store)) => db_store,
+        (None, None) => AutomationStore::default(),
     };
-    let Ok(bytes) = std::fs::read(path) else {
-        return AutomationStore::default();
-    };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    persist_automation_db(db, &store);
+    store
 }
 
 fn persist_automation(h: &Hub, store: &AutomationStore) {
+    if let Ok(db) = h.db.try_lock() {
+        persist_automation_db(&db, store);
+    }
     let Some(path) = &h.automation_path else {
         return;
     };
@@ -151,6 +212,49 @@ pub(crate) fn match_dispatch_rule(h: &Hub, owner: &str, message: &str) -> Option
         .cloned()
 }
 
+fn semantic_synonyms(term: &str) -> &'static [&'static str] {
+    match term {
+        "前端" | "ui" | "页面" | "界面" => &[
+            "前端", "ui", "页面", "界面", "样式", "组件", "css", "布局", "按钮", "弹窗",
+        ],
+        "后端" | "服务端" | "接口" | "api" => {
+            &["后端", "服务端", "接口", "api", "rust", "hub", "路由"]
+        }
+        "数据库" | "db" | "sql" => &[
+            "数据库",
+            "db",
+            "sql",
+            "sqlite",
+            "postgres",
+            "mysql",
+            "表结构",
+            "迁移",
+        ],
+        "生产" | "线上" | "prod" => &[
+            "生产",
+            "线上",
+            "prod",
+            "production",
+            "正式环境",
+            "主干",
+            "master",
+        ],
+        "生产数据库" => &[
+            "生产数据库",
+            "线上数据库",
+            "正式库",
+            "生产库",
+            "prod db",
+            "删库",
+            "drop table",
+        ],
+        "合同" | "报价" | "商务" => &[
+            "合同", "报价", "商务", "法务", "打款", "付款", "采购", "协议",
+        ],
+        _ => &[],
+    }
+}
+
 fn rule_keyword_matches(rule_kw: &str, text: &str) -> bool {
     let kw = rule_kw.trim();
     if kw.is_empty() {
@@ -163,7 +267,583 @@ fn rule_keyword_matches(rule_kw: &str, text: &str) -> bool {
     kw.split(['/', '、', '或', ',', '，', '|'])
         .map(str::trim)
         .filter(|part| !part.is_empty())
-        .any(|part| lower.contains(&part.to_ascii_lowercase()))
+        .any(|part| {
+            let p_low = part.to_ascii_lowercase();
+            if lower.contains(&p_low) {
+                return true;
+            }
+            semantic_synonyms(&p_low)
+                .iter()
+                .any(|syn| lower.contains(syn))
+        })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct ResolvedTaskContext {
+    pub task_id: String,
+    pub requester: String,
+    pub owner: String,
+    pub summary: String,
+    pub status: String,
+    pub revision: i64,
+    pub is_topic: bool,
+    pub score: i64,
+    pub stage: &'static str,
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF)
+}
+
+pub(crate) fn extract_semantic_tokens(text: &str) -> HashSet<String> {
+    const STOP_ASCII: &[&str] = &[
+        "http", "https", "the", "and", "for", "with", "from", "that", "this", "att", "png", "jpg",
+    ];
+    const STOP_CJK_BIGRAMS: &[&str] = &[
+        "帮我", "请问", "一下", "这个", "那个", "什么", "怎么", "可以", "需要", "我们", "你们",
+        "现在", "已经", "如果", "或者", "任务", "管家", "处理", "看看", "看下", "查下", "刚才",
+        "这里", "那里", "还是", "以及", "一个", "一些", "进行", "确认", "通过", "补充", "退回",
+    ];
+    let mut tokens = HashSet::new();
+    let lower = text.to_ascii_lowercase();
+    let mut ascii_buf = String::new();
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            ascii_buf.push(ch);
+        } else {
+            let word = ascii_buf.trim_matches(['_', '-']);
+            if word.len() >= 2 && !STOP_ASCII.contains(&word) {
+                tokens.insert(word.to_owned());
+                for &syn in semantic_synonyms(word) {
+                    tokens.insert(syn.to_owned());
+                }
+            }
+            ascii_buf.clear();
+        }
+    }
+    let word = ascii_buf.trim_matches(['_', '-']);
+    if word.len() >= 2 && !STOP_ASCII.contains(&word) {
+        tokens.insert(word.to_owned());
+        for &syn in semantic_synonyms(word) {
+            tokens.insert(syn.to_owned());
+        }
+    }
+
+    let cjk_chars: Vec<char> = text.chars().collect();
+    let mut idx = 0;
+    while idx < cjk_chars.len() {
+        if is_cjk(cjk_chars[idx]) {
+            let start = idx;
+            while idx < cjk_chars.len() && is_cjk(cjk_chars[idx]) {
+                idx += 1;
+            }
+            let seg = &cjk_chars[start..idx];
+            for win in seg.windows(2) {
+                let bg: String = win.iter().collect();
+                if !STOP_CJK_BIGRAMS.contains(&bg.as_str()) {
+                    for &syn in semantic_synonyms(&bg) {
+                        tokens.insert(syn.to_owned());
+                    }
+                    tokens.insert(bg);
+                }
+            }
+        } else {
+            idx += 1;
+        }
+    }
+    tokens
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_historical_task(
+    db: &Connection,
+    user: &str,
+    message: &str,
+    msg_tokens: &HashSet<String>,
+    rank_idx: usize,
+    task_id: &str,
+    requester: &str,
+    owner: &str,
+    summary: &str,
+    status: &str,
+    result: Option<&str>,
+) -> i64 {
+    let msg_lower = message.to_ascii_lowercase();
+    let mut raw_score: i64 = 0;
+
+    let sid = short_id(task_id).to_ascii_lowercase();
+    if sid.len() >= 6 && msg_lower.contains(&sid) {
+        raw_score += 120;
+    }
+
+    if requester != owner {
+        let counterpart = if owner == user { requester } else { owner };
+        if nodes::contains_alias(message, counterpart) {
+            raw_score += 45;
+        } else {
+            let disp = member_display_name(db, counterpart);
+            if !disp.is_empty() && message.contains(&disp) {
+                raw_score += 45;
+            }
+        }
+    }
+
+    if let Ok(Some((node_id, node_name))) = db
+        .query_row(
+            "SELECT a.node_id, COALESCE(u.name, a.node_id)
+             FROM node_assignments a
+             LEFT JOIN user_nodes u ON u.owner=a.owner AND u.id=a.node_id
+             WHERE a.task_id=?1 LIMIT 1",
+            [task_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+    {
+        if nodes::contains_alias(message, &node_id)
+            || (!node_name.is_empty() && nodes::contains_alias(message, &node_name))
+        {
+            raw_score += 35;
+        }
+    }
+
+    let summary_tokens = extract_semantic_tokens(summary);
+    let mut summary_hits = 0i64;
+    let mut matched_in_summary = HashSet::new();
+    for tok in msg_tokens {
+        if summary_tokens.contains(tok) {
+            summary_hits += 1;
+            matched_in_summary.insert(tok.as_str());
+        }
+    }
+    raw_score += (summary_hits * 16).min(80);
+
+    let details_text: String = db
+        .query_row(
+            "SELECT content FROM task_details WHERE task_id=?1",
+            [task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let mut history_blob = details_text;
+    if let Some(res) = result {
+        history_blob.push('\n');
+        history_blob.push_str(res);
+    }
+    if let Ok(mut stmt) = db.prepare(
+        "SELECT content, COALESCE((SELECT json_extract(t.response, '$.draft.instruction') FROM draft_turns t WHERE t.draft_id = deliveries.source_draft_id), '')
+         FROM deliveries WHERE task_id=?1 ORDER BY seq DESC LIMIT 3",
+    ) {
+        if let Ok(rows) = stmt.query_map([task_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+            for (ans, ask) in rows.flatten() {
+                history_blob.push('\n');
+                history_blob.push_str(&ask);
+                history_blob.push('\n');
+                history_blob.push_str(&ans);
+            }
+        }
+    }
+    if !history_blob.is_empty() {
+        let hist_tokens = extract_semantic_tokens(&history_blob);
+        let mut hist_hits = 0i64;
+        for tok in msg_tokens {
+            if !matched_in_summary.contains(tok.as_str()) && hist_tokens.contains(tok) {
+                hist_hits += 1;
+            }
+        }
+        raw_score += (hist_hits * 8).min(40);
+    }
+
+    if raw_score > 0 {
+        if matches!(
+            status,
+            "working" | "awaiting_owner" | "ready_for_acceptance"
+        ) {
+            raw_score += 10;
+        }
+        raw_score += match rank_idx {
+            0 => 8,
+            1 => 5,
+            2 => 3,
+            3..=5 => 1,
+            _ => 0,
+        };
+    }
+    raw_score
+}
+
+pub(crate) fn match_existing_self_topic(
+    db: &Connection,
+    owner: &str,
+    question: &str,
+) -> Result<Option<(String, String, String, i64)>> {
+    let msg_tokens = extract_semantic_tokens(question);
+    if msg_tokens.is_empty() {
+        return Ok(None);
+    }
+    let mut stmt = db.prepare(
+        "SELECT id, summary, status, result, revision
+         FROM tasks
+         WHERE requester=?1 AND owner=?1
+           AND (summary LIKE '📁 %' OR summary LIKE '🖥️ %' OR summary LIKE '💬 %' OR summary LIKE '🦊 %' OR summary LIKE '⏰ %')
+         ORDER BY rowid DESC LIMIT 30",
+    )?;
+    let rows = stmt
+        .query_map([owner], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut best: Option<(i64, String, String, String, i64)> = None;
+    for (idx, (id, summary, status, result, rev)) in rows.into_iter().enumerate() {
+        let sc = score_historical_task(
+            db,
+            owner,
+            question,
+            &msg_tokens,
+            idx,
+            &id,
+            owner,
+            owner,
+            &summary,
+            &status,
+            result.as_deref(),
+        );
+        if sc >= 30 && best.as_ref().is_none_or(|b| sc > b.0) {
+            best = Some((sc, id, summary, status, rev));
+        }
+    }
+    Ok(best.map(|(_, id, summary, status, rev)| (id, summary, status, rev)))
+}
+
+pub(crate) async fn resolve_historical_task_context(
+    h: &Hub,
+    user: &str,
+    message: &str,
+    explicit_selected: Option<&crate::task_context::Selection>,
+    status_filter: Option<&str>,
+) -> Result<Option<ResolvedTaskContext>> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let msg_tokens = extract_semantic_tokens(trimmed);
+    let is_continuity_cue = [
+        "那",
+        "再",
+        "它",
+        "这个",
+        "刚才",
+        "继续",
+        "还有",
+        "顺便",
+        "为什么",
+        "怎么",
+        "然后",
+        "接着",
+    ]
+    .iter()
+    .any(|cue| trimmed.starts_with(cue));
+
+    let (explicit_match, scored_candidates) = {
+        let db = h.db()?;
+        if let Some(sel) = explicit_selected {
+            let row = db
+                .query_row(
+                    "SELECT id, requester, owner, summary, status, revision
+                     FROM tasks WHERE id=?1 AND (requester=?2 OR owner=?2)",
+                    params![sel.task_id, user],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, String>(4)?,
+                            r.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            if let Some((id, req, own, sum, st, rev)) = row {
+                if status_filter.is_none_or(|want| want == st) {
+                    return Ok(Some(ResolvedTaskContext {
+                        is_topic: req == own,
+                        task_id: id,
+                        requester: req,
+                        owner: own,
+                        summary: sum,
+                        status: st,
+                        revision: rev,
+                        score: 100,
+                        stage: "explicit",
+                    }));
+                }
+            }
+        }
+
+        let mut stmt = db.prepare(
+            "SELECT id, requester, owner, summary, status, result, revision
+             FROM tasks
+             WHERE requester=?1 OR owner=?1
+             ORDER BY rowid DESC LIMIT 60",
+        )?;
+        let rows = stmt
+            .query_map([user], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, i64>(6)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut candidates: Vec<ResolvedTaskContext> = Vec::new();
+        for (idx, (id, req, own, sum, st, res, rev)) in rows.into_iter().enumerate() {
+            if status_filter.is_some_and(|want| want != st) {
+                continue;
+            }
+            let sc = score_historical_task(
+                &db,
+                user,
+                trimmed,
+                &msg_tokens,
+                idx,
+                &id,
+                &req,
+                &own,
+                &sum,
+                &st,
+                res.as_deref(),
+            );
+            candidates.push(ResolvedTaskContext {
+                is_topic: req == own,
+                task_id: id,
+                requester: req,
+                owner: own,
+                summary: sum,
+                status: st,
+                revision: rev,
+                score: sc,
+                stage: "stage2_feature",
+            });
+        }
+        (None::<ResolvedTaskContext>, candidates)
+    };
+    if explicit_match.is_some() {
+        return Ok(explicit_match);
+    }
+    if scored_candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ranked = scored_candidates.clone();
+    ranked.sort_by(|a, b| b.score.cmp(&a.score));
+    let top = &ranked[0];
+    let second_score = ranked.get(1).map_or(0, |c| c.score);
+
+    // Stage 1: Direct short ID match
+    if top.score >= 100 {
+        let mut out = top.clone();
+        out.stage = "stage1_short_id";
+        return Ok(Some(out));
+    }
+
+    // Stage 2: High-confidence multi-dimensional feature + time-decay score
+    if top.score >= 24 && (top.score >= second_score + 5 || top.score >= 40) {
+        return Ok(Some(top.clone()));
+    }
+
+    // Stage 1B: Follow-up continuity cue ("那...", "继续...", "为什么...") when no other task strongly conflicts
+    if is_continuity_cue && top.score < 24 {
+        if let Some(recent_active) = scored_candidates.iter().find(|c| {
+            matches!(
+                c.status.as_str(),
+                "working" | "awaiting_owner" | "ready_for_acceptance"
+            ) || c.is_topic
+        }) {
+            let mut out = recent_active.clone();
+            out.stage = "stage1_continuity";
+            out.score = out.score.max(25);
+            return Ok(Some(out));
+        }
+    }
+
+    // Stage 3: DSH Model semantic disambiguation when 2+ historical tasks are tied in the ambiguous band
+    if let crate::Runtime::Dsh { url, token } = &h.runtime {
+        if ranked.len() >= 2 && top.score >= 16 && top.score - second_score <= 4 {
+            let top_list: Vec<String> = ranked
+                .iter()
+                .take(5)
+                .map(|c| format!("- `{}` [{}]：{}", c.task_id, c.status, c.summary))
+                .collect();
+            let prompt = format!(
+                "你是用户的 Super-Agent 历史上下文归类器（Context Router）。请判断用户的最新输入是否属于下列某个历史任务上下文：\n\n\
+                 【候选历史任务上下文】\n{}\n\n\
+                 【用户最新输入】\n「{trimmed}」\n\n\
+                 请只输出一行严格合法的 JSON（不要代码块）：\n\
+                 - 若属于某个候选上下文：`{{\"task_id\":\"匹配的完整task_id\"}}`\n\
+                 - 若是全新话题或无关：`{{\"task_id\":null}}`",
+                top_list.join("\n")
+            );
+            let runtime_profile = {
+                let db = h.db()?;
+                crate::profiles::route(&db, user, None, None)?
+            };
+            let dsh = crate::runtime::DshRuntime {
+                client: &h.client,
+                url,
+                token,
+            };
+            let sid = Uuid::new_v4().to_string();
+            if let Ok(ans) = crate::runtime::Runtime::turn(
+                &dsh,
+                crate::runtime::TurnRequest {
+                    kind: crate::runtime::TurnKind::Chat,
+                    message: &prompt,
+                    session_id: &sid,
+                    history: &[],
+                    profile: &runtime_profile,
+                    task_context: None,
+                    draft_revision: None,
+                    task_role: None,
+                    owner_context: None,
+                    profile_context: None,
+                },
+            )
+            .await
+            {
+                let raw = ans.reply.trim();
+                if let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) {
+                    if let Ok(val) = serde_json::from_str::<Value>(&raw[s..=e]) {
+                        if let Some(tid) = val["task_id"].as_str() {
+                            if let Some(found) =
+                                scored_candidates.into_iter().find(|c| c.task_id == tid)
+                            {
+                                let mut out = found;
+                                out.stage = "stage3_dsh";
+                                out.score = out.score.max(30);
+                                return Ok(Some(out));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+pub(crate) fn format_routed_context_memory(
+    db: &Connection,
+    ctx: &ResolvedTaskContext,
+) -> Result<String> {
+    let mut lines = vec![format!(
+        "[Automatic Historical Task Context Routing: stage={}, task_id={}, status={}, title=\"{}\"]",
+        ctx.stage, ctx.task_id, ctx.status, ctx.summary
+    )];
+    if !ctx.is_topic {
+        lines.push(format!(
+            "Participants: requester={}, owner={}",
+            ctx.requester, ctx.owner
+        ));
+    }
+    if let Some(details) = db
+        .query_row(
+            "SELECT content FROM task_details WHERE task_id=?1",
+            [&ctx.task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        let excerpt: String = details.chars().take(1200).collect();
+        lines.push(format!("Shared details: {excerpt}"));
+    }
+    let turns = nodes::topic_turns(db, &ctx.task_id)?;
+    for turn in turns.iter().rev().take(3).rev() {
+        let seq = turn["seq"].as_i64().unwrap_or(1);
+        let q = turn["question"].as_str().unwrap_or("");
+        let a: String = turn["answer"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(600)
+            .collect();
+        if !q.is_empty() {
+            lines.push(format!("Turn #{seq} Q: {q}\nTurn #{seq} A: {a}"));
+        } else {
+            lines.push(format!("Turn #{seq}: {a}"));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+pub(crate) fn record_routed_topic_turn(
+    tx: &Connection,
+    ctx: &ResolvedTaskContext,
+    question: &str,
+    answer: &str,
+) -> Result<()> {
+    if !ctx.is_topic {
+        return Ok(());
+    }
+    let next_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM deliveries WHERE task_id=?1 AND status='submitted'",
+        [&ctx.task_id],
+        |r| r.get(0),
+    )?;
+    let draft_id = format!("topic-draft-{}", Uuid::new_v4());
+    let turn_req_id = format!("topic-turn-{}", Uuid::new_v4().simple());
+    let clean_q = nodes::truncate_bytes(question.trim(), 1000);
+    let clean_a = nodes::truncate_bytes(answer.trim(), 4000);
+    let response_json = json!({
+        "draft": {
+            "id": draft_id,
+            "seq": next_seq,
+            "instruction": clean_q,
+            "content": clean_a,
+        }
+    });
+    let _ = tx.execute(
+        "INSERT INTO draft_turns(owner,request_id,task_id,binding,status,draft_id,response)
+         VALUES (?1,?2,?3,?4,'complete',?5,?6)",
+        params![
+            ctx.owner,
+            turn_req_id,
+            ctx.task_id,
+            json!({"expected_revision": ctx.revision}).to_string(),
+            draft_id,
+            response_json.to_string()
+        ],
+    );
+    let _ = tx.execute(
+        "INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision,source_draft_id)
+         VALUES (?1,?2,?3,?4,?5,'submitted',?6,?7)",
+        params![
+            Uuid::new_v4().to_string(),
+            ctx.task_id,
+            next_seq,
+            ctx.owner,
+            clean_a,
+            ctx.revision,
+            draft_id
+        ],
+    );
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -180,7 +860,7 @@ pub(crate) fn evaluate_human_takeover_policy(
     text: &str,
 ) -> Option<HumanTakeoverReason> {
     let lower = text.to_ascii_lowercase();
-    // Layer 1A: Explicit request for the human owner
+    // Layer 1A: Explicit request for the human owner (including natural-language variations)
     if [
         "找你本人",
         "你本人",
@@ -191,9 +871,18 @@ pub(crate) fn evaluate_human_takeover_policy(
         "找本人",
         "本人回",
         "急事找你",
+        "别用机器人",
+        "不要机器人",
+        "别让ai",
+        "别让agent",
+        "不要自动回复",
+        "找活人",
+        "电话沟通",
+        "语音聊",
+        "当面聊",
     ]
     .iter()
-    .any(|cue| text.contains(cue))
+    .any(|cue| text.contains(cue) || lower.contains(cue))
     {
         return Some(HumanTakeoverReason {
             layer: "system-base",
@@ -207,14 +896,30 @@ pub(crate) fn evaluate_human_takeover_policy(
         "能不能发版",
         "几点发版",
         "几点上线",
+        "什么时候上线",
+        "今天能上线吗",
+        "今晚能发吗",
         "什么时候能好",
         "什么时候交付",
         "几点能好",
+        "多久能交",
+        "保证完成",
+        "立个军令状",
         "回滚生产",
         "删库",
         "线上回滚",
         "合入master",
         "合并到master",
+        "合并进主干",
+        "合到主分支",
+        "推到主干",
+        "直接发生产",
+        "drop table",
+        "truncate table",
+        "rm -rf",
+        "打款",
+        "批预算",
+        "签合同",
     ]
     .iter()
     .any(|cue| text.contains(cue) || lower.contains(cue))
@@ -264,10 +969,14 @@ pub(super) fn requires_human_approval(h: &Hub, owner: &str, summary: &str) -> bo
     evaluate_human_takeover_policy(h, owner, summary).is_some()
 }
 
-fn mark_task_managed(h: &Hub, task_id: &str) -> Result<()> {
-    with_store_mut(h, |store| {
+fn mark_task_managed(h: &Hub, tx: &Connection, task_id: &str) -> Result<()> {
+    let res = with_store_mut(h, |store| {
         store.managed_tasks.insert(task_id.to_owned());
-    })
+    });
+    if let Ok(guard) = h.automation.lock() {
+        persist_automation_db(tx, &guard);
+    }
+    res
 }
 
 fn is_task_managed(h: &Hub, task_id: &str) -> bool {
@@ -360,6 +1069,77 @@ fn complete_chat_reply(
     Ok(Json(response))
 }
 
+fn requirement_clause_satisfied(tok: &str, combined: &str, has_attachment: bool) -> bool {
+    let lower_tok = tok.to_ascii_lowercase();
+    let lower_comb = combined.to_ascii_lowercase();
+    if combined.contains(tok) || lower_comb.contains(&lower_tok) {
+        return true;
+    }
+    if ["截图", "图片", "画面", "录屏", "screenshot", "image"]
+        .iter()
+        .any(|k| lower_tok.contains(k))
+    {
+        return has_attachment;
+    }
+    if ["复现", "步骤", "重现", "操作"]
+        .iter()
+        .any(|k| lower_tok.contains(k))
+    {
+        return [
+            "复现",
+            "重现",
+            "步骤",
+            "第一步",
+            "1.",
+            "1、",
+            "先",
+            "点击",
+            "打开",
+            "输入",
+            "访问",
+            "操作",
+            "when ",
+            "steps",
+        ]
+        .iter()
+        .any(|cue| lower_comb.contains(cue));
+    }
+    if ["日志", "报错", "错误", "异常", "log", "error"]
+        .iter()
+        .any(|k| lower_tok.contains(k))
+    {
+        return [
+            "日志",
+            "报错",
+            "错误",
+            "异常",
+            "失败",
+            "error",
+            "exception",
+            "panic",
+            "trace",
+            "500",
+            "404",
+            "400",
+            "```",
+        ]
+        .iter()
+        .any(|cue| lower_comb.contains(cue));
+    }
+    if ["环境", "版本", "分支", "链接", "地址"]
+        .iter()
+        .any(|k| lower_tok.contains(k))
+    {
+        return [
+            "环境", "版本", "分支", "测试", "生产", "线上", "本地", "staging", "prod", "master",
+            "main", "http://", "https://",
+        ]
+        .iter()
+        .any(|cue| lower_comb.contains(cue));
+    }
+    false
+}
+
 fn requirement_missing_reason(
     h: &Hub,
     tx: &Connection,
@@ -397,7 +1177,7 @@ fn requirement_missing_reason(
         if needs_image && !has_attachment {
             return Ok(Some(req));
         }
-        // Check if any meaningful clause from requirement is already satisfied in text.
+        // Check if any meaningful clause from requirement is already satisfied in text or semantically.
         let tokens: Vec<&str> = req
             .split(|c: char| {
                 c.is_whitespace() || matches!(c, ',' | '，' | '、' | ';' | '；' | '+' | '/')
@@ -405,7 +1185,11 @@ fn requirement_missing_reason(
             .map(str::trim)
             .filter(|t| t.chars().count() >= 2)
             .collect();
-        if !tokens.is_empty() && !tokens.iter().any(|tok| combined.contains(tok)) {
+        if !tokens.is_empty()
+            && !tokens
+                .iter()
+                .any(|tok| requirement_clause_satisfied(tok, &combined, has_attachment))
+        {
             return Ok(Some(req));
         }
     }
@@ -435,7 +1219,7 @@ pub(crate) fn on_task_delegated(
     if !has_node && !has_rules_for_owner(h, owner) {
         return Ok(());
     }
-    mark_task_managed(h, task_id)?;
+    mark_task_managed(h, tx, task_id)?;
 
     if let Some(takeover) = evaluate_human_takeover_policy(h, owner, summary) {
         let notice = format!(
@@ -451,6 +1235,16 @@ pub(crate) fn on_task_delegated(
         );
         insert_contact_assistant_msg(tx, owner, requester, &req_msg)?;
         insert_chat_message(tx, requester, "assistant", &req_msg)?;
+        notify_im_card(
+            h,
+            owner,
+            "takeover",
+            &format!("🚨 需你本人接手（#{}）", short_id(task_id)),
+            &format!(
+                "**发起人**：`{requester}`\n**任务**：「{summary}」\n**原因**：{}",
+                takeover.reason
+            ),
+        );
         return Ok(());
     }
 
@@ -467,9 +1261,23 @@ pub(crate) fn on_task_delegated(
             short_id(task_id)
         );
         insert_chat_message(tx, owner, "assistant", &owner_note)?;
+        notify_im_card(
+            h,
+            requester,
+            "delegation",
+            &format!("📋 管家追问补充材料（#{}）", short_id(task_id)),
+            &format!("**接收人**：`{owner}`\n**任务**：「{summary}」\n**需补充**：{missing}"),
+        );
         return Ok(());
     }
 
+    notify_im_card(
+        h,
+        owner,
+        "delegation",
+        &format!("🤝 新委派已由管家自动接手（#{}）", short_id(task_id)),
+        &format!("**发起人**：`{requester}`\n**任务**：「{summary}」"),
+    );
     accept_and_assign_owner_node(tx, h, task_id, 0, requester, owner, summary, details)
 }
 
@@ -645,7 +1453,7 @@ pub(crate) fn on_node_draft_completed(
     )?;
 
     let req_msg = format!(
-        "🤝 [{owner} 的管家 → 你的管家] 任务「{summary}」（#{}）已由节点「{node_name}」完成，已按授权自动交付【验收证据包】（尚未经独立核验）：\n\n{content}\n\n---\n💡 手机端快捷闭环：可直接回复「通过」完成验收，或回复「退回：修改意见」让对方管家自动重新调度修改。",
+        "🤝 [{owner} 的管家 → 你的管家] 任务「{summary}」（#{}）已由节点「{node_name}」完成，已按授权自动交付【验收证据包】（尚未经独立核验）：\n\n{content}\n\n---\n💡 请打开这项任务核对交付物，再验收或退回。",
         short_id(task_id)
     );
     insert_contact_assistant_msg(tx, owner, requester, &req_msg)?;
@@ -656,6 +1464,16 @@ pub(crate) fn on_node_draft_completed(
         short_id(task_id)
     );
     insert_chat_message(tx, owner, "assistant", &owner_msg)?;
+    notify_im_card(
+        h,
+        requester,
+        "delivery",
+        &format!("✅ 收到待验收交付（#{}）", short_id(task_id)),
+        &format!(
+            "**执行方**：`{owner}`（节点 `{node_name}`）\n**任务**：「{summary}」\n**摘要**：{}",
+            nodes::truncate_bytes(content.trim(), 240)
+        ),
+    );
     Ok(())
 }
 
@@ -1092,6 +1910,8 @@ fn parse_rule_command(db: &Connection, owner: &str, body: &str) -> Result<Dispat
     }
 
     let keyword = extract_between(body, "包含", "的")
+        .or_else(|| extract_between(body, "涉及", "的"))
+        .or_else(|| extract_between(body, "关于", "的"))
         .or_else(|| {
             body.split("->")
                 .next()
@@ -1109,6 +1929,49 @@ fn parse_rule_command(db: &Connection, owner: &str, body: &str) -> Result<Dispat
         require_human_approval: false,
         created_at: now,
     })
+}
+
+fn try_parse_natural_rule(
+    db: &Connection,
+    owner: &str,
+    trimmed: &str,
+) -> Result<Option<DispatchRule>> {
+    if trimmed.starts_with('/') || trimmed.contains('@') || trimmed.len() > 360 {
+        return Ok(None);
+    }
+    if [
+        "查看",
+        "列出",
+        "显示",
+        "删除",
+        "取消",
+        "为什么",
+        "怎么",
+        "哪些规则",
+    ]
+    .iter()
+    .any(|kw| trimmed.contains(kw))
+    {
+        return Ok(None);
+    }
+    let has_standing_cue = [
+        "以后凡是",
+        "以后只要",
+        "凡是包含",
+        "凡是涉及",
+        "只要包含",
+        "只要涉及",
+        "以后别人委派",
+        "别人委派任务必须",
+        "把所有包含",
+        "把所有涉及",
+    ]
+    .iter()
+    .any(|cue| trimmed.contains(cue));
+    if !has_standing_cue {
+        return Ok(None);
+    }
+    Ok(parse_rule_command(db, owner, trimmed).ok())
 }
 
 fn extract_between(text: &str, start: &str, end: &str) -> Option<String> {
@@ -1701,12 +2564,13 @@ async fn execute_cloud_cron_report(h: &Hub, owner: &str, instruction: &str) -> R
                     url,
                     token,
                 };
+                let sid = Uuid::new_v4().to_string();
                 if let Ok(ans) = crate::runtime::Runtime::turn(
                     &dsh,
                     crate::runtime::TurnRequest {
                         kind: crate::runtime::TurnKind::Chat,
                         message: &prompt,
-                        session_id: "",
+                        session_id: &sid,
                         history: &[],
                         profile: &runtime_profile,
                         task_context: None,
@@ -1749,12 +2613,13 @@ async fn execute_cloud_cron_report(h: &Hub, owner: &str, instruction: &str) -> R
             url,
             token,
         };
+        let sid = Uuid::new_v4().to_string();
         if let Ok(ans) = crate::runtime::Runtime::turn(
             &dsh,
             crate::runtime::TurnRequest {
                 kind: crate::runtime::TurnKind::Chat,
                 message: &prompt,
-                session_id: "",
+                session_id: &sid,
                 history: &[],
                 profile: &runtime_profile,
                 task_context: None,
@@ -1874,8 +2739,8 @@ pub(crate) async fn answer_chat(
         return Ok(None);
     }
 
-    // 1. Module C: Personal Dispatch Rules
-    if let Some(body) = strip_prefix_any(
+    // 1. Module C: Personal Dispatch Rules (explicit prefix or natural-language standing rule)
+    let parsed_rule = if let Some(body) = strip_prefix_any(
         trimmed,
         &[
             "设置规则：",
@@ -1886,10 +2751,13 @@ pub(crate) async fn answer_chat(
             "规则:",
         ],
     ) {
-        let rule = {
-            let db = h.db()?;
-            parse_rule_command(&db, owner, body)?
-        };
+        let db = h.db()?;
+        Some(parse_rule_command(&db, owner, body)?)
+    } else {
+        let db = h.db()?;
+        try_parse_natural_rule(&db, owner, trimmed)?
+    };
+    if let Some(rule) = parsed_rule {
         let total_for_owner = with_store_mut(h, |store| {
             store.rules.push(rule.clone());
             store.rules.iter().filter(|r| r.owner == owner).count()
@@ -2073,12 +2941,37 @@ pub(crate) async fn answer_chat(
             .map(Some);
     }
 
-    // 4. Module B: Clarification reply ("补充：...") for an awaiting cross-user task
-    if let Some(extra) = strip_prefix_any(trimmed, &["补充信息：", "补充信息:", "补充：", "补充:"])
-    {
+    // 4. Module B: Clarification reply ("补充：..." or natural clarification supplement) for an awaiting cross-user task
+    let natural_clarify = strip_prefix_any(
+        trimmed,
+        &[
+            "补充信息：",
+            "补充信息:",
+            "补充说明：",
+            "补充说明:",
+            "补充：",
+            "补充:",
+            "补一下：",
+            "补一下:",
+            "补发：",
+            "补发:",
+            "复现步骤：",
+            "复现步骤:",
+            "报错日志：",
+            "报错日志:",
+        ],
+    );
+    if let Some(extra) = natural_clarify {
         if extra.is_empty() {
             return Ok(None);
         }
+        let routed_clarify = if input.selected_task.is_none() {
+            resolve_historical_task_context(h, owner, extra, None, Some("awaiting_owner"))
+                .await?
+                .filter(|c| c.requester == owner && c.owner != owner && c.score >= 25)
+        } else {
+            None
+        };
         let target_task: Option<(String, String, String, i64)> = {
             let db = h.db()?;
             if let Some(sel) = &input.selected_task {
@@ -2089,6 +2982,8 @@ pub(crate) async fn answer_chat(
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()?
+            } else if let Some(c) = routed_clarify {
+                Some((c.task_id, c.owner, c.summary, c.revision))
             } else {
                 db.query_row(
                     "SELECT id, owner, summary, revision FROM tasks
@@ -2115,7 +3010,7 @@ pub(crate) async fn answer_chat(
                 {
                     None
                 } else {
-                    mark_task_managed(h, &tid)?;
+                    mark_task_managed(h, &tx, &tid)?;
                     let existing_details: Option<String> = tx
                         .query_row(
                             "SELECT content FROM task_details WHERE task_id=?1",
@@ -2187,44 +3082,67 @@ pub(crate) async fn answer_chat(
         }
     }
 
-    // 5. Module B: Conversational Mobile Acceptance ("通过"/"验收") or Return ("退回：...")
-    let accept_intent = matches!(trimmed, "通过" | "验收" | "验收通过" | "确认验收" | "可以");
-    let return_reason = strip_prefix_any(
+    // Explicit commands or natural-language acceptance/return bound to the selected revision
+    // OR routed by the 3-Stage Historical Task Context Router when the user names the task.
+    let exact_accept = matches!(
         trimmed,
-        &["退回：", "退回:", "打回：", "打回:", "重做：", "重做:"],
+        "/approve" | "验收通过" | "确认验收" | "确认验收通过" | "通过验收"
     );
-    if accept_intent || return_reason.is_some() {
-        let ready_task: Option<(String, String, String, i64, Option<String>)> = {
-            let db = h.db()?;
-            let find_sql = if input.selected_task.is_some() {
-                "SELECT t.id, t.owner, t.summary, t.revision, a.node_id
-                 FROM tasks t
-                 JOIN node_assignments a ON a.task_id = t.id
-                 WHERE t.id=?1 AND t.requester=?2 AND t.owner!=?2 AND t.status='ready_for_acceptance'"
-            } else {
-                "SELECT t.id, t.owner, t.summary, t.revision, a.node_id
-                 FROM tasks t
-                 JOIN node_assignments a ON a.task_id = t.id
-                 WHERE t.requester=?1 AND t.owner!=?1 AND t.status='ready_for_acceptance'
-                 ORDER BY t.rowid DESC LIMIT 1"
-            };
-            if let Some(sel) = &input.selected_task {
-                db.query_row(find_sql, params![sel.task_id, owner], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+    let named_accept = !exact_accept
+        && (trimmed.ends_with("验收通过")
+            || trimmed.ends_with("确认验收")
+            || trimmed.ends_with("通过验收"));
+    let accept_intent = exact_accept || named_accept;
+    let return_reason = trimmed
+        .strip_prefix("/return ")
+        .or_else(|| {
+            strip_prefix_any(
+                trimmed,
+                &[
+                    "退回：",
+                    "退回:",
+                    "打回：",
+                    "打回:",
+                    "重做：",
+                    "重做:",
+                    "需要修改：",
+                    "需要修改:",
+                ],
+            )
+        })
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    let resolved_selection: Option<crate::task_context::Selection> = if accept_intent
+        || return_reason.is_some()
+    {
+        if let Some(sel) = input.selected_task.clone() {
+            Some(sel)
+        } else if named_accept || return_reason.is_some() {
+            resolve_historical_task_context(h, owner, trimmed, None, Some("ready_for_acceptance"))
+                .await?
+                .filter(|c| c.requester == owner && c.owner != owner && c.score >= 30)
+                .map(|c| crate::task_context::Selection {
+                    task_id: c.task_id,
+                    expected_revision: c.revision,
                 })
-                .optional()?
-            } else {
-                db.query_row(find_sql, [owner], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-                })
-                .optional()?
-            }
-        };
-
-        if let Some((tid, task_owner, summary, rev, node_id)) = ready_task {
-            let next_rev = rev + 1;
-            let mut db = h.db()?;
-            let tx = db.transaction()?;
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(selection) = resolved_selection {
+        let mut db = h.db()?;
+        let tx = db.transaction()?;
+        let ready_task = tx.query_row(
+            "SELECT t.owner,t.summary,a.node_id FROM tasks t JOIN node_assignments a ON a.task_id=t.id
+             WHERE t.id=?1 AND t.requester=?2 AND t.owner!=?2 AND t.status='ready_for_acceptance' AND t.revision=?3",
+            params![selection.task_id, owner, selection.expected_revision],
+            |r| Ok((r.get::<_, String>(0)?,r.get::<_, String>(1)?,r.get::<_, Option<String>>(2)?)),
+        ).optional()?;
+        if let Some((task_owner, summary, node_id)) = ready_task {
+            let tid = &selection.task_id;
+            let next_rev = selection.expected_revision + 1;
             let user_reply = if accept_intent {
                 tx.execute(
                     "UPDATE tasks SET status='completed', revision=?2 WHERE id=?1",
@@ -2345,6 +3263,193 @@ pub(crate) async fn answer_chat(
         }
     }
 
+    // 7. Model-Assisted Structured Intent Router (Dsh mode) for natural-language sagent actions
+    if !trimmed.starts_with('/') {
+        if let Some(resp) =
+            try_handle_model_sagent_intent(h, owner, input, runtime_profile, task_context).await?
+        {
+            return Ok(Some(resp));
+        }
+    }
+
+    Ok(None)
+}
+
+#[derive(Deserialize)]
+struct ModelSagentIntent {
+    intent: String,
+    #[serde(default)]
+    rule_body: Option<String>,
+    #[serde(default)]
+    clarification: Option<String>,
+}
+
+async fn try_handle_model_sagent_intent(
+    h: &Hub,
+    owner: &str,
+    input: &crate::messages::ChatInput,
+    runtime_profile: &crate::profiles::RuntimeProfile,
+    task_context: Option<&Value>,
+) -> Result<Option<Json<Value>>> {
+    let crate::Runtime::Dsh { url, token } = &h.runtime else {
+        return Ok(None);
+    };
+    let trimmed = input.message.trim();
+    // Only invoke the lightweight intent classifier when there is an active managed awaiting task
+    // or clear rule-setting phrasing that missed the deterministic parser.
+    let awaiting_task: Option<(String, String, String, i64)> = {
+        let db = h.db()?;
+        let found: Option<(String, String, String, i64)> = if let Some(sel) = &input.selected_task {
+            db.query_row(
+                "SELECT id, owner, summary, revision FROM tasks
+                 WHERE id=?1 AND requester=?2 AND owner!=?2 AND status='awaiting_owner'",
+                params![sel.task_id, owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+        } else {
+            db.query_row(
+                "SELECT id, owner, summary, revision FROM tasks
+                 WHERE requester=?1 AND owner!=?1 AND status='awaiting_owner'
+                 ORDER BY rowid DESC LIMIT 1",
+                [owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+        };
+        found.filter(|(tid, _, _, _)| is_task_managed(h, tid))
+    };
+
+    let maybe_rule_cue = [
+        "以后",
+        "所有",
+        "凡是",
+        "规则",
+        "必须由我",
+        "必须提供",
+        "自动派给",
+    ]
+    .iter()
+    .any(|k| trimmed.contains(k));
+    if awaiting_task.is_none() && !maybe_rule_cue {
+        return Ok(None);
+    }
+
+    let awaiting_desc = awaiting_task
+        .as_ref()
+        .map(|(tid, to, sum, _)| {
+            format!(
+                "当前有一项待补充信息的跨人任务 #{}: 接收人={to}, 摘要=「{sum}」",
+                short_id(tid)
+            )
+        })
+        .unwrap_or_else(|| "无待补充信息的跨人任务".to_owned());
+    let prompt = format!(
+        "你是意图分类器。请判断用户这句话是否属于以下动作之一，只输出单行 JSON（不要 Markdown 代码块）：\n\
+         1) 为待补充任务提供补充说明/材料/截图：{{\"intent\":\"clarify\",\"clarification\":\"提取的补充内容\"}}\n\
+         2) 设置个人管家分发/审核/澄清规则：{{\"intent\":\"add_rule\",\"rule_body\":\"包含 <关键词> 的任务需要真人接手 | 别人委派任务必须提供 <材料> | 包含 <关键词> 的任务派给 <节点>\"}}\n\
+         3) 普通对话或其他：{{\"intent\":\"none\"}}\n\
+         上下文：{awaiting_desc}\n\
+         用户原话：{trimmed}"
+    );
+    let dsh = crate::runtime::DshRuntime {
+        client: &h.client,
+        url,
+        token,
+    };
+    let sid = Uuid::new_v4().to_string();
+    let Ok(ans) = crate::runtime::Runtime::turn(
+        &dsh,
+        crate::runtime::TurnRequest {
+            kind: crate::runtime::TurnKind::Chat,
+            message: &prompt,
+            session_id: &sid,
+            history: &[],
+            profile: runtime_profile,
+            task_context: None,
+            draft_revision: None,
+            task_role: None,
+            owner_context: None,
+            profile_context: None,
+        },
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+    let raw = ans.reply.trim();
+    let json_slice = match (raw.find('{'), raw.rfind('}')) {
+        (Some(s), Some(e)) if s < e => &raw[s..=e],
+        _ => return Ok(None),
+    };
+    let Ok(parsed) = serde_json::from_str::<ModelSagentIntent>(json_slice) else {
+        return Ok(None);
+    };
+    if parsed.intent == "add_rule" {
+        if let Some(body) = parsed
+            .rule_body
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let rule_opt = {
+                let db = h.db()?;
+                parse_rule_command(&db, owner, body).ok()
+            };
+            if let Some(rule) = rule_opt {
+                let total_for_owner = with_store_mut(h, |store| {
+                    store.rules.push(rule.clone());
+                    store.rules.iter().filter(|r| r.owner == owner).count()
+                })?;
+                let desc = if rule.require_human_approval {
+                    format!("关键词 `{}` 委派先提醒你本人审核", rule.keyword)
+                } else if let Some(req) = &rule.require_clarification {
+                    format!("他人委派时自动核对必填信息「{req}」")
+                } else {
+                    format!(
+                        "关键词 `{}` 自动调度节点 `{}`",
+                        rule.keyword, rule.target_node_id
+                    )
+                };
+                let reply = format!(
+                    "✅ 管家已理解并保存个人分发规则 `{}`（当前共 {total_for_owner} 条）：\n- {desc}",
+                    rule.id
+                );
+                return complete_chat_reply(h, owner, input, runtime_profile, task_context, &reply)
+                    .map(Some);
+            }
+        }
+    } else if parsed.intent == "clarify" {
+        if let (Some((tid, task_owner, summary, rev)), Some(extra)) = (
+            awaiting_task,
+            parsed
+                .clarification
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) {
+            let rewritten = crate::messages::ChatInput {
+                message: format!("补充：{extra}"),
+                agent_id: input.agent_id.clone(),
+                expected_profile_revision: input.expected_profile_revision,
+                request_id: input.request_id.clone(),
+                selected_task: Some(crate::task_context::Selection {
+                    task_id: tid,
+                    expected_revision: rev,
+                }),
+                selected_project: None,
+            };
+            let _ = (&task_owner, &summary);
+            return Box::pin(answer_chat(
+                h,
+                owner,
+                &rewritten,
+                runtime_profile,
+                task_context,
+            ))
+            .await;
+        }
+    }
     Ok(None)
 }
 
@@ -2638,12 +3743,13 @@ async fn generate_peer_sagent_reply(
             url,
             token,
         };
+        let sid = Uuid::new_v4().to_string();
         if let Ok(ans) = crate::runtime::Runtime::turn(
             &dsh,
             crate::runtime::TurnRequest {
                 kind: crate::runtime::TurnKind::Chat,
                 message: &prompt,
-                session_id: "",
+                session_id: &sid,
                 history: &[],
                 profile: target_profile,
                 task_context: None,
@@ -2920,6 +4026,13 @@ async fn try_handle_colleague_at_mention(
             esc.reason
         );
         insert_chat_message(&tx, &target_id, "assistant", &notify_target)?;
+        notify_im_card(
+            h,
+            &target_id,
+            "takeover",
+            &format!("🚨 需你本人接手 · 来自 @{sender_name}"),
+            &format!("**消息**：「{clean_body}」\n**拦截原因**：{}", esc.reason),
+        );
         format!(
             "🤵 管家：已把消息转达给 **@{target_name}** 的管家。\n\n---\n\n🚨 **[@{target_name} 的管家 · 已转交本人接手]**：\n{peer_sagent_reply}"
         )
@@ -2953,6 +4066,327 @@ async fn try_handle_colleague_at_mention(
     crate::chat_turns::complete(&tx, owner, input.request_id.as_deref(), &mut response)?;
     tx.commit()?;
     Ok(Some(Json(response)))
+}
+
+pub(crate) fn build_im_card_payload(
+    provider: &str,
+    event_kind: &str,
+    title: &str,
+    markdown: &str,
+) -> Value {
+    let header_color = match event_kind {
+        "takeover" => "red",
+        "delivery" => "green",
+        _ => "blue",
+    };
+    match provider {
+        "wecom" => json!({
+            "msgtype": "markdown",
+            "markdown": {
+                "content": format!("### {title}\n{markdown}\n> 来自 **Agenct 7×24h 管家**")
+            }
+        }),
+        "dingtalk" => json!({
+            "msgtype": "markdown",
+            "markdown": {
+                "title": title,
+                "text": format!("### {title}\n\n{markdown}\n\n---\n*来自 Agenct 7×24h 管家*")
+            }
+        }),
+        "generic" => json!({
+            "event": event_kind,
+            "title": title,
+            "markdown": markdown,
+            "source": "agenct-sagent",
+            "timestamp": nodes::now_unix(),
+        }),
+        _ => json!({
+            "msg_type": "interactive",
+            "card": {
+                "config": { "wide_screen_mode": true },
+                "header": {
+                    "template": header_color,
+                    "title": { "tag": "plain_text", "content": title }
+                },
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": { "tag": "lark_md", "content": markdown }
+                    },
+                    {
+                        "tag": "note",
+                        "elements": [
+                            { "tag": "plain_text", "content": "Agenct 7×24h 个人超级管家实时推送" }
+                        ]
+                    }
+                ]
+            }
+        }),
+    }
+}
+
+pub(crate) fn notify_im_card(h: &Hub, owner: &str, event_kind: &str, title: &str, markdown: &str) {
+    let cfg = h
+        .automation
+        .lock()
+        .ok()
+        .and_then(|g| g.im_configs.get(owner).cloned());
+    let Some(cfg) = cfg.filter(|c| !c.webhook_url.trim().is_empty()) else {
+        return;
+    };
+    let enabled = match event_kind {
+        "takeover" => cfg.notify_takeover,
+        "delegation" => cfg.notify_delegation,
+        "delivery" => cfg.notify_delivery,
+        _ => true,
+    };
+    if !enabled {
+        return;
+    }
+    let payload = build_im_card_payload(&cfg.provider, event_kind, title, markdown);
+    let client = h.client.clone();
+    let url = cfg.webhook_url;
+    tokio::spawn(async move {
+        let _ = client.post(&url).json(&payload).send().await;
+    });
+}
+
+fn validate_im_webhook_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return None;
+    }
+    let url = reqwest::Url::parse(trimmed).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    Some(trimmed.to_owned())
+}
+
+fn format_im_config_json(cfg: &ImWebhookConfig) -> Value {
+    let configured = !cfg.webhook_url.trim().is_empty();
+    json!({
+        "configured": configured,
+        "provider": if cfg.provider.is_empty() { "feishu" } else { &cfg.provider },
+        "webhook_url_preview": mask_gitlab_token(&cfg.webhook_url),
+        "notify_takeover": cfg.notify_takeover,
+        "notify_delegation": cfg.notify_delegation,
+        "notify_delivery": cfg.notify_delivery,
+        "updated_at": cfg.updated_at,
+    })
+}
+
+pub(super) async fn get_im_config(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
+    let owner = h.identity(&headers)?;
+    let cfg = h
+        .automation
+        .lock()
+        .map_err(|_| invalid("automation unavailable"))?
+        .im_configs
+        .get(&owner)
+        .cloned()
+        .unwrap_or_default();
+    Ok(Json(format_im_config_json(&cfg)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SaveImConfigInput {
+    #[serde(default = "default_im_provider")]
+    provider: String,
+    #[serde(default)]
+    webhook_url: Option<String>,
+    #[serde(default)]
+    clear_webhook: bool,
+    #[serde(default = "default_true")]
+    notify_takeover: bool,
+    #[serde(default = "default_true")]
+    notify_delegation: bool,
+    #[serde(default = "default_true")]
+    notify_delivery: bool,
+}
+
+pub(super) async fn save_im_config(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Json(input): Json<SaveImConfigInput>,
+) -> Result<Json<Value>> {
+    let owner = h.identity(&headers)?;
+    let provider = input.provider.trim().to_ascii_lowercase();
+    if !matches!(
+        provider.as_str(),
+        "feishu" | "wecom" | "dingtalk" | "generic"
+    ) {
+        return Err(invalid(
+            "provider must be feishu, wecom, dingtalk, or generic",
+        ));
+    }
+    let next_url = match input.webhook_url.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => Some(
+            validate_im_webhook_url(raw)
+                .ok_or_else(|| invalid("Webhook 地址须为合法的 http(s):// URL"))?,
+        ),
+        _ => None,
+    };
+    let updated = with_store_mut(&h, |store| {
+        let entry = store.im_configs.entry(owner.clone()).or_default();
+        entry.provider = provider;
+        if input.clear_webhook {
+            entry.webhook_url.clear();
+        } else if let Some(u) = next_url {
+            entry.webhook_url = u;
+        }
+        entry.notify_takeover = input.notify_takeover;
+        entry.notify_delegation = input.notify_delegation;
+        entry.notify_delivery = input.notify_delivery;
+        entry.updated_at = nodes::now_unix();
+        entry.clone()
+    })?;
+    Ok(Json(format_im_config_json(&updated)))
+}
+
+pub(super) async fn test_im_webhook(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+) -> Result<Json<Value>> {
+    let owner = h.identity(&headers)?;
+    let cfg = h
+        .automation
+        .lock()
+        .map_err(|_| invalid("automation unavailable"))?
+        .im_configs
+        .get(&owner)
+        .cloned()
+        .unwrap_or_default();
+    if cfg.webhook_url.trim().is_empty() {
+        return Err(invalid("请先保存飞书 / 企微 / 钉钉 Webhook 地址"));
+    }
+    let payload = build_im_card_payload(
+        &cfg.provider,
+        "takeover",
+        "🔔 Agenct 7×24h 管家通知卡片测试",
+        &format!(
+            "**账号**：`{owner}`\n**状态**：实时通知通道已连通！当有【🚨 需本人接手】、【🤝 新任务委派】或【✅ 待验收交付】时，你的管家将第一时间推送卡片提醒。"
+        ),
+    );
+    let resp = h
+        .client
+        .post(&cfg.webhook_url)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|_| {
+            Error(
+                axum::http::StatusCode::BAD_GATEWAY,
+                "无法连接 Webhook 目标地址",
+            )
+        })?;
+    if !resp.status().is_success() {
+        return Err(Error(
+            axum::http::StatusCode::BAD_GATEWAY,
+            "Webhook 目标返回非 2xx 状态码，请核对机器人地址",
+        ));
+    }
+    Ok(Json(json!({ "ok": true, "provider": cfg.provider })))
+}
+
+fn extract_im_inbound_text(payload: &Value) -> Option<String> {
+    if let Some(s) = payload["text"].as_str() {
+        return Some(s.trim().to_owned());
+    }
+    if let Some(s) = payload["text"]["content"].as_str() {
+        return Some(s.trim().to_owned());
+    }
+    if let Some(s) = payload["content"].as_str() {
+        return Some(s.trim().to_owned());
+    }
+    if let Some(raw_content) = payload["event"]["message"]["content"].as_str() {
+        if let Ok(parsed) = serde_json::from_str::<Value>(raw_content) {
+            if let Some(t) = parsed["text"].as_str() {
+                return Some(t.trim().to_owned());
+            }
+        }
+        return Some(raw_content.trim().to_owned());
+    }
+    None
+}
+
+pub(super) async fn im_webhook(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>> {
+    // 1. Feishu / Lark event subscription URL verification handshake
+    if let Some(challenge) = payload.get("challenge").and_then(Value::as_str) {
+        return Ok(Json(json!({ "challenge": challenge })));
+    }
+    let owner = h.identity(&headers)?;
+    let raw_text =
+        extract_im_inbound_text(&payload).ok_or_else(|| invalid("missing IM message text"))?;
+    let clean_text = raw_text
+        .trim_start_matches(|c: char| c.is_whitespace())
+        .trim();
+    if clean_text.is_empty() || clean_text.len() > 4000 {
+        return Err(invalid("IM message text must be 1..4000 bytes"));
+    }
+
+    let auto_selected: Option<crate::task_context::Selection> = {
+        let db = h.db()?;
+        db.query_row(
+            "SELECT id, revision FROM tasks
+             WHERE requester=?1 AND owner!=?1 AND status='ready_for_acceptance'
+             ORDER BY rowid DESC LIMIT 1",
+            [&owner],
+            |r| {
+                Ok(crate::task_context::Selection {
+                    task_id: r.get(0)?,
+                    expected_revision: r.get(1)?,
+                })
+            },
+        )
+        .optional()?
+    };
+    let runtime_profile = {
+        let db = h.db()?;
+        crate::profiles::route(&db, &owner, None, None)?
+    };
+    let input = crate::messages::ChatInput {
+        message: clean_text.to_owned(),
+        agent_id: None,
+        expected_profile_revision: None,
+        request_id: None,
+        selected_task: auto_selected,
+        selected_project: None,
+    };
+    if let Some(Json(resp)) = answer_chat(&h, &owner, &input, &runtime_profile, None).await? {
+        return Ok(Json(json!({
+            "ok": true,
+            "owner": owner,
+            "handled_by": "sagent",
+            "reply": resp["reply"],
+        })));
+    }
+    if let Some(Json(resp)) =
+        crate::nodes::answer_chat(&h, &owner, &input, &runtime_profile, None).await?
+    {
+        return Ok(Json(json!({
+            "ok": true,
+            "owner": owner,
+            "handled_by": "pc-node",
+            "reply": resp["reply"],
+        })));
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "owner": owner,
+        "handled_by": "queued",
+        "reply": format!("🤵 管家已收到你的 IM 指令：「{clean_text}」"),
+    })))
 }
 
 pub(super) async fn pulse(State(h): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
@@ -3405,6 +4839,7 @@ fn dispatch_gitlab_event(h: &Hub, ev: IncomingGitLabEvent<'_>) -> Result<Value> 
         })
     };
     tx.commit()?;
+    drop(db);
 
     if let (Some(task_id), Some(iid)) = (registered_task_id, ev.issue_iid.filter(|&n| n > 0)) {
         if !ev.project_path.is_empty() && ev.project_path != "repo" {
@@ -4135,7 +5570,7 @@ mod tests {
     {
         let h = test_hub();
         enable_automation(&h, "bob");
-        let r = app(h);
+        let r = app(h.clone());
 
         // Bob registers a PC node and brings it online.
         let (s, bob_node) = call(
@@ -4328,13 +5763,31 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(fetched_img["name"], "fixed.png");
 
-        // Alice replies "通过" on mobile -> task closes cleanly to completed!
+        let (s, _) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({"message":"可以"})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (status, revision): (String, i64) = h
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT status,revision FROM tasks WHERE id=?1",
+                [&task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "ready_for_acceptance");
         let (s, accept_chat) = call(
             &r,
             &token("alice"),
             "POST",
             "/api/messages",
-            Some(json!({ "message": "通过" })),
+            Some(json!({ "message": "/approve", "selected_task":{"task_id":task_id,"expected_revision":revision} })),
         )
         .await;
         assert_eq!(s, StatusCode::OK);
@@ -4905,13 +6358,22 @@ mod tests {
             .unwrap();
         }
 
+        let (task_id, revision): (String, i64) = h
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT id,revision FROM tasks WHERE summary LIKE '%导出按钮%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
         // First return -> re-dispatches automatically
         let (s, ret1) = call(
             &r,
             &token("alice"),
             "POST",
             "/api/messages",
-            Some(json!({ "message": "退回：移动端圆角还是不对" })),
+            Some(json!({ "message": "/return 移动端圆角还是不对", "selected_task":{"task_id":task_id,"expected_revision":revision} })),
         )
         .await;
         assert_eq!(s, StatusCode::OK);
@@ -4936,7 +6398,7 @@ mod tests {
             &token("alice"),
             "POST",
             "/api/messages",
-            Some(json!({ "message": "退回：暗色模式下边框依然发白" })),
+            Some(json!({ "message": "/return 暗色模式下边框依然发白", "selected_task":{"task_id":task_id,"expected_revision":revision+1} })),
         )
         .await;
         assert_eq!(s, StatusCode::OK);
@@ -4951,5 +6413,242 @@ mod tests {
             .unwrap()
             .iter()
             .any(|m| { m["content"].as_str().unwrap_or("").contains("连续退回熔断") }));
+    }
+
+    #[tokio::test]
+    async fn semantic_rules_live_node_progress_and_im_webhook_cards_work() {
+        let h = test_hub();
+        enable_automation(&h, "bob");
+        let r = app(h.clone());
+
+        // 1. Configure Feishu IM notification card & verify card payload builders
+        let (s, im0) = call(&r, &token("bob"), "GET", "/api/im/config", None).await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(im0["configured"], false);
+
+        let (s, im1) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/im/config",
+            Some(json!({
+                "provider": "feishu",
+                "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/secret123456",
+                "notify_takeover": true,
+                "notify_delegation": true,
+                "notify_delivery": true
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(im1["configured"], true);
+        assert_eq!(im1["provider"], "feishu");
+
+        let feishu_card = super::build_im_card_payload("feishu", "takeover", "标题", "正文");
+        assert_eq!(feishu_card["msg_type"], "interactive");
+        assert_eq!(feishu_card["card"]["header"]["template"], "red");
+        let wecom_card = super::build_im_card_payload("wecom", "delivery", "标题", "正文");
+        assert_eq!(wecom_card["msgtype"], "markdown");
+
+        // 2. Natural-language standing rule without "规则：" prefix + semantic synonym matching ("数据库" <-> "postgres")
+        let (s, nat_rule) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "以后凡是包含 数据库 的任务都需要真人接手" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(nat_rule["reply"]
+            .as_str()
+            .unwrap()
+            .contains("已保存个人分发规则"));
+        assert!(super::evaluate_human_takeover_policy(&h, "bob", "迁移 postgres 表结构").is_some());
+        assert!(super::evaluate_human_takeover_policy(&h, "bob", "把这个改动合并进主干").is_some());
+
+        // 3. Semantic requirement satisfaction ("第一步点击登录报错 500" satisfies "复现步骤")
+        assert!(super::requirement_clause_satisfied(
+            "复现步骤",
+            "第一步打开首页，点击登录按钮报错 500",
+            false
+        ));
+        assert!(super::requirement_clause_satisfied(
+            "报错日志",
+            "panic: connection refused (500)",
+            false
+        ));
+
+        // 4. Live PC node progress via lease renewal appears on owner's GET /api/tasks
+        let (s, bob_node) = call(
+            &r,
+            &token("bob"),
+            "POST",
+            "/api/nodes",
+            Some(json!({ "id": "bob-pc", "name": "Bob主力机" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let node_token = bob_node["token"].as_str().unwrap().to_owned();
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "INSERT INTO tasks(id,requester,owner,summary,status,revision) VALUES ('live-t','alice','bob','测试进度','working',1)",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO node_assignments(task_id,owner,node_id,task_revision,instruction,status,updated_at)
+                 VALUES ('live-t','bob','bob-pc',1,'run test','queued',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let (s, work) = call(&r, &node_token, "GET", "/node/v1/work", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let lease_token = work["job"]["lease_token"].as_str().unwrap().to_owned();
+        let (s, _) = call(
+            &r,
+            &node_token,
+            "POST",
+            "/node/v1/tasks/live-t/lease",
+            Some(json!({
+                "lease_token": lease_token,
+                "expected_revision": 1,
+                "stage": "本机 codex 正在运行测试…",
+                "log_tail": "test 12/20 passed",
+                "elapsed_secs": 9
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let (s, bob_tasks) = call(&r, &token("bob"), "GET", "/api/tasks", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let t_item = bob_tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == "live-t")
+            .unwrap();
+        assert_eq!(
+            t_item["my_node_assignment"]["progress"]["stage"],
+            "本机 codex 正在运行测试…"
+        );
+        assert_eq!(
+            t_item["my_node_assignment"]["progress"]["log_tail"],
+            "test 12/20 passed"
+        );
+        assert_eq!(t_item["my_node_assignment"]["progress"]["elapsed_secs"], 9);
+
+        // 5. SQLite automation_state convergence: state is persisted directly inside SQLite
+        let raw_db_state: String = h
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT state_json FROM automation_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(raw_db_state.contains("feishu"));
+        assert!(raw_db_state.contains("数据库"));
+
+        // 6. 3-Stage Historical Task Context Router: routes unclicked user input to matching historical task/topic
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "INSERT INTO tasks(id,requester,owner,summary,status,revision)
+                 VALUES ('topic-login-500','alice','alice','💬 排查登录接口 500 报错','completed',1)",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO tasks(id,requester,owner,summary,status,revision)
+                 VALUES ('topic-q4-plan','alice','alice','💬 Q4 商业化定价方案','completed',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let routed = super::resolve_historical_task_context(
+            &h,
+            "alice",
+            "刚才那个登录接口 500 报错的根因找到了吗",
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(routed.task_id, "topic-login-500");
+        assert_eq!(routed.stage, "stage2_feature");
+
+        let (s, routed_chat) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "给 Q4 商业化定价方案加一页企业版报价" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(routed_chat["routed_context"]["task_id"], "topic-q4-plan");
+        let turns = crate::nodes::topic_turns(&h.db().unwrap(), "topic-q4-plan").unwrap();
+        assert_eq!(turns.len(), 1);
+
+        // 7. OpenAI-compatible response parser & Enterprise IM inbound webhook (/webhooks/im)
+        let parsed_json = crate::runtime::parse_openai_content_to_adapter_reply(
+            r#"{"reply":"来自通用大模型的回答","proposal":null}"#,
+        );
+        assert_eq!(parsed_json.reply, "来自通用大模型的回答");
+        assert_eq!(parsed_json.backend, "dsh");
+        let parsed_plain =
+            crate::runtime::parse_openai_content_to_adapter_reply("直接返回的纯文本回答");
+        assert_eq!(parsed_plain.reply, "直接返回的纯文本回答");
+
+        // Feishu challenge handshake
+        let (s, challenge_resp) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/webhooks/im",
+            Some(json!({ "challenge": "feishu-verify-123" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(challenge_resp["challenge"], "feishu-verify-123");
+
+        // Mobile IM direct approval via /webhooks/im
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "INSERT INTO tasks(id,requester,owner,summary,status,result,revision)
+                 VALUES ('im-approve-task','alice','bob','移动端IM直接验收','ready_for_acceptance','已修好',2)",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO node_assignments(task_id,owner,node_id,task_revision,instruction,status,updated_at)
+                 VALUES ('im-approve-task','bob','bob-pc',2,'fix','completed',1)",
+                [],
+            )
+            .unwrap();
+        }
+        let (s, im_in) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/webhooks/im",
+            Some(json!({
+                "event": {
+                    "message": {
+                        "content": "{\"text\":\"验收通过\"}"
+                    }
+                }
+            })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert_eq!(im_in["handled_by"], "sagent");
+        assert!(im_in["reply"].as_str().unwrap().contains("确认验收通过"));
     }
 }

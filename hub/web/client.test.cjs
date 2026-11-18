@@ -183,6 +183,36 @@ function fixture(auth = { enabled: false }, settings = {}) {
       if (url === '/api/gitlab/sync' && options.method === 'POST') {
         data = settings.gitlabSync || { ok: true, fetched: 2, dispatched: 1 };
       }
+      if (url === '/api/im/config' && options.method === 'GET') {
+        data = settings.imConfig || {
+          configured: false,
+          provider: 'feishu',
+          webhook_url_preview: '',
+          notify_takeover: true,
+          notify_delegation: true,
+          notify_delivery: true,
+          updated_at: 0
+        };
+      }
+      if (url === '/api/im/config' && options.method === 'POST') {
+        const body = JSON.parse(options.body);
+        const current = settings.imConfig || { configured: false, webhook_url_preview: '' };
+        const cleared = !!body.clear_webhook;
+        const configured = cleared ? false : (!!body.webhook_url || !!current.configured);
+        settings.imConfig = {
+          configured,
+          provider: body.provider || 'feishu',
+          webhook_url_preview: cleared ? '' : (body.webhook_url ? 'https:***hook' : current.webhook_url_preview),
+          notify_takeover: body.notify_takeover !== false,
+          notify_delegation: body.notify_delegation !== false,
+          notify_delivery: body.notify_delivery !== false,
+          updated_at: 12345
+        };
+        data = settings.imConfig;
+      }
+      if (url === '/api/im/test' && options.method === 'POST') {
+        data = { ok: true, provider: settings.imConfig?.provider || 'feishu' };
+      }
       if (url === '/api/nodes' && options.method === 'GET') data = settings.nodes || [];
       if (url === '/api/attachments' && options.method === 'POST') {
         const body = JSON.parse(options.body);
@@ -2512,6 +2542,91 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     f.$('text').onkeydown({ key: 'Enter', preventDefault() {} });
     assert.equal(f.$('text').value, '给@luojie ');
     assert.equal(picker.classList.contains('hide'), true);
+  });
+  await test('running PC node assignment renders live progress stage and log tail on task card, and IM notification card configures and tests webhook', async () => {
+    const f = fixture(undefined, {
+      nodes: [{ id: 'homelab', name: '算力机', online: true }],
+      tasks: [task({
+        id: 'live-node-task',
+        requester: 'alice',
+        owner: 'bob',
+        summary: '跑单元测试',
+        status: 'working',
+        revision: 1,
+        my_node_assignment: {
+          node_id: 'homelab',
+          node_name: '算力机',
+          task_revision: 1,
+          instruction: 'cargo test',
+          status: 'running',
+          progress: {
+            stage: '本机 codex 正在分析与执行…',
+            log_tail: 'running 42 tests | test ok',
+            elapsed_secs: 12
+          }
+        }
+      })]
+    });
+    await f.login('bob');
+    await settle();
+    const convText = f.$('conversation').textContent;
+    assert.match(convText, /⚡ 实时进度（已运行 12s）：本机 codex 正在分析与执行…/);
+    assert.match(convText, /running 42 tests \| test ok/);
+
+    await f.$('open-account').onclick();
+    await settle();
+    const imCard = walk(f.$('contacts-view')).find(n => n.className === 'member-card im-card');
+    assert(imCard);
+    const urlInput = walk(imCard).find(n => n.tagName === 'input' && n.type === 'url');
+    assert(urlInput);
+    urlInput.value = 'https://open.feishu.cn/open-apis/bot/v2/hook/secret-123456';
+    await findButton(imCard, '保存通知配置').onclick();
+    await settle();
+    const saveCall = f.calls.find(c => c.url === '/api/im/config' && c.options.method === 'POST');
+    assert(saveCall);
+    assert.equal(JSON.parse(saveCall.options.body).provider, 'feishu');
+    assert.match(imCard.textContent, /已启用实时卡片/);
+
+    await findButton(imCard, '发送测试卡片').onclick();
+    await settle();
+    const testCall = f.calls.find(c => c.url === '/api/im/test' && c.options.method === 'POST');
+    assert(testCall);
+    assert.match(imCard.textContent, /测试卡片已成功推送/);
+  });
+  await test('Muse topic bar attributes messages to historical task contexts and filters stream on click', async () => {
+    const f = fixture(undefined, {
+      messages: [
+        { role: 'user', content: '排查登录接口 500 报错', status: 'complete', created_at: '2026-04-06 08:00:00' },
+        { role: 'assistant', content: '已在日志中定位到 token 校验异常', status: 'complete', created_at: '2026-04-06 08:00:05' },
+        { role: 'user', content: '整理 Q4 商业化定价方案', status: 'complete', created_at: '2026-04-06 08:05:00' },
+        { role: 'assistant', content: '已生成三档订阅价格表', status: 'complete', created_at: '2026-04-06 08:05:05' },
+      ],
+      tasks: [
+        task({ id: 'topic-login', requester: 'alice', owner: 'alice', summary: '💬 排查登录接口 500 报错', status: 'completed', revision: 1, is_topic: true, turn_count: 1 }),
+        task({ id: 'topic-q4', requester: 'alice', owner: 'alice', summary: '💬 整理 Q4 商业化定价方案', status: 'completed', revision: 1, is_topic: true, turn_count: 1 }),
+      ]
+    });
+    await f.login('alice');
+    await settle();
+    const topicBar = f.$('muse-topic-bar');
+    assert.equal(topicBar.classList.contains('hide'), false);
+    assert.match(topicBar.textContent, /✨ 全部脉络/);
+    assert.match(topicBar.textContent, /排查登录接口 500 报错/);
+    assert.match(topicBar.textContent, /整理 Q4 商业化定价方案/);
+    assert.match(f.$('conversation').textContent, /📌 脉络：💬 排查登录接口 500 报错/);
+
+    const loginPill = [...topicBar.children].find(btn => btn.dataset?.topicId === 'topic-login');
+    assert(loginPill);
+    await loginPill.onclick();
+    await settle();
+    assert.match(f.$('conversation').textContent, /已在日志中定位到 token 校验异常/);
+    assert(!f.$('conversation').textContent.includes('已生成三档订阅价格表'));
+    assert.match(f.$('task-context-title').textContent, /排查登录接口 500 报错/);
+
+    const allPill = findButton(topicBar, '✨ 全部脉络');
+    await allPill.onclick();
+    await settle();
+    assert.match(f.$('conversation').textContent, /已生成三档订阅价格表/);
   });
   console.log('Client regression tests passed');
 

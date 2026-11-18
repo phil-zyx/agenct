@@ -265,6 +265,9 @@ def workspace_dirs() -> list[str]:
 
 
 def default_workdir() -> str:
+    env_dir = (os.environ.get("AGENCT_WORKDIR") or "").strip()
+    if env_dir and os.path.isdir(os.path.expanduser(env_dir)):
+        return os.path.abspath(os.path.expanduser(env_dir))
     home = os.path.expanduser("~")
     for candidate in (
         os.path.expanduser("~/projects/work"),
@@ -275,6 +278,47 @@ def default_workdir() -> str:
         if os.path.isdir(candidate):
             return os.path.abspath(candidate)
     return home
+
+
+def resolve_job_workdir(job: dict | None = None, configured_workdir: str | None = None) -> str:
+    explicit = (configured_workdir or os.environ.get("AGENCT_WORKDIR") or "").strip()
+    if explicit:
+        expanded = os.path.abspath(os.path.expanduser(explicit))
+        if os.path.isdir(expanded):
+            return expanded
+    if isinstance(job, dict):
+        haystack = "\n".join(
+            str(job.get(k) or "") for k in ("summary", "instruction", "details")
+        ).lower()
+        if haystack.strip():
+            best_match: tuple[int, str] | None = None
+            for root in (
+                os.getcwd(),
+                os.path.expanduser("~/projects/work"),
+                os.path.expanduser("~/projects"),
+            ):
+                if not os.path.isdir(root):
+                    continue
+                if os.path.exists(os.path.join(root, ".git")):
+                    rname = os.path.basename(os.path.abspath(root))
+                    if len(rname) >= 2 and rname.lower() in haystack:
+                        best_match = (len(rname), os.path.abspath(root))
+                try:
+                    names = os.listdir(root)
+                except OSError:
+                    continue
+                for name in names:
+                    if name.startswith(".") or len(name) < 2:
+                        continue
+                    full = os.path.join(root, name)
+                    if os.path.isdir(full) and os.path.exists(os.path.join(full, ".git")):
+                        if name.lower() in haystack:
+                            cand = (len(name), os.path.abspath(full))
+                            if best_match is None or cand[0] > best_match[0]:
+                                best_match = cand
+            if best_match is not None:
+                return best_match[1]
+    return default_workdir()
 
 
 def materialize_attachments(job: dict) -> tuple[list[str], str | None]:
@@ -451,25 +495,134 @@ def build_template_draft(job: dict, fallback_note: str | None = None) -> str:
     return truncate_utf8("\n".join(lines))
 
 
+_ACTIVE_EXECUTION: dict = {"progress_cb": None, "cancel_event": None}
+
+
+def _report_progress(stage: str, log_tail: str = "") -> None:
+    cb = _ACTIVE_EXECUTION.get("progress_cb")
+    if callable(cb):
+        try:
+            cb(stage, log_tail)
+        except Exception:
+            pass
+
+
+def _terminate_proc(proc: subprocess.Popen) -> None:
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2)
+    except Exception:
+        pass
+
+
+def _run_monitored_process(
+    argv: list[str] | str,
+    *,
+    shell: bool = False,
+    env: dict | None = None,
+    cwd: str | None = None,
+    stdin_bytes: bytes | None = None,
+    timeout: int = 300,
+    stage_label: str = "正在执行本机 Agent",
+) -> tuple[int, bytes, bytes, bool]:
+    cancel_event: threading.Event | None = _ACTIVE_EXECUTION.get("cancel_event")
+    proc = subprocess.Popen(
+        argv,
+        shell=shell,
+        env=env,
+        cwd=cwd if (cwd and os.path.isdir(cwd)) else None,
+        stdin=subprocess.PIPE if stdin_bytes is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    out_chunks: list[bytes] = []
+    err_chunks: list[bytes] = []
+    tail_lock = threading.Lock()
+    recent_lines: list[str] = []
+
+    def _reader(stream, sink: list[bytes]) -> None:
+        if stream is None:
+            return
+        try:
+            while True:
+                line = stream.readline()
+                if not line:
+                    break
+                sink.append(line)
+                decoded = decode_bytes(line).strip()
+                if decoded:
+                    with tail_lock:
+                        recent_lines.append(decoded[-160:])
+                        if len(recent_lines) > 4:
+                            recent_lines.pop(0)
+                        tail_str = " | ".join(recent_lines)[-360:]
+                    _report_progress(stage_label, tail_str)
+        except Exception:
+            pass
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, out_chunks), daemon=True)
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, err_chunks), daemon=True)
+    t_out.start()
+    t_err.start()
+    if stdin_bytes is not None and proc.stdin is not None:
+        try:
+            proc.stdin.write(stdin_bytes)
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+
+    deadline = time.monotonic() + max(1, timeout)
+    cancelled = False
+    while proc.poll() is None:
+        if cancel_event is not None and cancel_event.is_set():
+            cancelled = True
+            _terminate_proc(proc)
+            break
+        if time.monotonic() >= deadline:
+            _terminate_proc(proc)
+            t_out.join(timeout=1)
+            t_err.join(timeout=1)
+            raise subprocess.TimeoutExpired(argv, timeout)
+        time.sleep(0.2)
+
+    t_out.join(timeout=2)
+    t_err.join(timeout=2)
+    return proc.returncode or 0, b"".join(out_chunks), b"".join(err_chunks), cancelled
+
+
 def run_cli_agent(
     tool: str,
     prompt: str,
     cmd_timeout: int,
     image_paths: list[str] | None = None,
     evidence_dir: str | None = None,
+    workdir: str | None = None,
 ) -> tuple[bool, str]:
     exe = shutil.which(tool)
     if not exe:
         print(f"Local agent '{tool}' was not found in PATH.", file=sys.stderr, flush=True)
         return False, ""
+    effective_workdir = workdir if (workdir and os.path.isdir(workdir)) else default_workdir()
+    sandbox_level = (os.environ.get("AGENCT_SANDBOX") or "full").strip().lower()
     out_file: str | None = None
     if tool == "claude":
-        add_dirs = ["--add-dir", os.path.expanduser("~")]
+        add_dirs = ["--add-dir", effective_workdir]
+        if sandbox_level == "full":
+            add_dirs.extend(["--add-dir", os.path.expanduser("~")])
         if image_paths:
             add_dirs.extend(["--add-dir", os.path.dirname(image_paths[0])])
         if evidence_dir:
             add_dirs.extend(["--add-dir", evidence_dir])
-        argv = [exe, "-p", "--allowedTools", "Bash,Read,Glob,Grep", *add_dirs, "--", prompt]
+        allowed_tools = "Read,Glob,Grep" if sandbox_level == "readonly" else "Bash,Read,Glob,Grep"
+        argv = [exe, "-p", "--allowedTools", allowed_tools, *add_dirs, "--", prompt]
     elif tool == "codex":
         fd, out_file = tempfile.mkstemp(prefix="agenct-codex-", suffix=".txt")
         os.close(fd)
@@ -480,7 +633,12 @@ def run_cli_agent(
             img_args.extend(["--add-dir", os.path.dirname(image_paths[0])])
         if evidence_dir:
             img_args.extend(["--add-dir", evidence_dir])
-        sandbox_mode = os.environ.get("AGENCT_CODEX_SANDBOX", "danger-full-access")
+        default_codex_sb = (
+            "read-only"
+            if sandbox_level == "readonly"
+            else ("workspace-write" if sandbox_level == "workspace-write" else "danger-full-access")
+        )
+        sandbox_mode = os.environ.get("AGENCT_CODEX_SANDBOX", default_codex_sb)
         argv = [
             exe,
             "exec",
@@ -488,7 +646,7 @@ def run_cli_agent(
             "-s",
             sandbox_mode,
             "-C",
-            default_workdir(),
+            effective_workdir,
             *img_args,
             "-o",
             out_file,
@@ -501,17 +659,22 @@ def run_cli_agent(
     else:
         return False, ""
     env = dict(os.environ)
+    env["AGENCT_WORKDIR"] = effective_workdir
     if evidence_dir:
         env["AGENCT_EVIDENCE_DIR"] = evidence_dir
+    _report_progress(f"正在调用本机 {tool} 引擎（目录：{os.path.basename(effective_workdir) or effective_workdir}）…", "")
     try:
-        proc = subprocess.run(
+        returncode, raw_out, raw_err, cancelled = _run_monitored_process(
             argv,
             shell=False,
             env=env,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
+            cwd=effective_workdir,
             timeout=cmd_timeout,
+            stage_label=f"本机 {tool} 正在分析与执行…",
         )
+        if cancelled:
+            print(f"Local agent '{tool}' was cancelled remotely by Hub.", file=sys.stderr, flush=True)
+            return False, ""
         file_output = ""
         if out_file and os.path.exists(out_file):
             with open(out_file, "rb") as fh:
@@ -528,11 +691,11 @@ def run_cli_agent(
                 os.unlink(out_file)
             except OSError:
                 pass
-    output = file_output or decode_bytes(proc.stdout).strip()
-    if proc.returncode != 0 or not output:
-        err_text = decode_bytes(proc.stderr).strip()[:300] or decode_bytes(proc.stdout).strip()[:300]
+    output = file_output or decode_bytes(raw_out).strip()
+    if returncode != 0 or not output:
+        err_text = decode_bytes(raw_err).strip()[:300] or decode_bytes(raw_out).strip()[:300]
         print(
-            f"Local agent '{tool}' failed (code={proc.returncode}): {err_text or 'empty output'}",
+            f"Local agent '{tool}' failed (code={returncode}): {err_text or 'empty output'}",
             file=sys.stderr,
             flush=True,
         )
@@ -622,22 +785,25 @@ def run_custom_cmd(job: dict, cmd: str, cmd_timeout: int) -> tuple[str, str]:
         "AGENCT_BASE_DRAFT": str(job.get("base_draft") or ""),
     })
     try:
-        proc = subprocess.run(
+        returncode, raw_out, raw_err, cancelled = _run_monitored_process(
             cmd,
             shell=True,
-            input=json.dumps(job, ensure_ascii=False).encode("utf-8"),
             env=env,
-            capture_output=True,
+            stdin_bytes=json.dumps(job, ensure_ascii=False).encode("utf-8"),
             timeout=cmd_timeout,
+            stage_label="正在运行自定义命令…",
         )
+        if cancelled:
+            print("Local command was cancelled remotely by Hub.", file=sys.stderr, flush=True)
+            return "failed", ""
     except subprocess.TimeoutExpired:
         print("Local command timed out.", file=sys.stderr, flush=True)
         return "failed", ""
-    if proc.returncode != 0:
-        err_text = decode_bytes(proc.stderr).strip()[:300]
-        print(f"Local command exited with code {proc.returncode}: {err_text}", file=sys.stderr, flush=True)
+    if returncode != 0:
+        err_text = decode_bytes(raw_err).strip()[:300]
+        print(f"Local command exited with code {returncode}: {err_text}", file=sys.stderr, flush=True)
         return "failed", ""
-    output = decode_bytes(proc.stdout).strip()
+    output = decode_bytes(raw_out).strip()
     if not output:
         print("Local command produced empty stdout.", file=sys.stderr, flush=True)
         return "failed", ""
@@ -650,6 +816,7 @@ def run_job(
     cmd_timeout: int,
     node: dict | None = None,
 ) -> tuple[str, str, str, list[dict]]:
+    job_workdir = resolve_job_workdir(job)
     if agent_mode.startswith("custom:"):
         status, content = run_custom_cmd(job, agent_mode[len("custom:"):], cmd_timeout)
         return status, content, agent_mode, []
@@ -679,6 +846,7 @@ def run_job(
                     cmd_timeout,
                     image_paths=image_paths,
                     evidence_dir=evidence_dir,
+                    workdir=job_workdir,
                 )
                 if ok and output:
                     used_agent = candidate
@@ -798,22 +966,64 @@ def poll_once(hub: str, token: str, cmd_timeout: int, state: dict) -> bool:
     body = {"request_id": uuid.uuid4().hex, "expected_revision": revision, "lease_token": lease}
     pending = {"phase": "executing", "task_id": task_id, "body": body}
     save_pending(path, pending)  # Before any CLI or model call: a crash must never cause re-execution.
-    def renew():
+    started_at = time.monotonic()
+    progress_state = {"stage": "", "log_tail": "", "dirty": False}
+    progress_lock = threading.Lock()
+    cancel_event = threading.Event()
+
+    def on_progress(stage: str, log_tail: str = "") -> None:
+        with progress_lock:
+            if stage != progress_state["stage"] or log_tail != progress_state["log_tail"]:
+                progress_state["stage"] = stage
+                progress_state["log_tail"] = log_tail
+                progress_state["dirty"] = True
+
+    def renew(stage: str = "", log_tail: str = "", elapsed_secs: int = 0):
+        req_body: dict = {"lease_token": lease, "expected_revision": revision}
+        if stage:
+            req_body["stage"] = stage
+        if log_tail:
+            req_body["log_tail"] = log_tail
+        if elapsed_secs > 0:
+            req_body["elapsed_secs"] = elapsed_secs
         return http_json(f"{hub}/node/v1/tasks/{task_id}/lease", token=token, method="POST",
-                         body={"lease_token": lease, "expected_revision": revision})
+                         body=req_body)
+
     renew()
     stopped = threading.Event()
     def heartbeat():
-        while not stopped.wait(30):
+        ticks = 0
+        while not stopped.wait(3):
+            ticks += 1
+            with progress_lock:
+                dirty = progress_state["dirty"]
+                stage = progress_state["stage"]
+                log_tail = progress_state["log_tail"]
+                progress_state["dirty"] = False
+            if not dirty and ticks < 10:
+                continue
+            ticks = 0
+            elapsed = max(1, int(time.monotonic() - started_at))
             try:
-                renew()
+                renew(stage=stage, log_tail=log_tail, elapsed_secs=elapsed)
+            except urllib.error.HTTPError as err:
+                if err.code in (401, 403, 404, 409):
+                    print(f"[agenct-node] 任务 {task_id} 租约已失效或被取消 (HTTP {err.code})，立即终止本地执行。", file=sys.stderr, flush=True)
+                    cancel_event.set()
+                    break
+                print("租约续期失败；请检查连接。过期结果会保留供人工核对。", file=sys.stderr, flush=True)
             except Exception:
                 # The Hub remains authoritative: expiration/revocation rejects the result.
                 print("租约续期失败；请检查连接。过期结果会保留供人工核对。", file=sys.stderr, flush=True)
     worker = threading.Thread(target=heartbeat, daemon=True)
     worker.start()
+    _ACTIVE_EXECUTION["progress_cb"] = on_progress
+    _ACTIVE_EXECUTION["cancel_event"] = cancel_event
     try:
         status, content, used_agent, attachments = run_job(job, state["agent_mode"], cmd_timeout, node=node)
+        if cancel_event.is_set():
+            archive_pending(path, "rejected-result")
+            return False
         if state.get("auto_detect") and used_agent in CLI_AGENTS:
             state["agent_mode"] = used_agent
             state["node_env"] = build_node_env(used_agent)
@@ -824,6 +1034,8 @@ def poll_once(hub: str, token: str, cmd_timeout: int, state: dict) -> bool:
         save_pending(path, pending)
         return submit_pending(hub, token, path, pending)
     finally:
+        _ACTIVE_EXECUTION["progress_cb"] = None
+        _ACTIVE_EXECUTION["cancel_event"] = None
         stopped.set()
         worker.join(timeout=21)
 
@@ -857,6 +1069,14 @@ def main() -> int:
         help="Built-in agent backend (default: auto-detect)",
     )
     parser.add_argument("--cmd", default=None, help="Custom shell command to execute when a task arrives")
+    parser.add_argument("--workdir", default=os.environ.get("AGENCT_WORKDIR", ""), help="Default local workspace directory for CLI agents")
+    parser.add_argument(
+        "--sandbox",
+        default=os.environ.get("AGENCT_SANDBOX", "full"),
+        choices=("readonly", "workspace-write", "full"),
+        help="Execution sandbox level for local CLI agents (readonly | workspace-write | full)",
+    )
+    parser.add_argument("--daemon", action="store_true", help="Detach and run in the background (logs to ~/.agenct/node.log)")
     parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds")
     parser.add_argument("--timeout", type=int, default=300, help="Local agent timeout in seconds")
     parser.add_argument("--state-dir", help="Private local execution journal directory")
@@ -867,6 +1087,32 @@ def main() -> int:
     if not token:
         print("错误: 缺少节点令牌（请设置 AGENCT_NODE_TOKEN 或传入 --token）。", file=sys.stderr)
         return 2
+
+    os.environ["AGENCT_SANDBOX"] = args.sandbox
+    if args.workdir and os.path.isdir(os.path.expanduser(args.workdir)):
+        os.environ["AGENCT_WORKDIR"] = os.path.abspath(os.path.expanduser(args.workdir))
+
+    if args.daemon and os.environ.get("_AGENCT_DAEMON_CHILD") != "1":
+        agenct_dir = os.path.expanduser("~/.agenct")
+        os.makedirs(agenct_dir, mode=0o700, exist_ok=True)
+        log_path = os.path.join(agenct_dir, "node.log")
+        pid_path = os.path.join(agenct_dir, "node.pid")
+        child_env = dict(os.environ)
+        child_env["_AGENCT_DAEMON_CHILD"] = "1"
+        child_argv = [sys.executable, os.path.abspath(__file__), *[a for a in sys.argv[1:] if a != "--daemon"]]
+        with open(log_path, "ab") as log_fh:
+            proc = subprocess.Popen(
+                child_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=log_fh,
+                stderr=log_fh,
+                env=child_env,
+                start_new_session=True,
+            )
+        with open(pid_path, "w", encoding="utf-8") as pid_fh:
+            pid_fh.write(f"{proc.pid}\n")
+        print(f"Agenct 节点已在后台常驻运行 (PID: {proc.pid})。\n  日志文件: {log_path}\n  PID 文件: {pid_path}", flush=True)
+        return 0
 
     hub = args.hub.rstrip("/")
     agent_mode = detect_agent(args.agent, args.cmd)

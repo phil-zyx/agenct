@@ -99,9 +99,10 @@ pub(super) async fn tasks(
                 .optional()?
                 .or(crate::auto_drafts::projection(&db, &id, &task.id, task.revision)?)
                 .unwrap_or(serde_json::Value::Null);
-            if let Some(assigned) =
+            if let Some(mut assigned) =
                 crate::nodes::task_assignment(&db, &id, &task.id, task.revision)?
             {
+                crate::nodes::attach_live_progress(&h, &task.id, task.revision, &mut assigned);
                 value["my_node_assignment"] = assigned;
             }
         }

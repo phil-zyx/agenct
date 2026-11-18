@@ -31,16 +31,18 @@ async function openAccount() {
   const content = el('div', 'contacts-body');
   const accountSection = el('div', 'account-section', '正在读取账号…');
   const gitlabSection = el('div', 'gitlab-section');
+  const imSection = el('div', 'im-section');
   const nodesSection = el('div', 'nodes-section');
   const automationSection = el('div', 'automation-section');
   const rulesSection = el('div', 'rules-section');
   const adminSection = el('div', 'admin-section');
-  content.replaceChildren(...[accountSection, $('collaboration-profile-view'), nodesSection, automationSection, rulesSection, gitlabSection, $('account-tools'), adminSection].filter(Boolean));
+  content.replaceChildren(...[accountSection, $('collaboration-profile-view'), nodesSection, automationSection, rulesSection, imSection, gitlabSection, $('account-tools'), adminSection].filter(Boolean));
   host.append(header, content); close.focus?.();
   if (typeof collaborationProfileUI !== 'undefined') void collaborationProfileUI.open(context);
   void renderNodesSection(context, valid, nodesSection);
   void renderAutomationPermissions(context, valid, automationSection);
   void renderRulesSection(context, valid, rulesSection);
+  void renderImWebhookSection(context, valid, imSection);
   void renderGitlabSection(context, valid, gitlabSection);
   try {
     const me = await api(context, 'me'); if (!valid()) return;
@@ -561,4 +563,119 @@ async function renderRulesSection(context, valid, container) {
   };
 
   await loadRules();
+}
+
+async function renderImWebhookSection(context, valid, container) {
+  const card = el('article', 'member-card im-card');
+  const head = el('div', 'node-row-head');
+  const badge = el('span', 'node-badge offline', '读取中…');
+  head.append(el('h3', null, '🔔 飞书 / 企微 / 钉钉 实时通知卡片'), badge);
+  const intro = el('p', 'note', '当有【🚨 需本人接手】、【🤝 新任务委派】或【✅ 节点完成待验收】时，管家自动向你的群机器人或个人通知通道推送交互卡片，无需时刻盯着网页。');
+
+  const form = el('div', 'node-create-form');
+  const providerSelect = el('select'); providerSelect.setAttribute('aria-label', '通知平台');
+  for (const [val, label] of [
+    ['feishu', '🪶 飞书自定义机器人（Interactive 彩色卡片）'],
+    ['wecom', '💬 企业微信机器人（Markdown 卡片）'],
+    ['dingtalk', '📌 钉钉自定义机器人（Markdown 卡片）'],
+    ['generic', '🔗 通用 Webhook（标准 JSON）']
+  ]) {
+    const opt = el('option', null, label); opt.value = val; providerSelect.append(opt);
+  }
+  const urlInput = el('input'); urlInput.type = 'url'; urlInput.maxLength = 512;
+  urlInput.placeholder = 'https://open.feishu.cn/open-apis/bot/v2/hook/...';
+  urlInput.setAttribute('aria-label', 'IM Webhook 地址');
+
+  const takeoverCheck = el('input'); takeoverCheck.type = 'checkbox'; takeoverCheck.checked = true; takeoverCheck.setAttribute('aria-label', '推送需本人接手提醒');
+  const delegationCheck = el('input'); delegationCheck.type = 'checkbox'; delegationCheck.checked = true; delegationCheck.setAttribute('aria-label', '推送新委派提醒');
+  const deliveryCheck = el('input'); deliveryCheck.type = 'checkbox'; deliveryCheck.checked = true; deliveryCheck.setAttribute('aria-label', '推送待验收提醒');
+
+  const mkCheck = (input, text) => { const l = el('label', 'gitlab-check'); l.append(input, el('span', null, text)); return l; };
+  const providerLabel = el('label', 'member-label', '通知平台'); providerLabel.append(providerSelect);
+  const urlLabel = el('label', 'member-label', '机器人 Webhook 地址'); urlLabel.append(urlInput);
+  const formNote = el('p', 'note');
+  const saveBtn = el('button', 'primary', '保存通知配置'); saveBtn.type = 'button';
+  const testBtn = el('button', null, '发送测试卡片'); testBtn.type = 'button';
+  const clearBtn = el('button', 'danger hide', '清除地址'); clearBtn.type = 'button';
+  const btnRow = el('div', 'actions'); btnRow.append(saveBtn, testBtn, clearBtn);
+
+  form.append(
+    providerLabel,
+    urlLabel,
+    mkCheck(takeoverCheck, '🚨 当触发「需本人接手」护栏或连续退回熔断时推送'),
+    mkCheck(delegationCheck, '🤝 当收到新委派或需补充材料时推送'),
+    mkCheck(deliveryCheck, '✅ 当节点完成任务交付、等待验收时推送'),
+    formNote,
+    btnRow
+  );
+  card.append(head, intro, form);
+  container.replaceChildren(card);
+
+  function applyImConfig(cfg) {
+    if (!cfg || typeof cfg !== 'object') return;
+    if (cfg.provider) providerSelect.value = cfg.provider;
+    takeoverCheck.checked = cfg.notify_takeover !== false;
+    delegationCheck.checked = cfg.notify_delegation !== false;
+    deliveryCheck.checked = cfg.notify_delivery !== false;
+    urlInput.value = '';
+    if (cfg.configured) {
+      urlInput.placeholder = '已配置（' + (cfg.webhook_url_preview || '***') + '），留空保持不变';
+      clearBtn.classList.remove('hide');
+      badge.className = 'node-badge online';
+      badge.textContent = '已启用实时卡片';
+    } else {
+      urlInput.placeholder = 'https://open.feishu.cn/open-apis/bot/v2/hook/...';
+      clearBtn.classList.add('hide');
+      badge.className = 'node-badge offline';
+      badge.textContent = '未配置';
+    }
+  }
+
+  async function submitImConfig(clearWebhook = false) {
+    if (!valid() || saveBtn.disabled) return;
+    saveBtn.disabled = true; clearBtn.disabled = true; formNote.textContent = '';
+    try {
+      const payload = {
+        provider: providerSelect.value,
+        notify_takeover: !!takeoverCheck.checked,
+        notify_delegation: !!delegationCheck.checked,
+        notify_delivery: !!deliveryCheck.checked,
+      };
+      if (clearWebhook) payload.clear_webhook = true;
+      else if (urlInput.value.trim()) payload.webhook_url = urlInput.value.trim();
+      const res = await api(context, 'im/config', 'POST', payload);
+      if (!valid()) return;
+      applyImConfig(res);
+      formNote.textContent = clearWebhook ? '已清除通知 Webhook。' : '✅ 实时通知卡片配置已保存。';
+    } catch (error) {
+      if (valid()) formNote.textContent = error.message;
+    } finally {
+      if (valid()) { saveBtn.disabled = false; clearBtn.disabled = false; }
+    }
+  }
+
+  saveBtn.onclick = () => submitImConfig(false);
+  clearBtn.onclick = () => submitImConfig(true);
+  testBtn.onclick = async () => {
+    if (!valid() || testBtn.disabled) return;
+    testBtn.disabled = true; formNote.textContent = '正在发送测试卡片…';
+    try {
+      await api(context, 'im/test', 'POST');
+      if (valid()) formNote.textContent = '🎉 测试卡片已成功推送到目标群/应用！';
+    } catch (error) {
+      if (valid()) formNote.textContent = error.message;
+    } finally {
+      if (valid()) testBtn.disabled = false;
+    }
+  };
+
+  try {
+    const cfg = await api(context, 'im/config');
+    if (valid()) applyImConfig(cfg);
+  } catch (error) {
+    if (valid()) {
+      badge.textContent = '未连接';
+      formNote.textContent = '读取通知配置失败：' + error.message;
+    }
+  }
 }

@@ -2,6 +2,30 @@
 use super::messages::{execute_chat, ChatInput};
 use super::*;
 
+pub(crate) fn set_stage(h: &Hub, owner: &str, key: Option<&str>, stage: impl Into<String>) {
+    let Some(key) = key else { return };
+    if let Ok(mut guard) = h.turn_progress.lock() {
+        if guard.len() >= 512 {
+            guard.clear();
+        }
+        guard.insert((owner.to_owned(), key.to_owned()), stage.into());
+    }
+}
+
+pub(crate) fn clear_stage(h: &Hub, owner: &str, key: Option<&str>) {
+    let Some(key) = key else { return };
+    if let Ok(mut guard) = h.turn_progress.lock() {
+        guard.remove(&(owner.to_owned(), key.to_owned()));
+    }
+}
+
+pub(crate) fn read_stage(h: &Hub, owner: &str, key: &str) -> Option<String> {
+    h.turn_progress
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&(owner.to_owned(), key.to_owned())).cloned())
+}
+
 fn mark_uncertain(db: &mut Connection, owner: &str, key: &str) -> Result<()> {
     let tx = db.transaction()?;
     tx.execute("UPDATE messages SET status='uncertain' WHERE owner=?1 AND status IN ('pending','failed','interrupted') AND id IN (SELECT message_id FROM chat_turns WHERE owner=?1 AND request_id=?2 AND status='pending')", params![owner,key])?;
@@ -204,12 +228,25 @@ pub(super) async fn chat(
     let (task_hub, task_id) = (h.clone(), id.clone());
     let dispatch = tokio::spawn(async move {
         let _guard = guard;
+        set_stage(
+            &task_hub,
+            &task_id,
+            input.request_id.as_deref(),
+            "正在分析意图与上下文…",
+        );
         let result = if let Some(context) = project_context {
+            set_stage(
+                &task_hub,
+                &task_id,
+                input.request_id.as_deref(),
+                "正在结合项目共同状态推理…",
+            );
             crate::project_context::execute(&task_hub, &task_id, &input, runtime_profile, context)
                 .await
         } else {
             execute_chat(&task_hub, &task_id, &input, runtime_profile, task_context).await
         };
+        clear_stage(&task_hub, &task_id, input.request_id.as_deref());
         if let Err(error) = &result {
             if let Some(key) = input.request_id.as_deref() {
                 if let Some(code) = crate::chat_failures::code(error) {
@@ -233,6 +270,7 @@ pub(super) async fn chat(
     match dispatch.await {
         Ok(result) => result,
         Err(_) => {
+            clear_stage(&h, &id, key.as_deref());
             // Panicked dispatch: the outcome is unknown, never "not sent".
             if let Some(key) = key.as_deref() {
                 mark_uncertain(&mut *h.db()?, &id, key)?;
@@ -282,7 +320,79 @@ pub(super) async fn status(
             serde_json::from_str(&raw).map_err(|_| invalid("invalid stored project selection"))?;
         projects::authorize(&h, &db, &selected.project_id, &id)?;
     }
-    Ok(Json(receipt(&db, &id, &key)?.ok_or_else(denied)?))
+    let mut out = receipt(&db, &id, &key)?.ok_or_else(denied)?;
+    if out["status"] == "pending" {
+        if let Some(stage) = read_stage(&h, &id, &key) {
+            out["live_stage"] = serde_json::Value::String(stage);
+        }
+    }
+    Ok(Json(out))
+}
+
+pub(super) async fn stream_status(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Result<Response> {
+    let id = h.identity(&headers)?;
+    if !valid_key(&key) {
+        return Err(denied());
+    }
+    let mut current_receipt = {
+        let db = h.db()?;
+        let selection: Option<String> = db
+            .query_row(
+                "SELECT selected_project FROM chat_turns WHERE owner=?1 AND request_id=?2",
+                params![id, key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(raw) = selection {
+            let selected: crate::project_context::Selection = serde_json::from_str(&raw)
+                .map_err(|_| invalid("invalid stored project selection"))?;
+            projects::authorize(&h, &db, &selected.project_id, &id)?;
+        }
+        receipt(&db, &id, &key)?
+    };
+    let mut events = Vec::new();
+    for _ in 0..10 {
+        if let Some(ref mut r) = current_receipt {
+            if r["status"] == "pending" {
+                if let Some(stage) = read_stage(&h, &id, &key) {
+                    r["live_stage"] = serde_json::Value::String(stage);
+                }
+                events.push(format!("event: progress\ndata: {}\n\n", r));
+            } else {
+                events.push(format!("event: complete\ndata: {}\n\n", r));
+                break;
+            }
+        } else if let Some(stage) = read_stage(&h, &id, &key) {
+            let p =
+                serde_json::json!({"request_id": key, "status": "pending", "live_stage": stage});
+            events.push(format!("event: progress\ndata: {}\n\n", p));
+        } else {
+            return Err(denied());
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        current_receipt = {
+            let db = h.db()?;
+            receipt(&db, &id, &key)?
+        };
+    }
+    let body = events.join("");
+    Ok((
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/event-stream; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 #[cfg(test)]

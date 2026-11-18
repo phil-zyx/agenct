@@ -211,7 +211,21 @@ def restore(source, destination, runtime_directory=None):
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if 'node_assignments' in tables:
                 db.execute("UPDATE node_assignments SET status='failed' WHERE status IN ('queued','running')")
-                db.commit()
+            if 'browser_sessions' in tables:
+                db.execute("DELETE FROM browser_sessions")
+            if 'automation_state' in tables:
+                row = db.execute("SELECT state_json FROM automation_state WHERE id = 1").fetchone()
+                if row and row[0]:
+                    data = json.loads(row[0])
+                    for cron in data.get('crons', []):
+                        cron['enabled'] = False
+                    for config in data.get('gitlab_configs', {}).values():
+                        config['auto_poll_todos'] = False
+                    db.execute(
+                        "UPDATE automation_state SET state_json = ? WHERE id = 1",
+                        (json.dumps(data),),
+                    )
+            db.commit()
         automation = stage / 'automation_state.json'
         if automation.exists():
             data = json.loads(automation.read_text())

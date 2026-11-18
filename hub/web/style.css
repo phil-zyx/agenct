@@ -845,3 +845,9 @@ textarea, input { caret-color: var(--brand); }
 .project-question-thread { margin: 18px 0; padding-top: 2px; border-top: 1px solid var(--line-strong); }
 .project-question-reply { margin-left: 16px; border-left: 3px solid var(--brand); }
 .project-question-message > p { margin: 6px 0; }
+.muse-topic-bar { display: flex; flex-wrap: nowrap; gap: 6px; overflow-x: auto; padding: 8px 16px; margin: 0 auto 8px; max-width: 760px; border-bottom: 1px solid var(--line, #e5e7eb); scrollbar-width: thin; }
+.muse-topic-pill { flex: 0 0 auto; font-size: 12px; line-height: 1.4; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line, #d1d5db); background: var(--surface, #f9fafb); color: var(--fg, #374151); cursor: pointer; transition: all 0.15s ease; }
+.muse-topic-pill:hover { border-color: #10b981; color: #047857; }
+.muse-topic-pill.active { background: #ecfdf5; border-color: #059669; color: #065f46; font-weight: 600; }
+.muse-topic-pill.topic-working::before { content: "● "; color: #10b981; }
+.msg-topic-tag { color: #047857; font-weight: 500; }

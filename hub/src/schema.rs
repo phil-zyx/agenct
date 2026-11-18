@@ -3,7 +3,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::collections::BTreeMap;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-pub(super) const VERSION: i64 = 26;
+pub(super) const VERSION: i64 = 27;
 
 const BASE_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sessions (owner TEXT PRIMARY KEY, session_id TEXT NOT NULL);
@@ -96,6 +96,8 @@ const TABLES: &[&str] = &[
     "user_nodes",
     "node_assignments",
     "automation_permissions",
+    "automation_state",
+    "browser_sessions",
 ];
 
 pub(super) fn migrate(db: &mut Connection) -> Result<()> {
@@ -217,6 +219,22 @@ fn step(db: &Connection, version: i64) -> rusqlite::Result<()> {
             // Never resume legacy running execution without an exclusive lease.
             db.execute_batch("UPDATE node_assignments SET status='failed' WHERE status='running'")?;
         }
+        27 => {
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS automation_state (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    state_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS browser_sessions (
+                    session_hash TEXT PRIMARY KEY,
+                    binding_hash TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    csrf TEXT NOT NULL,
+                    expires_unix INTEGER NOT NULL
+                );",
+            )?;
+        }
         _ => unreachable!("only ordered, supported schema versions are applied"),
     }
     Ok(())
@@ -301,6 +319,7 @@ fn introduced(table: &str, column: &str) -> i64 {
         ("project_state_items" | "project_state_versions", _) => 19,
         ("project_questions" | "project_question_withdrawals", _) => 22,
         ("project_resolutions" | "project_acceptances" | "project_acceptance_withdrawals", _) => 23,
+        ("automation_state" | "browser_sessions", _) => 27,
         ("node_assignments", "lease_hash" | "lease_until" | "submission_hash") => 26,
         ("automation_permissions", _) | ("node_assignments", "authorization") => 25,
         ("user_nodes" | "node_assignments", _) => 24,
@@ -407,6 +426,7 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                     && version < 23)
                 || (["user_nodes", "node_assignments"].contains(&table) && version < 24)
                 || (table == "automation_permissions" && version < 25)
+                || (["automation_state", "browser_sessions"].contains(&table) && version < 27)
             {
                 continue;
             }
@@ -470,6 +490,8 @@ fn validate(db: &Connection, version: i64) -> Result<()> {
                 | "user_nodes"
                 | "node_assignments"
                 | "automation_permissions"
+                | "automation_state"
+                | "browser_sessions"
         ) {
             let legacy_nodes = Connection::open_in_memory()?;
             let old_nodes = table == "node_assignments" && !actual.contains_key("lease_hash");

@@ -59,8 +59,148 @@ function renderMarkdown(value) {
 }
 
 
+let activeMuseTopicId = null;
+function resetMuseTopicFilter() {
+  activeMuseTopicId = null;
+  const bar = typeof $ === 'function' ? $('muse-topic-bar') : null;
+  if (bar) { bar.replaceChildren(); bar.classList.add('hide'); }
+}
+
+const CLIENT_STOP_BIGRAMS = new Set([
+  '帮我', '请问', '一下', '这个', '那个', '什么', '怎么', '可以', '需要', '我们', '你们',
+  '现在', '已经', '如果', '或者', '任务', '管家', '处理', '看看', '看下', '查下', '刚才',
+  '这里', '那里', '还是', '以及', '一个', '一些', '进行', '确认', '通过', '补充', '退回'
+]);
+
+function extractClientSemanticTokens(text) {
+  const raw = String(text ?? '');
+  const tokens = new Set();
+  for (const m of raw.toLowerCase().matchAll(/[a-z0-9_-]{2,}/g)) {
+    const w = m[0].replace(/^[_-]+|[_-]+$/g, '');
+    if (w.length >= 2 && !['http', 'https', 'the', 'and', 'for', 'with', 'att', 'api'].includes(w)) {
+      tokens.add(w);
+    }
+  }
+  for (const seg of raw.matchAll(/[\u4e00-\u9fa5]{2,}/g)) {
+    const s = seg[0];
+    for (let i = 0; i + 1 < s.length; i++) {
+      const bg = s.slice(i, i + 2);
+      if (!CLIENT_STOP_BIGRAMS.has(bg)) tokens.add(bg);
+    }
+  }
+  return tokens;
+}
+
+function scoreClientMessageTask(content, msgTokens, task, me) {
+  const raw = String(content ?? '');
+  const lower = raw.toLowerCase();
+  const sid = String(task.id || '').slice(0, 8).toLowerCase();
+  let score = 0;
+  if (sid.length >= 6 && lower.includes(sid)) score += 120;
+  if (Array.isArray(task.recent_turns)) {
+    for (const t of task.recent_turns) {
+      if ((t.question && raw.includes(t.question)) || (t.answer && raw.includes(t.answer))) {
+        score += 110;
+        break;
+      }
+    }
+  }
+  if (task.summary && raw.includes(task.summary)) score += 60;
+  if (task.requester !== task.owner) {
+    const other = task.owner === me ? task.requester : task.owner;
+    if (other && lower.includes(other.toLowerCase())) score += 35;
+  }
+  const sumTokens = extractClientSemanticTokens(task.summary || '');
+  let hits = 0;
+  for (const tok of msgTokens) {
+    if (sumTokens.has(tok)) hits++;
+  }
+  score += Math.min(hits * 16, 80);
+  return score;
+}
+
+function attributeMessagesToTasks(messages, tasks, me) {
+  const attributed = new Map();
+  if (!Array.isArray(tasks) || !tasks.length || !Array.isArray(messages) || !messages.length) {
+    return attributed;
+  }
+  messages.forEach((msg, idx) => {
+    const msgTokens = extractClientSemanticTokens(msg.content);
+    let bestTask = null;
+    let bestScore = 0;
+    for (const task of tasks) {
+      const sc = scoreClientMessageTask(msg.content, msgTokens, task, me);
+      if (sc >= 30 && sc > bestScore) {
+        bestScore = sc;
+        bestTask = task;
+      }
+    }
+    if (bestTask) attributed.set(idx, bestTask);
+  });
+  // Pair propagation: link adjacent user <-> assistant exchange turns
+  for (let i = 0; i < messages.length; i++) {
+    if (!attributed.has(i) && messages[i].role === 'assistant' && i > 0 && messages[i - 1].role === 'user' && attributed.has(i - 1)) {
+      attributed.set(i, attributed.get(i - 1));
+    } else if (!attributed.has(i) && messages[i].role === 'user' && i + 1 < messages.length && messages[i + 1].role === 'assistant' && attributed.has(i + 1)) {
+      attributed.set(i, attributed.get(i + 1));
+    }
+  }
+  return attributed;
+}
+
+function selectMuseTopic(context, task) {
+  if (!task) {
+    activeMuseTopicId = null;
+  } else {
+    activeMuseTopicId = activeMuseTopicId === task.id ? null : task.id;
+    if (activeMuseTopicId && !$('text')?.value?.trim() && !pendingTurn && !selectedProject && visibleTasks?.has(task.id)) {
+      selectedTask = { ...visibleTasks.get(task.id), invalidated: false };
+      if (typeof renderTaskContext === 'function') renderTaskContext();
+    }
+  }
+  void refresh(context, false);
+}
+
+function renderMuseTopicBar(context, messages, attributed) {
+  const bar = typeof $ === 'function' ? $('muse-topic-bar') : null;
+  if (!bar) return;
+  const tasks = typeof visibleTasks !== 'undefined' ? [...visibleTasks.values()] : [];
+  if (activeMuseTopicId && !visibleTasks?.has(activeMuseTopicId)) {
+    activeMuseTopicId = null;
+  }
+  if (!tasks.length || !messages.length) {
+    bar.replaceChildren();
+    bar.classList.add('hide');
+    return;
+  }
+  const counts = new Map();
+  for (const task of attributed.values()) {
+    counts.set(task.id, (counts.get(task.id) || 0) + 1);
+  }
+  bar.replaceChildren();
+  bar.classList.remove('hide');
+  const allBtn = el('button', 'muse-topic-pill' + (!activeMuseTopicId ? ' active' : ''), '✨ 全部脉络');
+  allBtn.type = 'button';
+  allBtn.onclick = () => selectMuseTopic(context, null);
+  bar.append(allBtn);
+
+  for (const task of tasks.slice(0, 10)) {
+    const isTopic = Boolean(task.is_topic || task.requester === task.owner);
+    const turnCount = counts.get(task.id) || (Number.isFinite(task.turn_count) ? task.turn_count : 0);
+    const prefix = isTopic ? '' : '🤝 ';
+    const shortTitle = String(task.summary || '').length > 20 ? String(task.summary).slice(0, 20) + '…' : String(task.summary || '');
+    const label = `${prefix}${shortTitle}` + (turnCount > 0 ? ` (${turnCount})` : '');
+    const pill = el('button', 'muse-topic-pill' + (activeMuseTopicId === task.id ? ' active' : '') + (task.status === 'working' ? ' topic-working' : ''), label);
+    pill.type = 'button';
+    pill.dataset.topicId = task.id;
+    pill.title = `${task.summary} (#${String(task.id).slice(0, 8)})`;
+    pill.onclick = () => selectMuseTopic(context, task);
+    bar.append(pill);
+  }
+}
+
 const messagePanels = new Map();
-function addMessageActions(bubble, context, message) {
+function addMessageActions(bubble, context, message, matchedTask = null) {
   const messageKey = JSON.stringify([message.role, message.created_at, message.content]);
   const actions = el('div', 'message-actions');
   const copy = el('button', 'text-btn', '复制'); copy.type = 'button';
@@ -111,6 +251,16 @@ function addMessageActions(bubble, context, message) {
     propose.onclick = () => { if (current(context)) void proposeChatProject(context, message); };
     actions.append(propose);
   }
+  if (matchedTask) {
+    const shortSum = String(matchedTask.summary || '').length > 18
+      ? String(matchedTask.summary).slice(0, 18) + '…'
+      : String(matchedTask.summary || '');
+    const topicBtn = el('button', 'text-btn msg-topic-tag', `📌 脉络：${shortSum}`);
+    topicBtn.type = 'button';
+    topicBtn.title = `聚焦历史任务上下文：${matchedTask.summary}`;
+    topicBtn.onclick = () => selectMuseTopic(context, matchedTask);
+    actions.append(topicBtn);
+  }
   bubble.append(actions);
   if (messagePanels.has(messageKey)) bubble.append(messagePanels.get(messageKey));
 }
@@ -137,12 +287,17 @@ function renderChatExamples() {
   onboarding.append(el('p', 'muted', '或者花 10 秒让管家认识你（确认后才生效）：'));
   for (const [label, template] of [
     ['👋 告诉管家我的工作背景与回复偏好', '记住：我在 [所属团队] 负责 [核心工作]，回复我时请先给结论、简洁直接。'],
-    ['🪪 设置向同事公开的协作名片', '把我的公开资料设为：团队是 [所属团队]，负责 [主要职责]，同事可以找我帮忙 [可协助事项]，发起请求时请提供 [所需背景与期望时间]。']
+    ['🪪 设置向同事公开的协作名片', '把我的公开资料设为：团队是 [所属团队]，负责 [主要职责]，同事可以找我帮忙 [可协助事项]，发起请求时请提供 [所需背景与期望时间]。'],
+    ['🛡️ 设定个人接单底线规则（自然语言）', '以后凡是包含 [生产数据库] 的任务都需要真人接手']
   ]) {
     const button = el('button', 'example-prompt', label); button.type = 'button';
     button.onclick = () => fill(template);
     onboarding.append(button);
   }
+  const nodeBtn = el('button', 'example-prompt', '🖥️ 一键挂载我的第一台 PC 算力节点（常驻守护）');
+  nodeBtn.type = 'button';
+  nodeBtn.onclick = () => $('open-account')?.click?.();
+  onboarding.append(nodeBtn);
   box.append(onboarding);
   return box;
 }
@@ -195,6 +350,14 @@ function renderMessageAttachments(context, attachments) {
 }
 
 function renderConversation(context, messages, proposals, moments = []) {
+  const allTasks = typeof visibleTasks !== 'undefined' ? [...visibleTasks.values()] : [];
+  const attributed = attributeMessagesToTasks(messages, allTasks, context?.user);
+  renderMuseTopicBar(context, messages, attributed);
+  if (activeMuseTopicId && visibleTasks?.has(activeMuseTopicId)) {
+    messages = messages.filter((_, idx) => attributed.get(idx)?.id === activeMuseTopicId);
+    moments = moments.filter(m => !m.task || m.task.id === activeMuseTopicId);
+  }
+  const activeAttributed = activeMuseTopicId ? attributeMessagesToTasks(messages, allTasks, context?.user) : attributed;
   const separators = new Map();
   let previous = null;
   messages.forEach((message, index) => {
@@ -205,10 +368,12 @@ function renderConversation(context, messages, proposals, moments = []) {
     }
     previous = at;
   });
-  const entries = messages.map(message => {
+  const entries = messages.map((message, index) => {
     const notice = message.role !== 'user' && /^\[(系统提示|MOCK)/.test(message.content);
+    const matchedTask = activeAttributed.get(index) || null;
     const bubble = el('article', 'msg ' + (message.role === 'user' ? 'msg-user' : notice ? 'msg-notice' : 'msg-assistant')
-      + (message.status === 'failed' ? ' msg-failed' : message.status === 'pending' ? ' msg-sending' : ''));
+      + (message.status === 'failed' ? ' msg-failed' : message.status === 'pending' ? ' msg-sending' : '')
+      + (matchedTask ? ' msg-has-topic' : ''));
     const { cleanText, attachments } = extractMessageAttachments(message.content);
     if (cleanText || !attachments.length) {
       bubble.append(message.role === 'assistant' && !notice ? renderMarkdown(cleanText) : el('div', 'msg-body', cleanText));
@@ -216,7 +381,7 @@ function renderConversation(context, messages, proposals, moments = []) {
     if (attachments.length) {
       bubble.append(renderMessageAttachments(context, attachments));
     }
-    addMessageActions(bubble, context, message);
+    addMessageActions(bubble, context, message, matchedTask);
     // In flight is shown by the typing dots; only outcomes needing attention get words.
     if (!['complete', 'pending'].includes(message.status)) bubble.append(el('div', 'msg-status', MESSAGE_STATUS[message.status] || message.status));
     return bubble;
