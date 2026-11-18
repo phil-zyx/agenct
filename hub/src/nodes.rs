@@ -677,9 +677,50 @@ fn should_auto_route_to_node(
         "挂了",
         "报错",
     ];
-    Ok(LOCAL_INTENT_KEYWORDS
+    if LOCAL_INTENT_KEYWORDS
         .iter()
-        .any(|kw| lower.contains(kw) || message.contains(kw)))
+        .any(|kw| lower.contains(kw) || message.contains(kw))
+    {
+        return Ok(true);
+    }
+    let recent_node_active: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM node_assignments WHERE owner=?1 AND updated_at >= ?2)",
+            params![owner, now_unix().saturating_sub(600)],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if recent_node_active {
+        let is_followup_or_confirm = [
+            "哪些",
+            "哪个",
+            "那",
+            "再",
+            "它",
+            "这个",
+            "刚才",
+            "继续",
+            "还有",
+            "顺便",
+            "为什么",
+            "怎么",
+            "多少",
+            "什么",
+            "要",
+            "好",
+            "好的",
+            "可以",
+            "行",
+            "去查",
+            "试试",
+        ]
+        .iter()
+        .any(|cue| message.contains(cue));
+        if is_followup_or_confirm {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn is_topic_summary(summary: &str) -> bool {
@@ -851,6 +892,64 @@ pub(crate) fn consolidate_self_topics(db: &Connection, owner: &str) -> Result<()
             db.execute(
                 "UPDATE tasks SET result=?1 WHERE id=?2",
                 params![res, canon_id],
+            )?;
+        }
+    }
+
+    // Consolidate multiple completed `🦊 GitLab #... · <repo>` topics for the same repo into `🦊 GitLab · <repo>`
+    let mut gl_stmt = db.prepare(
+        "SELECT id, summary, result FROM tasks
+         WHERE requester=?1 AND owner=?1 AND summary LIKE '🦊 GitLab %· %' AND status != 'working'
+         ORDER BY rowid ASC",
+    )?;
+    let gl_rows = gl_stmt
+        .query_map([owner], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut by_repo: std::collections::HashMap<String, Vec<(String, String, Option<String>)>> =
+        std::collections::HashMap::new();
+    for (id, summary, result) in gl_rows {
+        if let Some((_, repo)) = summary.split_once("· ") {
+            let repo = repo.trim().to_owned();
+            if !repo.is_empty() {
+                by_repo.entry(repo).or_default().push((id, summary, result));
+            }
+        }
+    }
+    for (repo, group) in by_repo {
+        if group.len() < 2 {
+            continue;
+        }
+        let canon_title = format!("🦊 GitLab · {repo}");
+        let (canon_id, _, _) = &group[group.len() - 1];
+        let canon_id = canon_id.clone();
+        db.execute(
+            "UPDATE tasks SET summary=?1 WHERE id=?2",
+            params![canon_title, canon_id],
+        )?;
+        let mut latest_res: Option<String> = None;
+        for (frag_id, old_sum, res) in group {
+            if let Some(r) = res.filter(|s| !s.trim().is_empty()) {
+                latest_res = Some(r);
+            }
+            if frag_id == canon_id {
+                continue;
+            }
+            let archived = format!("[归并:{canon_id}] {old_sum}");
+            db.execute(
+                "UPDATE tasks SET summary=?1 WHERE id=?2",
+                params![archived, frag_id],
+            )?;
+        }
+        if let Some(r) = latest_res {
+            db.execute(
+                "UPDATE tasks SET result=?1 WHERE id=?2",
+                params![r, canon_id],
             )?;
         }
     }
@@ -1708,8 +1807,8 @@ fn completed_node_reply(db: &Connection, task_id: &str) -> Result<Option<String>
 }
 
 pub(super) async fn wait_for_node_completion(h: &Hub, task_id: &str) -> Result<Option<String>> {
-    for _ in 0..25 {
-        tokio::time::sleep(Duration::from_millis(120)).await;
+    for _ in 0..180 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
         let reply = {
             let db = h.db()?;
             completed_node_reply(&db, task_id)?
@@ -2733,11 +2832,29 @@ pub(super) async fn submit_draft(
             "🤵 管家（已调度「{node_name}」· 归入主题「{summary}」）：\n\n{}",
             final_content
         );
-        tx.execute(
-            "INSERT INTO messages(owner,role,content,status,created_at)
-             VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",
-            params![owner, reply],
-        )?;
+        let placeholder_id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM messages
+                 WHERE owner=?1 AND role='assistant' AND status='complete'
+                   AND content LIKE '已归入主题「%'
+                   AND content LIKE '%节点正在后台继续执行，完成后结果会自动发回本对话。'
+                 ORDER BY id DESC LIMIT 1",
+                [&owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(pid) = placeholder_id {
+            tx.execute(
+                "UPDATE messages SET content=?1, created_at=CURRENT_TIMESTAMP WHERE id=?2",
+                params![reply, pid],
+            )?;
+        } else {
+            tx.execute(
+                "INSERT INTO messages(owner,role,content,status,created_at)
+                 VALUES (?1,'assistant',?2,'complete',CURRENT_TIMESTAMP)",
+                params![owner, reply],
+            )?;
+        }
     } else {
         crate::sagent::on_node_draft_completed(
             &tx,
