@@ -682,17 +682,21 @@ pub(crate) async fn resolve_historical_task_context(
         }
     }
 
-    // Stage 3: DSH Model semantic disambiguation when 2+ historical tasks are tied in the ambiguous band
+    // Stage 3: DSH Model semantic disambiguation & topic routing
     if let crate::Runtime::Dsh { url, token } = &h.runtime {
-        if ranked.len() >= 2 && top.score >= 16 && top.score - second_score <= 4 {
+        let has_topics = scored_candidates.iter().any(|c| c.is_topic);
+        let needs_llm_routing =
+            (ranked.len() >= 2 && top.score >= 16 && top.score - second_score <= 4)
+                || (has_topics && top.score < 24);
+        if needs_llm_routing {
             let top_list: Vec<String> = ranked
                 .iter()
-                .take(5)
+                .take(8)
                 .map(|c| format!("- `{}` [{}]：{}", c.task_id, c.status, c.summary))
                 .collect();
             let prompt = format!(
-                "你是用户的 Super-Agent 历史上下文归类器（Context Router）。请判断用户的最新输入是否属于下列某个历史任务上下文：\n\n\
-                 【候选历史任务上下文】\n{}\n\n\
+                "你是用户的 Super-Agent 历史上下文归类器（LLM Context Router）。请根据**语义**判断用户的最新输入是否属于下列某个历史任务或脉络主题：\n\n\
+                 【候选历史任务与脉络主题】\n{}\n\n\
                  【用户最新输入】\n「{trimmed}」\n\n\
                  请只输出一行严格合法的 JSON（不要代码块）：\n\
                  - 若属于某个候选上下文：`{{\"task_id\":\"匹配的完整task_id\"}}`\n\

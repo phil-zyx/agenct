@@ -47,8 +47,8 @@ pub(super) async fn tasks(
     headers: HeaderMap,
 ) -> Result<Json<Vec<serde_json::Value>>> {
     let id = h.identity(&headers)?;
+    let _ = crate::nodes::llm_consolidate_self_topics(&h, &id).await;
     let db = h.db()?;
-    let _ = crate::nodes::consolidate_self_topics(&db, &id);
     let mut q=db.prepare("SELECT id,requester,owner,summary,status,result,revision FROM tasks WHERE requester=?1 OR owner=?1 ORDER BY rowid DESC")?;
     let rows = q
         .query_map([&id], row_task)?

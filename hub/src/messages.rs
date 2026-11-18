@@ -324,19 +324,28 @@ pub(super) async fn execute_chat(
             Err(adapter_failed())
         }
     });
+    let fallback_node_hint = match &answer {
+        Ok((_, Some((_, node_name, _, summary)))) => {
+            let explicit_sel = input.selected_task.as_ref().map(|s| s.task_id.as_str());
+            crate::nodes::llm_resolve_topic_hint(h, id, node_name, summary, explicit_sel).await
+        }
+        _ => (None, None),
+    };
     let (task_id, fallback_reply, online) = {
         let mut db = h.db()?;
         let tx = db.transaction()?;
         match answer {
             Ok((_, Some((node_id, node_name, online, summary)))) => {
-                let (task_id, fallback_reply) = crate::nodes::dispatch_chat_task(
+                let explicit_sel = input.selected_task.as_ref().map(|s| s.task_id.as_str());
+                let (task_id, fallback_reply) = crate::nodes::dispatch_chat_task_with_hint(
                     &tx,
                     id,
                     &node_id,
                     &node_name,
                     online,
                     &summary,
-                    input.selected_task.as_ref().map(|s| s.task_id.as_str()),
+                    explicit_sel.or(fallback_node_hint.0.as_deref()),
+                    fallback_node_hint.1.as_deref(),
                 )?;
                 tx.execute(
                     "UPDATE messages SET status='complete' WHERE id=?1",

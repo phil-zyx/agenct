@@ -847,6 +847,356 @@ pub(crate) fn consolidate_self_topics(db: &Connection, owner: &str) -> Result<()
     Ok(())
 }
 
+static LAST_TOPIC_CONSOLIDATION_SIG: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn topic_consolidation_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    LAST_TOPIC_CONSOLIDATION_SIG.get_or_init(|| std::sync::Mutex::new(Default::default()))
+}
+
+fn compute_self_topics_signature(db: &Connection, owner: &str) -> Result<String> {
+    let mut stmt = db.prepare(
+        "SELECT id, summary FROM tasks
+         WHERE requester=?1 AND owner=?1 AND status != 'working'
+         ORDER BY rowid DESC LIMIT 30",
+    )?;
+    let rows = stmt
+        .query_map([owner], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let parts: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, s)| is_topic_summary(s))
+        .map(|(id, s)| format!("{id}:{s}"))
+        .collect();
+    Ok(parts.join("|"))
+}
+
+pub(crate) async fn llm_consolidate_self_topics(h: &Hub, owner: &str) -> Result<()> {
+    {
+        let db = h.db()?;
+        consolidate_self_topics(&db, owner)?;
+    }
+    let crate::Runtime::Dsh { url, token } = &h.runtime else {
+        return Ok(());
+    };
+
+    let (topics, runtime_profile) = {
+        let db = h.db()?;
+        let mut stmt = db.prepare(
+            "SELECT id, summary, COALESCE(result, '') FROM tasks
+             WHERE requester=?1 AND owner=?1 AND status != 'working'
+             ORDER BY rowid DESC LIMIT 30",
+        )?;
+        let raw = stmt
+            .query_map([owner], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let filtered: Vec<(String, String, String)> = raw
+            .into_iter()
+            .filter(|(_, sum, _)| is_topic_summary(sum))
+            .collect();
+        let has_chat_frag = filtered.iter().any(|(_, sum, _)| sum.starts_with("💬 "));
+        if !has_chat_frag || filtered.len() < 2 {
+            return Ok(());
+        }
+        let sig = filtered
+            .iter()
+            .map(|(id, sum, _)| format!("{id}:{sum}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        if let Ok(mut guard) = topic_consolidation_cache().lock() {
+            if guard.get(owner) == Some(&sig) {
+                return Ok(());
+            }
+            guard.insert(owner.to_owned(), sig);
+        }
+        let prof = crate::profiles::route(&db, owner, None, None)?;
+        (filtered, prof)
+    };
+
+    let topic_lines: Vec<String> = topics
+        .iter()
+        .map(|(id, sum, res)| {
+            let short_res: String = res
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(80)
+                .collect();
+            if short_res.is_empty() {
+                format!("- ID `{id}` | 标题：{sum}")
+            } else {
+                format!("- ID `{id}` | 标题：{sum} | 最近内容：{short_res}")
+            }
+        })
+        .collect();
+
+    let prompt = format!(
+        "你是用户的个人 Super-Agent 历史脉络整理器（LLM Topic Consolidator）。\n\
+         请审视用户当前的任务脉络列表，根据**真实语义**找出属于同一件事、同一台机器/终端环境、同一个代码仓库或同一个定时任务的散装 `💬` 话题，将它们归并到对应的目标主脉络中。\n\n\
+         【当前任务脉络列表】\n{}\n\n\
+         【归并要求】\n\
+         1. `from_id` 必须是待归并的散装碎片脉络 ID，`into_id` 必须是保留的目标主脉络 ID（两者不能相同，且都必须在上述列表中）。\n\
+         2. 如果两个 `💬` 话题聊的是同一件事，可以将较旧或较零散的一个 `from_id` 归并到另一个 `into_id`，并在 `new_title` 中给出一个更干净的归纳标题（以 `🖥️ `、`📁 ` 或 `💬 ` 开头，6～16 字）。\n\
+         3. 如果话题之间语义确实相互独立，不要强行归并。\n\n\
+         请只输出一行严格合法的 JSON（不要代码块）：\n\
+         `{{\"merges\":[{{\"from_id\":\"碎片ID\",\"into_id\":\"目标主脉络ID\",\"new_title\":null}}]}}`",
+        topic_lines.join("\n")
+    );
+
+    let dsh = crate::runtime::DshRuntime {
+        client: &h.client,
+        url,
+        token,
+    };
+    let sid = Uuid::new_v4().to_string();
+    let Ok(ans) = crate::runtime::Runtime::turn(
+        &dsh,
+        crate::runtime::TurnRequest {
+            kind: crate::runtime::TurnKind::Chat,
+            message: &prompt,
+            session_id: &sid,
+            history: &[],
+            profile: &runtime_profile,
+            task_context: None,
+            draft_revision: None,
+            task_role: None,
+            owner_context: None,
+            profile_context: None,
+        },
+    )
+    .await
+    else {
+        return Ok(());
+    };
+
+    let raw = ans.reply.trim();
+    let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) else {
+        return Ok(());
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw[s..=e]) else {
+        return Ok(());
+    };
+    let Some(merges) = parsed["merges"].as_array() else {
+        return Ok(());
+    };
+    if merges.is_empty() {
+        return Ok(());
+    }
+
+    let db = h.db()?;
+    let valid_ids: std::collections::HashMap<String, (String, String)> = topics
+        .into_iter()
+        .map(|(id, sum, res)| (id, (sum, res)))
+        .collect();
+    let mut merged_from = std::collections::HashSet::new();
+
+    for m in merges {
+        let Some(from_id) = m["from_id"].as_str() else {
+            continue;
+        };
+        let Some(into_id) = m["into_id"].as_str() else {
+            continue;
+        };
+        if from_id == into_id
+            || merged_from.contains(from_id)
+            || merged_from.contains(into_id)
+            || !valid_ids.contains_key(from_id)
+            || !valid_ids.contains_key(into_id)
+        {
+            continue;
+        }
+        let (old_from_sum, from_res) = &valid_ids[from_id];
+        let archived = format!("[归并:{into_id}] {old_from_sum}");
+        db.execute(
+            "UPDATE tasks SET summary=?1 WHERE id=?2 AND requester=?3 AND owner=?3",
+            params![archived, from_id, owner],
+        )?;
+        if !from_res.trim().is_empty() {
+            db.execute(
+                "UPDATE tasks SET result=?1 WHERE id=?2 AND requester=?3 AND owner=?3 AND (result IS NULL OR result='')",
+                params![from_res, into_id, owner],
+            )?;
+        }
+        if let Some(new_title) = m["new_title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && is_topic_summary(t))
+        {
+            db.execute(
+                "UPDATE tasks SET summary=?1 WHERE id=?2 AND requester=?3 AND owner=?3",
+                params![new_title, into_id, owner],
+            )?;
+        }
+        merged_from.insert(from_id.to_owned());
+    }
+
+    if !merged_from.is_empty() {
+        if let Ok(new_sig) = compute_self_topics_signature(&db, owner) {
+            if let Ok(mut guard) = topic_consolidation_cache().lock() {
+                guard.insert(owner.to_owned(), new_sig);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn llm_resolve_topic_hint(
+    h: &Hub,
+    owner: &str,
+    node_name: &str,
+    question: &str,
+    selected_task_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if selected_task_id.is_some() {
+        return (None, None);
+    }
+    let crate::Runtime::Dsh { url, token } = &h.runtime else {
+        return (None, None);
+    };
+    let clean_q = strip_attachment_markers(question);
+    let q_match = if clean_q.is_empty() {
+        question.trim()
+    } else {
+        clean_q.as_str()
+    };
+    if q_match.is_empty() || q_match.starts_with("[🦊 GitLab") || q_match.starts_with("定时任务：")
+    {
+        return (None, None);
+    }
+
+    let Ok((topics, runtime_profile)) = ({
+        let db = match h.db() {
+            Ok(db) => db,
+            Err(_) => return (None, None),
+        };
+        let mut stmt = match db.prepare(
+            "SELECT id, summary, COALESCE(result, '') FROM tasks
+             WHERE requester=?1 AND owner=?1
+             ORDER BY rowid DESC LIMIT 25",
+        ) {
+            Ok(s) => s,
+            Err(_) => return (None, None),
+        };
+        let rows = stmt
+            .query_map([owner], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .ok()
+            .and_then(|it| it.collect::<rusqlite::Result<Vec<_>>>().ok())
+            .unwrap_or_default();
+        let filtered: Vec<(String, String, String)> = rows
+            .into_iter()
+            .filter(|(_, sum, _)| is_topic_summary(sum))
+            .collect();
+        crate::profiles::route(&db, owner, None, None).map(|prof| (filtered, prof))
+    }) else {
+        return (None, None);
+    };
+
+    let candidates_block = if topics.is_empty() {
+        "（当前尚无历史脉络）".to_owned()
+    } else {
+        topics
+            .iter()
+            .map(|(id, sum, res)| {
+                let short_res: String = res
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(60)
+                    .collect();
+                if short_res.is_empty() {
+                    format!("- `{id}`：{sum}")
+                } else {
+                    format!("- `{id}`：{sum}（最近结果：{short_res}）")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let prompt = format!(
+        "你是用户的个人 Super-Agent 任务脉络归并器（LLM Topic Router）。\n\
+         用户正在向节点「{node_name}」发送新指令，请根据**语义**判断它应该归并到哪个已有任务脉络，或者为它提炼一个精炼的新脉络标题。\n\n\
+         【已有任务脉络列表】\n{candidates_block}\n\n\
+         【用户最新指令】\n「{q_match}」\n\n\
+         【判断准则】\n\
+         1. 凡是涉及本机系统状态、终端窗口（如 tmux/screen）、后台进程/Agent/容器、网络路由或机器环境检查的，优先归并到已有的 `🖥️ ... 系统与环境` 脉络（返回其 `task_id`；若列表中还没有，则返回 `task_id: null, title: \"🖥️ {node_name} 系统与环境\"`）。\n\
+         2. 凡是与已有某个 `📁 ...`、`🦊 ...` 或 `💬 ...` 语义上围绕同一项目、同一问题或上下文追问的，返回该脉络的 `task_id`。\n\
+         3. 若确属全新的独立话题，返回 `task_id: null`，并在 `title` 中提炼一个 6～14 字的干净主题名（以 `📁 `、`🖥️ ` 或 `💬 ` 开头，不要直接照抄原句）。\n\n\
+         请只输出一行严格合法的 JSON（不要代码块）：\n\
+         `{{\"task_id\":\"匹配的已有ID或null\",\"title\":\"匹配的标题或新提炼的主题名\"}}`"
+    );
+
+    let dsh = crate::runtime::DshRuntime {
+        client: &h.client,
+        url,
+        token,
+    };
+    let sid = Uuid::new_v4().to_string();
+    let Ok(ans) = crate::runtime::Runtime::turn(
+        &dsh,
+        crate::runtime::TurnRequest {
+            kind: crate::runtime::TurnKind::Chat,
+            message: &prompt,
+            session_id: &sid,
+            history: &[],
+            profile: &runtime_profile,
+            task_context: None,
+            draft_revision: None,
+            task_role: None,
+            owner_context: None,
+            profile_context: None,
+        },
+    )
+    .await
+    else {
+        return (None, None);
+    };
+
+    let raw = ans.reply.trim();
+    let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) else {
+        return (None, None);
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&raw[s..=e]) else {
+        return (None, None);
+    };
+    let matched_id = val["task_id"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && *id != "null" && topics.iter().any(|(tid, _, _)| tid == id))
+        .map(str::to_owned);
+    let suggested_title = val["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "null")
+        .map(|t| {
+            let clean: String = t.chars().take(28).collect();
+            if is_topic_summary(&clean) {
+                clean
+            } else {
+                format!("💬 {clean}")
+            }
+        });
+    (matched_id, suggested_title)
+}
+
 fn explicit_named_repo(message: &str) -> Option<String> {
     for suffix in ["仓库", "项目"] {
         if let Some(pos) = message.find(suffix) {
@@ -889,6 +1239,7 @@ fn classify_chat_topic(
     node_name: &str,
     question: &str,
     selected_task_id: Option<&str>,
+    llm_suggested_title: Option<&str>,
 ) -> Result<(Option<(String, String, i64)>, String)> {
     if let Some(tid) = selected_task_id {
         if let Some((id, summary, status, revision)) = db
@@ -1043,42 +1394,47 @@ fn classify_chat_topic(
         ]
         .iter()
         .any(|cue| trimmed.starts_with(cue));
-        if let Some((id, summary, status, revision)) =
-            crate::sagent::match_existing_self_topic(db, owner, trimmed)?
-        {
-            return Ok((Some((id, status, revision)), summary));
-        }
-        if is_followup {
-            if let Some((id, summary, status, revision)) = db
-                .query_row(
-                    "SELECT id, summary, status, revision FROM tasks
-                     WHERE requester=?1 AND owner=?1
-                       AND (summary LIKE '📁 %' OR summary LIKE '🖥️ %' OR summary LIKE '💬 %')
-                     ORDER BY rowid DESC LIMIT 1",
-                    [owner],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
-                        ))
-                    },
-                )
-                .optional()?
+        if let Some(llm_title) = llm_suggested_title.filter(|t| !t.trim().is_empty()) {
+            llm_title.trim().to_owned()
+        } else {
+            if let Some((id, summary, status, revision)) =
+                crate::sagent::match_existing_self_topic(db, owner, trimmed)?
             {
                 return Ok((Some((id, status, revision)), summary));
             }
-        }
-        if clean_question.is_empty() || clean_question == "请帮我查看并分析这张图片" {
-            "💬 图片分析与解答".to_owned()
-        } else {
-            let clean: String = trimmed
-                .trim_end_matches(['?', '？', '!', '！', '.', '。'])
-                .chars()
-                .take(24)
-                .collect();
-            format!("💬 {}", if clean.is_empty() { trimmed } else { &clean })
+            if is_followup {
+                if let Some((id, summary, status, revision)) = db
+                    .query_row(
+                        "SELECT id, summary, status, revision FROM tasks
+                         WHERE requester=?1 AND owner=?1
+                           AND (summary LIKE '📁 %' OR summary LIKE '🖥️ %' OR summary LIKE '💬 %')
+                         ORDER BY rowid DESC LIMIT 1",
+                        [owner],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?,
+                                r.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()?
+                {
+                    return Ok((Some((id, status, revision)), summary));
+                }
+            }
+            if clean_question.is_empty() || clean_question == "请帮我查看并分析这张图片"
+            {
+                "💬 图片分析与解答".to_owned()
+            } else {
+                let clean: String = trimmed
+                    .trim_end_matches(['?', '？', '!', '！', '.', '。'])
+                    .chars()
+                    .take(24)
+                    .collect();
+                format!("💬 {}", if clean.is_empty() { trimmed } else { &clean })
+            }
         }
     };
 
@@ -1111,12 +1467,41 @@ pub(super) fn dispatch_chat_task(
     question: &str,
     selected_task_id: Option<&str>,
 ) -> Result<(String, String)> {
+    dispatch_chat_task_with_hint(
+        tx,
+        owner,
+        node_id,
+        node_name,
+        online,
+        question,
+        selected_task_id,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_chat_task_with_hint(
+    tx: &Connection,
+    owner: &str,
+    node_id: &str,
+    node_name: &str,
+    online: bool,
+    question: &str,
+    selected_task_id: Option<&str>,
+    llm_suggested_title: Option<&str>,
+) -> Result<(String, String)> {
     let question = truncate_bytes(question.trim(), 4000);
     if question.is_empty() {
         return Err(invalid("请说明要让该 PC 执行的具体任务内容"));
     }
-    let (existing, topic_title) =
-        classify_chat_topic(tx, owner, node_name, &question, selected_task_id)?;
+    let (existing, topic_title) = classify_chat_topic(
+        tx,
+        owner,
+        node_name,
+        &question,
+        selected_task_id,
+        llm_suggested_title,
+    )?;
     let mut final_node_id = node_id.to_owned();
     let mut final_node_name = node_name.to_owned();
     let mut final_online = online;
@@ -1445,17 +1830,22 @@ pub(super) async fn answer_chat(
         return Ok(None);
     }
 
+    let explicit_sel = selected_self_topic.map(|s| s.task_id.as_str());
+    let (llm_tid, llm_title) =
+        llm_resolve_topic_hint(h, owner, &node_name, &summary, explicit_sel).await;
+
     let (task_id, fallback_reply) = {
         let mut db = h.db()?;
         let tx = db.transaction()?;
-        let (task_id, fallback_reply) = dispatch_chat_task(
+        let (task_id, fallback_reply) = dispatch_chat_task_with_hint(
             &tx,
             owner,
             &node_id,
             &node_name,
             online,
             &summary,
-            selected_self_topic.map(|s| s.task_id.as_str()),
+            explicit_sel.or(llm_tid.as_deref()),
+            llm_title.as_deref(),
         )?;
         tx.execute(
             "INSERT INTO messages(owner,role,content,status,created_at) VALUES (?1,'user',?2,'complete',CURRENT_TIMESTAMP)",
@@ -3914,5 +4304,67 @@ mod tests {
             .unwrap();
         assert_eq!(sys_task["turn_count"], 4);
         assert_eq!(sys_task["result"], "agy 运行中");
+    }
+
+    #[tokio::test]
+    async fn llm_semantic_topic_consolidation_and_routing_merges_arbitrary_fragments() {
+        let adapter = axum::Router::new().route(
+            "/v1/turn",
+            axum::routing::post(|Json(body): Json<Value>| async move {
+                let msg = body["message"].as_str().unwrap_or("");
+                let reply = if msg.contains("LLM Topic Consolidator") {
+                    r#"{"merges":[{"from_id":"t-frag2","into_id":"t-frag1","new_title":"💬 鉴权网关超时排查"}]}"#
+                } else if msg.contains("LLM Topic Router") {
+                    r#"{"task_id":"t-frag1","title":"💬 鉴权网关超时排查"}"#
+                } else {
+                    "ok"
+                };
+                Json(json!({ "reply": reply, "backend": "dsh", "proposal": Value::Null }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/turn", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+
+        let mut h = hub();
+        h.runtime = crate::Runtime::Dsh {
+            url,
+            token: "test-token".into(),
+        };
+        let db = h.db().unwrap();
+        db.execute(
+            "INSERT INTO tasks (id, requester, owner, summary, status, result, revision)
+             VALUES ('t-frag1', 'bob', 'bob', '💬 上游证书握手偶发断连', 'completed', 'TLS 1.3 协商异常', 1),
+                    ('t-frag2', 'bob', 'bob', '💬 网关偶发 504 原因分析', 'completed', '上游握手超时导致', 1)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO deliveries (id, task_id, seq, author, content, status, task_revision, created_at)
+             VALUES ('d-f1', 't-frag1', 1, 'bob', 'TLS 1.3 协商异常', 'submitted', 1, '2026-11-18 11:00:00'),
+                    ('d-f2', 't-frag2', 1, 'bob', '上游握手超时导致', 'submitted', 1, '2026-11-18 11:05:00')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let r = app(h.clone());
+        let (s, tasks) = call(&r, &token("bob"), "GET", "/api/tasks", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let list: Vec<&Value> = tasks
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| t["is_topic"] == true)
+            .collect();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["id"], "t-frag1");
+        assert_eq!(list[0]["summary"], "💬 鉴权网关超时排查");
+        assert_eq!(list[0]["turn_count"], 2);
+
+        let (matched_id, suggested_title) =
+            llm_resolve_topic_hint(&h, "bob", "homelab", "把重试次数调成 2 次再观察下", None).await;
+        assert_eq!(matched_id.as_deref(), Some("t-frag1"));
+        assert_eq!(suggested_title.as_deref(), Some("💬 鉴权网关超时排查"));
     }
 }
