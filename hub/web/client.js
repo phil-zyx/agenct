@@ -589,7 +589,7 @@ async function failTurn(context, failure) {
   }
 }
 
-async function completeTurn(context, response) {
+async function completeTurn(context, response, { recovered = false } = {}) {
   const { id: requestId, text, selectedTask: expectedTask, selectedAgent: expectedAgent } = pendingTurn;
   if (!repositoryReceiptMatches(pendingTurn.selectedRepository, response.repository_context)) throw Error('仓库回执与本次选择不符，保留恢复凭据');
   const profile = response.runtime_profile;
@@ -625,7 +625,11 @@ async function completeTurn(context, response) {
       : '';
   forgetTurn();
   if (current(context) && !project) handleTaskAction(context, response.task_action, requestId);
-  status('已核实消息处理完成。' + receiptContext + projectReceipt + receiptRole);
+  if (recovered || expectedTask || expectedProject || expectedAgent) {
+    status('已核实消息处理完成。' + receiptContext + projectReceipt + receiptRole, { transient: true });
+  } else {
+    status('');
+  }
   try { await refresh(context); }
   catch (error) {
     if (current(context)) status('消息处理已完成，但会话刷新失败：' + error.message + receiptContext + projectReceipt + receiptRole
@@ -1048,7 +1052,7 @@ $('check-turn').onclick = async () => {
       throw Error('发送状态响应无效');
     }
     if (receipt.status === 'complete') {
-      await completeTurn(context, receipt.response);
+      await completeTurn(context, receipt.response, { recovered: true });
     } else if (receipt.status === 'failed') {
       await failTurn(context, receipt.failure);
     } else {
