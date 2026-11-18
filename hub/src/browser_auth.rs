@@ -552,7 +552,14 @@ pub(crate) async fn guard(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
-    response.headers_mut().insert(header::CONTENT_SECURITY_POLICY,HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"));
+    // Chat previews use data URLs from local files and authenticated attachments.
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(concat!(
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; ",
+            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
+        )),
+    );
     response
 }
 pub(crate) async fn session(State(h): State<Hub>, headers: HeaderMap) -> Json<serde_json::Value> {

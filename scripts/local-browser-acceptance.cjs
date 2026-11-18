@@ -1,6 +1,7 @@
 /* Real local Hub + two isolated Chromium contexts. Mock model only; no remote
  * provider, shared-host, physical-device or screen-reader acceptance is claimed.
  * Build first: cargo build --locked --manifest-path hub/Cargo.toml
+ * Chat image checks only: npm run test:local -- --chat-images
  */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
@@ -17,7 +18,10 @@ async function freePort() {
   const port = socket.address().port; await new Promise(resolve => socket.close(resolve)); return port;
 }
 (async () => {
-  try { execFileSync('pdftotext', ['-v'], { stdio: 'ignore' }); } catch { throw Error('Real PDF acceptance requires poppler-utils (pdftotext).'); }
+  const chatImagesOnly = process.argv.includes('--chat-images');
+  if (!chatImagesOnly) {
+    try { execFileSync('pdftotext', ['-v'], { stdio: 'ignore' }); } catch { throw Error('Real PDF acceptance requires poppler-utils (pdftotext).'); }
+  }
   assert(fs.existsSync(binary), 'Build the Hub first: cargo build --locked --manifest-path hub/Cargo.toml');
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'agenct-browser-acceptance-'));
   const state = path.join(temporary, 'state'), backup = path.join(temporary, 'backup.sqlite3');
@@ -132,6 +136,86 @@ async function freePort() {
       await alice.locator('#repository-context.hide').waitFor({state:'attached'});
       console.log('PASS real gated repository preview, explicit single-chat attachment, matching snapshot receipt and owner isolation');
     }
+    const originalViewport = alice.viewportSize();
+    await alice.setViewportSize({ width: 390, height: 844 });
+    await alice.locator('#open-chat').click();
+    const imageUpload = alice.waitForResponse(response => response.url() === origin + '/api/attachments' && response.request().method() === 'POST');
+    await alice.locator('#chat-image-input').setInputFiles({
+      name: 'agenct-preview.png', mimeType: 'image/png', buffer: fs.readFileSync(path.join(root, 'hub/web/brand/agenct-icon-180.png'))
+    });
+    const uploaded = await imageUpload;
+    assert.equal(uploaded.status(), 200);
+    const attachment = await uploaded.json();
+    const expectDecodedImage = async selector => {
+      await alice.locator(selector).waitFor({ state: 'visible' });
+      assert(await alice.locator(selector).evaluate(async image => {
+        await image.decode();
+        return image.naturalWidth === 180;
+      }), `Expected the uploaded image to render in ${selector}`);
+    };
+    await expectDecodedImage('#chat-attachments .chat-attachment-thumb');
+    const evidenceDir = process.env.AGENCT_TEST_SCREENSHOT_DIR;
+    if (evidenceDir) {
+      fs.mkdirSync(evidenceDir, { recursive: true });
+      await alice.screenshot({ path: path.join(evidenceDir, 'mobile-image-preview.png') });
+    }
+    await alice.locator('#text').fill('这是一张图片显示验收截图。');
+    await alice.locator('#send').click();
+    await expectDecodedImage('#conversation .msg-user .msg-image');
+    assert.equal(await alice.locator('#status').textContent(), '', 'Ordinary chat success must leave no receipt toast');
+    const savedImage = alice.waitForResponse(response => response.url() === origin + '/api/attachments/' + attachment.id);
+    await alice.reload();
+    assert.equal((await savedImage).status(), 200);
+    await expectDecodedImage('#conversation .msg-user .msg-image');
+    // Verify PC node reply attachment renders in assistant bubble and supports tap-to-expand preview.
+    const nodeCreate = await fetch(origin + '/api/nodes', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + credentials().alice, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: 'homelab', name: '办公主力机', capabilities: 'linux/x86_64 | host:HomeLab | agent:codex' })
+    });
+    assert.equal(nodeCreate.status, 200);
+    const { token: nodeToken } = await nodeCreate.json();
+    const pollEmpty = await fetch(origin + '/node/v1/work', {
+      headers: { Authorization: 'Bearer ' + nodeToken, 'x-agenct-node-protocol': '2' }
+    });
+    assert.equal(pollEmpty.status, 200);
+    await alice.locator('#text').fill('@homelab 请回传节点截图');
+    await alice.locator('#send').click();
+    const pollJob = await fetch(origin + '/node/v1/work', {
+      headers: { Authorization: 'Bearer ' + nodeToken, 'x-agenct-node-protocol': '2' }
+    });
+    assert.equal(pollJob.status, 200);
+    const { job } = await pollJob.json();
+    assert(job && job.task_id, 'Expected queued node job for @homelab');
+    const iconB64 = fs.readFileSync(path.join(root, 'hub/web/brand/agenct-icon-180.png')).toString('base64');
+    const submitDraft = await fetch(origin + '/node/v1/tasks/' + encodeURIComponent(job.task_id) + '/drafts', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + nodeToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        lease_token: job.lease_token,
+        request_id: 'node-img-check-1',
+        expected_revision: job.task_revision,
+        status: 'completed',
+        content: '节点已完成验证并回传截图。',
+        attachments: [
+          { name: 'mobile-chat-attachment.png', mime_type: 'image/png', data_base64: iconB64 },
+          { name: 'mobile-image-preview.png', mime_type: 'image/png', data_base64: iconB64 }
+        ]
+      })
+    });
+    assert.equal(submitDraft.status, 200);
+    await alice.reload();
+    await expectDecodedImage('#conversation .msg-assistant .msg-image');
+    await alice.locator('#conversation .msg-assistant .msg-image').first().click();
+    await alice.locator('#conversation .msg-assistant .msg-image-card.expanded').waitFor({ state: 'visible' });
+    if (evidenceDir) {
+      await alice.locator('#conversation .msg-assistant .msg-image').first().scrollIntoViewIfNeeded();
+      await alice.screenshot({ path: path.join(evidenceDir, 'mobile-chat-attachment.png') });
+    }
+    console.log('PASS mobile image upload, composer preview, user & node assistant bubble images, tap-to-expand, and no routine receipt toast');
+    if (chatImagesOnly) { assert.deepEqual(errors, []); return; }
+    await alice.setViewportSize(originalViewport);
+
     await alice.locator('#text').fill('请让 bob 帮我 检查本地验收文档'); await alice.locator('#send').click();
     const proposal = alice.locator('.proposal:not(.settled)'); await proposal.waitFor();
     await proposal.getByRole('button', { name: '＋ 附带共享材料（可选）', exact: true }).click();
