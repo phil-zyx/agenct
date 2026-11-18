@@ -101,7 +101,8 @@ function renderActivity(context, items) {
   for (const group of groups) {
     nodes.push(el('h3', 'day', group.label));
     for (const { item, at } of group.items) {
-      const row = el('button', 'activity-item status-' + item.status);
+      const row = el('button', 'activity-item status-' + item.status
+        + (typeof activeMuseTopicId !== 'undefined' && activeMuseTopicId === item.id ? ' topic-active' : ''));
       row.type = 'button';
       const icon = activityIcon(item.status);
       const body = el('span', 'activity-body');
@@ -111,11 +112,14 @@ function renderActivity(context, items) {
         if (!current(context)) return;
         if (item.kind === 'task') {
           const task = typeof visibleTasks !== 'undefined' ? visibleTasks.get(item.id) : null;
-          if (task?.is_topic && typeof selectMuseTopic === 'function' && activeMuseTopicId !== task.id) {
+          if (task?.is_topic && typeof selectMuseTopic === 'function') {
             selectMuseTopic(context, task);
+            closeContacts(); closePeerConversation();
+            returnToChatOnNarrowScreen();
+          } else {
+            setPaneTab('tasks');
+            revealTask(item.id);
           }
-          setPaneTab('tasks');
-          revealTask(item.id);
         } else {
           closeContacts(); closePeerConversation();
           returnToChatOnNarrowScreen();
