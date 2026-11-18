@@ -234,6 +234,19 @@ async function freePort() {
     await alice.locator('#send').click();
     assert.equal(await alice.locator('#status').textContent(), '', 'Ordinary file chat success must leave no receipt toast');
     await alice.locator('#conversation .msg-user .msg-file-card').first().waitFor({ state: 'visible' });
+    const pollFileJob = await fetch(origin + '/node/v1/work', {
+      headers: { Authorization: 'Bearer ' + nodeToken, 'x-agenct-node-protocol': '2' }
+    });
+    assert.equal(pollFileJob.status, 200);
+    const { job: fileJob } = await pollFileJob.json();
+    assert(fileJob && Array.isArray(fileJob.attachments), 'Expected node job to carry file attachments');
+    assert.deepEqual(
+      fileJob.attachments.map(a => ({ name: a.name, mime_type: a.mime_type })),
+      [
+        { name: 'mobile-notes.txt', mime_type: 'text/plain' },
+        { name: 'mobile-spec.pdf', mime_type: 'application/pdf' }
+      ]
+    );
     await alice.reload();
     const txtCard = alice.locator('#conversation .msg-user .msg-file-card').filter({ hasText: 'mobile-notes.txt' });
     const pdfCard = alice.locator('#conversation .msg-user .msg-file-card').filter({ hasText: 'mobile-spec.pdf' });

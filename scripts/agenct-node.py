@@ -352,11 +352,11 @@ def materialize_attachments(job: dict) -> tuple[list[str], str | None]:
             raw = base64.b64decode(b64, validate=True)
         except Exception:
             continue
-        mime = str(att.get("mime_type") or "image/png")
-        ext = ext_map.get(mime, ".png")
-        raw_name = str(att.get("name") or f"attachment{ext}")
+        mime = str(att.get("mime_type") or "application/octet-stream")
+        ext = ext_map.get(mime, "")
+        raw_name = str(att.get("name") or f"attachment{ext or '.bin'}")
         safe_base = "".join(c if (c.isalnum() or c in "._-") else "_" for c in raw_name)[:48].strip("._") or "attachment"
-        if "." not in safe_base or (mime.startswith("image/") and not safe_base.lower().endswith(ext)):
+        if ext and not safe_base.lower().endswith(ext):
             safe_base = f"{safe_base}{ext}"
         target = os.path.join(temp_dir, f"{idx}_{safe_base}")
         with open(target, "wb") as fh:
@@ -447,13 +447,24 @@ def build_prompt(
     else:
         parts.append(f"任务内容：{summary}")
     if image_paths:
-        parts.extend(
-            [
-                "",
-                "用户在本轮对话中附带了以下图片附件（已下载到本机临时路径，请直接结合图片内容回答）：",
-                *[f"- {p}" for p in image_paths],
-            ]
-        )
+        img_only = [p for p in image_paths if p.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))]
+        doc_only = [p for p in image_paths if p not in img_only]
+        if img_only:
+            parts.extend(
+                [
+                    "",
+                    "用户在本轮对话中附带了以下图片附件（已下载到本机临时路径，请直接结合图片内容回答）：",
+                    *[f"- {p}" for p in img_only],
+                ]
+            )
+        if doc_only:
+            parts.extend(
+                [
+                    "",
+                    "用户在本轮对话中附带了以下文件附件（已保存到本机临时路径，请直接读取或解析文件内容回答）：",
+                    *[f"- {p}" for p in doc_only],
+                ]
+            )
     if dirs:
         parts.append("本机常用工作目录：" + ", ".join(dirs))
     if job.get("requester"):
@@ -734,8 +745,14 @@ def run_openai_agent(
                 continue
             b64 = str(att.get("data_base64") or "").strip()
             mime = str(att.get("mime_type") or "image/png")
-            if b64:
+            if b64 and mime.startswith("image/"):
                 parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+            elif b64 and (mime.startswith("text/") or mime == "application/json"):
+                try:
+                    decoded = base64.b64decode(b64).decode("utf-8", errors="replace")[:4000]
+                    parts.append({"type": "text", "text": f"[文件附件 {att.get('name') or 'file'}]:\n{decoded}"})
+                except Exception:
+                    pass
         messages = [{"role": "user", "content": parts}]
     else:
         messages = [{"role": "user", "content": prompt}]
