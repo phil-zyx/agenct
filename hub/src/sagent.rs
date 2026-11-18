@@ -2556,8 +2556,12 @@ async fn execute_cloud_cron_report(h: &Hub, owner: &str, instruction: &str) -> R
         };
         if let crate::Runtime::Dsh { url, token } = &h.runtime {
             if !raw_summary.starts_with("⚠️") && !raw_summary.starts_with("📊") {
+                let wants_raw_detail = ["明细", "详细", "原文", "全部提交", "完整列表"]
+                    .iter()
+                    .any(|kw| instruction.contains(kw));
                 let prompt = format!(
-                    "你是用户的 7×24h 云端 Super-Agent（管家）。请根据下面从公司 GitLab 实时抓取的最近 24 小时真实代码提交记录，按项目/模块提炼重点改动总结（简洁分点，不要编造任何未列出的提交）：\n\n{raw_summary}"
+                    "你是用户的 7×24h 云端 Super-Agent（管家）。用户的定时汇总要求是：「{instruction}」。\n\
+                     请根据下面从公司 GitLab 实时抓取的最近 24 小时真实代码提交记录，严格按照用户的汇总要求按项目提炼核心改动（默认力求精炼易读、每个项目 1~3 条核心要点，不要编造任何未列出的提交）：\n\n{raw_summary}"
                 );
                 let runtime_profile = {
                     let db = h.db()?;
@@ -2587,7 +2591,10 @@ async fn execute_cloud_cron_report(h: &Hub, owner: &str, instruction: &str) -> R
                 .await
                 {
                     if !ans.reply.trim().is_empty() {
-                        return Ok(format!("{}\n\n---\n\n{raw_summary}", ans.reply.trim()));
+                        if wants_raw_detail {
+                            return Ok(format!("{}\n\n---\n\n{raw_summary}", ans.reply.trim()));
+                        }
+                        return Ok(ans.reply.trim().to_owned());
                     }
                 }
             }
@@ -2833,18 +2840,30 @@ pub(crate) async fn answer_chat(
             "PC 节点在线时优先由节点执行，离线或无节点时由云端 X 7×24h 自动执行"
         };
         let preview = if is_gitlab_commit_query(&job.instruction) {
-            fetch_gitlab_commit_summary(h, owner)
+            execute_cloud_cron_report(h, owner, &job.instruction)
                 .await
+                .ok()
                 .map(|s| format!("\n\n---\n\n{s}"))
                 .unwrap_or_default()
         } else {
             String::new()
         };
         let reply = format!(
-            "⏰ 已创建 7×24h 定时任务 `{}`：\n- 触发周期：{sched_desc}\n- 内容：{}\n- 执行方式：{mode_desc}\n\n可随时发送 `查看定时任务`、`立即执行定时任务 {}` 或 `删除定时任务 {}` 管理。{preview}",
-            job.id, job.instruction, job.id, job.id
+            "⏰ 已创建 7×24h 定时任务 `{}`：\n- 触发周期：{sched_desc}\n- 内容：{}\n- 执行方式：{mode_desc}\n\n可随时直接用自然语言说「把这个定时汇总简化一下」「改到晚上 9 点半」或发送 `查看定时任务` 管理。{preview}",
+            job.id, job.instruction
         );
-        with_store_mut(h, |store| store.crons.push(job))?;
+        with_store_mut(h, |store| {
+            // Auto-deduplicate any existing identical or same-time GitLab commit cron for this owner.
+            let is_gl = is_gitlab_commit_query(&job.instruction);
+            store.crons.retain(|c| {
+                !(c.owner == owner
+                    && c.daily_time_cst == job.daily_time_cst
+                    && c.interval_minutes == job.interval_minutes
+                    && (c.instruction == job.instruction
+                        || (is_gl && is_gitlab_commit_query(&c.instruction))))
+            });
+            store.crons.push(job);
+        })?;
         h.automation_notify.notify_one();
         return complete_chat_reply(h, owner, input, runtime_profile, task_context, &reply)
             .map(Some);
@@ -3283,6 +3302,16 @@ pub(crate) async fn answer_chat(
 struct ModelSagentIntent {
     intent: String,
     #[serde(default)]
+    cron_id: Option<String>,
+    #[serde(default)]
+    daily_time_cst: Option<String>,
+    #[serde(default)]
+    interval_minutes: Option<u64>,
+    #[serde(default)]
+    instruction: Option<String>,
+    #[serde(default)]
+    deduplicate_ids: Vec<String>,
+    #[serde(default)]
     rule_body: Option<String>,
     #[serde(default)]
     clarification: Option<String>,
@@ -3299,9 +3328,7 @@ async fn try_handle_model_sagent_intent(
         return Ok(None);
     };
     let trimmed = input.message.trim();
-    // Only invoke the lightweight intent classifier when there is an active managed awaiting task
-    // or clear rule-setting phrasing that missed the deterministic parser.
-    let awaiting_task: Option<(String, String, String, i64)> = {
+    let (awaiting_task, recent_msgs) = {
         let db = h.db()?;
         let found: Option<(String, String, String, i64)> = if let Some(sel) = &input.selected_task {
             db.query_row(
@@ -3321,8 +3348,30 @@ async fn try_handle_model_sagent_intent(
             )
             .optional()?
         };
-        found.filter(|(tid, _, _, _)| is_task_managed(h, tid))
+        let mut m_stmt = db.prepare(
+            "SELECT role, content FROM (
+                SELECT id, role, content FROM messages
+                WHERE owner=?1 AND status='complete'
+                ORDER BY id DESC LIMIT 6
+             ) ORDER BY id ASC",
+        )?;
+        let recent: Vec<(String, String)> = m_stmt
+            .query_map([owner], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        (found.filter(|(tid, _, _, _)| is_task_managed(h, tid)), recent)
     };
+
+    let user_crons: Vec<CronJob> = h
+        .automation
+        .lock()
+        .map(|g| {
+            g.crons
+                .iter()
+                .filter(|c| c.owner == owner)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
 
     let maybe_rule_cue = [
         "以后",
@@ -3335,7 +3384,40 @@ async fn try_handle_model_sagent_intent(
     ]
     .iter()
     .any(|k| trimmed.contains(k));
-    if awaiting_task.is_none() && !maybe_rule_cue {
+    let last_assistant_was_cron = recent_msgs
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "assistant")
+        .is_some_and(|(_, content)| {
+            content.contains("云端定时任务报告")
+                || content.contains("7×24h 定时任务")
+                || content.contains("cron-")
+        });
+    let maybe_cron_cue = last_assistant_was_cron
+        || [
+            "定时",
+            "汇总",
+            "总结",
+            "简化",
+            "精简",
+            "简短",
+            "每天",
+            "每晚",
+            "每早",
+            "每隔",
+            "每小时",
+            "几点",
+            "改到",
+            "改成",
+            "取消定时",
+            "关掉定时",
+            "删除定时",
+            "cron-",
+        ]
+        .iter()
+        .any(|k| trimmed.contains(k));
+
+    if awaiting_task.is_none() && !maybe_rule_cue && (!maybe_cron_cue && user_crons.is_empty()) {
         return Ok(None);
     }
 
@@ -3348,13 +3430,64 @@ async fn try_handle_model_sagent_intent(
             )
         })
         .unwrap_or_else(|| "无待补充信息的跨人任务".to_owned());
+    let crons_desc = if user_crons.is_empty() {
+        "（当前尚无已配置的定时任务）".to_owned()
+    } else {
+        user_crons
+            .iter()
+            .map(|c| {
+                let sched = match &c.daily_time_cst {
+                    Some(hhmm) => format!("每天北京时间 {hhmm}"),
+                    None => format!("每 {} 分钟", c.interval_minutes),
+                };
+                format!(
+                    "- cron_id=`{}` | 周期={sched} | target=`{}` | 当前指令=「{}」",
+                    c.id, c.target, c.instruction
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let history_desc = if recent_msgs.is_empty() {
+        "（暂无最近对话）".to_owned()
+    } else {
+        recent_msgs
+            .iter()
+            .map(|(role, content)| {
+                let speaker = if role == "user" { "用户" } else { "管家" };
+                let snippet: String = content
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .chars()
+                    .take(220)
+                    .collect();
+                format!("[{speaker}] {snippet}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     let prompt = format!(
-        "你是意图分类器。请判断用户这句话是否属于以下动作之一，只输出单行 JSON（不要 Markdown 代码块）：\n\
-         1) 为待补充任务提供补充说明/材料/截图：{{\"intent\":\"clarify\",\"clarification\":\"提取的补充内容\"}}\n\
-         2) 设置个人管家分发/审核/澄清规则：{{\"intent\":\"add_rule\",\"rule_body\":\"包含 <关键词> 的任务需要真人接手 | 别人委派任务必须提供 <材料> | 包含 <关键词> 的任务派给 <节点>\"}}\n\
-         3) 普通对话或其他：{{\"intent\":\"none\"}}\n\
-         上下文：{awaiting_desc}\n\
-         用户原话：{trimmed}"
+        "你是用户的 7×24h 管家自动化与定时任务意图路由器（LLM Sagent Router）。\n\
+         请结合【用户现有的定时任务】、【最近对话历史】与【待补充跨人任务】，判断【用户最新消息】是否属于以下动作之一，只输出单行严格合法的 JSON（不要代码块）：\n\n\
+         【用户现有的定时任务】\n{crons_desc}\n\n\
+         【最近对话历史】\n{history_desc}\n\n\
+         【待补充跨人任务】\n{awaiting_desc}\n\n\
+         【用户最新消息】\n「{trimmed}」\n\n\
+         【可选动作与 JSON 格式】\n\
+         1) **修改/简化/调整已有定时任务**（例如用户刚收到定时汇总报告后说「提交汇总这个简化一下」「只列核心要点」「把晚上的定时任务改到 21:30」等）：\n\
+            `{{\"intent\":\"update_cron\",\"cron_id\":\"目标cron_id\",\"daily_time_cst\":\"HH:MM或null\",\"interval_minutes\":1440,\"instruction\":\"融合用户新要求后的完整定时任务指令（如：汇总一下 GitLab 上的提交总结给我，要求精简速览，每个项目只列 1~2 条核心进展）\",\"deduplicate_ids\":[\"若列表中存在同时间同主题的重复cron_id则填入以一并清理\"]}}`\n\
+         2) **新增定时任务**（用户明确要求周期性/每天某时间执行某事）：\n\
+            `{{\"intent\":\"add_cron\",\"daily_time_cst\":\"HH:MM或null\",\"interval_minutes\":1440,\"instruction\":\"定时任务指令\"}}`\n\
+         3) **删除/关闭定时任务**：\n\
+            `{{\"intent\":\"delete_cron\",\"cron_id\":\"要删除的cron_id\",\"deduplicate_ids\":[\"其他要一并删除的cron_id\"]}}`\n\
+         4) **设置个人管家分发/审核/澄清规则**：\n\
+            `{{\"intent\":\"add_rule\",\"rule_body\":\"包含 <关键词> 的任务需要真人接手 | 别人委派任务必须提供 <材料> | 包含 <关键词> 的任务派给 <节点>\"}}`\n\
+         5) **为待补充跨人任务提供补充说明/材料**：\n\
+            `{{\"intent\":\"clarify\",\"clarification\":\"提取的补充内容\"}}`\n\
+         6) **不属于以上任何操作（普通对话或本机节点开发任务）**：\n\
+            `{{\"intent\":\"none\"}}`"
     );
     let dsh = crate::runtime::DshRuntime {
         client: &h.client,
@@ -3389,7 +3522,185 @@ async fn try_handle_model_sagent_intent(
     let Ok(parsed) = serde_json::from_str::<ModelSagentIntent>(json_slice) else {
         return Ok(None);
     };
-    if parsed.intent == "add_rule" {
+    if parsed.intent == "update_cron" && !user_crons.is_empty() {
+        let target_id = parsed
+            .cron_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| user_crons.iter().any(|c| c.id == *id))
+            .map(str::to_owned)
+            .unwrap_or_else(|| user_crons[0].id.clone());
+        let mut updated_job: Option<CronJob> = None;
+        let mut removed_dups: Vec<String> = Vec::new();
+        with_store_mut(h, |store| {
+            if let Some(c) = store
+                .crons
+                .iter_mut()
+                .find(|c| c.owner == owner && c.id == target_id)
+            {
+                if let Some(instr) = parsed
+                    .instruction
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "null")
+                {
+                    c.instruction = nodes::truncate_bytes(instr, 300);
+                }
+                if let Some(hhmm) = parsed
+                    .daily_time_cst
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "null" && s.contains(':'))
+                {
+                    c.daily_time_cst = Some(hhmm.to_owned());
+                    c.interval_minutes = 1440;
+                } else if let Some(mins) = parsed.interval_minutes.filter(|m| (1..=10080).contains(m))
+                {
+                    if c.daily_time_cst.is_none() {
+                        c.interval_minutes = mins;
+                    }
+                }
+                if is_gitlab_commit_query(&c.instruction) {
+                    c.target = "cloud".into();
+                }
+                updated_job = Some(c.clone());
+            }
+            if let Some(ref up) = updated_job {
+                let is_gl = is_gitlab_commit_query(&up.instruction);
+                store.crons.retain(|c| {
+                    if c.owner != owner || c.id == up.id {
+                        return true;
+                    }
+                    let explicit_dup = parsed.deduplicate_ids.iter().any(|d| d.trim() == c.id);
+                    let auto_gl_dup = is_gl
+                        && is_gitlab_commit_query(&c.instruction)
+                        && c.daily_time_cst == up.daily_time_cst;
+                    if explicit_dup || auto_gl_dup {
+                        removed_dups.push(c.id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        })?;
+        if let Some(job) = updated_job {
+            h.automation_notify.notify_one();
+            let sched_desc = match &job.daily_time_cst {
+                Some(hhmm) => format!("每天 **北京时间 {hhmm}**"),
+                None => format!("每 **{}** 分钟", job.interval_minutes),
+            };
+            let dup_note = if removed_dups.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n- 🧹 已自动合并清理同时间段重复定时任务：`{}`",
+                    removed_dups.join("`、`")
+                )
+            };
+            let preview = if is_gitlab_commit_query(&job.instruction) {
+                execute_cloud_cron_report(h, owner, &job.instruction)
+                    .await
+                    .ok()
+                    .map(|s| format!("\n\n---\n\n{s}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let reply = format!(
+                "⏰ 已为你更新 7×24h 定时任务 `{}`：\n- 触发周期：{sched_desc}\n- 更新后要求：{}{} {}",
+                job.id, job.instruction, dup_note, preview
+            );
+            return complete_chat_reply(h, owner, input, runtime_profile, task_context, &reply)
+                .map(Some);
+        }
+    } else if parsed.intent == "add_cron" {
+        if let Some(instr) = parsed
+            .instruction
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null")
+        {
+            let hhmm = parsed
+                .daily_time_cst
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != "null" && s.contains(':'))
+                .map(str::to_owned);
+            let mins = if hhmm.is_some() {
+                1440
+            } else {
+                parsed.interval_minutes.unwrap_or(60).clamp(1, 10080)
+            };
+            let job = build_cron_job(owner, mins, hhmm, instr);
+            let sched_desc = match &job.daily_time_cst {
+                Some(t) => format!("每天 **北京时间 {t}**"),
+                None => format!("每 **{}** 分钟", job.interval_minutes),
+            };
+            let preview = if is_gitlab_commit_query(&job.instruction) {
+                execute_cloud_cron_report(h, owner, &job.instruction)
+                    .await
+                    .ok()
+                    .map(|s| format!("\n\n---\n\n{s}"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            let reply = format!(
+                "⏰ 已创建 7×24h 定时任务 `{}`：\n- 触发周期：{sched_desc}\n- 内容：{}\n\n可随时直接用自然语言修改或发送 `查看定时任务` 管理。{preview}",
+                job.id, job.instruction
+            );
+            with_store_mut(h, |store| {
+                let is_gl = is_gitlab_commit_query(&job.instruction);
+                store.crons.retain(|c| {
+                    !(c.owner == owner
+                        && c.daily_time_cst == job.daily_time_cst
+                        && c.interval_minutes == job.interval_minutes
+                        && (c.instruction == job.instruction
+                            || (is_gl && is_gitlab_commit_query(&c.instruction))))
+                });
+                store.crons.push(job);
+            })?;
+            h.automation_notify.notify_one();
+            return complete_chat_reply(h, owner, input, runtime_profile, task_context, &reply)
+                .map(Some);
+        }
+    } else if parsed.intent == "delete_cron" && !user_crons.is_empty() {
+        let mut to_remove: Vec<String> = parsed
+            .deduplicate_ids
+            .iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if let Some(cid) = parsed
+            .cron_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "null")
+        {
+            if !to_remove.iter().any(|x| x == cid) {
+                to_remove.push(cid.to_owned());
+            }
+        }
+        if !to_remove.is_empty() {
+            let mut removed = Vec::new();
+            with_store_mut(h, |store| {
+                store.crons.retain(|c| {
+                    if c.owner == owner && to_remove.iter().any(|id| id == &c.id) {
+                        removed.push(c.id.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            })?;
+            if !removed.is_empty() {
+                let reply = format!("🗑️ 已为你删除定时任务：`{}`。", removed.join("`、`"));
+                return complete_chat_reply(h, owner, input, runtime_profile, task_context, &reply)
+                    .map(Some);
+            }
+        }
+    } else if parsed.intent == "add_rule" {
         if let Some(body) = parsed
             .rule_body
             .as_deref()
@@ -6654,5 +6965,92 @@ mod tests {
         assert_eq!(s, StatusCode::OK);
         assert_eq!(im_in["handled_by"], "sagent");
         assert!(im_in["reply"].as_str().unwrap().contains("确认验收通过"));
+    }
+
+    #[tokio::test]
+    async fn llm_sagent_router_updates_and_deduplicates_cron_from_natural_followup() {
+        let adapter = axum::Router::new().route(
+            "/v1/turn",
+            axum::routing::post(|axum::Json(body): axum::Json<Value>| async move {
+                let msg = body["message"].as_str().unwrap_or("");
+                let reply = if msg.contains("LLM Sagent Router") {
+                    assert!(msg.contains("cron-7d2629"));
+                    assert!(msg.contains("cron-1f1b46"));
+                    assert!(msg.contains("「提交汇总这个简化一下」"));
+                    r#"{"intent":"update_cron","cron_id":"cron-7d2629","daily_time_cst":"22:00","interval_minutes":1440,"instruction":"汇总一下 GitLab 上的提交总结给我（精简速览版：按项目只列 1~2 条核心进展，不附原始提交明细）","deduplicate_ids":["cron-1f1b46"]}"#
+                } else {
+                    "ok"
+                };
+                axum::Json(json!({ "reply": reply, "backend": "dsh", "proposal": Value::Null }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/v1/turn", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, adapter).await.unwrap() });
+
+        let mut h = test_hub();
+        h.runtime = crate::Runtime::Dsh {
+            url,
+            token: "test-token".into(),
+        };
+        super::with_store_mut(&h, |store| {
+            store.crons.push(super::CronJob {
+                id: "cron-7d2629".into(),
+                owner: "alice".into(),
+                interval_minutes: 1440,
+                daily_time_cst: Some("22:00".into()),
+                instruction: "汇总一下gitlab上的提交总结给我".into(),
+                target: "cloud".into(),
+                last_run_unix: Some(1795010404),
+                enabled: true,
+                created_at: 1794886396,
+            });
+            store.crons.push(super::CronJob {
+                id: "cron-1f1b46".into(),
+                owner: "alice".into(),
+                interval_minutes: 1440,
+                daily_time_cst: Some("22:00".into()),
+                instruction: "汇总一下gitlab上的提交给我".into(),
+                target: "cloud".into(),
+                last_run_unix: Some(1795010404),
+                enabled: true,
+                created_at: 1794888996,
+            });
+        })
+        .unwrap();
+        {
+            let db = h.db().unwrap();
+            db.execute(
+                "INSERT INTO messages (owner, role, content, status)
+                 VALUES ('alice', 'assistant', '⏰ 管家 7×24h 云端定时任务报告（「汇总一下gitlab上的提交总结给我」· `cron-7d2629`）：...', 'complete')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let r = app(h.clone());
+        let (s, chat) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "提交汇总这个简化一下" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        let reply = chat["reply"].as_str().unwrap();
+        assert!(reply.contains("已为你更新 7×24h 定时任务 `cron-7d2629`"));
+        assert!(reply.contains("精简速览版"));
+        assert!(reply.contains("cron-1f1b46"));
+
+        let (s, auto_state) = call(&r, &token("alice"), "GET", "/api/automation", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let crons = auto_state["crons"].as_array().unwrap();
+        assert_eq!(crons.len(), 1);
+        assert_eq!(crons[0]["id"], "cron-7d2629");
+        assert!(crons[0]["instruction"]
+            .as_str()
+            .unwrap()
+            .contains("精简速览版"));
     }
 }
