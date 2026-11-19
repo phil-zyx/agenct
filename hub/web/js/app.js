@@ -133,6 +133,15 @@ async function boot() {
       setContactsOpen(false);
       chatUI.insertMention(username);
     },
+    onPromptChat(prefix) {
+      setSettingsOpen(false);
+      if (window.innerWidth <= 900) setTasksOpen(false);
+      const input = document.getElementById('chat-input');
+      if (input) {
+        if (!input.value.trim()) input.value = prefix;
+        input.focus();
+      }
+    },
   });
 
   // Left rail & floating avatar navigation

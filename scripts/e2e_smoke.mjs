@@ -141,11 +141,11 @@ try {
   // 6. Verify live SSE pushed the completed node result directly into the open browser!
   await page.waitForFunction(() => document.body.textContent.includes('Node Result:'), { timeout: 10000 });
 
-  // 7. Verify Muse drawer tabs + Settings view via left rail menu.
+  // 7. Verify Muse drawer tabs (read-only by default + collapsible manual edit) + Settings view.
   await page.click('.muse-seg button[data-tab="memory"]');
-  await page.waitForSelector('#add-ledger-form');
+  await page.waitForSelector('#drawer-body .panel-card h3');
   await page.click('.muse-seg button[data-tab="soul"]');
-  await page.waitForSelector('#brain-form');
+  await page.waitForSelector('#chat-tune-memory');
   await page.click('#rail-more');
   await page.click('#open-settings');
   await page.waitForSelector('#perms-form');

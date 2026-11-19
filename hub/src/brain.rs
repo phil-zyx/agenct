@@ -18,8 +18,9 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 const DEFAULT_AGENT_NAME: &str = "Agenct";
-const DEFAULT_SOUL_MD: &str = "# SOUL.md\n- 身份：用户的 7×24h 个人超级智能体 Agenct。\n- 风格：干练、直接、结论先行，用第一人称自然沟通。\n- 原则：云端能直接解决的直接解决；需要操作代码/终端/本机环境时调度在线节点；跨人承诺或高危动作主动说明边界。";
-const DEFAULT_MEMORY_MD: &str = "# MEMORY.md\n- 在这里记录长期偏好、工作环境事实与沟通习惯。";
+const DEFAULT_SOUL_MD: &str = "- 身份：你的 7×24h 个人超级智能体 Agenct。\n- 风格：干练、直接、结论先行，用第一人称自然沟通。\n- 原则：云端能直接解决的直接解决；涉及本机代码或终端时调度在线节点；跨人承诺或高危操作主动说明边界。";
+const DEFAULT_MEMORY_MD: &str =
+    "暂无长期记忆。在对话中告诉我你的习惯、规矩或环境事实，我会自动整理记住。";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentProfile {
@@ -761,10 +762,16 @@ fn build_system_prompt(
     format!(
         r#"你是用户的 7×24h 个人超级智能体「{name}」。请始终用第一人称、干练、结论先行的中文交流。
 
-=== SOUL.md ===
+=== 自动维护记忆与台账（核心纪律） ===
+- 用户不需要手工填表维护人设、记忆、台账或定时任务；你负责在对话中自动维护。
+- 只要用户在对话中表达称呼偏好（如「以后叫你…」）、沟通风格要求、纠偏规矩、长期工作事实或明确说「记住…」，当轮必须顺手调用 `update_memory` 落盘，并在回复末尾用一句简短自然的话交代（如「已记住」）。
+- 只要用户跟进某个专项、提出某项进展/待办或要求某件事别再提醒（静默挂起），当轮顺手调用 `update_ledger` 维护对应台账。
+- 只要用户用自然语言新增、修改或取消定时任务，当轮直接调用 `manage_cron` 生效。
+
+=== 当前人设风格 (SOUL) ===
 {soul}
 
-=== MEMORY.md ===
+=== 当前长期记忆 (MEMORY) ===
 {memory}
 
 === 实时工作台快照 ===
@@ -837,7 +844,11 @@ async fn apply_update_memory(hub: &Hub, user_id: &str, call: &ToolCall) -> Resul
                 } else {
                     format!("- {a}")
                 };
-                if !p.memory_md.contains(&line) {
+                if p.memory_md.trim() == DEFAULT_MEMORY_MD
+                    || p.memory_md.contains("在这里记录长期偏好")
+                {
+                    p.memory_md = truncate_bytes(&line, 8000);
+                } else if !p.memory_md.contains(&line) {
                     p.memory_md =
                         truncate_bytes(&format!("{}\n{line}", p.memory_md.trim_end()), 8000);
                 }

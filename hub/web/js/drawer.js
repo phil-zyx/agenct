@@ -1,7 +1,7 @@
 // Right Muse Drawer (Tasks/Nodes, Ledgers/Crons/Audit, SOUL/MEMORY) + Settings Pane + Contacts.
-import { api, esc, fmtTime, showToast } from './api.js';
+import { api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 
-export function initDrawer({ state, onRefresh, onMention }) {
+export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
   const bodyEl = document.getElementById('drawer-body');
   const settingsBody = document.getElementById('settings-body');
   const contactsList = document.getElementById('contacts-list');
@@ -123,16 +123,19 @@ export function initDrawer({ state, onRefresh, onMention }) {
       <section class="panel-card">
         <h3>我的节点 (${nodes.length})</h3>
         ${nodesHtml}
-        <form class="add-node-form mt-10">
-          <div class="row">
-            <input type="text" name="name" placeholder="输入节点名称" required class="flex-1">
-            <select name="kind" class="w-kind">
-              <option value="pc">本机</option>
-              <option value="cloud">云端</option>
-            </select>
-            <button type="submit" class="primary sm">添加</button>
-          </div>
-        </form>
+        <details class="node-repos mt-10" ${nodes.length === 0 ? 'open' : ''}>
+          <summary>+ 添加新节点</summary>
+          <form class="add-node-form mt-6">
+            <div class="row">
+              <input type="text" name="name" placeholder="输入节点名称" required class="flex-1">
+              <select name="kind" class="w-kind">
+                <option value="pc">本机</option>
+                <option value="cloud">云端</option>
+              </select>
+              <button type="submit" class="primary sm">添加</button>
+            </div>
+          </form>
+        </details>
         ${lastInstallCmd ? `<div class="install-box"><strong>一次性接入命令：</strong><br><code>${esc(lastInstallCmd)}</code></div>` : ''}
       </section>`;
   }
@@ -285,13 +288,16 @@ export function initDrawer({ state, onRefresh, onMention }) {
               </div>`,
                 )
                 .join('')
-            : '<p class="note">暂无活账本</p>'
+            : '<p class="note">暂无活账本，在对话中跟进专项时会自动记录</p>'
         }
-        <form id="add-ledger-form" class="mt-10">
-          <input type="text" name="title" placeholder="新增台账标题" required>
-          <textarea name="notes" rows="2" placeholder="要点 / 规则…" class="mt-6"></textarea>
-          <div class="row"><button type="submit" class="primary sm">保存台账</button></div>
-        </form>
+        <details class="node-repos mt-10">
+          <summary>+ 手动添加台账</summary>
+          <form id="add-ledger-form" class="mt-6">
+            <input type="text" name="title" placeholder="台账标题" required>
+            <textarea name="notes" rows="2" placeholder="要点 / 规则…" class="mt-6"></textarea>
+            <div class="row"><button type="submit" class="primary sm">保存</button></div>
+          </form>
+        </details>
       </section>
 
       <section class="panel-card">
@@ -313,20 +319,23 @@ export function initDrawer({ state, onRefresh, onMention }) {
               </div>`;
                 })
                 .join('')
-            : '<p class="note">暂无定时任务</p>'
+            : '<p class="note">暂无预定任务，直接对话即可创建（如「每天 22 点汇总 GitLab 提交」）</p>'
         }
-        <form id="add-cron-form" class="mt-10">
-          <input type="text" name="instruction" placeholder="定时内容（如：汇总今日 GitLab 提交）" required>
-          <div class="row">
-            <input type="text" name="daily_time_cst" placeholder="每天 HH:MM" class="flex-1">
-            <select name="target" class="w-kind">
-              <option value="cloud">云端</option>
-              <option value="cloud-node">云端节点</option>
-              <option value="auto">自动</option>
-            </select>
-            <button type="submit" class="primary sm">添加</button>
-          </div>
-        </form>
+        <details class="node-repos mt-10">
+          <summary>+ 手动添加定时</summary>
+          <form id="add-cron-form" class="mt-6">
+            <input type="text" name="instruction" placeholder="定时内容（如：汇总今日 GitLab 提交）" required>
+            <div class="row">
+              <input type="text" name="daily_time_cst" placeholder="每天 HH:MM" class="flex-1">
+              <select name="target" class="w-kind">
+                <option value="cloud">云端</option>
+                <option value="cloud-node">云端节点</option>
+                <option value="auto">自动</option>
+              </select>
+              <button type="submit" class="primary sm">添加</button>
+            </div>
+          </form>
+        </details>
       </section>
 
       <section class="panel-card">
@@ -388,21 +397,48 @@ export function initDrawer({ state, onRefresh, onMention }) {
     };
   }
 
+  function stripMdHeading(raw) {
+    return String(raw || '')
+      .replace(/^#\s*(SOUL\.md|MEMORY\.md)[^\n]*\n?/i, '')
+      .trim();
+  }
+
   function renderSoulTab() {
-    const p = state.profile || { name: 'Agenct', soul_md: '', memory_md: '' };
+    const p = state.profile || { name: 'Agenct', soul_md: '', memory_md: '', updated_at: 0 };
+    const soulText = stripMdHeading(p.soul_md);
+    const memText = stripMdHeading(p.memory_md);
+    const updatedHint = p.updated_at ? `更新于 ${fmtTime(p.updated_at)}` : '系统自动维护';
+
     bodyEl.innerHTML = `
       <section class="panel-card">
-        <h3>命名与 SOUL.md / MEMORY.md</h3>
-        <form id="brain-form">
-          <label class="field-label">管家命名</label>
-          <input type="text" name="name" value="${esc(p.name)}" maxlength="48" required>
-          <label class="field-label">SOUL.md · 核心灵魂与行事准则</label>
-          <textarea name="soul_md" rows="6">${esc(p.soul_md)}</textarea>
-          <label class="field-label">MEMORY.md · 长期记忆与环境事实</label>
-          <textarea name="memory_md" rows="7">${esc(p.memory_md)}</textarea>
-          <div class="row"><button type="submit" class="primary wide">保存命名与 SOUL / MEMORY</button></div>
-        </form>
+        <h3><span>行事风格</span><span class="note">${esc(updatedHint)}</span></h3>
+        <div class="memory-prose">${renderMarkdown(soulText || '默认干练直接风格')}</div>
+      </section>
+
+      <section class="panel-card">
+        <h3>长期记忆</h3>
+        <div class="memory-prose">${renderMarkdown(memText || '暂无长期记忆，聊天中告诉我即可自动记住。')}</div>
+        <p class="note mt-10">无需手填：在对话中直接说「以后叫你…」「记住…」即可由系统自动更新。</p>
+        <div class="row">
+          <button type="button" id="chat-tune-memory" class="sm primary">去对话调整</button>
+        </div>
+        <details class="node-repos mt-10">
+          <summary>手动修正（高级）</summary>
+          <form id="brain-form" class="mt-6">
+            <label class="field-label">管家命名</label>
+            <input type="text" name="name" value="${esc(p.name)}" maxlength="48" required>
+            <label class="field-label">SOUL</label>
+            <textarea name="soul_md" rows="4">${esc(p.soul_md)}</textarea>
+            <label class="field-label">MEMORY</label>
+            <textarea name="memory_md" rows="5">${esc(p.memory_md)}</textarea>
+            <div class="row"><button type="submit" class="primary sm">保存修正</button></div>
+          </form>
+        </details>
       </section>`;
+
+    document.getElementById('chat-tune-memory').onclick = () => {
+      if (onPromptChat) onPromptChat('记住：');
+    };
 
     document.getElementById('brain-form').onsubmit = async (ev) => {
       ev.preventDefault();
@@ -411,7 +447,7 @@ export function initDrawer({ state, onRefresh, onMention }) {
         method: 'PUT',
         body: { name: fd.get('name'), soul_md: fd.get('soul_md'), memory_md: fd.get('memory_md') },
       });
-      showToast('已保存命名与 SOUL / MEMORY');
+      showToast('已修正人设与记忆');
       await onRefresh();
     };
   }
