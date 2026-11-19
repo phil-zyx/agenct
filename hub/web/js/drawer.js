@@ -35,36 +35,63 @@ export function initDrawer({ state, onRefresh, onMention }) {
     }
   }
 
+  function parseCapabilities(raw) {
+    const info = {};
+    for (const part of String(raw || '').split('|')) {
+      const idx = part.indexOf(':');
+      if (idx <= 0) continue;
+      const k = part.slice(0, idx).trim().toLowerCase();
+      const v = part.slice(idx + 1).trim();
+      if (k && v) info[k] = v;
+    }
+    const osMap = { linux: 'Linux', darwin: 'macOS', windows: 'Windows' };
+    const summary = [];
+    if (info.os) summary.push(osMap[info.os] || info.os);
+    if (info.agent) summary.push(`引擎 ${info.agent}`);
+    const repos = info.repos ? info.repos.split(',').map((s) => s.trim()).filter(Boolean) : [];
+    if (repos.length) summary.push(`${repos.length} 个仓库`);
+    return {
+      summary: summary.join(' · ') || (raw && !raw.includes(':') ? raw : ''),
+      repos,
+    };
+  }
+
   function nodesCardHtml(nodes) {
     const nodesHtml = nodes.length
       ? nodes
-          .map(
-            (n) => `
+          .map((n) => {
+            const kindLabel = n.kind === 'cloud' ? '云端' : '本机';
+            const parsed = parseCapabilities(n.capabilities);
+            const reposHtml = parsed.repos.length
+              ? `<details class="node-repos"><summary>已发现仓库 (${parsed.repos.length})</summary><div class="repo-tags">${parsed.repos.map((r) => `<span class="repo-tag">${esc(r)}</span>`).join('')}</div></details>`
+              : '';
+            return `
           <div class="item">
             <div class="item-head">
-              <span>${esc(n.name)} <span class="muted">(${esc(n.kind)} · ${esc(n.id)})</span></span>
+              <span class="node-title">${esc(n.name)} <span class="badge">${kindLabel}</span></span>
               <span class="badge ${n.online ? 'ok' : ''}">${n.online ? '在线' : '离线'}</span>
             </div>
-            ${n.capabilities ? `<div class="item-sub">${esc(n.capabilities)}</div>` : ''}
+            ${parsed.summary ? `<div class="item-sub">${esc(parsed.summary)}</div>` : ''}
+            ${reposHtml}
             <div class="row">
               <button type="button" class="sm" data-rotate="${esc(n.id)}">重置令牌</button>
               <button type="button" class="sm danger" data-rm-node="${esc(n.id)}">移除</button>
             </div>
-          </div>`,
-          )
+          </div>`;
+          })
           .join('')
-      : '<p class="note">尚未接入 PC 或云端执行节点</p>';
+      : '<p class="note">尚未接入执行节点</p>';
 
     return `
       <section class="panel-card">
-        <h3>执行节点 · PC & Cloud (${nodes.length})</h3>
+        <h3>我的节点 (${nodes.length})</h3>
         ${nodesHtml}
         <form class="add-node-form mt-10">
           <div class="row">
-            <input type="text" name="name" placeholder="节点名称 (如 MacBook / 云端容器)" required class="flex-1">
+            <input type="text" name="name" placeholder="输入节点名称" required class="flex-1">
             <select name="kind" class="w-kind">
-              <option value="pc">PC</option>
-              <option value="cloud">Cloud</option>
+              <option value="pc">本机</option>
+              <option value="cloud">云端</option>
             </select>
             <button type="submit" class="primary sm">添加</button>
           </div>
