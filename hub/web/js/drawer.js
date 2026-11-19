@@ -51,6 +51,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     cron_run: '定时执行',
     update_memory: '更新记忆',
     update_ledger: '更新事项',
+    context_compact: '压缩上下文',
     permissions: '修改授权',
     delegate: '发起协作',
     task_deliver: '交付结果',
@@ -59,16 +60,48 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     member_status: '成员状态',
   };
 
-  function compactTextHtml(text, limit = 60, moreLabel = '查看详情') {
-    const clean = String(text || '').trim();
+  function stripNoise(raw) {
+    return String(raw || '')
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+      .replace(/\u25af\[\d+(?:;\d+)*m/g, '')
+      .replace(/\r\n/g, '\n')
+      .trim();
+  }
+
+  function cleanPreviewLine(raw, limit = 64) {
+    const clean = stripNoise(raw);
     if (!clean) return '';
+    const lines = clean
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('```') && !/^[-*_]{3,}$/.test(l));
+    const line = (lines[0] || clean.split('\n')[0] || '')
+      .replace(/^#+\s*/, '')
+      .replace(/^>\s*/, '')
+      .replace(/\*\*/g, '')
+      .trim();
+    if (!line) return '';
+    return line.length > limit ? `${line.slice(0, limit)}…` : line;
+  }
+
+  function formatStage(stage) {
+    const s = String(stage || '').trim();
+    if (!s || s === 'done' || s === 'failed') return '';
+    if (s === 'Claimed by node') return '节点已接单';
+    if (s === 'Starting execution') return '准备执行';
+    if (s.startsWith('Running ')) return `${s.slice(8)} 执行中`;
+    return s;
+  }
+
+  function compactTextHtml(text, limit = 60, moreLabel = '查看详情') {
+    const clean = stripNoise(text);
+    if (!clean) return '';
+    const preview = cleanPreviewLine(clean, limit);
     if (clean.length <= limit && !clean.includes('\n')) {
-      return `<div class="item-sub">${esc(clean)}</div>`;
+      return `<div class="item-sub">${esc(preview || clean)}</div>`;
     }
-    const firstLine = clean.split('\n')[0];
-    const preview = firstLine.length > limit ? `${firstLine.slice(0, limit)}…` : `${firstLine}…`;
     return `
-      <div class="item-sub">${esc(preview)}</div>
+      ${preview ? `<div class="item-sub">${esc(preview)}</div>` : ''}
       <details class="node-repos"><summary>${esc(moreLabel)}</summary><div class="item-sub detail-body">${esc(clean)}</div></details>`;
   }
 
@@ -184,43 +217,220 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
   }
 
   function renderTasksTab() {
+    const threads = state.threads || [];
     const tasks = state.tasks || [];
     const crons = state.crons || [];
     const ledgers = state.ledgers || [];
     const nodes = state.nodes || [];
     const uid = state.user?.id;
 
-    const tasksHtml = tasks.length
-      ? tasks
-          .map((t) => {
-            const isOwner = t.owner_id === uid;
-            const actions = [];
-            if (isOwner && (t.status === 'pending' || t.status === 'failed')) {
-              actions.push(`<button type="button" class="sm primary" data-assign="${esc(t.id)}">派给节点</button>`);
-            }
-            if (isOwner && t.status !== 'done' && t.status !== 'canceled') {
-              actions.push(`<button type="button" class="sm" data-deliver="${esc(t.id)}">交付结果</button>`);
-            }
-            if (t.status === 'pending' || t.status === 'running') {
-              actions.push(`<button type="button" class="sm danger" data-cancel="${esc(t.id)}">取消</button>`);
-            }
-            const progress = t.stage
-              ? `<div class="item-sub">进度：${esc(t.stage)}${t.log_tail ? `\n${esc(t.log_tail)}` : ''}</div>`
-              : '';
-            const res = t.result ? compactTextHtml(t.result, 72, '查看结果') : '';
-            const stLabel = TASK_STATUS_LABEL[t.status] || t.status;
-            return `
-              <div class="item">
-                <div class="item-head">
-                  <span>${esc(t.title)}</span>
-                  <span class="badge ${t.status === 'done' ? 'ok' : t.status === 'running' ? 'warn' : ''}">${esc(stLabel)}</span>
-                </div>
-                ${progress}${res}
-                ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
-              </div>`;
-          })
-          .join('')
-      : '<p class="note">暂无进行中任务</p>';
+    // Group tasks by implicit thread_id; legacy unthreaded self-tasks collapse by title.
+    const tasksByThread = new Map();
+    const legacyGroups = new Map();
+    const standaloneCollab = [];
+
+    for (const t of tasks) {
+      if (t.thread_id) {
+        if (!tasksByThread.has(t.thread_id)) tasksByThread.set(t.thread_id, []);
+        tasksByThread.get(t.thread_id).push(t);
+      } else if (t.requester_id !== t.owner_id) {
+        standaloneCollab.push(t);
+      } else {
+        const key = (t.title || t.id).trim();
+        if (!legacyGroups.has(key)) legacyGroups.set(key, []);
+        legacyGroups.get(key).push(t);
+      }
+    }
+
+    function renderRunsDetails(runs) {
+      if (!runs.length) return '';
+      if (runs.length === 1) {
+        const clean = stripNoise(runs[0].result);
+        return clean
+          ? `<details class="node-repos"><summary>查看结果</summary><div class="item-sub detail-body">${esc(clean)}</div></details>`
+          : '';
+      }
+      const rows = runs
+        .map((r) => {
+          const st = TASK_STATUS_LABEL[r.status] || r.status;
+          const res = stripNoise(r.result);
+          const snippet = res ? `<div class="item-sub detail-body">${esc(res)}</div>` : '';
+          return `
+            <div class="run-entry">
+              <div class="run-head">
+                <span class="badge ${r.status === 'done' ? 'ok' : r.status === 'running' ? 'warn' : ''}">${esc(st)}</span>
+                <span>${esc(fmtTime(r.updated_at))}</span>
+              </div>
+              ${snippet}
+            </div>`;
+        })
+        .join('');
+      return `<details class="node-repos"><summary>执行记录 (${runs.length})</summary>${rows}</details>`;
+    }
+
+    function taskActionsHtml(latest) {
+      if (!latest) return [];
+      const isOwner = latest.owner_id === uid;
+      const isCrossUser = latest.requester_id !== latest.owner_id;
+      const actions = [];
+      if (isOwner && (latest.status === 'pending' || latest.status === 'failed')) {
+        actions.push(
+          `<button type="button" class="sm primary" data-assign="${esc(latest.id)}">${latest.status === 'failed' ? '重试' : '派给节点'}</button>`,
+        );
+      }
+      if (isOwner && isCrossUser && latest.status !== 'done' && latest.status !== 'canceled') {
+        actions.push(`<button type="button" class="sm" data-deliver="${esc(latest.id)}">交付结果</button>`);
+      }
+      if (latest.status === 'pending' || latest.status === 'running') {
+        actions.push(`<button type="button" class="sm danger" data-cancel="${esc(latest.id)}">取消</button>`);
+      }
+      return actions;
+    }
+
+    function renderThreadCard(thr) {
+      const runs = tasksByThread.get(thr.id) || [];
+      const latest = runs[0] || null;
+      const isRunning = runs.some((r) => r.status === 'running');
+      const isPending = runs.some((r) => r.status === 'pending');
+
+      let badgeText = thr.status === 'archived' ? '已归档' : '进行中';
+      let badgeCls = thr.status === 'active' ? 'ok' : '';
+      if (isRunning) {
+        badgeText = '执行中';
+        badgeCls = 'warn';
+      } else if (isPending) {
+        badgeText = '待处理';
+        badgeCls = 'warn';
+      } else if (latest?.status === 'failed' && thr.status === 'active') {
+        badgeText = '失败';
+        badgeCls = '';
+      } else if (latest?.status === 'done' && thr.status === 'active') {
+        badgeText = '已完成';
+        badgeCls = 'ok';
+      }
+
+      const metaParts = [];
+      if (thr.node_id) {
+        metaParts.push(thr.has_session ? `节点 ${thr.node_id} · 可续接` : `节点 ${thr.node_id}`);
+      }
+      if (runs.length > 1) metaParts.push(`${runs.length} 次执行`);
+      if (thr.updated_at) metaParts.push(fmtTime(thr.updated_at));
+      const metaHtml = metaParts.length ? `<div class="thread-meta">${esc(metaParts.join(' · '))}</div>` : '';
+
+      const stageText = isRunning && latest ? formatStage(latest.stage) : '';
+      const progressHtml =
+        isRunning && (stageText || latest?.log_tail)
+          ? `<div class="item-sub">${esc(stageText || '执行中')}${latest?.log_tail ? `\n${esc(stripNoise(latest.log_tail))}` : ''}</div>`
+          : '';
+
+      const preview = cleanPreviewLine(latest?.result || thr.summary, 72);
+      const previewHtml = !isRunning && preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
+      const detailsHtml = renderRunsDetails(runs);
+
+      const actions = taskActionsHtml(latest);
+      if (thr.status === 'active') {
+        actions.push(`<button type="button" class="sm" data-archive-thread="${esc(thr.id)}">归档</button>`);
+      } else {
+        actions.push(`<button type="button" class="sm" data-restore-thread="${esc(thr.id)}">恢复</button>`);
+        actions.push(`<button type="button" class="sm danger" data-del-thread="${esc(thr.id)}">删除</button>`);
+      }
+
+      return `
+        <div class="item">
+          <div class="item-head">
+            <span>${esc(thr.title)}</span>
+            <span class="badge ${badgeCls}">${esc(badgeText)}</span>
+          </div>
+          ${metaHtml}
+          ${progressHtml}
+          ${previewHtml}
+          ${detailsHtml}
+          ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
+        </div>`;
+    }
+
+    const activeThreads = threads.filter((t) => t.status === 'active');
+    const archivedThreads = threads.filter((t) => t.status !== 'active');
+
+    const activeCards = [];
+    for (const thr of activeThreads) {
+      activeCards.push(renderThreadCard(thr));
+    }
+
+    // Cross-user delegated tasks (not tied to a thread).
+    for (const t of standaloneCollab) {
+      const stLabel = TASK_STATUS_LABEL[t.status] || t.status;
+      const stageText = t.status === 'running' ? formatStage(t.stage) : '';
+      const progress =
+        t.status === 'running' && (stageText || t.log_tail)
+          ? `<div class="item-sub">${esc(stageText || '执行中')}${t.log_tail ? `\n${esc(stripNoise(t.log_tail))}` : ''}</div>`
+          : '';
+      const preview = cleanPreviewLine(t.result || t.instruction, 72);
+      const actions = taskActionsHtml(t);
+      activeCards.push(`
+        <div class="item">
+          <div class="item-head">
+            <span>${esc(t.title)}</span>
+            <span class="badge ${t.status === 'done' ? 'ok' : t.status === 'running' || t.status === 'pending' ? 'warn' : ''}">${esc(stLabel)}</span>
+          </div>
+          <div class="thread-meta">同事协作 · ${esc(fmtTime(t.updated_at))}</div>
+          ${progress}
+          ${preview ? `<div class="item-sub">${esc(preview)}</div>` : ''}
+          ${renderRunsDetails([t])}
+          ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
+        </div>`);
+    }
+
+    // Active ledgers unified into the same thread list.
+    for (const l of ledgers) {
+      activeCards.push(`
+        <div class="item">
+          <div class="item-head">
+            <span>${esc(l.title)}</span>
+            <span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span>
+          </div>
+          ${compactTextHtml(l.notes, 64, '查看全文')}
+          <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
+        </div>`);
+    }
+
+    // Legacy unthreaded self-tasks grouped cleanly by title (eliminates duplicate cards).
+    for (const [title, runs] of legacyGroups.entries()) {
+      const latest = runs[0];
+      const isRunning = latest.status === 'running';
+      const stLabel = TASK_STATUS_LABEL[latest.status] || latest.status;
+      const metaParts = [];
+      if (latest.node_id) metaParts.push(`节点 ${latest.node_id}`);
+      if (runs.length > 1) metaParts.push(`${runs.length} 次执行`);
+      if (latest.updated_at) metaParts.push(fmtTime(latest.updated_at));
+      const stageText = isRunning ? formatStage(latest.stage) : '';
+      const progress =
+        isRunning && (stageText || latest.log_tail)
+          ? `<div class="item-sub">${esc(stageText || '执行中')}${latest.log_tail ? `\n${esc(stripNoise(latest.log_tail))}` : ''}</div>`
+          : '';
+      const preview = !isRunning ? cleanPreviewLine(latest.result, 72) : '';
+      const actions = taskActionsHtml(latest);
+      activeCards.push(`
+        <div class="item">
+          <div class="item-head">
+            <span>${esc(title)}</span>
+            <span class="badge ${latest.status === 'done' ? 'ok' : isRunning ? 'warn' : ''}">${esc(stLabel)}</span>
+          </div>
+          ${metaParts.length ? `<div class="thread-meta">${esc(metaParts.join(' · '))}</div>` : ''}
+          ${progress}
+          ${preview ? `<div class="item-sub">${esc(preview)}</div>` : ''}
+          ${renderRunsDetails(runs)}
+          ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
+        </div>`);
+    }
+
+    const threadsHtml = activeCards.length
+      ? activeCards.join('')
+      : '<p class="note">暂无活跃工作线程，在对话中发起任务或跟进事项会自动生成</p>';
+
+    const archivedHtml = archivedThreads.length
+      ? `<details class="node-repos mt-10"><summary>已归档线程 (${archivedThreads.length})</summary><div class="mt-6">${archivedThreads.map(renderThreadCard).join('')}</div></details>`
+      : '';
 
     const cronsHtml = crons.length
       ? crons
@@ -238,29 +448,17 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
               </div>`;
           })
           .join('')
-      : '<p class="note">暂无预定任务，直接对话即可创建</p>';
-
-    const ledgersHtml = ledgers.length
-      ? ledgers
-          .map(
-            (l) => `
-              <div class="item">
-                <div class="item-head"><span>${esc(l.title)}</span><span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span></div>
-                ${compactTextHtml(l.notes, 56, '查看全文')}
-                <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
-              </div>`,
-          )
-          .join('')
-      : '<p class="note">暂无持续事项，对话跟进时自动记录</p>';
+      : '<p class="note">暂无定时任务，直接对话即可创建</p>';
 
     bodyEl.innerHTML = `
       <section class="panel-card">
-        <h3>当前任务 (${tasks.length})</h3>
-        ${tasksHtml}
+        <h3>工作线程 (${activeCards.length})</h3>
+        ${threadsHtml}
+        ${archivedHtml}
       </section>
 
       <section class="panel-card">
-        <h3>预定任务 (${crons.length})</h3>
+        <h3>定时任务 (${crons.length})</h3>
         ${cronsHtml}
         <details class="node-repos mt-10">
           <summary>+ 手动添加定时</summary>
@@ -275,19 +473,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
               </select>
               <button type="submit" class="primary sm">添加</button>
             </div>
-          </form>
-        </details>
-      </section>
-
-      <section class="panel-card">
-        <h3>持续事项 (${ledgers.length})</h3>
-        ${ledgersHtml}
-        <details class="node-repos mt-10">
-          <summary>+ 手动添加事项</summary>
-          <form id="add-ledger-form" class="mt-6">
-            <input type="text" name="title" placeholder="事项名称" required>
-            <textarea name="notes" rows="2" placeholder="进展 / 备忘…" class="mt-6"></textarea>
-            <div class="row"><button type="submit" class="primary sm">保存</button></div>
           </form>
         </details>
       </section>
@@ -332,6 +517,39 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
         }
       };
     });
+    bodyEl.querySelectorAll('[data-archive-thread]').forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api(`/api/threads/${b.dataset.archiveThread}`, { method: 'PUT', body: { status: 'archived' } });
+          showToast('线程已归档');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
+    bodyEl.querySelectorAll('[data-restore-thread]').forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api(`/api/threads/${b.dataset.restoreThread}`, { method: 'PUT', body: { status: 'active' } });
+          showToast('线程已恢复');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
+    bodyEl.querySelectorAll('[data-del-thread]').forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api(`/api/threads/${b.dataset.delThread}`, { method: 'DELETE' });
+          showToast('线程已删除');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
     bodyEl.querySelectorAll('[data-del-ledger]').forEach((b) => {
       b.onclick = async () => {
         await api(`/api/ledgers/${b.dataset.delLedger}`, { method: 'DELETE' });
@@ -344,16 +562,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
         await onRefresh();
       };
     });
-    document.getElementById('add-ledger-form').onsubmit = async (ev) => {
-      ev.preventDefault();
-      const fd = new FormData(ev.target);
-      await api('/api/ledgers', {
-        method: 'POST',
-        body: { title: fd.get('title'), notes: fd.get('notes'), status: 'active' },
-      });
-      showToast('事项已保存');
-      await onRefresh();
-    };
     document.getElementById('add-cron-form').onsubmit = async (ev) => {
       ev.preventDefault();
       const fd = new FormData(ev.target);

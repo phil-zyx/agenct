@@ -135,6 +135,10 @@ pub fn app(hub: Hub) -> Router {
         .route("/api/brain", put(brain::save_profile))
         .route("/api/ledgers", post(brain::upsert_ledger))
         .route("/api/ledgers/{id}", delete(brain::delete_ledger))
+        .route(
+            "/api/threads/{id}",
+            put(brain::update_thread).delete(brain::delete_thread),
+        )
         // Tasks & Lightweight Collaboration
         .route("/api/tasks/{id}/action", post(collab::task_action))
         .route("/api/members", get(auth::list_members))

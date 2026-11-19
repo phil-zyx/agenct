@@ -751,4 +751,35 @@ async fn implicit_threads_session_resume_and_rolling_compaction_work() {
     assert!(compacted || watermark > 0);
     assert!(summary.contains("已压缩历史摘要"));
     assert!(watermark > 0);
+
+    // 6. Bootstrap exposes threads and PUT/DELETE /api/threads/{id} work cleanly.
+    let (st, boot) = req_json(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(boot["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["id"].as_str() == Some(thread_id.as_str()) && t["has_session"] == true));
+
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        &format!("/api/threads/{thread_id}"),
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"status": "archived"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, _) = req_json(
+        &router,
+        "DELETE",
+        &format!("/api/threads/{thread_id}"),
+        Some(&cookie),
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
 }

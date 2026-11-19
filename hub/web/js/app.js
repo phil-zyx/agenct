@@ -7,6 +7,7 @@ import { connectEvents } from './sse.js';
 const state = {
   user: null,
   profile: null,
+  threads: [],
   messages: [],
   tasks: [],
   nodes: [],

@@ -136,6 +136,30 @@ pub fn list_active_threads_sync(conn: &Connection, user_id: &str) -> Result<Vec<
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+pub fn list_threads_sync(conn: &Connection, user_id: &str) -> Result<Vec<ThreadView>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, status, summary, node_id, node_session_id, turn_count, updated_at
+         FROM threads
+         WHERE user_id = ?1
+         ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, updated_at DESC
+         LIMIT 30",
+    )?;
+    let rows = stmt.query_map([user_id], |r| {
+        let sid: Option<String> = r.get(5)?;
+        Ok(ThreadView {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            status: r.get(2)?,
+            summary: r.get(3)?,
+            node_id: r.get(4)?,
+            has_session: sid.as_deref().is_some_and(|s| !s.is_empty()),
+            turn_count: r.get(6)?,
+            updated_at: r.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
 /// Single initial payload for the frontend (replaces 7 parallel polling requests).
 pub async fn bootstrap(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
     let user = hub.require_user(&headers).await?;
@@ -145,6 +169,7 @@ pub async fn bootstrap(State(hub): State<Hub>, headers: HeaderMap) -> Result<Jso
         .db
         .read(move |conn| {
             let profile = read_profile_sync(conn, &uid)?;
+            let threads = list_threads_sync(conn, &uid)?;
             let ledgers = list_ledgers_sync(conn, &uid)?;
             let node_list = nodes::list_nodes_sync(conn, &uid)?;
             let permissions = automation::read_permissions_sync(conn, &uid)?;
@@ -172,7 +197,7 @@ pub async fn bootstrap(State(hub): State<Hub>, headers: HeaderMap) -> Result<Jso
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
             let mut task_stmt = conn.prepare(
-                "SELECT t.id, t.requester_id, t.owner_id, t.title, t.instruction, t.status,
+                "SELECT t.id, t.requester_id, t.owner_id, t.thread_id, t.title, t.instruction, t.status,
                         t.result, t.revision, t.updated_at,
                         j.node_id, j.status, j.stage, j.log_tail
                  FROM tasks t
@@ -186,16 +211,17 @@ pub async fn bootstrap(State(hub): State<Hub>, headers: HeaderMap) -> Result<Jso
                         "id": r.get::<_, String>(0)?,
                         "requester_id": r.get::<_, String>(1)?,
                         "owner_id": r.get::<_, String>(2)?,
-                        "title": r.get::<_, String>(3)?,
-                        "instruction": r.get::<_, String>(4)?,
-                        "status": r.get::<_, String>(5)?,
-                        "result": r.get::<_, Option<String>>(6)?,
-                        "revision": r.get::<_, i64>(7)?,
-                        "updated_at": r.get::<_, i64>(8)?,
-                        "node_id": r.get::<_, Option<String>>(9)?,
-                        "job_status": r.get::<_, Option<String>>(10)?,
-                        "stage": r.get::<_, Option<String>>(11)?,
-                        "log_tail": r.get::<_, Option<String>>(12)?,
+                        "thread_id": r.get::<_, Option<String>>(3)?,
+                        "title": r.get::<_, String>(4)?,
+                        "instruction": r.get::<_, String>(5)?,
+                        "status": r.get::<_, String>(6)?,
+                        "result": r.get::<_, Option<String>>(7)?,
+                        "revision": r.get::<_, i64>(8)?,
+                        "updated_at": r.get::<_, i64>(9)?,
+                        "node_id": r.get::<_, Option<String>>(10)?,
+                        "job_status": r.get::<_, Option<String>>(11)?,
+                        "stage": r.get::<_, Option<String>>(12)?,
+                        "log_tail": r.get::<_, Option<String>>(13)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -233,6 +259,7 @@ pub async fn bootstrap(State(hub): State<Hub>, headers: HeaderMap) -> Result<Jso
 
             Ok(json!({
                 "profile": profile,
+                "threads": threads,
                 "messages": messages,
                 "tasks": tasks,
                 "nodes": node_list,
@@ -389,6 +416,81 @@ pub async fn delete_ledger(
         .await?;
     hub.events
         .emit(user.id, "brain", json!({"deleted_ledger": id}));
+    Ok(Json(json!({"ok": true, "id": id})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateThreadInput {
+    pub status: String,
+}
+
+pub async fn update_thread(
+    State(hub): State<Hub>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(input): Json<UpdateThreadInput>,
+) -> Result<Json<Value>> {
+    let user = hub.require_user(&headers).await?;
+    let status = input.status.trim().to_owned();
+    if !matches!(status.as_str(), "active" | "archived") {
+        return Err(invalid("thread status must be active or archived"));
+    }
+    let uid = user.id.clone();
+    let tid = id.clone();
+    let st_db = status.clone();
+    hub.db
+        .write(move |conn| {
+            if conn.execute(
+                "UPDATE threads SET status = ?3, updated_at = ?4 WHERE id = ?1 AND user_id = ?2",
+                params![tid, uid, st_db, now_unix()],
+            )? == 0
+            {
+                return Err(denied());
+            }
+            Ok(())
+        })
+        .await?;
+    hub.events.emit(
+        user.id,
+        "brain",
+        json!({"updated_thread": id, "status": status}),
+    );
+    Ok(Json(json!({"ok": true, "id": id, "status": status})))
+}
+
+pub async fn delete_thread(
+    State(hub): State<Hub>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let user = hub.require_user(&headers).await?;
+    let uid = user.id.clone();
+    let tid = id.clone();
+    hub.db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            if tx.execute(
+                "DELETE FROM threads WHERE id = ?1 AND user_id = ?2",
+                params![tid, uid],
+            )? == 0
+            {
+                return Err(denied());
+            }
+            tx.execute(
+                "UPDATE messages SET thread_id = NULL WHERE thread_id = ?1 AND user_id = ?2",
+                params![tid, uid],
+            )?;
+            tx.execute(
+                "UPDATE tasks SET thread_id = NULL WHERE thread_id = ?1 AND owner_id = ?2",
+                params![tid, uid],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await?;
+    hub.events
+        .emit(user.id, "brain", json!({"deleted_thread": id}));
     Ok(Json(json!({"ok": true, "id": id})))
 }
 
