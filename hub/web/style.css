@@ -200,8 +200,8 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
 .msg-meta { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
 
 .stage-pill {
-  max-width: var(--col); margin: 12px auto 0; width: fit-content; padding: 5px 14px;
-  border-radius: 999px; background: var(--brand-soft); color: var(--brand); font-size: 13px; font-weight: 500;
+  max-width: var(--col); margin: 10px auto 0; padding: 0 18px;
+  color: var(--muted); font-size: 13px;
 }
 .typing { max-width: var(--col); margin: 12px auto 0; display: flex; gap: 5px; align-items: center; }
 .typing span { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); animation: typing 1.2s infinite ease-in-out; }

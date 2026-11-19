@@ -469,12 +469,6 @@ pub async fn run_turn(
         .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, "another chat turn is already running"))?;
 
-    hub.events.emit(
-        user_id.to_owned(),
-        "stage",
-        json!({"stage": "正在整理上下文与记忆…"}),
-    );
-
     // Persist user message + load structured workbench snapshot cleanly in one DB read/write.
     let uid = user_id.to_owned();
     let msg_owned = message.to_owned();
@@ -530,12 +524,6 @@ pub async fn run_turn(
     let system_prompt =
         build_system_prompt(&profile, &ledgers, &node_list, &crons, &rules, &contacts);
 
-    hub.events.emit(
-        user_id.to_owned(),
-        "stage",
-        json!({"stage": "正在思考与决策…"}),
-    );
-
     let raw_llm = hub
         .llm
         .complete(&system_prompt, &history, message, true)
@@ -560,6 +548,11 @@ pub async fn run_turn(
                 apply_manage_rule(hub, user_id, &call).await?;
             }
             "fetch_gitlab_commits" => {
+                hub.events.emit(
+                    user_id.to_owned(),
+                    "stage",
+                    json!({"stage": "正在拉取 GitLab 提交记录…"}),
+                );
                 if let Some(summary) =
                     crate::integrations::gitlab::fetch_commit_summary(hub, user_id).await
                 {
@@ -568,6 +561,11 @@ pub async fn run_turn(
                 }
             }
             "dispatch_node" => {
+                hub.events.emit(
+                    user_id.to_owned(),
+                    "stage",
+                    json!({"stage": "正在派发到执行节点…"}),
+                );
                 let instr = call
                     .instruction
                     .as_deref()
