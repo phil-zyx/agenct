@@ -41,28 +41,166 @@ export function esc(str) {
     .replaceAll("'", '&#39;');
 }
 
-export function renderMarkdown(raw) {
-  let text = esc(raw || '');
-  // Fenced code blocks
-  text = text.replace(/```[\w-]*\n([\s\S]*?)```/g, (_, code) => `<pre><code>${code}</code></pre>`);
-  // Inline code
-  text = text.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-  // Headings (### / ## / #)
-  text = text.replace(/^#{1,3}\s+([^\n]+)$/gm, '<div class="md-h">$1</div>');
-  // Bold
-  text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
-  // Attachment images (same-origin /api/attachments/att_... only)
+function renderInline(raw) {
+  const codeSpans = [];
+  let text = esc(raw || '').replace(/`([^`\n]+)`/g, (_, code) => {
+    const idx = codeSpans.length;
+    codeSpans.push(`<code>${code}</code>`);
+    return `\u0000C${idx}\u0000`;
+  });
+  // Safe same-origin attachment images & links only
   text = text.replace(
     /!\[([^\]]*)\]\((\/api\/attachments\/att_[0-9a-f]{32})\)/g,
     (_, alt, url) => `<img src="${url}" alt="${alt}" loading="lazy">`,
   );
-  // Attachment links
   text = text.replace(
     /\[([^\]]+)\]\((\/api\/attachments\/att_[0-9a-f]{32})\)/g,
     (_, label, url) => `<a href="${url}" target="_blank" rel="noopener">${label}</a>`,
   );
-  // Line breaks outside <pre>
-  return text.replace(/\n/g, '<br>');
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  text = text.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>');
+  return text.replace(/\u0000C(\d+)\u0000/g, (_, i) => codeSpans[Number(i)]);
+}
+
+function splitTableRow(line) {
+  let trimmed = line.trim();
+  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith('|')) trimmed = trimmed.slice(0, -1);
+  return trimmed.split('|').map((cell) => cell.trim());
+}
+
+function isTableSep(line) {
+  return /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$/.test(line);
+}
+
+export function renderMarkdown(raw) {
+  const normalized = String(raw || '').replace(/\r\n/g, '\n').trim();
+  if (!normalized) return '';
+  const lines = normalized.split('\n');
+  const out = [];
+  let i = 0;
+
+  // Render leading Hub source tag like "**[节点 homelab · 标题]**" as a crisp pill badge.
+  const tagMatch = lines[0].match(/^\*\*\[((?:节点|定时汇报|协作交付|来自)[^\]]+)\]\*\*$/);
+  if (tagMatch) {
+    out.push(`<div class="msg-source-pill">${esc(tagMatch[1])}</div>`);
+    i = 1;
+    while (i < lines.length && !lines[i].trim()) i++;
+  }
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+
+    // Fenced code block
+    if (/^\s*```/.test(line)) {
+      const codeLines = [];
+      i++;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
+        codeLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) i++;
+      out.push(`<pre class="md-pre"><code>${esc(codeLines.join('\n'))}</code></pre>`);
+      continue;
+    }
+
+    // Markdown pipe table
+    if (line.includes('|') && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      const headers = splitTableRow(line);
+      i += 2;
+      const bodyRows = [];
+      while (i < lines.length && lines[i].trim() && lines[i].includes('|')) {
+        bodyRows.push(splitTableRow(lines[i]));
+        i++;
+      }
+      const th = headers.map((c) => `<th>${renderInline(c)}</th>`).join('');
+      const tb = bodyRows
+        .map((row) => {
+          const cells = headers.map((_, idx) => `<td>${renderInline(row[idx] ?? '')}</td>`).join('');
+          return `<tr>${cells}</tr>`;
+        })
+        .join('');
+      out.push(
+        `<div class="md-table-wrap"><table class="md-table"><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table></div>`,
+      );
+      continue;
+    }
+
+    // Headings
+    const hMatch = line.match(/^(#{1,4})\s+(.+)$/);
+    if (hMatch) {
+      const lvl = hMatch[1].length;
+      out.push(`<div class="md-h md-h${lvl}">${renderInline(hMatch[2].trim())}</div>`);
+      i++;
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) {
+      out.push('<hr class="md-hr">');
+      i++;
+      continue;
+    }
+
+    // Blockquote
+    if (/^\s*>\s?/.test(line)) {
+      const qLines = [];
+      while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+        qLines.push(lines[i].replace(/^\s*>\s?/, ''));
+        i++;
+      }
+      out.push(`<blockquote class="md-quote">${qLines.map(renderInline).join('<br>')}</blockquote>`);
+      continue;
+    }
+
+    // Unordered list
+    if (/^\s*[-*•]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*•]\s+/.test(lines[i])) {
+        items.push(`<li>${renderInline(lines[i].replace(/^\s*[-*•]\s+/, ''))}</li>`);
+        i++;
+      }
+      out.push(`<ul class="md-list">${items.join('')}</ul>`);
+      continue;
+    }
+
+    // Ordered list
+    if (/^\s*\d+[.)]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+        items.push(`<li>${renderInline(lines[i].replace(/^\s*\d+[.)]\s+/, ''))}</li>`);
+        i++;
+      }
+      out.push(`<ol class="md-list">${items.join('')}</ol>`);
+      continue;
+    }
+
+    // Paragraph (stop before any block starter)
+    const pLines = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() &&
+      !/^\s*```/.test(lines[i]) &&
+      !/^#{1,4}\s+/.test(lines[i]) &&
+      !/^\s*([-*_])\1{2,}\s*$/.test(lines[i]) &&
+      !/^\s*>\s?/.test(lines[i]) &&
+      !/^\s*[-*•]\s+/.test(lines[i]) &&
+      !/^\s*\d+[.)]\s+/.test(lines[i]) &&
+      !(lines[i].includes('|') && i + 1 < lines.length && isTableSep(lines[i + 1]))
+    ) {
+      pLines.push(renderInline(lines[i]));
+      i++;
+    }
+    if (pLines.length) {
+      out.push(`<p class="md-p">${pLines.join('<br>')}</p>`);
+    }
+  }
+
+  return `<div class="md-body">${out.join('')}</div>`;
 }
 
 export function fmtTime(unix) {
