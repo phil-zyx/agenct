@@ -47,6 +47,8 @@ export function renderMarkdown(raw) {
   text = text.replace(/```[\w-]*\n([\s\S]*?)```/g, (_, code) => `<pre><code>${code}</code></pre>`);
   // Inline code
   text = text.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+  // Headings (### / ## / #)
+  text = text.replace(/^#{1,3}\s+([^\n]+)$/gm, '<div class="md-h">$1</div>');
   // Bold
   text = text.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
   // Attachment images (same-origin /api/attachments/att_... only)

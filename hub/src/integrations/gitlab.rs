@@ -167,34 +167,122 @@ pub async fn fetch_commit_summary(hub: &Hub, user_id: &str) -> Option<String> {
     if cfg.token.is_empty() || !hub.config.allowed_gitlab_origins.contains(&cfg.base_url) {
         return None;
     }
-    let url = format!("{}/api/v4/events?action=pushed&per_page=20", cfg.base_url);
-    let resp = hub
-        .http
-        .get(&url)
-        .header("PRIVATE-TOKEN", &cfg.token)
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
+    let events_url = format!("{}/api/v4/events?action=pushed&per_page=30", cfg.base_url);
+    let projects_url = format!(
+        "{}/api/v4/projects?membership=true&order_by=last_activity_at&per_page=100&simple=true",
+        cfg.base_url
+    );
+
+    let (ev_res, proj_res) = tokio::join!(
+        hub.http
+            .get(&events_url)
+            .header("PRIVATE-TOKEN", &cfg.token)
+            .send(),
+        hub.http
+            .get(&projects_url)
+            .header("PRIVATE-TOKEN", &cfg.token)
+            .send(),
+    );
+
+    let ev_resp = ev_res.ok()?;
+    if !ev_resp.status().is_success() {
         return None;
     }
-    let events: Vec<Value> = resp.json().await.ok()?;
+    let events: Vec<Value> = ev_resp.json().await.ok()?;
     if events.is_empty() {
         return Some("最近没有新的 GitLab 推送记录。".into());
     }
-    let mut lines = Vec::new();
-    for ev in events.iter().take(12) {
+
+    let mut project_names: std::collections::HashMap<i64, String> =
+        std::collections::HashMap::new();
+    if let Ok(pr) = proj_res {
+        if pr.status().is_success() {
+            if let Ok(projs) = pr.json::<Vec<Value>>().await {
+                for p in projs {
+                    if let (Some(id), Some(path)) = (
+                        p["id"].as_i64(),
+                        p["path_with_namespace"]
+                            .as_str()
+                            .or_else(|| p["name"].as_str()),
+                    ) {
+                        project_names.insert(id, path.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    // Group non-empty push events by repository while preserving recency order.
+    let mut repo_order: Vec<String> = Vec::new();
+    let mut by_repo: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut kept = 0usize;
+
+    for ev in &events {
+        if kept >= 16 {
+            break;
+        }
+        let action = ev["action_name"].as_str().unwrap_or("");
+        let count = ev["push_data"]["commit_count"].as_i64().unwrap_or(0);
+        if count <= 0 || action == "deleted" {
+            continue;
+        }
+        let repo = ev["project_id"]
+            .as_i64()
+            .and_then(|pid| project_names.get(&pid).cloned())
+            .or_else(|| {
+                ev["target_title"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "未命名仓库".into());
         let author = ev["author_username"].as_str().unwrap_or("unknown");
         let branch = ev["push_data"]["ref"].as_str().unwrap_or("-");
         let title = ev["push_data"]["commit_title"]
             .as_str()
-            .unwrap_or("(no commit title)");
-        let count = ev["push_data"]["commit_count"].as_i64().unwrap_or(1);
-        lines.push(format!(
-            "- `{branch}` ({count} commits) by @{author}: {title}"
-        ));
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("（无提交说明）");
+        let ts = format_gitlab_ts(ev["created_at"].as_str().unwrap_or(""));
+        let ts_prefix = if ts.is_empty() {
+            String::new()
+        } else {
+            format!("{ts} · ")
+        };
+        let line = format!("- {ts_prefix}`{branch}` ({count} commits) · @{author}：{title}");
+        if !by_repo.contains_key(&repo) {
+            repo_order.push(repo.clone());
+        }
+        by_repo.entry(repo).or_default().push(line);
+        kept += 1;
     }
-    Some(format!("### 近期 GitLab 提交汇总\n{}", lines.join("\n")))
+
+    if repo_order.is_empty() {
+        return Some("最近没有新的 GitLab 代码提交记录。".into());
+    }
+
+    let mut sections = Vec::with_capacity(repo_order.len() + 1);
+    sections.push("### 近期 GitLab 提交汇总".to_owned());
+    for repo in repo_order {
+        if let Some(lines) = by_repo.get(&repo) {
+            sections.push(format!("**{repo}**\n{}", lines.join("\n")));
+        }
+    }
+    Some(sections.join("\n\n"))
+}
+
+fn format_gitlab_ts(raw: &str) -> String {
+    // Converts ISO-8601 like "2026-11-19T16:48:38.612+08:00" into "11-19 16:48".
+    let bytes = raw.as_bytes();
+    if bytes.len() >= 16
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && (bytes[10] == b'T' || bytes[10] == b' ')
+    {
+        return format!("{} {}", &raw[5..10], &raw[11..16]);
+    }
+    String::new()
 }
 
 async fn authenticate_webhook(hub: &Hub, headers: &HeaderMap) -> Result<Option<String>> {
