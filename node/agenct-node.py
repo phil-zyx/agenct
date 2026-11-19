@@ -39,6 +39,106 @@ MAX_RESULT_BYTES = 16_000
 MAX_EVIDENCE_BYTES = 5 * 1024 * 1024
 MAX_EVIDENCE_COUNT = 4
 
+_ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_ANSI_ESC_RE = re.compile(r"\x1b[@-Z\\-_]")
+_CTRL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI/VT100 terminal escape codes and stray non-printable control chars."""
+    if not text:
+        return ""
+    cleaned = _ANSI_OSC_RE.sub("", text)
+    cleaned = _ANSI_CSI_RE.sub("", cleaned)
+    cleaned = _ANSI_ESC_RE.sub("", cleaned)
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "")
+    return _CTRL_CHARS_RE.sub("", cleaned)
+
+
+def parse_opencode_json(raw: str) -> str | None:
+    """Extract the final assistant text from `opencode run --format json` JSONL output.
+
+    Returns:
+      - Final assistant text (str) when JSON events contain text or error messages.
+      - "" when valid JSON events were parsed but carried no text.
+      - None when stdout is not opencode JSONL (caller should fall back to plain text).
+    """
+    parsed_any = False
+    msg_order: list[str] = []
+    msg_texts: dict[str, list[str]] = {}
+    errors: list[str] = []
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict) or "type" not in ev:
+            continue
+        parsed_any = True
+        ev_type = ev.get("type")
+        if ev_type == "text":
+            part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+            txt = part.get("text") if isinstance(part.get("text"), str) else ev.get("text")
+            if isinstance(txt, str) and txt.strip():
+                mid = str(part.get("messageID") or "")
+                if mid not in msg_texts:
+                    msg_order.append(mid)
+                    msg_texts[mid] = []
+                msg_texts[mid].append(txt)
+        elif ev_type == "error":
+            err_obj = ev.get("error")
+            if isinstance(err_obj, dict):
+                data = err_obj.get("data") if isinstance(err_obj.get("data"), dict) else {}
+                msg = data.get("message") or err_obj.get("message") or err_obj.get("name")
+                if msg:
+                    errors.append(str(msg))
+            elif err_obj:
+                errors.append(str(err_obj))
+            elif ev.get("message"):
+                errors.append(str(ev["message"]))
+
+    if not parsed_any:
+        return None
+    if msg_order:
+        last_mid = msg_order[-1]
+        return strip_ansi("".join(msg_texts[last_mid])).strip()
+    if errors:
+        return strip_ansi("\n".join(errors)).strip()
+    return ""
+
+
+def summarize_progress_line(agent: str, raw_line: str) -> str:
+    """Turn a raw stdout/stderr line into clean human-readable progress text."""
+    stripped = raw_line.strip()
+    if agent == "opencode" and stripped.startswith("{"):
+        try:
+            ev = json.loads(stripped)
+        except json.JSONDecodeError:
+            ev = None
+        if isinstance(ev, dict) and "type" in ev:
+            ev_type = ev.get("type")
+            if ev_type == "tool_use":
+                part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+                tool = str(part.get("tool") or "tool")
+                state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+                detail = state.get("title") or inp.get("command") or inp.get("path") or ""
+                summary = f"{tool}: {detail}" if detail else tool
+                return strip_ansi(str(summary)).strip()
+            if ev_type == "text":
+                part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+                txt = part.get("text") or ev.get("text") or ""
+                return strip_ansi(str(txt)).strip()
+            if ev_type == "error":
+                return strip_ansi(str(ev.get("error") or ev.get("message") or "error")).strip()
+            return ""
+    return strip_ansi(raw_line).strip()
+
 EVIDENCE_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -250,6 +350,7 @@ def build_prompt(job: dict, input_files: list[str], evidence_dir: str, workdir: 
     parts = [
         "You are an Agenct execution node handling an assigned task.",
         "Complete the request concisely using available tools and output the final Markdown result directly.",
+        "Stay strictly scoped to the instruction; do not inspect unrelated directories or sensitive files (such as ~/.ssh, credentials, or secrets) unless explicitly requested.",
         f"Working directory: {workdir}",
         f"Title: {job.get('title') or ''}",
         f"Instruction:\n{job.get('instruction') or ''}",
@@ -274,6 +375,7 @@ def run_monitored(
     cancel_event: threading.Event,
     progress_cb,
     stage_label: str,
+    agent_hint: str = "",
 ) -> tuple[int, bytes, bytes, bool]:
     proc = subprocess.Popen(
         argv,
@@ -298,7 +400,7 @@ def run_monitored(
                 if not line:
                     break
                 sink.append(line)
-                text = decode_bytes(line).strip()
+                text = summarize_progress_line(agent_hint, decode_bytes(line))
                 if text:
                     with tail_lock:
                         recent.append(text[-160:])
@@ -359,6 +461,10 @@ def execute_job(
         env["AGENCT_WORKDIR"] = workdir
         env["AGENCT_EVIDENCE_DIR"] = evidence_dir
         env["AGENCT_PROMPT"] = prompt
+        env["NO_COLOR"] = "1"
+        env["CLICOLOR"] = "0"
+        env["FORCE_COLOR"] = "0"
+        env["TERM"] = "dumb"
 
         if agent.startswith("custom:"):
             custom_cmd = agent[len("custom:"):]
@@ -371,10 +477,11 @@ def execute_job(
                 cancel_event=cancel_event,
                 progress_cb=progress_cb,
                 stage_label="Running custom command",
+                agent_hint="custom",
             )
             if cancelled:
                 return "failed", "Job cancelled because Hub lease expired or was revoked.", []
-            text = (decode_bytes(out).strip() or decode_bytes(err).strip())
+            text = strip_ansi(decode_bytes(out)).strip() or strip_ansi(decode_bytes(err)).strip()
             status = "completed" if rc == 0 and text else "failed"
             return status, truncate_utf8(text or f"Command exited with code {rc}"), collect_evidence(evidence_dir)
 
@@ -410,7 +517,7 @@ def execute_job(
                 elif agent == "gemini":
                     argv = [exe, "-p", prompt]
                 else:
-                    argv = [exe, "run", prompt]
+                    argv = [exe, "run", "--format", "json", prompt]
 
                 rc, out, err, cancelled = run_monitored(
                     argv,
@@ -421,14 +528,22 @@ def execute_job(
                     cancel_event=cancel_event,
                     progress_cb=progress_cb,
                     stage_label=f"Running {agent}",
+                    agent_hint=agent,
                 )
                 if cancelled:
                     return "failed", "Job cancelled because Hub lease expired or was revoked.", []
                 file_text = ""
                 if out_file and os.path.exists(out_file):
                     with open(out_file, "rb") as fh:
-                        file_text = decode_bytes(fh.read()).strip()
-                text = file_text or decode_bytes(out).strip() or decode_bytes(err).strip()
+                        file_text = strip_ansi(decode_bytes(fh.read())).strip()
+                raw_out = decode_bytes(out)
+                raw_err = decode_bytes(err)
+                if agent == "opencode":
+                    parsed = parse_opencode_json(raw_out)
+                    out_text = parsed if parsed is not None else strip_ansi(raw_out).strip()
+                else:
+                    out_text = strip_ansi(raw_out).strip()
+                text = file_text or out_text or strip_ansi(raw_err).strip()
                 status = "completed" if rc == 0 and text else "failed"
                 return status, truncate_utf8(text or f"{agent} exited with code {rc}"), collect_evidence(evidence_dir)
             finally:

@@ -79,6 +79,33 @@ class TestUnifiedNode(unittest.TestCase):
             self.assertIn("Inspect repo", content)
             self.assertEqual(atts, [])
 
+    def test_strip_ansi_removes_escape_codes_and_control_chars(self) -> None:
+        raw = "\x1b[0m\r\n\x1b[32;1m> build · deepseek\x1b[0m\n\x1b]0;title\x07结果：ok\x00\n\t缩进"
+        self.assertEqual(node.strip_ansi(raw), "\n> build · deepseek\n结果：ok\n\t缩进")
+
+    def test_parse_opencode_json_extracts_final_message_text_only(self) -> None:
+        stream = "\n".join([
+            '{"type":"step_start","part":{"type":"step-start","messageID":"m1"}}',
+            '{"type":"text","part":{"type":"text","messageID":"m1","text":"先查一下 tmux..."}}',
+            '{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"title":"tmux ls","input":{"command":"tmux ls"}}}}',
+            '{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls"}}',
+            '{"type":"step_start","part":{"type":"step-start","messageID":"m2"}}',
+            '{"type":"text","part":{"type":"text","messageID":"m2","text":"\\u001b[0m当前活跃会话：\\n- `agy` (3 windows)\\n- `cc` (5 windows)"}}',
+            '{"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}',
+        ])
+        parsed = node.parse_opencode_json(stream)
+        self.assertEqual(parsed, "当前活跃会话：\n- `agy` (3 windows)\n- `cc` (5 windows)")
+        self.assertIsNone(node.parse_opencode_json("plain text output"))
+
+    def test_summarize_progress_line_formats_opencode_events(self) -> None:
+        ev = '{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"title":"tmux ls","input":{"command":"tmux ls"}}}}'
+        self.assertEqual(node.summarize_progress_line("opencode", ev), "bash: tmux ls")
+        self.assertEqual(
+            node.summarize_progress_line("opencode", '{"type":"step_start","part":{"type":"step-start"}}'),
+            "",
+        )
+        self.assertEqual(node.summarize_progress_line("claude", "\x1b[31mhi\x1b[0m"), "hi")
+
 
 if __name__ == "__main__":
     unittest.main()

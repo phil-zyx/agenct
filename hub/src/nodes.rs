@@ -48,6 +48,54 @@ fn default_kind() -> String {
     "pc".into()
 }
 
+/// Strips ANSI/VT100 terminal escape codes and stray non-printable control characters
+/// while preserving UTF-8 text, newlines, and tabs.
+fn sanitize_terminal_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                // CSI sequence: ESC [ <params/intermediates> <final 0x40..=0x7E>
+                Some('[') => {
+                    chars.next();
+                    for ch in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
+                    }
+                }
+                // OSC sequence: ESC ] ... (BEL or ST ESC \)
+                Some(']') => {
+                    chars.next();
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' {
+                            break;
+                        }
+                        if ch == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // 2-byte ESC sequence
+                Some(next) if ('@'..='_').contains(&next) => {
+                    chars.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if c == '\r' {
+            continue;
+        }
+        if c == '\n' || c == '\t' || !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
 fn valid_node_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 48
@@ -474,8 +522,8 @@ pub async fn renew_lease(
     Json(input): Json<RenewLeaseInput>,
 ) -> Result<Json<Value>> {
     let (user_id, node_id, _) = authenticate_node(&hub, &headers).await?;
-    let clean_stage = truncate_bytes(input.stage.trim(), 120);
-    let clean_tail = truncate_bytes(input.log_tail.trim(), 360);
+    let clean_stage = truncate_bytes(sanitize_terminal_text(&input.stage).trim(), 120);
+    let clean_tail = truncate_bytes(sanitize_terminal_text(&input.log_tail).trim(), 360);
     let lease_hash = sha256_hex(&input.lease_token);
     let uid = user_id.clone();
     let tid = task_id.clone();
@@ -577,7 +625,8 @@ pub async fn submit_result(
             .await?
     };
 
-    let mut content = truncate_bytes(input.content.trim(), 16_000);
+    let sanitized_content = sanitize_terminal_text(&input.content);
+    let mut content = truncate_bytes(sanitized_content.trim(), 16_000);
     let extra_grants = if requester_id != user_id {
         vec![requester_id.clone()]
     } else {
@@ -840,4 +889,18 @@ Write-Host "Downloaded $script. Run: python `"$script`" --hub `"{origin}`" --tok
 "#
     );
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_terminal_text;
+
+    #[test]
+    fn strips_ansi_csi_osc_and_control_bytes_preserving_utf8() {
+        let raw = "\x1b[0m\n\x1b[32;1m活跃会话\x1b[0m\r\n\x1b]0;window title\x07- `agy`: 3 windows\n\t- `cc`: 5 windows\x00";
+        assert_eq!(
+            sanitize_terminal_text(raw),
+            "\n活跃会话\n- `agy`: 3 windows\n\t- `cc`: 5 windows"
+        );
+    }
 }
