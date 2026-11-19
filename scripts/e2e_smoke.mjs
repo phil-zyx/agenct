@@ -148,8 +148,8 @@ try {
   await page.click('[data-pick-avatar="sakura"]');
   await page.waitForFunction(
     () =>
-      document.getElementById('head-avatar')?.getAttribute('src') === 'avatars/sakura.webp' &&
-      document.getElementById('drawer-avatar')?.getAttribute('src') === 'avatars/sakura.webp',
+      (document.getElementById('head-avatar')?.getAttribute('src') || '').startsWith('avatars/sakura.webp') &&
+      (document.getElementById('drawer-avatar')?.getAttribute('src') || '').startsWith('avatars/sakura.webp'),
     { timeout: 5000 },
   );
   await page.click('#rail-more');

@@ -268,11 +268,16 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
 .muse-hero-avatar-wrap.has-portrait {
   background: linear-gradient(135deg, color-mix(in srgb, var(--brand) 65%, #fff), color-mix(in srgb, var(--brand) 20%, #e5d4ff));
   box-shadow: 0 6px 20px rgba(24, 67, 56, .16);
+  animation: avatar-idle-float 4.2s ease-in-out infinite;
 }
-.muse-hero-avatar-wrap.is-thinking { animation: avatar-breathe 1.8s ease-in-out infinite; }
+.muse-hero-avatar-wrap.is-thinking { animation: avatar-breathe 1.6s ease-in-out infinite; }
 .muse-hero-avatar-wrap .avatar.big {
-  width: 84px; height: 84px; border-radius: 50%; object-fit: cover;
+  width: 92px; height: 92px; border-radius: 50%; object-fit: cover;
   background: var(--surface); box-shadow: 0 2px 10px rgba(0, 0, 0, .08);
+}
+@keyframes avatar-idle-float {
+  0%, 100% { transform: translateY(0); box-shadow: 0 6px 20px rgba(24, 67, 56, .14); }
+  50% { transform: translateY(-2px); box-shadow: 0 10px 24px rgba(24, 67, 56, .22); }
 }
 @keyframes avatar-breathe {
   0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--brand) 35%, transparent), 0 4px 16px color-mix(in srgb, var(--brand) 22%, transparent); }

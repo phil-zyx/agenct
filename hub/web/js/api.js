@@ -79,9 +79,9 @@ export function showToast(msg) {
 
 export const AVATAR_CATALOG = [
   { id: 'agenct', name: '默认图标', desc: '极简矢量', src: 'brand/agenct-icon.svg', animated: false },
-  { id: 'sakura', name: '樱粉巫女', desc: '动态微动', src: 'avatars/sakura.webp', animated: true },
-  { id: 'violet', name: '冷紫和风', desc: '动态微动', src: 'avatars/violet.webp', animated: true },
-  { id: 'cheshire', name: '猫耳女仆', desc: '动态微动', src: 'avatars/cheshire.webp', animated: true },
+  { id: 'sakura', name: '樱粉巫女', desc: '动态微动', src: 'avatars/sakura.webp?v=2', animated: true },
+  { id: 'violet', name: '冷紫和风', desc: '动态微动', src: 'avatars/violet.webp?v=2', animated: true },
+  { id: 'cheshire', name: '猫耳女仆', desc: '动态微动', src: 'avatars/cheshire.webp?v=2', animated: true },
 ];
 
 export function avatarById(id) {
