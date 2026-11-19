@@ -2621,7 +2621,7 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     assert(testCall);
     assert.match(imCard.textContent, /测试卡片已成功推送/);
   });
-  await test('Muse topic bar attributes messages to historical task contexts and filters stream on click', async () => {
+  await test('Muse drawer activity items attribute messages to historical task contexts and filter stream on click without top topic bar', async () => {
     const f = fixture(undefined, {
       messages: [
         { role: 'user', content: '排查登录接口 500 报错', status: 'complete', created_at: '2026-04-06 08:00:00' },
@@ -2636,23 +2636,19 @@ const chatPosts = f => f.calls.filter(call => call.url === '/api/messages' && ca
     });
     await f.login('alice');
     await settle();
-    const topicBar = f.$('muse-topic-bar');
-    assert.equal(topicBar.classList.contains('hide'), false);
-    assert.match(topicBar.textContent, /✨ 全部脉络/);
-    assert.match(topicBar.textContent, /排查登录接口 500 报错/);
-    assert.match(topicBar.textContent, /整理 Q4 商业化定价方案/);
+    assert.equal(f.$('muse-topic-bar').children.length, 0);
     assert.match(f.$('conversation').textContent, /📌 脉络：💬 排查登录接口 500 报错/);
 
-    const loginPill = [...topicBar.children].find(btn => btn.dataset?.topicId === 'topic-login');
-    assert(loginPill);
-    await loginPill.onclick();
+    const loginTopicBtn = findButton(f.$('conversation'), '📌 脉络：💬 排查登录接口 500 报错');
+    assert(loginTopicBtn);
+    await loginTopicBtn.onclick();
     await settle();
     assert.match(f.$('conversation').textContent, /已在日志中定位到 token 校验异常/);
     assert(!f.$('conversation').textContent.includes('已生成三档订阅价格表'));
     assert.match(f.$('task-context-title').textContent, /排查登录接口 500 报错/);
 
-    const allPill = findButton(topicBar, '✨ 全部脉络');
-    await allPill.onclick();
+    const activeTopicBtn = findButton(f.$('conversation'), '📌 脉络：💬 排查登录接口 500 报错');
+    await activeTopicBtn.onclick();
     await settle();
     assert.match(f.$('conversation').textContent, /已生成三档订阅价格表/);
   });

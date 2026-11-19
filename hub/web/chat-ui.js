@@ -161,41 +161,11 @@ function selectMuseTopic(context, task) {
   void refresh(context, false);
 }
 
-function renderMuseTopicBar(context, messages, attributed) {
+function renderMuseTopicBar(_context, _messages, _attributed) {
   const bar = typeof $ === 'function' ? $('muse-topic-bar') : null;
-  if (!bar) return;
-  const tasks = typeof visibleTasks !== 'undefined' ? [...visibleTasks.values()] : [];
-  if (activeMuseTopicId && !visibleTasks?.has(activeMuseTopicId)) {
-    activeMuseTopicId = null;
-  }
-  if (!tasks.length || !messages.length) {
+  if (bar) {
     bar.replaceChildren();
     bar.classList.add('hide');
-    return;
-  }
-  const counts = new Map();
-  for (const task of attributed.values()) {
-    counts.set(task.id, (counts.get(task.id) || 0) + 1);
-  }
-  bar.replaceChildren();
-  bar.classList.remove('hide');
-  const allBtn = el('button', 'muse-topic-pill' + (!activeMuseTopicId ? ' active' : ''), '✨ 全部脉络');
-  allBtn.type = 'button';
-  allBtn.onclick = () => selectMuseTopic(context, null);
-  bar.append(allBtn);
-
-  for (const task of tasks.slice(0, 10)) {
-    const isTopic = Boolean(task.is_topic || task.requester === task.owner);
-    const turnCount = counts.get(task.id) || (Number.isFinite(task.turn_count) ? task.turn_count : 0);
-    const prefix = isTopic ? '' : '🤝 ';
-    const shortTitle = String(task.summary || '').length > 20 ? String(task.summary).slice(0, 20) + '…' : String(task.summary || '');
-    const label = `${prefix}${shortTitle}` + (turnCount > 0 ? ` (${turnCount})` : '');
-    const pill = el('button', 'muse-topic-pill' + (activeMuseTopicId === task.id ? ' active' : '') + (task.status === 'working' ? ' topic-working' : ''), label);
-    pill.type = 'button';
-    pill.dataset.topicId = task.id;
-    pill.title = `${task.summary} (#${String(task.id).slice(0, 8)})`;
-    pill.onclick = () => selectMuseTopic(context, task);
-    bar.append(pill);
   }
 }
 
