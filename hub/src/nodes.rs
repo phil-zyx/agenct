@@ -1830,6 +1830,8 @@ fn classify_chat_topic(
             "⏰ 定时任务：{}",
             if short.is_empty() { "巡检" } else { &short }
         )
+    } else if let Some(llm_title) = llm_suggested_title.filter(|t| !t.trim().is_empty()) {
+        llm_title.trim().to_owned()
     } else if let Some(repo) = repos.iter().find(|r| contains_alias(question_for_match, r)) {
         format!("📁 {} 仓库上下文", repo.to_ascii_lowercase())
     } else if let Some(repo) = explicit_named_repo(question_for_match) {
@@ -2895,7 +2897,7 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
                 let speaker = if role == "user" {
                     "用户"
                 } else {
-                    "管家/节点"
+                    "Muse"
                 };
                 let snippet: String = strip_attachment_markers(&content)
                     .chars()
@@ -2905,10 +2907,26 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
             })
             .filter(|line| !line.ends_with("] "))
             .collect();
-        if lines.is_empty() {
+        let muse_persona_note = h
+            .automation
+            .lock()
+            .ok()
+            .and_then(|g| g.muse_profiles.get(&owner).cloned())
+            .map(|mp| {
+                format!(
+                    "\n\n【Muse 核心人设 (SOUL.md) 与汇报要求】\n{}\n\n【Muse 长期记忆 (MEMORY.md)】\n{}\n（请直接以第一人称跟用户自然汇报结果与验证情况，不要输出『### 本地节点初稿』或任何机械套话抬头。）",
+                    truncate_bytes(&mp.soul_md, 600),
+                    truncate_bytes(&mp.memory_md, 800)
+                )
+            })
+            .unwrap_or_default();
+        if lines.is_empty() && muse_persona_note.is_empty() {
             None
         } else {
-            Some(truncate_bytes(&lines.join("\n"), 3000))
+            Some(truncate_bytes(
+                &format!("{}{}", lines.join("\n"), muse_persona_note),
+                3800,
+            ))
         }
     };
     tx.commit()?;
@@ -3294,10 +3312,14 @@ pub(super) async fn submit_draft(
             "completed",
             input.expected_revision + 2,
         )?;
-        let reply = format!(
-            "🤵 管家（已调度「{node_name}」· 归入主题「{summary}」）：\n\n{}",
-            final_content
-        );
+        let reply = if matches!(h.runtime, crate::Runtime::Dsh { .. }) {
+            final_content.clone()
+        } else {
+            format!(
+                "🤵 管家（已调度「{node_name}」· 归入主题「{summary}」）：\n\n{}",
+                final_content
+            )
+        };
         let placeholder_id: Option<i64> = tx
             .query_row(
                 "SELECT id FROM messages
@@ -3340,6 +3362,13 @@ pub(super) async fn submit_draft(
     clear_live_progress(&h, &task_id);
     if requester == owner {
         crate::sagent::notify_gitlab_task_completed(&h, &task_id, &node_name, &final_content);
+        crate::sagent::spawn_muse_post_completion_distillation(
+            h.clone(),
+            owner.clone(),
+            task_id.clone(),
+            instruction.clone(),
+            final_content.clone(),
+        );
     }
     Ok(Json(json!({
         "status": "completed",

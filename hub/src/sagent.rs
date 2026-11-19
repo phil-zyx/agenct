@@ -148,6 +148,17 @@ impl Default for MuseProfileConfig {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct MuseAuditRecord {
+    pub id: String,
+    pub owner: String,
+    pub action: String,
+    pub status: String,
+    pub title: String,
+    pub detail: String,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct AutomationStore {
     #[serde(default)]
@@ -164,6 +175,35 @@ pub(crate) struct AutomationStore {
     pub im_configs: HashMap<String, ImWebhookConfig>,
     #[serde(default)]
     pub muse_profiles: HashMap<String, MuseProfileConfig>,
+    #[serde(default)]
+    pub topic_outcomes: HashMap<String, String>,
+    #[serde(default)]
+    pub audit_logs: Vec<MuseAuditRecord>,
+}
+
+pub(crate) fn record_muse_audit(
+    h: &Hub,
+    owner: &str,
+    action: &str,
+    status: &str,
+    title: &str,
+    detail: &str,
+) {
+    let _ = with_store_mut(h, |store| {
+        store.audit_logs.push(MuseAuditRecord {
+            id: format!("aud-{}", &Uuid::new_v4().simple().to_string()[..8]),
+            owner: owner.to_owned(),
+            action: action.to_owned(),
+            status: status.to_owned(),
+            title: nodes::truncate_bytes(title.trim(), 120),
+            detail: nodes::truncate_bytes(detail.trim(), 300),
+            created_at: nodes::now_unix(),
+        });
+        if store.audit_logs.len() > 120 {
+            let drain = store.audit_logs.len() - 120;
+            store.audit_logs.drain(0..drain);
+        }
+    });
 }
 
 pub(crate) fn persist_automation_db(db: &Connection, store: &AutomationStore) {
@@ -2722,6 +2762,48 @@ pub(crate) async fn run_due_crons(
 
     let mut executed = 0usize;
     for job in due {
+        if job.instruction.eq_ignore_ascii_case("Heartbeat") || job.id.starts_with("cron-heartbeat")
+        {
+            let failed_count: i64 = h
+                .db()
+                .ok()
+                .and_then(|db| {
+                    db.query_row(
+                        "SELECT COUNT(*) FROM node_assignments WHERE owner=?1 AND status='failed' AND updated_at >= ?2",
+                        params![job.owner, now.saturating_sub(1800)],
+                        |r| r.get(0),
+                    )
+                    .ok()
+                })
+                .unwrap_or(0);
+            if failed_count > 0 {
+                if let Ok(db) = h.db() {
+                    let msg = format!(
+                        "刚才 30 分钟例行巡检发现你有 {failed_count} 项本机节点任务执行异常中断，我已经记录在右侧任务脉络里，需要重跑或改由云端处理跟我说一声。"
+                    );
+                    let _ = insert_chat_message(&db, &job.owner, "assistant", &msg);
+                }
+                record_muse_audit(
+                    h,
+                    &job.owner,
+                    "heartbeat",
+                    "awaiting_human",
+                    "Heartbeat 发现异常任务并主动提醒",
+                    &format!("检测到最近 30 分钟内有 {failed_count} 项失败作业"),
+                );
+            } else {
+                record_muse_audit(
+                    h,
+                    &job.owner,
+                    "heartbeat",
+                    "completed",
+                    "Heartbeat 30分钟静默自检",
+                    "HEARTBEAT_OK · 节点与任务主线正常，保持静默不打扰对话",
+                );
+            }
+            executed += 1;
+            continue;
+        }
         let online_node = if job.target != "cloud" {
             let db = h.db()?;
             if job.target == "auto" {
@@ -3962,6 +4044,64 @@ async fn try_handle_muse_agent_loop(
                     }
                     entry.updated_at = nodes::now_unix();
                 })?;
+                record_muse_audit(
+                    h,
+                    owner,
+                    "update_memory",
+                    "auto_approved",
+                    "更新管家命名与 SOUL / MEMORY",
+                    call.memory_append
+                        .as_deref()
+                        .or(call.name.as_deref())
+                        .unwrap_or("已同步更新长期记忆与人设"),
+                );
+            }
+            _ => {}
+        }
+    }
+    for call in &parsed.tools {
+        match call.tool.as_str() {
+            "manage_cron" => {
+                record_muse_audit(
+                    h,
+                    owner,
+                    "manage_cron",
+                    "auto_approved",
+                    &format!(
+                        "管理预定任务（{}）",
+                        call.action.as_deref().unwrap_or("update")
+                    ),
+                    call.instruction
+                        .as_deref()
+                        .or(call.cron_id.as_deref())
+                        .unwrap_or("已更新定时任务配置"),
+                );
+            }
+            "manage_rule" => {
+                record_muse_audit(
+                    h,
+                    owner,
+                    "manage_rule",
+                    "auto_approved",
+                    "更新个人安全与分发规则",
+                    call.rule_body
+                        .as_deref()
+                        .or(call.rule_id.as_deref())
+                        .unwrap_or("已更新规则"),
+                );
+            }
+            "dispatch_pc_node" => {
+                record_muse_audit(
+                    h,
+                    owner,
+                    "dispatch_pc_node",
+                    "auto_approved",
+                    &format!(
+                        "调度节点「{}」执行任务",
+                        call.node_id.as_deref().unwrap_or("homelab")
+                    ),
+                    call.instruction.as_deref().unwrap_or(trimmed),
+                );
             }
             _ => {}
         }
@@ -5460,7 +5600,156 @@ pub(super) async fn get_automation(
         .get(&owner)
         .cloned()
         .unwrap_or_default();
-    Ok(Json(json!({ "rules": rules, "crons": crons, "muse": muse })))
+    let topic_outcomes = guard.topic_outcomes.clone();
+    let mut audit_logs: Vec<_> = guard
+        .audit_logs
+        .iter()
+        .filter(|a| a.owner == owner)
+        .cloned()
+        .collect();
+    audit_logs.reverse();
+    audit_logs.truncate(30);
+    Ok(Json(json!({
+        "rules": rules,
+        "crons": crons,
+        "muse": muse,
+        "topic_outcomes": topic_outcomes,
+        "audit_logs": audit_logs,
+    })))
+}
+
+pub(crate) fn spawn_muse_post_completion_distillation(
+    h: Hub,
+    owner: String,
+    task_id: String,
+    instruction: String,
+    final_content: String,
+) {
+    let crate::Runtime::Dsh { url, token } = h.runtime.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let Ok(runtime_profile) = ({
+            let db = match h.db() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            crate::profiles::route(&db, &owner, None, None)
+        }) else {
+            return;
+        };
+        let instr_short: String = nodes::strip_attachment_markers(&instruction)
+            .chars()
+            .take(300)
+            .collect();
+        let res_short: String = nodes::strip_attachment_markers(&final_content)
+            .chars()
+            .take(1000)
+            .collect();
+        let prompt = format!(
+            "[MUSE_AGENT_TURN]\n\
+             你是用户的 Muse 智能体归档与记忆提炼引擎。刚才一项任务已执行完毕，请根据【任务指令】与【完成结果】提炼三个字段：\n\
+             1. `title`：动宾结构的干净中文短标题（6~14字，如「重排任务流程，简化作答路径」「修复移动端顶部气泡布局」「排查 Atlas 远端提交状态」，不要加任何 emoji 或标点前缀）；\n\
+             2. `outcome_summary`：一句话（14~44字）高度概括实际完成了什么与验证结论（直接写成果，如「已将话题栏移为独立 flex 区域并通过 390×844 验收」）；\n\
+             3. `memory_fact`：如果本次任务反映出值得长期写入 `MEMORY.md` 的项目架构、机器环境或用户偏好新事实，提炼为一条简短事实（不超过 60 字），否则设为 `null`。\n\n\
+             【任务指令】\n{instr_short}\n\n\
+             【完成结果】\n{res_short}\n\n\
+             请保持内部思考极度简短，立即只输出一行严格合法的 JSON（不要代码块）：\n\
+             `{{\"title\":\"动宾短标题\",\"outcome_summary\":\"一句话成果摘要\",\"memory_fact\":null}}`"
+        );
+        let dsh = crate::runtime::DshRuntime {
+            client: &h.client,
+            url: &url,
+            token: &token,
+        };
+        let sid = Uuid::new_v4().to_string();
+        let Ok(ans) = crate::runtime::Runtime::turn(
+            &dsh,
+            crate::runtime::TurnRequest {
+                kind: crate::runtime::TurnKind::Chat,
+                message: &prompt,
+                session_id: &sid,
+                history: &[],
+                profile: &runtime_profile,
+                task_context: None,
+                draft_revision: None,
+                task_role: None,
+                owner_context: None,
+                profile_context: None,
+            },
+        )
+        .await
+        else {
+            return;
+        };
+        let raw = ans.reply.trim();
+        let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) else {
+            return;
+        };
+        let Ok(val) = serde_json::from_str::<Value>(&raw[s..=e]) else {
+            return;
+        };
+        let title = val["title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && *t != "null")
+            .map(|t| {
+                let clean: String = t
+                    .trim_start_matches(['💬', '🖥', '📁', '🦊', '⏰', '\u{fe0f}', ' '])
+                    .chars()
+                    .take(22)
+                    .collect();
+                clean
+            });
+        let outcome = val["outcome_summary"]
+            .as_str()
+            .map(str::trim)
+            .filter(|o| !o.is_empty() && *o != "null")
+            .map(|o| nodes::truncate_bytes(o, 160));
+        let mem_fact = val["memory_fact"]
+            .as_str()
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && *m != "null")
+            .map(|m| nodes::truncate_bytes(m, 200));
+
+        if let Some(ref t) = title {
+            if let Ok(db) = h.db() {
+                let stored_summary = format!("💬 {t}");
+                let _ = db.execute(
+                    "UPDATE tasks SET summary=?1 WHERE id=?2 AND requester=?3 AND owner=?3",
+                    params![stored_summary, task_id, owner],
+                );
+            }
+        }
+        let _ = with_store_mut(&h, |store| {
+            if let Some(ref o) = outcome {
+                store.topic_outcomes.insert(task_id.clone(), o.clone());
+            }
+            if let Some(ref m) = mem_fact {
+                let entry = store.muse_profiles.entry(owner.clone()).or_default();
+                let bullet = if m.starts_with('-') {
+                    m.clone()
+                } else {
+                    format!("- {m}")
+                };
+                if !entry.memory_md.contains(&bullet) {
+                    entry.memory_md = nodes::truncate_bytes(
+                        &format!("{}\n{bullet}", entry.memory_md.trim_end()),
+                        12000,
+                    );
+                    entry.updated_at = nodes::now_unix();
+                }
+            }
+        });
+        record_muse_audit(
+            &h,
+            &owner,
+            "task_distill",
+            "completed",
+            title.as_deref().unwrap_or("任务完结归档"),
+            outcome.as_deref().unwrap_or("已提炼任务成果摘要并归档"),
+        );
+    });
 }
 
 #[derive(Deserialize)]

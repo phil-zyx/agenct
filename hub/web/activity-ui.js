@@ -67,12 +67,17 @@ function activityLine(item, me) {
     case 'draft_uncertain': return '暂时无法确认起草结果，请打开草稿查看';
     case 'draft_pending': return '正在为你起草…';
     case 'topic_turn': {
+      const distilled = lastMuseAutomation?.topic_outcomes?.[item.id];
+      if (typeof distilled === 'string' && distilled.trim()) {
+        return distilled.trim();
+      }
       const task = typeof visibleTasks !== 'undefined' ? visibleTasks.get(item.id) : null;
       const turns = Array.isArray(task?.recent_turns) ? task.recent_turns : [];
       const count = Number.isFinite(task?.turn_count) ? task.turn_count : turns.length;
       const last = turns.length ? turns[turns.length - 1] : null;
       const raw = String(last?.answer || last?.question || task?.result || '')
         .replace(/^🤵\s*管家（[^）]*）：\s*/u, '')
+        .replace(/^###\s*本地节点初稿[^\n]*\n+/u, '')
         .replace(/[#*`>-]+/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
@@ -100,6 +105,7 @@ let lastMuseAutomation = null;
 function cleanTopicTitle(rawTitle) {
   return String(rawTitle || '')
     .replace(/^\[归并:[^\]]+\]\s*/u, '')
+    .replace(/^(?:💬|🖥️|📁|⏰|🦊)\s*/u, '')
     .trim();
 }
 
@@ -291,10 +297,21 @@ function renderMuseDrawer(context, automation, proposals, tasks) {
   if (auditBox) {
     auditBox.replaceChildren();
     const rules = Array.isArray(auto.rules) ? auto.rules : [];
+    const auditLogs = Array.isArray(auto.audit_logs) ? auto.audit_logs : [];
     const propList = Array.isArray(proposals) ? proposals : [];
     const crossTasks = (Array.isArray(tasks) ? tasks : []).filter(t => t.requester !== t.owner);
-    const title = el('h3', 'muse-audit-head', `审核记录与安全边界（${propList.length + crossTasks.length + rules.length}）`);
+    const title = el('h3', 'muse-audit-head', `审核记录与工具权限流水（${auditLogs.length + propList.length + crossTasks.length + rules.length}）`);
     auditBox.append(title);
+    for (const a of auditLogs.slice(0, 12)) {
+      const row = el('div', 'muse-audit-item');
+      const badgeLabel = a.status === 'awaiting_human' ? '待你审批' : a.status === 'auto_approved' ? '自动放行' : '已核验';
+      row.append(
+        el('span', 'muse-audit-badge ' + (a.status === 'awaiting_human' ? 'pending' : 'confirmed'), badgeLabel),
+        el('span', 'muse-audit-text', `${a.title || a.action} · ${a.detail || ''}`)
+      );
+      row.title = `${a.title || ''}\n${a.detail || ''}`;
+      auditBox.append(row);
+    }
     for (const r of rules) {
       const row = el('div', 'muse-audit-item');
       const desc = r.require_human_approval
