@@ -623,6 +623,11 @@ pub fn app(mut hub: Hub) -> Router {
             post(sagent::remove_rule),
         )
         .route("/api/automation/crons", post(sagent::create_cron))
+        .route(
+            "/api/automation/crons/{id}/remove",
+            post(sagent::remove_cron),
+        )
+        .route("/api/automation/muse", post(sagent::save_muse_profile))
         .route("/api/automation/tick", post(sagent::tick_crons))
         .route("/api/webhooks/gitlab", post(sagent::gitlab_webhook))
         .route("/webhooks/gitlab", post(sagent::gitlab_webhook))

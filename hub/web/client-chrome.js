@@ -199,6 +199,48 @@ function setTasksOpen(open) {
 }
 $('toggle-tasks').onclick = () => setTasksOpen($('room').classList.contains('contacts-open') || $('room').classList.contains('settings-open') || !$('room').classList.contains('tasks-open'));
 $('close-tasks').onclick = () => { setTasksOpen(false); $('toggle-tasks').focus?.(); };
+if ($('muse-head-toggle')) {
+  $('muse-head-toggle').onclick = () => $('toggle-tasks').onclick();
+  $('muse-head-toggle').onkeydown = event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      $('toggle-tasks').onclick();
+    }
+  };
+}
+if ($('muse-edit-avatar')) {
+  $('muse-edit-avatar').onclick = () => {
+    setPaneTab('soul');
+    $('muse-name-input')?.focus?.();
+  };
+}
+if ($('save-muse-soul')) {
+  $('save-muse-soul').onclick = async () => {
+    const context = session();
+    if (!current(context) || $('save-muse-soul').disabled) return;
+    $('save-muse-soul').disabled = true;
+    const statusNote = $('muse-soul-status');
+    if (statusNote) statusNote.textContent = '正在保存…';
+    try {
+      const saved = await api(context, 'automation/muse', 'POST', {
+        name: $('muse-name-input')?.value || 'Muse',
+        soul_md: $('muse-soul-input')?.value || '',
+        memory_md: $('muse-memory-input')?.value || ''
+      });
+      if (!current(context)) return;
+      if (typeof lastMuseAutomation === 'object' && lastMuseAutomation) {
+        lastMuseAutomation.muse = saved;
+      }
+      if ($('muse-drawer-name') && saved?.name) $('muse-drawer-name').textContent = saved.name;
+      if ($('muse-avatar-name') && saved?.name) $('muse-avatar-name').textContent = saved.name;
+      if (statusNote) statusNote.textContent = '已保存命名与 SOUL.md / MEMORY.md。';
+    } catch (error) {
+      if (current(context) && statusNote) statusNote.textContent = '保存失败：' + (error?.message || '请稍后重试');
+    } finally {
+      if (current(context)) $('save-muse-soul').disabled = false;
+    }
+  };
+}
 function returnToChatOnNarrowScreen() {
   if (globalThis.innerWidth <= 900) setTasksOpen(false);
 }
@@ -251,6 +293,7 @@ $('text').oninput = () => {
 };
 $('tab-activity').onclick = () => setPaneTab('activity');
 $('tab-tasks').onclick = () => setPaneTab('tasks');
+if ($('tab-soul')) $('tab-soul').onclick = () => setPaneTab('soul');
 setPaneTab('activity');
 
 

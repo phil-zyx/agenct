@@ -226,6 +226,35 @@ async function freePort() {
     await alice.reload();
     await expectDecodedImage('#conversation .msg-assistant img[alt="mobile-chat-attachment.png"]');
     await expectDecodedImage('#conversation .msg-assistant img[alt="mobile-image-preview.png"]');
+    const topicBar = alice.locator('#muse-topic-bar');
+    const scroller = alice.locator('#scroller');
+    const readTopicLayout = () => topicBar.evaluate(bar => {
+      const history = document.getElementById('scroller');
+      const barRect = bar.getBoundingClientRect();
+      return {
+        top: barRect.top,
+        bottom: barRect.bottom,
+        railBottom: document.querySelector('.rail').getBoundingClientRect().bottom,
+        historyTop: history.getBoundingClientRect().top,
+        historyHeight: history.clientHeight,
+        viewportWidth: document.documentElement.clientWidth,
+        pageWidth: document.documentElement.scrollWidth,
+        barWidth: barRect.width
+      };
+    });
+    const assertTopicLayout = layout => {
+      assert(Math.abs(layout.top - layout.railBottom) <= 1, 'Topic bar must sit directly below the top rail');
+      assert(Math.abs(layout.bottom - layout.historyTop) <= 1, 'Topic bar must not overlap message history');
+      assert.equal(layout.barWidth, layout.viewportWidth, 'Topic bar must fit the mobile viewport');
+      assert.equal(layout.pageWidth, layout.viewportWidth, 'Topic bar must not cause page overflow');
+    };
+    await topicBar.getByRole('button', { name: /请回传节点截图/ }).waitFor();
+    const topicBeforeAttachments = await readTopicLayout();
+    assertTopicLayout(topicBeforeAttachments);
+    if (evidenceDir) {
+      await scroller.evaluate(history => { history.scrollTop = 0; });
+      await alice.screenshot({ path: path.join(evidenceDir, 'mobile-topic-bar-390.png') });
+    }
     await alice.locator('#conversation .msg-assistant img[alt="mobile-chat-attachment.png"]').click();
     await alice.locator('#conversation .msg-assistant .msg-image-card.expanded').waitFor({ state: 'visible' });
     if (evidenceDir) {
@@ -253,6 +282,11 @@ async function freePort() {
     await zipChooser.setFiles({ name: 'mobile-bundle.zip', mimeType: 'application/zip', buffer: zipBytes });
     assert.equal((await zipUpload).status(), 200);
     await alice.locator('#chat-attachments .chat-attachment-file-badge').nth(2).waitFor({ state: 'visible' });
+    const topicWithAttachments = await readTopicLayout();
+    assertTopicLayout(topicWithAttachments);
+    assert.equal(topicWithAttachments.top, topicBeforeAttachments.top);
+    assert.equal(topicWithAttachments.bottom, topicBeforeAttachments.bottom);
+    assert(topicWithAttachments.historyHeight < topicBeforeAttachments.historyHeight, 'Attachment previews must reduce only the space available to message history');
     if (evidenceDir) {
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-file-preview.png') });
     }
@@ -307,6 +341,25 @@ async function freePort() {
       await zipCard.scrollIntoViewIfNeeded();
       await alice.screenshot({ path: path.join(evidenceDir, 'mobile-file-attachment.png') });
     }
+    await alice.setViewportSize({ width: 320, height: 600 });
+    await alice.waitForFunction(() => Math.abs(document.getElementById('room').getBoundingClientRect().bottom - window.visualViewport.height) <= 1);
+    await scroller.evaluate(history => { history.scrollTop = 0; });
+    const compactTopicLayout = await readTopicLayout();
+    assertTopicLayout(compactTopicLayout);
+    assert(await scroller.evaluate(history => {
+      history.scrollTop = history.scrollHeight;
+      return history.scrollTop > 0;
+    }), 'Expected a scrollable message history');
+    assert.deepEqual(await readTopicLayout(), compactTopicLayout, 'Scrolling history must not move the topic bar');
+    assert(await topicBar.evaluate(bar => {
+      bar.scrollLeft = bar.scrollWidth;
+      return bar.scrollLeft > 0 && bar.lastElementChild.getBoundingClientRect().right <= bar.getBoundingClientRect().right + 1;
+    }), 'The last topic must be reachable without scrolling the page sideways');
+    if (evidenceDir) {
+      await topicBar.evaluate(bar => { bar.scrollLeft = 0; });
+      await alice.screenshot({ path: path.join(evidenceDir, 'mobile-topic-bar-320.png') });
+    }
+    console.log('PASS mobile topic bar below the rail at 390×844 and 320×600, independent of attachment previews and message scrolling');
     console.log('PASS mobile attachment button, image & file (TXT/PDF/ZIP) upload, composer preview, user & node assistant bubbles, tap-to-expand, inline preview, byte-identical download, and no routine receipt toast');
     if (chatImagesOnly) { assert.deepEqual(errors, []); return; }
     await alice.setViewportSize(originalViewport);

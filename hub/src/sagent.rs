@@ -113,6 +113,41 @@ impl Default for ImWebhookConfig {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct MuseProfileConfig {
+    #[serde(default = "default_muse_name")]
+    pub name: String,
+    #[serde(default = "default_soul_md")]
+    pub soul_md: String,
+    #[serde(default = "default_memory_md")]
+    pub memory_md: String,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
+fn default_muse_name() -> String {
+    "Muse".to_owned()
+}
+
+fn default_soul_md() -> String {
+    "# SOUL.md · 核心人设与行事准则\n- 身份：我是你的 7×24h 个人超级智能体 Muse。\n- 沟通风格：干练、直接、结论先行，绝不说生硬的客服套话。\n- 自主性准则：能直接调用工具或联动本机节点解决的事务一步到位；涉及生产高危操作或跨人承诺时主动请示。".to_owned()
+}
+
+fn default_memory_md() -> String {
+    "# MEMORY.md · 长期记忆与环境事实\n- 主力开发节点：办公主力机（homelab），常驻 tmux 会话与本地开发 Agent（agy / codex）。\n- 汇报偏好：GitLab 每日定时提交汇总默认采用精简速览格式，按项目提炼 1~2 条核心进展。".to_owned()
+}
+
+impl Default for MuseProfileConfig {
+    fn default() -> Self {
+        Self {
+            name: default_muse_name(),
+            soul_md: default_soul_md(),
+            memory_md: default_memory_md(),
+            updated_at: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct AutomationStore {
     #[serde(default)]
@@ -127,6 +162,8 @@ pub(crate) struct AutomationStore {
     pub gitlab_targets: HashMap<String, GitLabReplyTarget>,
     #[serde(default)]
     pub im_configs: HashMap<String, ImWebhookConfig>,
+    #[serde(default)]
+    pub muse_profiles: HashMap<String, MuseProfileConfig>,
 }
 
 pub(crate) fn persist_automation_db(db: &Connection, store: &AutomationStore) {
@@ -3338,6 +3375,12 @@ struct MuseToolCall {
     topic_id: Option<String>,
     #[serde(default)]
     topic_title: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    soul_md: Option<String>,
+    #[serde(default)]
+    memory_append: Option<String>,
 }
 
 async fn try_handle_muse_agent_loop(
@@ -3378,7 +3421,7 @@ async fn try_handle_muse_agent_loop(
         return Ok(None);
     }
 
-    let (user_crons, user_rules, has_gitlab) = h
+    let (user_crons, user_rules, has_gitlab, muse_prof) = h
         .automation
         .lock()
         .map(|g| {
@@ -3398,7 +3441,8 @@ async fn try_handle_muse_agent_loop(
                 .gitlab_configs
                 .get(owner)
                 .is_some_and(|c| !c.token.is_empty());
-            (crons, rules, gl)
+            let mp = g.muse_profiles.get(owner).cloned().unwrap_or_default();
+            (crons, rules, gl, mp)
         })
         .unwrap_or_default();
 
@@ -3440,7 +3484,7 @@ async fn try_handle_muse_agent_loop(
             "SELECT role, content FROM (
                 SELECT id, role, content FROM messages
                 WHERE owner=?1 AND status='complete'
-                ORDER BY id DESC LIMIT 8
+                ORDER BY id DESC LIMIT 6
              ) ORDER BY id ASC",
         )?;
         let recent_msgs: Vec<(String, String)> = m_stmt
@@ -3526,7 +3570,7 @@ async fn try_handle_muse_agent_loop(
                 let speaker = if role == "user" { "用户" } else { "Muse" };
                 let snippet: String = nodes::strip_attachment_markers(content)
                     .chars()
-                    .take(1200)
+                    .take(360)
                     .collect();
                 format!("[{speaker}]\n{snippet}")
             })
@@ -3563,11 +3607,16 @@ async fn try_handle_muse_agent_loop(
         clean_msg.as_str()
     };
 
+    let soul_snippet: String = muse_prof.soul_md.chars().take(600).collect();
+    let memory_snippet: String = muse_prof.memory_md.chars().take(800).collect();
+
     let prompt = format!(
         "[MUSE_AGENT_TURN]\n\
-         你是用户的 7×24h 个人超级智能体（Meta Muse 架构：单一大脑 + 多工具自由组合调用）。\n\
+         你是用户的 7×24h 个人超级智能体「{}」（Meta Muse 架构：单一大脑 + 多工具自由组合调用）。\n\
          你是唯一与用户直接对话的大脑，你的 `reply` 字段会直接展示给用户，请始终用自然、干练、聪明的中文与用户交流，绝不要使用冷冰冰的客服模板，也绝不要要求用户按特定格式复述。\n\
          你可以根据上下文在单轮思考中调用 0 个、1 个或多个后台工具（放入 `tools` 数组）。\n\n\
+         === 核心人设 (SOUL.md) ===\n{soul_snippet}\n\n\
+         === 长期记忆 (MEMORY.md) ===\n{memory_snippet}\n\n\
          === 实时环境状态快照 ===\n\
          【7×24h 定时任务 (crons)】\n{crons_block}\n\n\
          【个人管家规则 (rules)】\n{rules_block}\n\n\
@@ -3592,10 +3641,14 @@ async fn try_handle_muse_agent_loop(
             `{{\"tool\":\"dispatch_pc_node\",\"node_id\":\"homelab\",\"instruction\":\"结合对话历史补全指代后的完整自包含本机指令\",\"topic_id\":\"匹配的已有脉络ID或null\",\"topic_title\":\"匹配的脉络标题或新提炼的6~14字标题（以 📁 / 🖥️ / 💬 开头）\"}}`\n\
             - 当用户要求查看、运行、修改、构建、测试或部署本机/代码仓库/终端窗口（tmux）/本地 Agent（agy/agy1/codex）时调用；\n\
             - 当用户接着上文说简短的「更新」「部署到线上」「让 agy1 部署到线上」「哪些是活跃窗口」「继续」且上文确实是本机开发/节点任务时，你**必须**从【最近对话历史】中提取指代的具体提交号（如 13dba7c）、仓库名或 Agent 补全进 `instruction`！\n\
-            - 若只是纯问答、闲聊、或对对话历史中已有文本做总结/改写/翻译，请保持 `tools: []` 直接在 `reply` 中回答，不要调用 `dispatch_pc_node`。\n\n\
-         请只输出一个严格合法的 JSON 对象（不要 Markdown 代码块包裹）：\n\
-         `{{\"reply\":\"你直接对用户说的自然中文回复\",\"tools\":[]}}`"
+            - 若只是纯问答、闲聊、或对对话历史中已有文本做总结/改写/翻译，请保持 `tools: []` 直接在 `reply` 中回答，不要调用 `dispatch_pc_node`。\n\
+         5. **更新管家命名、SOUL.md 或 MEMORY.md (`update_memory`)**：\n\
+            `{{\"tool\":\"update_memory\",\"name\":\"新名字或null\",\"soul_md\":\"更新后的完整SOUL.md或null\",\"memory_append\":\"要追加写入MEMORY.md的一条长期记忆事实或null\"}}`\n\n\
+         请保持内部思考极度简短（最多两三句，不要反复起草或数字数），并立刻只输出一个严格合法的 JSON 对象（不要 Markdown 代码块包裹）：\n\
+         `{{\"reply\":\"你直接对用户说的自然中文回复\",\"tools\":[]}}`",
+        muse_prof.name
     );
+    let prompt: String = prompt.chars().take(7500).collect();
 
     let dsh = crate::runtime::DshRuntime {
         client: &h.client,
@@ -3869,6 +3922,46 @@ async fn try_handle_muse_agent_loop(
                         });
                     node_dispatch = Some((node_id, node_name, online, instr, tid, title));
                 }
+            }
+            "update_memory" => {
+                with_store_mut(h, |store| {
+                    let entry = store.muse_profiles.entry(owner.to_owned()).or_default();
+                    if let Some(n) = call
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "null")
+                    {
+                        entry.name = nodes::truncate_bytes(n, 48);
+                    }
+                    if let Some(s) = call
+                        .soul_md
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "null")
+                    {
+                        entry.soul_md = nodes::truncate_bytes(s, 8000);
+                    }
+                    if let Some(m) = call
+                        .memory_append
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "null")
+                    {
+                        let bullet = if m.starts_with('-') {
+                            m.to_owned()
+                        } else {
+                            format!("- {m}")
+                        };
+                        if !entry.memory_md.contains(&bullet) {
+                            entry.memory_md = nodes::truncate_bytes(
+                                &format!("{}\n{bullet}", entry.memory_md.trim_end()),
+                                12000,
+                            );
+                        }
+                    }
+                    entry.updated_at = nodes::now_unix();
+                })?;
             }
             _ => {}
         }
@@ -5362,7 +5455,65 @@ pub(super) async fn get_automation(
         .filter(|c| c.owner == owner)
         .cloned()
         .collect();
-    Ok(Json(json!({ "rules": rules, "crons": crons })))
+    let muse = guard
+        .muse_profiles
+        .get(&owner)
+        .cloned()
+        .unwrap_or_default();
+    Ok(Json(json!({ "rules": rules, "crons": crons, "muse": muse })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SaveMuseProfileInput {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    soul_md: Option<String>,
+    #[serde(default)]
+    memory_md: Option<String>,
+}
+
+pub(super) async fn save_muse_profile(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    Json(input): Json<SaveMuseProfileInput>,
+) -> Result<Json<MuseProfileConfig>> {
+    let owner = h.identity(&headers)?;
+    let updated = with_store_mut(&h, |store| {
+        let entry = store.muse_profiles.entry(owner.clone()).or_default();
+        if let Some(name) = input.name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            entry.name = nodes::truncate_bytes(name, 48);
+        }
+        if let Some(soul) = input.soul_md.as_deref() {
+            entry.soul_md = nodes::truncate_bytes(soul.trim(), 8000);
+        }
+        if let Some(mem) = input.memory_md.as_deref() {
+            entry.memory_md = nodes::truncate_bytes(mem.trim(), 12000);
+        }
+        entry.updated_at = nodes::now_unix();
+        entry.clone()
+    })?;
+    Ok(Json(updated))
+}
+
+pub(super) async fn remove_cron(
+    State(h): State<Hub>,
+    headers: HeaderMap,
+    axum::extract::Path(cron_id): axum::extract::Path<String>,
+) -> Result<Json<Value>> {
+    let owner = h.identity(&headers)?;
+    let removed = with_store_mut(&h, |store| {
+        let before = store.crons.len();
+        store
+            .crons
+            .retain(|c| !(c.owner == owner && c.id == cron_id));
+        before != store.crons.len()
+    })?;
+    if !removed {
+        return Err(denied());
+    }
+    Ok(Json(json!({ "ok": true, "removed": cron_id })))
 }
 
 #[derive(Deserialize)]

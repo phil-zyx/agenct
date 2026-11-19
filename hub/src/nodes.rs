@@ -2221,7 +2221,7 @@ fn completed_node_reply(db: &Connection, task_id: &str) -> Result<Option<String>
 }
 
 pub(super) async fn wait_for_node_completion(h: &Hub, task_id: &str) -> Result<Option<String>> {
-    for _ in 0..180 {
+    for _ in 0..8 {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let reply = {
             let db = h.db()?;
@@ -3301,10 +3301,9 @@ pub(super) async fn submit_draft(
         let placeholder_id: Option<i64> = tx
             .query_row(
                 "SELECT id FROM messages
-                 WHERE owner=?1 AND role='assistant' AND status='complete'
-                   AND content LIKE '已归入主题「%'
-                   AND content LIKE '%节点正在后台继续执行，完成后结果会自动发回本对话。'
-                 ORDER BY id DESC LIMIT 1",
+                 WHERE owner=?1 AND id=(SELECT MAX(id) FROM messages WHERE owner=?1)
+                   AND role='assistant' AND status='complete'
+                   AND (content LIKE '已归入主题「%' OR content LIKE '%完成后结果会自动发回%')",
                 [&owner],
                 |r| r.get(0),
             )

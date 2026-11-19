@@ -81,9 +81,9 @@
   <section id="sync-error" class="sync-error hide" aria-label="同步异常"><p id="sync-error-text" role="status" aria-live="polite"></p><button type="button" id="retry-sync">重试同步</button></section>
   <aside id="contact-sidebar" class="contact-sidebar hide" aria-label="联系人与会话"></aside>
   <section class="chat-pane" aria-label="与管家的对话">
+    <nav id="muse-topic-bar" class="muse-topic-bar hide" aria-label="历史任务上下文脉络"></nav>
     <div id="scroller" class="scroller">
-      <div class="stream-head" aria-hidden="true"><img class="avatar" src="brand/agenct-icon.svg" alt="" width="56" height="56"><span class="avatar-name">管家</span></div>
-      <nav id="muse-topic-bar" class="muse-topic-bar hide" aria-label="历史任务上下文脉络"></nav>
+      <div id="muse-head-toggle" class="stream-head" role="button" tabindex="0" title="点击展开右侧 Muse 面板" aria-label="展开 Muse 面板"><img class="avatar" src="brand/agenct-icon.svg" alt="" width="56" height="56"><span id="muse-avatar-name" class="avatar-name">Muse</span></div>
       <div id="conversation" class="stream" aria-label="私聊与待确认提案"></div>
       <div id="outgoing-message" class="stream hide" aria-label="本次发送的消息"></div>
       <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -165,16 +165,54 @@
   <section id="profile-view" class="profile-view hide" role="dialog" aria-modal="false" aria-label="个人角色设置"></section>
   <aside id="project-panel" class="project-panel hide" aria-label="项目共同状态"></aside>
   <aside class="task-pane" aria-label="任务">
-    <div class="pane-head">
-      <div class="seg" role="tablist" aria-label="任务视图">
-        <button type="button" id="tab-activity" aria-controls="activity" class="on" role="tab" aria-selected="true">任务脉络<span id="task-count" class="count"></span></button>
-        <button type="button" id="tab-tasks" aria-controls="tasks" role="tab" aria-selected="false">任务详情</button>
+    <div class="muse-hero">
+      <button type="button" id="close-tasks" class="icon-btn muse-close-btn" title="收起" aria-label="收起"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      <div class="muse-hero-avatar-wrap">
+        <img class="avatar big" src="brand/agenct-icon.svg" alt="" width="68" height="68">
+        <button type="button" id="muse-edit-avatar" class="muse-edit-badge" title="编辑管家命名与 SOUL.md" aria-label="编辑管家命名与 SOUL.md"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>
       </div>
-      <button type="button" id="close-tasks" class="icon-btn" title="收起" aria-label="收起"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
+      <h2 id="muse-drawer-name" class="muse-drawer-name">Muse</h2>
+      <p id="muse-conn-status" class="muse-conn-status"><span class="muse-conn-bolt">⚡</span><span id="muse-conn-text">已连接</span></p>
     </div>
+    <div class="pane-head muse-seg-wrap">
+      <div class="seg muse-seg" role="tablist" aria-label="任务视图">
+        <button type="button" id="tab-activity" aria-controls="activity" class="on" role="tab" aria-selected="true" title="任务（预定任务与脉络）">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
+          <span class="sr-only">任务脉络</span><span id="task-count" class="count"></span>
+        </button>
+        <button type="button" id="tab-tasks" aria-controls="tasks" role="tab" aria-selected="false" title="审核记录与任务详情">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+          <span class="sr-only">任务详情</span>
+        </button>
+        <button type="button" id="tab-soul" aria-controls="muse-soul-panel" role="tab" aria-selected="false" title="管家命名与 SOUL.md / MEMORY.md">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></svg>
+          <span class="sr-only">管家命名与记忆</span>
+        </button>
+      </div>
+    </div>
+    <section id="muse-scheduled-box" class="muse-scheduled-box hide" aria-label="预定任务"></section>
     <div id="activity" role="tabpanel" aria-labelledby="tab-activity" class="activity-list" aria-label="任务脉络：每件事的最近进展"></div>
+    <section id="muse-audit-box" class="muse-audit-box hide" aria-label="审核记录"></section>
     <div id="task-filters" class="task-filters hide"><label for="task-filter">筛选任务</label><select id="task-filter"><option value="active">进行中的任务</option><option value="waiting">待我处理</option><option value="mine">我发起的</option><option value="completed">已完成 / 已取消</option></select><p id="task-filter-empty" class="note" role="status"></p></div>
     <div id="tasks" role="tabpanel" aria-labelledby="tab-tasks" class="task-list hide" aria-label="与你相关的任务"></div>
+    <div id="muse-soul-panel" role="tabpanel" aria-labelledby="tab-soul" class="muse-soul-panel hide" aria-label="管家命名与 SOUL.md / MEMORY.md">
+      <div class="muse-soul-card">
+        <label for="muse-name-input" class="muse-field-label">管家命名</label>
+        <input type="text" id="muse-name-input" maxlength="48" placeholder="例如：Muse">
+      </div>
+      <div class="muse-soul-card">
+        <label for="muse-soul-input" class="muse-field-label"><code>SOUL.md</code> · 核心灵魂与行事准则</label>
+        <textarea id="muse-soul-input" rows="6" placeholder="# SOUL.md&#10;- 身份与行事风格…"></textarea>
+      </div>
+      <div class="muse-soul-card">
+        <label for="muse-memory-input" class="muse-field-label"><code>MEMORY.md</code> · 长期记忆与环境事实</label>
+        <textarea id="muse-memory-input" rows="7" placeholder="# MEMORY.md&#10;- 长期记住的项目与偏好事实…"></textarea>
+      </div>
+      <div class="muse-soul-actions">
+        <button type="button" id="save-muse-soul" class="primary wide">保存命名与 SOUL / MEMORY</button>
+        <p id="muse-soul-status" class="note" role="status"></p>
+      </div>
+    </div>
   </aside>
 </main>
 <script src="profiles-ui.js"></script>

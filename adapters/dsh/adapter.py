@@ -451,11 +451,14 @@ def run_sdk(turn, home, workspace, factory=None, *, resume=False):
         and turn["message"].startswith(("[MUSE_AGENT_TURN]", "你是用户的", "你是意图分类器"))
     )
     if is_muse_or_structured:
-        prompt = turn["message"].lstrip("/")
+        prompt = (
+            turn["message"].lstrip("/")
+            + "\nKeep internal thinking brief (at most a few short sentences; never draft multiple versions or count characters in reasoning) and emit the response immediately."
+        )
     with factory(dsh_home=str(home), cwd=str(workspace), runtime_cwd=str(workspace),
                  profile="sdk-minimal", patches=(str(ROOT / "no-tools.patch.yml"),),
                  provider="deepseek-official", model=os.environ.get("AGENCT_DSH_MODEL", "deepseek-v4-flash"),
-                 max_tokens=4096, initialize_timeout_seconds=20,
+                 max_tokens=8192 if is_muse_or_structured else 4096, initialize_timeout_seconds=20,
                  request_timeout_seconds=45, shutdown_timeout_seconds=2) as harness:
         if resume and not is_muse_or_structured:
             # Never fall back to start/run when restoration fails.

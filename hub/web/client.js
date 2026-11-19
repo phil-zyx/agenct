@@ -841,16 +841,17 @@ async function readSnapshot(context) {
   const abort = () => reads.abort();
   context.signal.addEventListener('abort', abort, { once: true });
   const timeout = setTimeout(abort, READ_TIMEOUT);
-  let messages, proposals, tasks, activity, profileSuggestions, nodes;
+  let messages, proposals, tasks, activity, profileSuggestions, nodes, automation;
   try {
-    [messages, proposals, tasks, activity, profileSuggestions, nodes] = await Promise.all([
+    [messages, proposals, tasks, activity, profileSuggestions, nodes, automation] = await Promise.all([
       api({ ...context, signal: reads.signal }, 'messages'),
       api({ ...context, signal: reads.signal }, 'proposals'),
       api({ ...context, signal: reads.signal }, 'tasks'),
       // Index is derived and optional: a failure must not block the conversation.
       api({ ...context, signal: reads.signal }, 'activity').catch(() => null),
       api({ ...context, signal: reads.signal }, 'profile-suggestions'),
-      api({ ...context, signal: reads.signal }, 'nodes').catch(() => null)
+      api({ ...context, signal: reads.signal }, 'nodes').catch(() => null),
+      api({ ...context, signal: reads.signal }, 'automation').catch(() => null)
     ]);
   } finally {
     clearTimeout(timeout);
@@ -908,6 +909,7 @@ async function readSnapshot(context) {
   $('tasks').replaceChildren(...taskCards);
   applyTaskFilter();
   renderActivity(context, activity);
+  if (typeof renderMuseDrawer === 'function') renderMuseDrawer(context, automation, proposals, tasks);
   $('task-count').textContent = tasks.length ? String(tasks.length) : '';
   // The rail badge counts tasks waiting on *this* user, not all tasks.
   const waiting = tasks.filter(task => task.requester !== task.owner
