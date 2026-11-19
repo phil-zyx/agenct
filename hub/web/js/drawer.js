@@ -35,6 +35,43 @@ export function initDrawer({ state, onRefresh, onMention }) {
     }
   }
 
+  const TASK_STATUS_LABEL = {
+    pending: '待处理',
+    running: '执行中',
+    done: '已完成',
+    failed: '失败',
+    canceled: '已取消',
+  };
+  const LEDGER_STATUS_LABEL = { active: '跟进中', muted: '已静默', done: '已完成' };
+  const TARGET_LABEL = { cloud: '云端', 'cloud-node': '云端节点', auto: '自动节点' };
+  const AUDIT_ACTION_LABEL = {
+    node_create: '接入节点',
+    node_submit: '节点完成',
+    dispatch_node: '派发节点',
+    cron_run: '定时执行',
+    update_memory: '更新记忆',
+    update_ledger: '更新台账',
+    permissions: '修改授权',
+    delegate: '发起协作',
+    task_deliver: '交付结果',
+    gitlab_config: 'GitLab 配置',
+    gitlab_mention: 'GitLab 提及',
+    member_status: '成员状态',
+  };
+
+  function compactTextHtml(text, limit = 60, moreLabel = '查看详情') {
+    const clean = String(text || '').trim();
+    if (!clean) return '';
+    if (clean.length <= limit && !clean.includes('\n')) {
+      return `<div class="item-sub">${esc(clean)}</div>`;
+    }
+    const firstLine = clean.split('\n')[0];
+    const preview = firstLine.length > limit ? `${firstLine.slice(0, limit)}…` : `${firstLine}…`;
+    return `
+      <div class="item-sub">${esc(preview)}</div>
+      <details class="node-repos"><summary>${esc(moreLabel)}</summary><div class="item-sub detail-body">${esc(clean)}</div></details>`;
+  }
+
   function parseCapabilities(raw) {
     const info = {};
     for (const part of String(raw || '').split('|')) {
@@ -165,12 +202,13 @@ export function initDrawer({ state, onRefresh, onMention }) {
             const progress = t.stage
               ? `<div class="item-sub">进度：${esc(t.stage)}${t.log_tail ? `\n${esc(t.log_tail)}` : ''}</div>`
               : '';
-            const res = t.result ? `<div class="item-sub">${esc(t.result.slice(0, 220))}</div>` : '';
+            const res = t.result ? compactTextHtml(t.result, 72, '查看结果') : '';
+            const stLabel = TASK_STATUS_LABEL[t.status] || t.status;
             return `
               <div class="item">
                 <div class="item-head">
                   <span>${esc(t.title)}</span>
-                  <span class="badge ${t.status === 'done' ? 'ok' : t.status === 'running' ? 'warn' : ''}">${esc(t.status)}</span>
+                  <span class="badge ${t.status === 'done' ? 'ok' : t.status === 'running' ? 'warn' : ''}">${esc(stLabel)}</span>
                 </div>
                 ${progress}${res}
                 ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
@@ -241,8 +279,8 @@ export function initDrawer({ state, onRefresh, onMention }) {
                 .map(
                   (l) => `
               <div class="item">
-                <div class="item-head"><span>${esc(l.title)}</span><span class="badge">${esc(l.status)}</span></div>
-                <div class="item-sub">${esc(l.notes)}</div>
+                <div class="item-head"><span>${esc(l.title)}</span><span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span></div>
+                ${compactTextHtml(l.notes, 56, '查看全文')}
                 <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
               </div>`,
                 )
@@ -261,28 +299,30 @@ export function initDrawer({ state, onRefresh, onMention }) {
         ${
           crons.length
             ? crons
-                .map(
-                  (c) => `
+                .map((c) => {
+                  const when = c.daily_time_cst ? `每天 ${c.daily_time_cst}` : `每 ${c.interval_minutes} 分钟`;
+                  const target = TARGET_LABEL[c.target] || c.target;
+                  return `
               <div class="item">
                 <div class="item-head">
-                  <span>${c.daily_time_cst ? `每天 ${esc(c.daily_time_cst)}` : `每 ${c.interval_minutes} 分钟`}</span>
-                  <span class="badge">${esc(c.target)}</span>
+                  <span>${esc(when)}</span>
+                  <span class="badge">${esc(target)}</span>
                 </div>
-                <div class="item-sub">${esc(c.instruction)}</div>
+                ${compactTextHtml(c.instruction, 46, '查看完整指令')}
                 <div class="row"><button type="button" class="sm danger" data-del-cron="${esc(c.id)}">删除</button></div>
-              </div>`,
-                )
+              </div>`;
+                })
                 .join('')
             : '<p class="note">暂无定时任务</p>'
         }
         <form id="add-cron-form" class="mt-10">
-          <input type="text" name="instruction" placeholder="定时指令（如：汇总今日 GitLab 提交）" required>
+          <input type="text" name="instruction" placeholder="定时内容（如：汇总今日 GitLab 提交）" required>
           <div class="row">
-            <input type="text" name="daily_time_cst" placeholder="每日 HH:MM (可选)" class="flex-1">
+            <input type="text" name="daily_time_cst" placeholder="每天 HH:MM" class="flex-1">
             <select name="target" class="w-kind">
-              <option value="cloud">云端直跑</option>
+              <option value="cloud">云端</option>
               <option value="cloud-node">云端节点</option>
-              <option value="auto">自动节点</option>
+              <option value="auto">自动</option>
             </select>
             <button type="submit" class="primary sm">添加</button>
           </div>
@@ -290,20 +330,21 @@ export function initDrawer({ state, onRefresh, onMention }) {
       </section>
 
       <section class="panel-card">
-        <h3>审计记录 (只追加)</h3>
+        <h3>动态记录</h3>
         ${
           audits.length
             ? audits
-                .slice(0, 15)
-                .map(
-                  (a) => `
+                .slice(0, 12)
+                .map((a) => {
+                  const act = AUDIT_ACTION_LABEL[a.action] || a.action;
+                  return `
               <div class="item">
                 <div class="item-head"><span>${esc(a.title)}</span><span class="note">${esc(fmtTime(a.created_at))}</span></div>
-                <div class="item-sub">${esc(a.action)} · ${esc(a.status)}${a.detail ? ` — ${esc(a.detail)}` : ''}</div>
-              </div>`,
-                )
+                <div class="item-sub">${esc(act)}${a.detail ? ` · ${esc(a.detail.slice(0, 60))}` : ''}</div>
+              </div>`;
+                })
                 .join('')
-            : '<p class="note">暂无审计记录</p>'
+            : '<p class="note">暂无记录</p>'
         }
       </section>`;
 
