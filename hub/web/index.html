@@ -1,236 +1,74 @@
 <!doctype html>
-<html lang="zh">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,interactive-widget=resizes-content">
-<title>Agenct</title>
-<link rel="icon" type="image/svg+xml" href="brand/agenct-icon.svg">
-<link rel="icon" type="image/png" sizes="32x32" href="brand/agenct-icon-32.png">
-<link rel="apple-touch-icon" href="brand/agenct-icon-180.png">
-<link rel="stylesheet" href="style.css">
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <title>Agenct</title>
+  <link rel="icon" type="image/svg+xml" href="brand/agenct-icon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="brand/agenct-icon-32.png">
+  <link rel="apple-touch-icon" href="brand/agenct-icon-180.png">
+  <link rel="stylesheet" href="style.css">
+</head>
 <body>
-<nav class="rail" aria-label="主导航">
-  <img class="rail-logo" src="brand/agenct-icon.svg" alt="Agenct" width="34" height="34">
-  <button type="button" id="open-chat" class="rail-btn active" title="聊天" aria-label="聊天" aria-current="page">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 1 3.4 6.5L4 20l1.3-3.6A7.9 7.9 0 0 1 4 12Z"/></svg>
-    <span class="rail-label">聊天</span>
-  </button>
-  <button type="button" id="toggle-tasks" class="rail-btn" title="工作与任务" aria-label="工作与任务" aria-pressed="false">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>
-    <span id="rail-badge" class="rail-badge"></span>
-    <span class="rail-label">任务</span>
-  </button>
-  <button type="button" id="open-contacts" class="rail-btn" title="联系人" aria-label="联系人" aria-expanded="false" aria-controls="contact-sidebar">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="15" height="18" rx="3"/><path d="M3 7h4M3 12h4M3 17h4"/><circle cx="12.5" cy="9" r="2.2"/><path d="M9 17a3.5 3.5 0 0 1 7 0"/></svg>
-    <span id="contacts-badge" class="rail-badge"></span>
-    <span class="rail-label">联系人</span>
-  </button>
-  <button type="button" id="open-projects" class="rail-btn" title="项目" aria-label="项目" aria-expanded="false" aria-controls="project-panel">
-    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2-3h9v16H3Z"/><path d="M7 12h10M7 16h6"/></svg>
-    <span class="rail-label">项目</span>
-  </button>
-  <div class="rail-spacer"></div>
-  <div class="rail-more-wrap">
-    <button type="button" id="rail-more" class="rail-btn" title="设置与账号" aria-label="设置与账号" aria-haspopup="menu" aria-expanded="false" aria-controls="rail-menu">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>
-      <span class="rail-label">我的</span>
-    </button>
-    <div id="rail-menu" class="rail-menu hide" role="menu" aria-label="设置与账号">
-      <button type="button" id="open-account" class="rail-menu-item" role="menuitem" aria-expanded="false">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>
-        <span>账号与设置</span>
-      </button>
-      <hr class="rail-menu-sep">
-      <button type="button" id="logout" class="rail-menu-item danger" role="menuitem">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"/></svg>
-        <span>退出登录</span>
-      </button>
-    </div>
-  </div>
-</nav>
+  <div id="toast" class="toast hide" role="status" aria-live="polite"></div>
 
-<p id="status" class="toast" role="status" tabindex="0" aria-keyshortcuts="Escape" title="点击或按 Escape 关闭"></p>
+  <!-- Login View (GitLab OAuth only) -->
+  <main id="login-view" class="login-wrap hide">
+    <section class="login-card">
+      <div class="brand-lockup">
+        <img src="brand/agenct-icon.svg" alt="Agenct" width="48" height="48">
+        <h1>Agenct</h1>
+      </div>
+      <p class="muted">7×24h 个人超级智能体 · 云端与本地执行节点统一控制面</p>
+      <p id="login-error" class="alert hide" role="alert"></p>
+      <a id="gitlab-login-btn" class="btn primary wide" href="/auth/login">使用 GitLab 登录</a>
+    </section>
+  </main>
 
-<section id="login" class="login">
-  <div class="login-card">
-    <h1 class="login-brand"><img src="brand/agenct-icon.svg" alt="" width="52" height="52"><svg class="login-wordmark" viewBox="0 280 3278 960" role="img" aria-label="Agenct"><path d="M15 1000 294.5 294.0H436.5L713.5 1000.0H547.5L336 414H393L178 1000ZM174.0 872.5V744.5H558.5V872.5Z"/><path d="M978.5 1218.0Q899.0 1218 838.5 1190.5Q778.0 1163 743.0 1113L837.0 1019.5Q863.0 1050 895.5 1066.25Q928.0 1082.5 974.0 1082.5Q1030.5 1082.5 1063.25 1054.25Q1096.0 1026 1096.0 975V851L1121.5 745.0L1098.5 639.0V514.0H1249.0V971Q1249.0 1046 1214.0 1101.25Q1179.0 1156.5 1118.0 1187.25Q1057.0 1218 978.5 1218.0ZM971.5 985.0Q905.0 985 852.75 953.25Q800.5 921.5 770.75 866.5Q741.0 811.5 741.0 744Q741.0 676 770.75 621.75Q800.5 567.5 852.75 535.75Q905.0 504 971.5 504.0Q1021.5 504.0 1061.25 522.75Q1101.0 541.5 1125.25 574.75Q1149.5 608.0 1153.0 652V837Q1149.5 880.5 1125.0 914.0Q1100.5 947.5 1060.75 966.25Q1021.0 985 971.5 985.0ZM1000.5 849.5Q1032.5 849.5 1056.0 835.5Q1079.5 821.5 1092.25 797.75Q1105.0 774 1105.0 744Q1105.0 714 1092.25 690.25Q1079.5 666.5 1056.25 652.5Q1033.0 638.5 1001.0 638.5Q969.5 638.5 945.75 652.5Q922.0 666.5 909.0 690.5Q896.0 714.5 896.0 744Q896.0 772.5 909.0 796.75Q922.0 821 945.5 835.25Q969.0 849.5 1000.5 849.5Z"/><path d="M1586.5 1011.0Q1507.5 1011.0 1446.25 978.5Q1385.0 946 1350.0 888.25Q1315.0 830.5 1315.0 757Q1315.0 684 1349.25 626.75Q1383.5 569.5 1442.75 536.25Q1502.0 503 1575.5 503.0Q1647.5 503.0 1702.75 534.25Q1758.0 565.5 1789.5 620.5Q1821.0 675.5 1821.0 746Q1821.0 759.5 1819.5 774.0Q1818.0 788.5 1814.0 807L1395.0 808.5V703.5L1749.0 702L1683.0 746.5Q1682.0 704.5 1669.75 676.75Q1657.5 649.0 1634.25 634.5Q1611.0 620 1576.5 620.0Q1540.5 620.0 1514.0 636.5Q1487.5 653.0 1473.25 683.25Q1459.0 713.5 1459.0 756Q1459.0 799 1474.25 829.75Q1489.5 860.5 1518.0 876.75Q1546.5 893.0 1586.0 893Q1622.0 893 1651.0 880.75Q1680.0 868.5 1702.0 843.5L1786.0 927.5Q1750.0 969 1699.0 990.0Q1648.0 1011 1586.5 1011.0Z"/><path d="M2206.0 1000V723.5Q2206.0 685 2182.5 661.75Q2159.0 638.5 2122.622448979592 638.5Q2097.872448979592 638.5 2078.6862244897957 649.0Q2059.5 659.5 2048.75 678.75Q2038.0 698 2038.0 723.5L1978.5 694.5Q1978.5 637.0 2003.75 594.25Q2029.0 551.5 2073.4479695431473 527.75Q2117.8959390862947 504.0 2174.1979695431473 504.0Q2227.5 504.0 2269.25 529.5Q2311.0 555 2335.0 597.0Q2359.0 639 2359.0 689V1000ZM1885.0 1000V514H2038.0V1000Z"/><path d="M2682.0 1011Q2606.5 1011.0 2545.75 978.0Q2485.0 945 2450.0 887.25Q2415.0 829.5 2415.0 757.5Q2415.0 684.5 2450.25 627.0Q2485.5 569.5 2546.5 536.25Q2607.5 503.0 2683.5 503.0L2900 503 L2900 644 L2683.5 642.0Q2651.0 642 2625.5 656.5Q2600.0 671 2585.25 696.5Q2570.5 722.0 2570.5 756.5Q2570.5 790.5 2585.25 816.5Q2600.0 842.5 2625.75 857.25Q2651.5 872.0 2683.5 872.0Q2714.0 872 2737.25 861.75Q2760.5 851.5 2777.5 832.0L2875.0 930Q2836.5 970.0 2788.75 990.5Q2741.0 1011 2682.0 1011Z"/><path d="M3002.0 1000V313H3155.0V1000ZM2892.0 644V503H3265.0V644Z"/></svg></h1>
-    <p class="lead">和你的管家一起处理工作。</p>
-    <p id="login-error" class="login-error hide" role="alert"></p>
-    <p id="dev-login" class="hide login-form"><input type="password" id="token" placeholder="输入开发访问令牌" aria-label="开发访问令牌" autocomplete="off"><button id="enter" class="primary">进入</button></p>
-    <button id="oidc-login" class="hide primary wide">使用 GitLab 登录</button>
-    <button id="auth-retry" class="hide">重试登录状态检查</button>
-    <button id="switch-account" class="hide">退出并切换账号</button>
-    <small id="dev-login-hint" class="hint">开发令牌在状态目录的 <code>credentials.json</code> 中，保留在当前标签页会话中，刷新自动登录，退出时清除。验证版 · 无真实代码执行或 GitHub 发布。</small>
-  </div>
-</section>
-
-<div id="account-tools-home" class="hide">
-  <button type="button" id="open-agents" role="tab" aria-selected="false">助手分身</button>
-  <section id="collaboration-profile-view" class="collaboration-embedded" aria-label="助手记住的我"></section>
-  <section id="account-tools" class="account-tools" aria-label="会话与通知">
-    <h3>会话与通知</h3>
-    <p id="identity" class="identity"></p>
-    <p class="sync"><small id="last-refresh"></small><span id="sync-notice" class="sync-notice" role="status" aria-live="polite"></span></p>
-    <div class="actions">
-      <button type="button" id="refresh">刷新会话与任务</button>
-      <button type="button" id="enable-notifications">开启系统通知</button>
-    </div>
-  </section>
-</div>
-
-<main id="room" class="app hide">
-  <section id="sync-error" class="sync-error hide" aria-label="同步异常"><p id="sync-error-text" role="status" aria-live="polite"></p><button type="button" id="retry-sync">重试同步</button></section>
-  <aside id="contact-sidebar" class="contact-sidebar hide" aria-label="联系人与会话"></aside>
-  <section class="chat-pane" aria-label="与管家的对话">
-    <div id="scroller" class="scroller">
-      <div id="muse-head-toggle" class="stream-head" role="button" tabindex="0" title="点击展开右侧管家面板" aria-label="展开管家面板"><img class="avatar" src="brand/agenct-icon.svg" alt="" width="56" height="56"><span id="muse-avatar-name" class="avatar-name">Agenct</span></div>
-      <div id="conversation" class="stream" aria-label="私聊与待确认提案"></div>
-      <div id="outgoing-message" class="stream hide" aria-label="本次发送的消息"></div>
-      <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
-    </div>
-    <div class="composer">
-      <section id="turn-recovery" class="sheet warn hide" aria-label="消息发送恢复">
-        <p id="turn-status" role="status" aria-live="polite"></p>
-        <div class="row"><button type="button" id="check-turn" class="primary">核对发送状态</button><button type="button" id="new-turn">开始新尝试</button></div>
-      </section>
-      <section id="project-context" class="chip-bar hide" aria-label="下一条聊天的项目上下文">
-        <span class="chip-label">讨论项目</span><span id="project-context-title" class="chip-title"></span>
-        <details class="chip-more"><summary>来源与范围</summary><p id="project-context-details"></p></details>
-        <button type="button" id="clear-project-context" class="text-btn">清除项目上下文</button>
-      </section>
-      <span id="task-context-status" class="sr-only" role="status" aria-live="polite"></span>
-      <section id="task-context" class="chip-bar hide" aria-label="下一条聊天的任务上下文">
-        <span id="task-context-label" class="chip-label">讨论</span><span id="task-context-title" class="chip-title"></span>
-        <details class="chip-more"><summary>附带内容</summary><p id="task-context-details"></p></details>
-        <button type="button" id="clear-task-context" class="icon-btn small" title="清除讨论的任务" aria-label="清除讨论的任务"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-      </section>
-      <section id="repository-context" class="chip-bar hide" aria-label="下一条聊天的仓库内容"><span id="repository-context-text"></span><button type="button" id="clear-repository" class="text-btn">清除仓库选择</button></section>
-      <section id="repository-picker" class="sheet hide" aria-label="只读仓库选择"><div id="repository-options"></div><button type="button" id="close-repository-picker" class="text-btn">关闭仓库选择</button></section>
-      <section id="role-picker" class="sheet hide" aria-label="启用的个人角色">
-        <p class="muted">为下一条消息选择一个角色。各角色使用同一段聊天记录，操作权限不变。</p>
-        <div id="role-options" class="chips"></div>
-        <button type="button" id="close-role-picker" class="text-btn">关闭角色选择</button>
-      </section>
-      <section id="composer-menu" class="sheet menu hide" aria-label="对话选项">
-        <div class="menu-row" aria-label="下一条聊天的角色">
-          <span id="role-details" class="role-details" role="status" aria-live="polite">提问时，默认由管家回复。</span>
-          <button type="button" id="choose-role" class="text-btn">选择本次角色</button>
-          <button type="button" id="clear-role" class="text-btn">恢复默认管家</button>
-          <button type="button" id="manage-roles" class="text-btn">管理助手分身</button>
+  <!-- Main Workspace -->
+  <div id="app-view" class="workspace hide">
+    <section class="chat-col">
+      <header class="topbar">
+        <div class="topbar-left">
+          <img src="brand/agenct-icon.svg" alt="" width="30" height="30">
+          <strong id="agent-name">Agenct</strong>
+          <span id="node-pill" class="pill muted">0 节点在线</span>
+          <span id="sse-pill" class="pill muted">连接中…</span>
         </div>
-        <button type="button" id="choose-repository" class="text-btn">选择只读仓库</button>
-        <details id="help" class="help"><summary>使用说明</summary>
-        <p><strong>请同事帮忙：</strong>从「联系人」选择同事，填写任务摘要。核对接收人、摘要和材料后，点击「确认共享并委派」。私聊内容不会发送。</p>
-        <p><strong>审阅和交付：</strong>草稿仅你可见。检查并修改后，预览交付内容，再点击「确认交付」。最后由任务发起人验收。</p>
-        <p><strong>发送后没有回复：</strong>先点击「核对发送状态」。系统不会自动重发。若要再发一次，选择「开始新尝试」，核对内容后再点发送。上次消息可能已经处理，再次发送可能重复。</p>
-        <p>点击输入框下方的「对话选项」可选择下一条消息的角色；在「个人角色设置」中管理角色，也可输入 <code>/agents</code> 打开设置。按 Ctrl / ⌘ + Shift + K 可打开或收起任务面板。</p>
-        <details><summary>高级说明：仓库、数据与恢复</summary>
-        <p>管理员启用只读仓库后，可输入 <code>/repo 仓库ID 完整提交ID 文件路径</code>，换行写问题；或 <code>/repo-search 仓库ID 完整提交ID 关键词</code>，换行写问题。仅限你的白名单仓库与固定提交，不执行代码。</p>
-        <small>Mock 模式仅按固定规则匹配文本，不是真实 AI 理解或自动执行。自然语言委派和 /delegate 都只生成待确认提案。确认后才共享摘要、创建服务端任务；完整私聊不共享。点击「讨论此任务」只选择一个当前可见任务作为下一条普通聊天的上下文，不会发送或执行。任务更新后需重新选择；/agents 和 /delegate 不附带或消耗此选择。任务状态来自当前账号的服务端快照，每 3 秒自动检查更新（后台标签页可能被浏览器延迟），离线后仅自动重试读取快照。聊天发送结果未知时不会重发，可核对状态或明确开始新尝试。恢复凭据仅保存请求编号、所属账号及显式选择的角色 ID 和角色版本，不保存令牌、消息正文或任务内容；退出或更换账号后清除。交付按钮提交人工结果，不是自动执行证据。验证版 · 无真实代码执行或 GitHub 发布。</small>
-        </details>
-        </details>
-      </section>
-      <div id="mention-picker" class="mention-picker hide" role="listbox" aria-label="选择要提及的同事"></div>
-      <div id="chat-attachments" class="chat-attachments hide" aria-label="待发送附件"></div>
-      <form id="form" class="composer-pill">
-        <input type="file" id="chat-image-input" class="hide" accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,application/zip,application/x-zip-compressed,text/plain,text/markdown,text/csv,application/json,.txt,.md,.markdown,.pdf,.zip,.json,.csv,.log" multiple aria-label="选择附件">
-        <button type="button" id="attach-image" class="attach-btn" title="添加附件（支持图片、PDF、ZIP、文本等文件）" aria-label="添加附件">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
-          <span class="attach-label">附件</span>
-        </button>
-        <textarea id="text" aria-label="给管家发消息" aria-describedby="chat-help" placeholder="输入问题，或说说你的想法…" rows="1"></textarea>
-        <button id="send" class="send-btn" title="发送" aria-label="发送">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M6 11l6-6 6 6"/></svg>
-        </button>
+        <div class="topbar-right">
+          <span id="user-label" class="muted small"></span>
+          <button type="button" id="toggle-drawer" class="btn">工作台</button>
+          <button type="button" id="logout-btn" class="btn ghost">退出</button>
+        </div>
+      </header>
+
+      <div id="messages" class="messages" aria-label="对话记录"></div>
+
+      <div id="stage-bar" class="stage-bar hide" role="status" aria-live="polite"></div>
+
+      <form id="chat-form" class="composer">
+        <div id="pending-atts" class="att-chips hide"></div>
+        <div class="composer-row">
+          <label class="btn ghost icon" title="添加附件 (图片/PDF/ZIP/文本)">
+            <input id="file-input" type="file" hidden>
+            📎
+          </label>
+          <textarea id="chat-input" rows="1" placeholder="直接对话、@同事 协作、或让节点执行本机/云端任务… (Enter 发送, Shift+Enter 换行)"></textarea>
+          <button type="submit" id="send-btn" class="btn primary">发送</button>
+        </div>
       </form>
-      <div class="composer-options">
-        <button type="button" id="composer-menu-toggle" class="text-btn" aria-expanded="false" aria-controls="composer-menu">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h4m4 0h8M4 17h10m4 0h2"/><circle cx="10" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg>
-          对话选项
-        </button>
-      </div>
-      <p id="chat-help" class="sr-only">直接说你想解决的问题，无需先配置角色。选择角色是可选项，只影响下一条普通聊天。委派会先展示接收人和共享摘要，等你确认。Enter 发送，Shift+Enter 换行。</p>
-    </div>
-  </section>
-  <section id="peer-view" class="peer-view hide" aria-label="联系人会话">
-    <header class="peer-header"><button type="button" id="peer-back">联系人</button><div><h2 id="peer-name"></h2><p id="peer-visibility" class="note"></p></div><button type="button" id="peer-details">协作资料</button></header>
-    <div id="peer-messages" class="peer-messages" aria-label="双方共享的消息"></div>
-    <form id="peer-form" class="peer-composer">
-      <label for="peer-message-input" id="peer-input-label">发送消息</label>
-      <textarea id="peer-message-input" rows="2" maxlength="4000" placeholder="输入消息…"></textarea>
-      <div class="peer-send-row"><p id="peer-send-status" class="note" role="status"></p><button type="submit" id="peer-send" class="primary">发送消息</button></div>
-    </form>
-  </section>
-  <section id="contacts-view" class="profile-view contacts-view hide" aria-label="联系人协作资料"></section>
-  <section id="profile-view" class="profile-view hide" role="dialog" aria-modal="false" aria-label="个人角色设置"></section>
-  <aside id="project-panel" class="project-panel hide" aria-label="项目共同状态"></aside>
-  <aside class="task-pane" aria-label="任务">
-    <div class="muse-hero">
-      <button type="button" id="close-tasks" class="icon-btn muse-close-btn" title="收起" aria-label="收起"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg></button>
-      <div class="muse-hero-avatar-wrap">
-        <img class="avatar big" src="brand/agenct-icon.svg" alt="" width="68" height="68">
-        <button type="button" id="muse-edit-avatar" class="muse-edit-badge" title="编辑管家命名与 SOUL.md" aria-label="编辑管家命名与 SOUL.md"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 20h9M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>
-      </div>
-      <h2 id="muse-drawer-name" class="muse-drawer-name">Agenct</h2>
-      <p id="muse-conn-status" class="muse-conn-status"><span class="muse-conn-bolt">⚡</span><span id="muse-conn-text">已连接</span></p>
-    </div>
-    <div class="pane-head muse-seg-wrap">
-      <div class="seg muse-seg" role="tablist" aria-label="任务视图">
-        <button type="button" id="tab-activity" aria-controls="activity" class="on" role="tab" aria-selected="true" title="任务（预定任务与脉络）">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg>
-          <span class="sr-only">任务脉络</span><span id="task-count" class="count"></span>
-        </button>
-        <button type="button" id="tab-tasks" aria-controls="tasks" role="tab" aria-selected="false" title="审核记录与任务详情">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
-          <span class="sr-only">任务详情</span>
-        </button>
-        <button type="button" id="tab-soul" aria-controls="muse-soul-panel" role="tab" aria-selected="false" title="管家命名与 SOUL.md / MEMORY.md">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/><path d="M5 19.5C5.5 18 6 15 6 12c0-.7.12-1.37.34-2"/><path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/><path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/><path d="M8.65 22c.21-.66.45-1.32.57-2"/><path d="M14 13.12c0 2.38 0 6.38-1 8.88"/><path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/><path d="M9 6.8a6 6 0 0 1 9 5.2c0 .47 0 1.17-.02 2"/></svg>
-          <span class="sr-only">管家命名与记忆</span>
-        </button>
-      </div>
-    </div>
-    <section id="muse-scheduled-box" class="muse-scheduled-box hide" aria-label="预定任务"></section>
-    <div id="activity" role="tabpanel" aria-labelledby="tab-activity" class="activity-list" aria-label="任务脉络：每件事的最近进展"></div>
-    <section id="muse-audit-box" class="muse-audit-box hide" aria-label="审核记录"></section>
-    <div id="task-filters" class="task-filters hide"><label for="task-filter">筛选任务</label><select id="task-filter"><option value="active">进行中的任务</option><option value="waiting">待我处理</option><option value="mine">我发起的</option><option value="completed">已完成 / 已取消</option></select><p id="task-filter-empty" class="note" role="status"></p></div>
-    <div id="tasks" role="tabpanel" aria-labelledby="tab-tasks" class="task-list hide" aria-label="与你相关的任务"></div>
-    <div id="muse-soul-panel" role="tabpanel" aria-labelledby="tab-soul" class="muse-soul-panel hide" aria-label="管家命名与 SOUL.md / MEMORY.md">
-      <div class="muse-soul-card">
-        <label for="muse-name-input" class="muse-field-label">管家命名</label>
-        <input type="text" id="muse-name-input" maxlength="48" placeholder="例如：Agenct">
-      </div>
-      <div class="muse-soul-card">
-        <label for="muse-soul-input" class="muse-field-label"><code>SOUL.md</code> · 核心灵魂与行事准则</label>
-        <textarea id="muse-soul-input" rows="6" placeholder="# SOUL.md&#10;- 身份与行事风格…"></textarea>
-      </div>
-      <div class="muse-soul-card">
-        <label for="muse-memory-input" class="muse-field-label"><code>MEMORY.md</code> · 长期记忆与环境事实</label>
-        <textarea id="muse-memory-input" rows="7" placeholder="# MEMORY.md&#10;- 长期记住的项目与偏好事实…"></textarea>
-      </div>
-      <div class="muse-soul-actions">
-        <button type="button" id="save-muse-soul" class="primary wide">保存命名与 SOUL / MEMORY</button>
-        <p id="muse-soul-status" class="note" role="status"></p>
-      </div>
-    </div>
-  </aside>
-</main>
-<script src="profiles-ui.js"></script>
-<script src="collaboration-profile-ui.js"></script>
-<script src="worker-ui.js"></script>
-<script src="draft-ui.js"></script>
-<script src="task-timeline-model.js"></script>
-<script src="task-timeline-ui.js"></script>
-<script src="activity-ui.js"></script>
-<script src="chat-ui.js"></script>
-<script src="profile-suggestions-ui.js"></script>
-<script src="task-ui.js"></script>
-<script src="repo-ui.js"></script>
-<script src="client.js"></script>
-<script src="task-chat.js"></script>
-<script src="account-ui.js"></script>
-<script src="contacts-ui.js"></script>
-<script src="project-state-model.js"></script>
-<script src="projects-ui.js"></script>
-<script src="client-chrome.js"></script>
+    </section>
+
+    <aside id="drawer" class="drawer">
+      <nav class="tabs" role="tablist">
+        <button type="button" class="tab active" data-tab="work" role="tab" aria-selected="true">任务与节点</button>
+        <button type="button" class="tab" data-tab="memory" role="tab" aria-selected="false">台账与定时</button>
+        <button type="button" class="tab" data-tab="settings" role="tab" aria-selected="false">人设与设置</button>
+      </nav>
+      <div id="drawer-body" class="drawer-body"></div>
+    </aside>
+  </div>
+
+  <script type="module" src="js/app.js"></script>
 </body>
 </html>

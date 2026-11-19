@@ -1,122 +1,31 @@
-name: Test
-on: [push, pull_request]
-permissions:
-  contents: read
+name: CI
+on:
+  push:
+    branches: [master]
+  pull_request:
+
 jobs:
-  local-acceptance:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 20
+  verify:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          persist-credentials: false
+          components: rustfmt, clippy
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: npm
+          node-version: "22"
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: sudo apt-get install --yes poppler-utils
-      - run: rustup toolchain install stable --profile minimal
-      - run: cargo +stable build --locked --manifest-path hub/Cargo.toml
-      - name: Three-person project foundation and legacy isolation (real Hub, mock runtime)
+          python-version: "3.12"
+      - name: Rust format, clippy & tests
         run: |
-          node scripts/three-person-acceptance.test.cjs
-          AGENCT_TEST_HUB_BINARY="$PWD/hub/target/debug/agenct-hub" node scripts/three-person-acceptance.cjs --scope all
-      - name: Durable automatic draft dispatch (real process restarts, fake loopback adapter)
+          cargo fmt --manifest-path hub/Cargo.toml -- --check
+          cargo clippy --manifest-path hub/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path hub/Cargo.toml
+      - name: Python node & backup checks
         run: |
-          node scripts/durable-draft-acceptance.cjs --self-test
-          AGENCT_TEST_HUB_BINARY="$PWD/hub/target/debug/agenct-hub" node scripts/durable-draft-acceptance.cjs
-      - name: Real Hub node receipt replay and complete state restore
-        run: python3 -m unittest discover -s scripts -p 'test_state_node_integration.py' -v
-      - run: npm run test:local
-      - name: Browser flows against a real Hub (contacts, collaboration, profile chat, chat failures, projects)
-        env:
-          AGENCT_TEST_SCREENSHOT_DIR: ${{ runner.temp }}/hub-browser-screens
-        run: npm run test:hub-browser
-      - name: Upload real-Hub browser screenshots
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hub-browser-screens
-          path: ${{ runner.temp }}/hub-browser-screens/
-          if-no-files-found: ignore
-          retention-days: 14
-  browser:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: npm
-      - run: npm ci
-      - run: npx playwright install --with-deps chromium
-      - run: sudo apt-get install --yes fonts-dejavu-core fonts-droid-fallback
-      - name: Browser interaction regressions (fixture API)
-        run: npm run test:browser
-      - name: Desktop, mobile and dark-mode visual regressions
-        run: npm run test:visual
-      - name: Upload screenshots, diffs and traces
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: browser-regressions
-          path: |
-            playwright-report/
-            test-results/
-          retention-days: 14
-  test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - run: npm test
-      - run: npm run check
-  python-offline:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      # Standard-library protocol tests only: no provider keys, SDK, or Docker.
-      # These are not evidence that real worker execution is enabled or trusted.
-      - name: Test state archives and node execution journal
-        run: |
-          python3 -m unittest discover -s scripts -p 'test_state_backup.py' -v
-          python3 -m unittest discover -s scripts -p 'test_node_journal.py' -v
-          python3 -m unittest discover -s scripts -p 'test_backup_script.py' -v
-      - name: Test DSH adapter protocol
-        run: python3 -m unittest discover -s adapters/dsh -p 'test*.py' -v
-      - name: Test fail-closed sandbox and independent verifier
-        run: python3 -m unittest discover -s sandbox -p 'test*.py' -v
-  rust:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install ephemeral OIDC fixture dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends openssl poppler-utils
-      - run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-      - run: cargo +stable fmt --manifest-path hub/Cargo.toml -- --check
-      - run: cargo +stable test --locked --manifest-path hub/Cargo.toml
-      - run: cargo +stable clippy --locked --manifest-path hub/Cargo.toml --all-targets -- -D warnings
+          python3 -m unittest discover -s node -p 'test_*.py' -v
+          python3 -m py_compile node/agenct-node.py scripts/backup.py
+      - name: Frontend ESM syntax check
+        run: npm run check

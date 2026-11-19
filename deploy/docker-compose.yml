@@ -1,0 +1,37 @@
+services:
+  hub:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: agenct-hub
+    restart: unless-stopped
+    env_file: agenct.env
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./data:/data
+    mem_limit: 512m
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+
+  # Optional 7x24h isolated Cloud Execution Node (uses the exact same Node protocol as PC nodes).
+  # Enable with: docker compose --profile cloud-node up -d
+  cloud-node:
+    profiles: ["cloud-node"]
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.node
+    container_name: agenct-cloud-node
+    restart: unless-stopped
+    environment:
+      AGENCT_NODE_TOKEN: ${AGENCT_CLOUD_NODE_TOKEN:-}
+    command: ["--hub", "http://hub:8080", "--sandbox", "workspace-write"]
+    volumes:
+      - ./cloud-workspace:/workspace
+    mem_limit: 1g
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - hub

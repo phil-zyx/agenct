@@ -1,0 +1,11 @@
+# Optional isolated Cloud Execution Node running the exact same agenct-node.py protocol.
+FROM python:3.12-slim
+RUN useradd --uid 1002 --create-home --shell /bin/bash runner \
+ && mkdir -p /workspace /state && chown -R runner:runner /workspace /state
+COPY node/agenct-node.py /usr/local/bin/agenct-node.py
+RUN chmod 755 /usr/local/bin/agenct-node.py
+USER runner
+WORKDIR /workspace
+ENV AGENCT_NODE_KIND=cloud \
+    AGENCT_WORKDIR=/workspace
+ENTRYPOINT ["python3", "/usr/local/bin/agenct-node.py", "--kind", "cloud", "--state-dir", "/state"]

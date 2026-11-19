@@ -1,12 +1,12 @@
 .git
 node_modules
 hub/target
-playwright-report
-test-results
 .pytest_cache
 **/__pycache__
-dist
 *.sqlite3*
 .env
 .env.*
-deploy/docker/*.env
+deploy/agenct.env
+deploy/data
+deploy/cloud-workspace
+data
