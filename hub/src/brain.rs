@@ -504,6 +504,7 @@ pub struct ChatInput {
 
 #[derive(Deserialize)]
 struct BrainResponse {
+    #[serde(default)]
     reply: String,
     #[serde(default)]
     thread_id: Option<String>,
@@ -643,6 +644,16 @@ pub async fn run_turn(
             let crons = automation::list_crons_sync(conn, &uid)?;
             let rules = automation::list_rules_sync(conn, &uid)?;
             let matched_rule = automation::match_rule_sync(conn, &uid, &msg_owned)?;
+            let gitlab_configured: bool = conn
+                .query_row(
+                    "SELECT config_json FROM integrations WHERE user_id = ?1 AND kind = 'gitlab'",
+                    [&uid],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v["token"].as_str().map(|t| !t.trim().is_empty()))
+                .unwrap_or(false);
 
             let mut hist_stmt = conn.prepare(
                 "SELECT role, content, thread_id FROM (
@@ -698,6 +709,7 @@ pub async fn run_turn(
                 crons,
                 rules,
                 matched_rule,
+                gitlab_configured,
                 history,
                 contacts,
                 user_msg_id,
@@ -714,6 +726,7 @@ pub async fn run_turn(
         crons,
         rules,
         matched_rule,
+        gitlab_configured,
         history,
         contacts,
         user_msg_id,
@@ -729,6 +742,7 @@ pub async fn run_turn(
         &crons,
         &rules,
         &contacts,
+        gitlab_configured,
     );
 
     let raw_llm = hub
@@ -784,6 +798,42 @@ pub async fn run_turn(
                 {
                     final_reply.push_str("\n\n");
                     final_reply.push_str(&summary);
+                } else if node_list.iter().any(|n| n.online && n.kind == "pc") {
+                    // GitLab PAT is not configured: seamlessly fall back to online PC node git log.
+                    hub.events.emit(
+                        user_id.to_owned(),
+                        "stage",
+                        json!({"stage": "未配置 GitLab 令牌，改派到在线节点查询仓库提交…"}),
+                    );
+                    let title = truncate_bytes(message, 48);
+                    let thr_id = match active_thread_id.clone() {
+                        Some(id) => id,
+                        None => {
+                            let created = create_thread(hub, user_id, &title).await?;
+                            active_thread_id = Some(created.clone());
+                            created
+                        }
+                    };
+                    if let Some(info) = dispatch_to_node(
+                        hub,
+                        user_id,
+                        None,
+                        false,
+                        &title,
+                        &format!("用户请求：{message}\n请在工作目录中定位对应本地 git 仓库并运行 git log 查看提交记录，用简洁中文汇总结果。"),
+                        Some(&thr_id),
+                    )
+                    .await?
+                    {
+                        dispatched_tasks.push(info);
+                        if final_reply.contains("GitLab") || final_reply == "好的，我来查一下 GitLab 提交记录。" {
+                            final_reply = "尚未配置 GitLab 访问令牌，已改派给在线本机节点查询本地仓库提交，稍后发回结果。".into();
+                        }
+                    }
+                } else {
+                    final_reply.push_str(
+                        "\n\n（尚未在设置中配置 GitLab 访问令牌，且当前没有在线的本机节点可查本地仓库。）",
+                    );
                 }
             }
             "dispatch_node" => {
@@ -943,6 +993,7 @@ fn build_system_prompt(
     crons: &[automation::CronJob],
     rules: &[automation::DispatchRule],
     contacts: &[String],
+    gitlab_configured: bool,
 ) -> String {
     let soul = truncate_bytes(&profile.soul_md, 1500);
     let memory = truncate_bytes(&profile.memory_md, 2000);
@@ -1012,7 +1063,7 @@ fn build_system_prompt(
                     n.name,
                     n.kind,
                     if n.online { "在线" } else { "离线" },
-                    truncate_bytes(&n.capabilities, 120)
+                    truncate_bytes(&n.capabilities, 240)
                 )
             })
             .collect::<Vec<_>>()
@@ -1063,6 +1114,12 @@ fn build_system_prompt(
         contacts.join(", ")
     };
 
+    let gitlab_hint = if gitlab_configured {
+        "GitLab PAT 已配置（仅用于查全局推送事件；查特定本地仓库提交可按需用 dispatch_node）"
+    } else {
+        "GitLab PAT 未配置（查任意代码仓库的 git 提交/分支/代码，请直接用 dispatch_node 派给在线本机节点，勿调 fetch_gitlab_commits）"
+    };
+
     format!(
         r#"你是用户的 7×24h 个人超级智能体「{name}」。请始终用第一人称、干练、结论先行的中文交流。
 
@@ -1107,34 +1164,125 @@ fn build_system_prompt(
 【活跃同事 (contacts)】
 {contacts_str}
 
-=== 输出格式（严格合法 JSON，勿加 Markdown 代码块） ===
-{{"reply":"直接展示给用户的自然中文回复","thread_id":"thr_xxx 或 new 或 null","thread_title":"仅当 thread_id=new 时给简短标题，否则 null","tools":[]}}
+【GitLab 集成状态】
+{gitlab_hint}
 
-=== 可组合调用的工具（tools 数组可为空或多项） ===
+=== 输出格式（严格合法 JSON，勿加 Markdown 代码块，严禁输出 <tool_call> / </tool_call> 标签或裸工具 JSON） ===
+{{"reply":"直接展示给用户的自然中文回复（必填）","thread_id":"thr_xxx 或 new 或 null","thread_title":"仅当 thread_id=new 时给简短标题，否则 null","tools":[]}}
+
+=== 可组合调用的工具（必须放在 tools 数组中，严禁单独输出） ===
 1. update_memory: {{"tool":"update_memory","name":null,"soul_md":null,"memory_append":"追加一条长期记忆/规矩","memory_replace":null}}
 2. update_ledger: {{"tool":"update_ledger","action":"upsert|mute|done|delete","ledger_id":null,"title":"专项名","status":"active|muted|done","notes_append":"增量记录","notes_replace":null}}
 3. manage_cron: {{"tool":"manage_cron","action":"add|delete","cron_id":null,"daily_time_cst":"HH:MM或null","interval_minutes":60,"target":"cloud|auto|node_id","instruction":"完整指令"}}
 4. manage_rule: {{"tool":"manage_rule","action":"add|delete","rule_id":null,"keyword":"关键词","node_id":"目标节点或cloud"}}
-5. fetch_gitlab_commits: {{"tool":"fetch_gitlab_commits"}}
+5. fetch_gitlab_commits: {{"tool":"fetch_gitlab_commits"}}（仅在 GitLab PAT 已配置时使用）
 6. dispatch_node: {{"tool":"dispatch_node","thread_id":"沿用的 thr_xxx 或 null","node_id":null,"prefer_cloud":false,"title":"简短标题","instruction":"补全全部上下文指代后的自包含执行指令"}}
-   - 涉及本机代码/tmux/私有环境时 prefer_cloud=false；通用云端脚本/分析/爬虫/截图任务可设 prefer_cloud=true。
+   - 涉及本机代码/git 提交/tmux/私有环境时 prefer_cloud=false；通用云端脚本/分析/爬虫/截图任务可设 prefer_cloud=true。
 7. close_thread: {{"tool":"close_thread","thread_id":"已完结的 thr_xxx"}}
 8. delegate_colleague: {{"tool":"delegate_colleague","peer":"同事username或姓名","instruction":"需要同事协助的清晰事项"}}"#,
         name = profile.name,
     )
 }
 
+fn default_reply_for_tools(tools: &[ToolCall]) -> String {
+    if tools.iter().any(|t| t.tool == "dispatch_node") {
+        return "已派发给执行节点处理，完成后我会把结果发回来。".into();
+    }
+    if tools.iter().any(|t| t.tool == "fetch_gitlab_commits") {
+        return "好的，我来查一下 GitLab 提交记录。".into();
+    }
+    if tools.iter().any(|t| t.tool == "delegate_colleague") {
+        return "已发起协作请求。".into();
+    }
+    if tools.iter().any(|t| t.tool == "manage_cron") {
+        return "已更新定时任务。".into();
+    }
+    if tools
+        .iter()
+        .any(|t| matches!(t.tool.as_str(), "update_memory" | "update_ledger"))
+    {
+        return "好的，已记录。".into();
+    }
+    "好的，已处理。".into()
+}
+
+fn strip_hallucinated_tags(raw: &str) -> String {
+    let mut s = raw.trim().to_owned();
+    // Strip <think>...</think> blocks if any reasoning model emits them.
+    while let (Some(a), Some(b)) = (s.find("<think>"), s.find("</think>")) {
+        if b > a {
+            s.replace_range(a..b + "</think>".len(), "");
+        } else {
+            break;
+        }
+    }
+    for tag in [
+        "<tool_call>",
+        "</tool_call>",
+        "<function_call>",
+        "</function_call>",
+    ] {
+        s = s.replace(tag, "");
+    }
+    s.trim().to_owned()
+}
+
 fn parse_brain_response(raw: &str) -> BrainResponse {
-    let trimmed = raw.trim();
-    if let (Some(s), Some(e)) = (trimmed.find('{'), trimmed.rfind('}')) {
-        if let Ok(parsed) = serde_json::from_str::<BrainResponse>(&trimmed[s..=e]) {
-            if !parsed.reply.trim().is_empty() {
+    let cleaned = strip_hallucinated_tags(raw);
+    if let (Some(s), Some(e)) = (cleaned.find('{'), cleaned.rfind('}')) {
+        let json_slice = &cleaned[s..=e];
+        if let Ok(mut parsed) = serde_json::from_str::<BrainResponse>(json_slice) {
+            if !parsed.reply.trim().is_empty() || !parsed.tools.is_empty() {
+                if parsed.reply.trim().is_empty() {
+                    parsed.reply = default_reply_for_tools(&parsed.tools);
+                }
                 return parsed;
+            }
+        }
+        // Fallback 1: model emitted a bare tool object like `{"tool":"fetch_gitlab_commits"}`.
+        if let Ok(single_tool) = serde_json::from_str::<ToolCall>(json_slice) {
+            if !single_tool.tool.trim().is_empty() {
+                let prose = format!("{} {}", cleaned[..s].trim(), cleaned[e + 1..].trim())
+                    .trim()
+                    .to_owned();
+                let tools = vec![single_tool];
+                let reply = if prose.is_empty() {
+                    default_reply_for_tools(&tools)
+                } else {
+                    prose
+                };
+                return BrainResponse {
+                    reply,
+                    thread_id: None,
+                    thread_title: None,
+                    tools,
+                };
+            }
+        }
+    }
+    // Fallback 2: model emitted a bare JSON array of ToolCalls `[{"tool":"..."}]`.
+    if let (Some(s), Some(e)) = (cleaned.find('['), cleaned.rfind(']')) {
+        if let Ok(tools) = serde_json::from_str::<Vec<ToolCall>>(&cleaned[s..=e]) {
+            if !tools.is_empty() && tools.iter().all(|t| !t.tool.trim().is_empty()) {
+                let prose = format!("{} {}", cleaned[..s].trim(), cleaned[e + 1..].trim())
+                    .trim()
+                    .to_owned();
+                let reply = if prose.is_empty() {
+                    default_reply_for_tools(&tools)
+                } else {
+                    prose
+                };
+                return BrainResponse {
+                    reply,
+                    thread_id: None,
+                    thread_title: None,
+                    tools,
+                };
             }
         }
     }
     BrainResponse {
-        reply: trimmed.to_owned(),
+        reply: cleaned,
         thread_id: None,
         thread_title: None,
         tools: Vec::new(),
@@ -1712,4 +1860,36 @@ pub async fn compact_user_context(hub: &Hub, user_id: &str) -> Result<bool> {
             .emit(user_id.to_owned(), "brain", json!({"updated": "profile"}));
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_brain_response;
+
+    #[test]
+    fn recovers_bare_tool_call_with_hallucinated_xml_tag() {
+        let parsed = parse_brain_response(r#"{"tool":"fetch_gitlab_commits"}</tool_call>"#);
+        assert_eq!(parsed.tools.len(), 1);
+        assert_eq!(parsed.tools[0].tool, "fetch_gitlab_commits");
+        assert!(!parsed.reply.contains("</tool_call>"));
+        assert!(!parsed.reply.contains('{'));
+    }
+
+    #[test]
+    fn recovers_prose_plus_tool_call_tag_and_strips_think() {
+        let raw = r#"<think>internal</think>好的，我来查一下。<tool_call>{"tool":"dispatch_node","title":"查 Atlas 提交","instruction":"git log"}</tool_call>"#;
+        let parsed = parse_brain_response(raw);
+        assert_eq!(parsed.reply, "好的，我来查一下。");
+        assert_eq!(parsed.tools.len(), 1);
+        assert_eq!(parsed.tools[0].tool, "dispatch_node");
+    }
+
+    #[test]
+    fn synthesizes_reply_when_tools_envelope_omits_reply() {
+        let parsed = parse_brain_response(
+            r#"{"reply":"","tools":[{"tool":"dispatch_node","title":"t","instruction":"i"}]}"#,
+        );
+        assert_eq!(parsed.tools.len(), 1);
+        assert!(parsed.reply.contains("已派发给执行节点"));
+    }
 }

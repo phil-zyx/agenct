@@ -248,7 +248,7 @@ def build_env_header(kind: str, agent: str, workdir: str) -> str:
                     continue
                 if os.path.isdir(os.path.join(workdir, name, ".git")):
                     repos.append(name)
-                if len(repos) >= 8:
+                if len(repos) >= 20:
                     break
         except OSError:
             pass
