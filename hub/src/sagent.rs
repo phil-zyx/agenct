@@ -384,576 +384,41 @@ fn rule_keyword_matches(rule_kw: &str, text: &str) -> bool {
         })
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct ResolvedTaskContext {
-    pub task_id: String,
-    pub requester: String,
-    pub owner: String,
-    pub summary: String,
-    pub status: String,
-    pub revision: i64,
-    pub is_topic: bool,
-    pub score: i64,
-    pub stage: &'static str,
-}
-
-fn is_cjk(c: char) -> bool {
-    matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF)
-}
-
-pub(crate) fn extract_semantic_tokens(text: &str) -> HashSet<String> {
-    const STOP_ASCII: &[&str] = &[
-        "http", "https", "the", "and", "for", "with", "from", "that", "this", "att", "png", "jpg",
-    ];
-    const STOP_CJK_BIGRAMS: &[&str] = &[
-        "帮我", "请问", "一下", "这个", "那个", "什么", "怎么", "可以", "需要", "我们", "你们",
-        "现在", "已经", "如果", "或者", "任务", "管家", "处理", "看看", "看下", "查下", "刚才",
-        "这里", "那里", "还是", "以及", "一个", "一些", "进行", "确认", "通过", "补充", "退回",
-    ];
-    let mut tokens = HashSet::new();
-    let lower = text.to_ascii_lowercase();
-    let mut ascii_buf = String::new();
-    for ch in lower.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-            ascii_buf.push(ch);
-        } else {
-            let word = ascii_buf.trim_matches(['_', '-']);
-            if word.len() >= 2 && !STOP_ASCII.contains(&word) {
-                tokens.insert(word.to_owned());
-                for &syn in semantic_synonyms(word) {
-                    tokens.insert(syn.to_owned());
-                }
-            }
-            ascii_buf.clear();
-        }
-    }
-    let word = ascii_buf.trim_matches(['_', '-']);
-    if word.len() >= 2 && !STOP_ASCII.contains(&word) {
-        tokens.insert(word.to_owned());
-        for &syn in semantic_synonyms(word) {
-            tokens.insert(syn.to_owned());
-        }
-    }
-
-    let cjk_chars: Vec<char> = text.chars().collect();
-    let mut idx = 0;
-    while idx < cjk_chars.len() {
-        if is_cjk(cjk_chars[idx]) {
-            let start = idx;
-            while idx < cjk_chars.len() && is_cjk(cjk_chars[idx]) {
-                idx += 1;
-            }
-            let seg = &cjk_chars[start..idx];
-            for win in seg.windows(2) {
-                let bg: String = win.iter().collect();
-                if !STOP_CJK_BIGRAMS.contains(&bg.as_str()) {
-                    for &syn in semantic_synonyms(&bg) {
-                        tokens.insert(syn.to_owned());
-                    }
-                    tokens.insert(bg);
-                }
-            }
-        } else {
-            idx += 1;
-        }
-    }
-    tokens
-}
-
-#[allow(clippy::too_many_arguments)]
-fn score_historical_task(
+fn find_peer_task_for_requester(
     db: &Connection,
-    user: &str,
-    message: &str,
-    msg_tokens: &HashSet<String>,
-    rank_idx: usize,
-    task_id: &str,
     requester: &str,
-    owner: &str,
-    summary: &str,
     status: &str,
-    result: Option<&str>,
-) -> i64 {
-    let msg_lower = message.to_ascii_lowercase();
-    let mut raw_score: i64 = 0;
-
-    let sid = short_id(task_id).to_ascii_lowercase();
-    if sid.len() >= 6 && msg_lower.contains(&sid) {
-        raw_score += 120;
-    }
-
-    if requester != owner {
-        let counterpart = if owner == user { requester } else { owner };
-        if nodes::contains_alias(message, counterpart) {
-            raw_score += 45;
-        } else {
-            let disp = member_display_name(db, counterpart);
-            if !disp.is_empty() && message.contains(&disp) {
-                raw_score += 45;
-            }
-        }
-    }
-
-    if let Ok(Some((node_id, node_name))) = db
-        .query_row(
-            "SELECT a.node_id, COALESCE(u.name, a.node_id)
-             FROM node_assignments a
-             LEFT JOIN user_nodes u ON u.owner=a.owner AND u.id=a.node_id
-             WHERE a.task_id=?1 LIMIT 1",
-            [task_id],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-        )
-        .optional()
-    {
-        if nodes::contains_alias(message, &node_id)
-            || (!node_name.is_empty() && nodes::contains_alias(message, &node_name))
-        {
-            raw_score += 35;
-        }
-    }
-
-    let summary_tokens = extract_semantic_tokens(summary);
-    let mut summary_hits = 0i64;
-    let mut matched_in_summary = HashSet::new();
-    for tok in msg_tokens {
-        if summary_tokens.contains(tok) {
-            summary_hits += 1;
-            matched_in_summary.insert(tok.as_str());
-        }
-    }
-    raw_score += (summary_hits * 16).min(80);
-
-    let details_text: String = db
-        .query_row(
-            "SELECT content FROM task_details WHERE task_id=?1",
-            [task_id],
-            |r| r.get(0),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let mut history_blob = details_text;
-    if let Some(res) = result {
-        history_blob.push('\n');
-        history_blob.push_str(res);
-    }
-    if let Ok(mut stmt) = db.prepare(
-        "SELECT content, COALESCE((SELECT json_extract(t.response, '$.draft.instruction') FROM draft_turns t WHERE t.draft_id = deliveries.source_draft_id), '')
-         FROM deliveries WHERE task_id=?1 ORDER BY seq DESC LIMIT 3",
-    ) {
-        if let Ok(rows) = stmt.query_map([task_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        }) {
-            for (ans, ask) in rows.flatten() {
-                history_blob.push('\n');
-                history_blob.push_str(&ask);
-                history_blob.push('\n');
-                history_blob.push_str(&ans);
-            }
-        }
-    }
-    if !history_blob.is_empty() {
-        let hist_tokens = extract_semantic_tokens(&history_blob);
-        let mut hist_hits = 0i64;
-        for tok in msg_tokens {
-            if !matched_in_summary.contains(tok.as_str()) && hist_tokens.contains(tok) {
-                hist_hits += 1;
-            }
-        }
-        raw_score += (hist_hits * 8).min(40);
-    }
-
-    if raw_score > 0 {
-        if matches!(
-            status,
-            "working" | "awaiting_owner" | "ready_for_acceptance"
-        ) {
-            raw_score += 10;
-        }
-        raw_score += match rank_idx {
-            0 => 8,
-            1 => 5,
-            2 => 3,
-            3..=5 => 1,
-            _ => 0,
-        };
-    }
-    raw_score
-}
-
-pub(crate) fn match_existing_self_topic(
-    db: &Connection,
-    owner: &str,
-    question: &str,
+    text: &str,
 ) -> Result<Option<(String, String, String, i64)>> {
-    let msg_tokens = extract_semantic_tokens(question);
-    if msg_tokens.is_empty() {
-        return Ok(None);
-    }
     let mut stmt = db.prepare(
-        "SELECT id, summary, status, result, revision
-         FROM tasks
-         WHERE requester=?1 AND owner=?1
-           AND (summary LIKE '📁 %' OR summary LIKE '🖥️ %' OR summary LIKE '💬 %' OR summary LIKE '🦊 %' OR summary LIKE '⏰ %')
-         ORDER BY rowid DESC LIMIT 30",
+        "SELECT id, owner, summary, revision FROM tasks
+         WHERE requester=?1 AND owner!=?1 AND status=?2
+         ORDER BY rowid DESC LIMIT 20",
     )?;
     let rows = stmt
-        .query_map([owner], |r| {
+        .query_map(params![requester, status], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(3)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut best: Option<(i64, String, String, String, i64)> = None;
-    for (idx, (id, summary, status, result, rev)) in rows.into_iter().enumerate() {
-        let sc = score_historical_task(
-            db,
-            owner,
-            question,
-            &msg_tokens,
-            idx,
-            &id,
-            owner,
-            owner,
-            &summary,
-            &status,
-            result.as_deref(),
-        );
-        if sc >= 30 && best.as_ref().is_none_or(|b| sc > b.0) {
-            best = Some((sc, id, summary, status, rev));
-        }
+    let lower = text.to_ascii_lowercase();
+    if let Some(matched) = rows.iter().find(|(id, own, sum, _)| {
+        let sid = short_id(id).to_ascii_lowercase();
+        (sid.len() >= 6 && lower.contains(&sid))
+            || nodes::contains_alias(text, own)
+            || sum
+                .chars()
+                .collect::<Vec<_>>()
+                .windows(2)
+                .any(|w| text.contains(&w.iter().collect::<String>()))
+    }) {
+        return Ok(Some(matched.clone()));
     }
-    Ok(best.map(|(_, id, summary, status, rev)| (id, summary, status, rev)))
-}
-
-pub(crate) async fn resolve_historical_task_context(
-    h: &Hub,
-    user: &str,
-    message: &str,
-    explicit_selected: Option<&crate::task_context::Selection>,
-    status_filter: Option<&str>,
-) -> Result<Option<ResolvedTaskContext>> {
-    let trimmed = message.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-    let msg_tokens = extract_semantic_tokens(trimmed);
-    let is_continuity_cue = [
-        "那",
-        "再",
-        "它",
-        "这个",
-        "刚才",
-        "继续",
-        "还有",
-        "顺便",
-        "为什么",
-        "怎么",
-        "然后",
-        "接着",
-    ]
-    .iter()
-    .any(|cue| trimmed.starts_with(cue));
-
-    let (explicit_match, scored_candidates) = {
-        let db = h.db()?;
-        if let Some(sel) = explicit_selected {
-            let row = db
-                .query_row(
-                    "SELECT id, requester, owner, summary, status, revision
-                     FROM tasks WHERE id=?1 AND (requester=?2 OR owner=?2)",
-                    params![sel.task_id, user],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, String>(4)?,
-                            r.get::<_, i64>(5)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            if let Some((id, req, own, sum, st, rev)) = row {
-                if status_filter.is_none_or(|want| want == st) {
-                    return Ok(Some(ResolvedTaskContext {
-                        is_topic: req == own,
-                        task_id: id,
-                        requester: req,
-                        owner: own,
-                        summary: sum,
-                        status: st,
-                        revision: rev,
-                        score: 100,
-                        stage: "explicit",
-                    }));
-                }
-            }
-        }
-
-        let mut stmt = db.prepare(
-            "SELECT id, requester, owner, summary, status, result, revision
-             FROM tasks
-             WHERE requester=?1 OR owner=?1
-             ORDER BY rowid DESC LIMIT 60",
-        )?;
-        let rows = stmt
-            .query_map([user], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, Option<String>>(5)?,
-                    r.get::<_, i64>(6)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-
-        let mut candidates: Vec<ResolvedTaskContext> = Vec::new();
-        for (idx, (id, req, own, sum, st, res, rev)) in rows.into_iter().enumerate() {
-            if status_filter.is_some_and(|want| want != st) {
-                continue;
-            }
-            let sc = score_historical_task(
-                &db,
-                user,
-                trimmed,
-                &msg_tokens,
-                idx,
-                &id,
-                &req,
-                &own,
-                &sum,
-                &st,
-                res.as_deref(),
-            );
-            candidates.push(ResolvedTaskContext {
-                is_topic: req == own,
-                task_id: id,
-                requester: req,
-                owner: own,
-                summary: sum,
-                status: st,
-                revision: rev,
-                score: sc,
-                stage: "stage2_feature",
-            });
-        }
-        (None::<ResolvedTaskContext>, candidates)
-    };
-    if explicit_match.is_some() {
-        return Ok(explicit_match);
-    }
-    if scored_candidates.is_empty() {
-        return Ok(None);
-    }
-
-    let mut ranked = scored_candidates.clone();
-    ranked.sort_by(|a, b| b.score.cmp(&a.score));
-    let top = &ranked[0];
-    let second_score = ranked.get(1).map_or(0, |c| c.score);
-
-    // Stage 1: Direct short ID match
-    if top.score >= 100 {
-        let mut out = top.clone();
-        out.stage = "stage1_short_id";
-        return Ok(Some(out));
-    }
-
-    // Stage 2: High-confidence multi-dimensional feature + time-decay score
-    if top.score >= 24 && (top.score >= second_score + 5 || top.score >= 40) {
-        return Ok(Some(top.clone()));
-    }
-
-    // Stage 1B: Follow-up continuity cue ("那...", "继续...", "为什么...") when no other task strongly conflicts
-    if is_continuity_cue && top.score < 24 {
-        if let Some(recent_active) = scored_candidates.iter().find(|c| {
-            matches!(
-                c.status.as_str(),
-                "working" | "awaiting_owner" | "ready_for_acceptance"
-            ) || c.is_topic
-        }) {
-            let mut out = recent_active.clone();
-            out.stage = "stage1_continuity";
-            out.score = out.score.max(25);
-            return Ok(Some(out));
-        }
-    }
-
-    // Stage 3: DSH Model semantic disambiguation & topic routing
-    if let crate::Runtime::Dsh { url, token } = &h.runtime {
-        let has_topics = scored_candidates.iter().any(|c| c.is_topic);
-        let needs_llm_routing =
-            (ranked.len() >= 2 && top.score >= 16 && top.score - second_score <= 4)
-                || (has_topics && top.score < 24);
-        if needs_llm_routing {
-            let top_list: Vec<String> = ranked
-                .iter()
-                .take(8)
-                .map(|c| format!("- `{}` [{}]：{}", c.task_id, c.status, c.summary))
-                .collect();
-            let prompt = format!(
-                "你是用户的 Super-Agent 历史上下文归类器（LLM Context Router）。请根据**语义**判断用户的最新输入是否属于下列某个历史任务或脉络主题：\n\n\
-                 【候选历史任务与脉络主题】\n{}\n\n\
-                 【用户最新输入】\n「{trimmed}」\n\n\
-                 请只输出一行严格合法的 JSON（不要代码块）：\n\
-                 - 若属于某个候选上下文：`{{\"task_id\":\"匹配的完整task_id\"}}`\n\
-                 - 若是全新话题或无关：`{{\"task_id\":null}}`",
-                top_list.join("\n")
-            );
-            let runtime_profile = {
-                let db = h.db()?;
-                crate::profiles::route(&db, user, None, None)?
-            };
-            let dsh = crate::runtime::DshRuntime {
-                client: &h.client,
-                url,
-                token,
-            };
-            let sid = Uuid::new_v4().to_string();
-            if let Ok(ans) = crate::runtime::Runtime::turn(
-                &dsh,
-                crate::runtime::TurnRequest {
-                    kind: crate::runtime::TurnKind::Chat,
-                    message: &prompt,
-                    session_id: &sid,
-                    history: &[],
-                    profile: &runtime_profile,
-                    task_context: None,
-                    draft_revision: None,
-                    task_role: None,
-                    owner_context: None,
-                    profile_context: None,
-                },
-            )
-            .await
-            {
-                let raw = ans.reply.trim();
-                if let (Some(s), Some(e)) = (raw.find('{'), raw.rfind('}')) {
-                    if let Ok(val) = serde_json::from_str::<Value>(&raw[s..=e]) {
-                        if let Some(tid) = val["task_id"].as_str() {
-                            if let Some(found) =
-                                scored_candidates.into_iter().find(|c| c.task_id == tid)
-                            {
-                                let mut out = found;
-                                out.stage = "stage3_dsh";
-                                out.score = out.score.max(30);
-                                return Ok(Some(out));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(None)
-}
-
-pub(crate) fn format_routed_context_memory(
-    db: &Connection,
-    ctx: &ResolvedTaskContext,
-) -> Result<String> {
-    let mut lines = vec![format!(
-        "[Automatic Historical Task Context Routing: stage={}, task_id={}, status={}, title=\"{}\"]",
-        ctx.stage, ctx.task_id, ctx.status, ctx.summary
-    )];
-    if !ctx.is_topic {
-        lines.push(format!(
-            "Participants: requester={}, owner={}",
-            ctx.requester, ctx.owner
-        ));
-    }
-    if let Some(details) = db
-        .query_row(
-            "SELECT content FROM task_details WHERE task_id=?1",
-            [&ctx.task_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?
-    {
-        let excerpt: String = details.chars().take(1200).collect();
-        lines.push(format!("Shared details: {excerpt}"));
-    }
-    let turns = nodes::topic_turns(db, &ctx.task_id)?;
-    for turn in turns.iter().rev().take(3).rev() {
-        let seq = turn["seq"].as_i64().unwrap_or(1);
-        let q = turn["question"].as_str().unwrap_or("");
-        let a: String = turn["answer"]
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .take(600)
-            .collect();
-        if !q.is_empty() {
-            lines.push(format!("Turn #{seq} Q: {q}\nTurn #{seq} A: {a}"));
-        } else {
-            lines.push(format!("Turn #{seq}: {a}"));
-        }
-    }
-    Ok(lines.join("\n"))
-}
-
-pub(crate) fn record_routed_topic_turn(
-    tx: &Connection,
-    ctx: &ResolvedTaskContext,
-    question: &str,
-    answer: &str,
-) -> Result<()> {
-    if !ctx.is_topic {
-        return Ok(());
-    }
-    let next_seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM deliveries WHERE task_id=?1 AND status='submitted'",
-        [&ctx.task_id],
-        |r| r.get(0),
-    )?;
-    let draft_id = format!("topic-draft-{}", Uuid::new_v4());
-    let turn_req_id = format!("topic-turn-{}", Uuid::new_v4().simple());
-    let clean_q = nodes::truncate_bytes(question.trim(), 1000);
-    let clean_a = nodes::truncate_bytes(answer.trim(), 4000);
-    let response_json = json!({
-        "draft": {
-            "id": draft_id,
-            "seq": next_seq,
-            "instruction": clean_q,
-            "content": clean_a,
-        }
-    });
-    let _ = tx.execute(
-        "INSERT INTO draft_turns(owner,request_id,task_id,binding,status,draft_id,response)
-         VALUES (?1,?2,?3,?4,'complete',?5,?6)",
-        params![
-            ctx.owner,
-            turn_req_id,
-            ctx.task_id,
-            json!({"expected_revision": ctx.revision}).to_string(),
-            draft_id,
-            response_json.to_string()
-        ],
-    );
-    let _ = tx.execute(
-        "INSERT INTO deliveries(id,task_id,seq,author,content,status,task_revision,source_draft_id)
-         VALUES (?1,?2,?3,?4,?5,'submitted',?6,?7)",
-        params![
-            Uuid::new_v4().to_string(),
-            ctx.task_id,
-            next_seq,
-            ctx.owner,
-            clean_a,
-            ctx.revision,
-            draft_id
-        ],
-    );
-    Ok(())
+    Ok(rows.into_iter().next())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3169,13 +2634,6 @@ pub(crate) async fn answer_chat(
         if extra.is_empty() {
             return Ok(None);
         }
-        let routed_clarify = if input.selected_task.is_none() {
-            resolve_historical_task_context(h, owner, extra, None, Some("awaiting_owner"))
-                .await?
-                .filter(|c| c.requester == owner && c.owner != owner && c.score >= 25)
-        } else {
-            None
-        };
         let target_task: Option<(String, String, String, i64)> = {
             let db = h.db()?;
             if let Some(sel) = &input.selected_task {
@@ -3186,17 +2644,8 @@ pub(crate) async fn answer_chat(
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )
                 .optional()?
-            } else if let Some(c) = routed_clarify {
-                Some((c.task_id, c.owner, c.summary, c.revision))
             } else {
-                db.query_row(
-                    "SELECT id, owner, summary, revision FROM tasks
-                     WHERE requester=?1 AND owner!=?1 AND status='awaiting_owner'
-                     ORDER BY rowid DESC LIMIT 1",
-                    [owner],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-                )
-                .optional()?
+                find_peer_task_for_requester(&db, owner, "awaiting_owner", extra)?
             }
         };
         if let Some((tid, task_owner, summary, rev)) = target_task {
@@ -3322,13 +2771,13 @@ pub(crate) async fn answer_chat(
         if let Some(sel) = input.selected_task.clone() {
             Some(sel)
         } else if named_accept || return_reason.is_some() {
-            resolve_historical_task_context(h, owner, trimmed, None, Some("ready_for_acceptance"))
-                .await?
-                .filter(|c| c.requester == owner && c.owner != owner && c.score >= 30)
-                .map(|c| crate::task_context::Selection {
-                    task_id: c.task_id,
-                    expected_revision: c.revision,
-                })
+            let db = h.db()?;
+            find_peer_task_for_requester(&db, owner, "ready_for_acceptance", trimmed)?.map(
+                |(task_id, _, _, revision)| crate::task_context::Selection {
+                    task_id,
+                    expected_revision: revision,
+                },
+            )
         } else {
             None
         }
@@ -7758,48 +7207,6 @@ mod tests {
             .unwrap();
         assert!(raw_db_state.contains("feishu"));
         assert!(raw_db_state.contains("数据库"));
-
-        // 6. 3-Stage Historical Task Context Router: routes unclicked user input to matching historical task/topic
-        {
-            let db = h.db().unwrap();
-            db.execute(
-                "INSERT INTO tasks(id,requester,owner,summary,status,revision)
-                 VALUES ('topic-login-500','alice','alice','💬 排查登录接口 500 报错','completed',1)",
-                [],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO tasks(id,requester,owner,summary,status,revision)
-                 VALUES ('topic-q4-plan','alice','alice','💬 Q4 商业化定价方案','completed',1)",
-                [],
-            )
-            .unwrap();
-        }
-        let routed = super::resolve_historical_task_context(
-            &h,
-            "alice",
-            "刚才那个登录接口 500 报错的根因找到了吗",
-            None,
-            None,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert_eq!(routed.task_id, "topic-login-500");
-        assert_eq!(routed.stage, "stage2_feature");
-
-        let (s, routed_chat) = call(
-            &r,
-            &token("alice"),
-            "POST",
-            "/api/messages",
-            Some(json!({ "message": "给 Q4 商业化定价方案加一页企业版报价" })),
-        )
-        .await;
-        assert_eq!(s, StatusCode::OK);
-        assert_eq!(routed_chat["routed_context"]["task_id"], "topic-q4-plan");
-        let turns = crate::nodes::topic_turns(&h.db().unwrap(), "topic-q4-plan").unwrap();
-        assert_eq!(turns.len(), 1);
 
         // 7. OpenAI-compatible response parser & Enterprise IM inbound webhook (/webhooks/im)
         let parsed_json = crate::runtime::parse_openai_content_to_adapter_reply(

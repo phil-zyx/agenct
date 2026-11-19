@@ -678,15 +678,12 @@ async function completeTurn(context, response, { recovered = false } = {}) {
       + (Array.isArray(project.feedback) ? `本轮包含 ${project.feedback.length} 条共享问答记录（含无正文的撤回记录），不代表确认或承诺。` : '')
       + (project.omitted_items > 0 ? `已省略 ${project.omitted_items} 条超出上下文上限的状态条目。` : '')
       + (project.omitted_feedback > 0 ? `已省略 ${project.omitted_feedback} 条共享问答，不能据此判断完整讨论或推断缺失原文。` : '') : '';
-  const routed = response.routed_context;
   const receiptContext = task
     ? `\n本次任务上下文：${task.id} · 版本 ${task.revision}。`
       + (task.summary_truncated ? '共享摘要已截断。' : '')
       + (task.result_truncated ? '交付结果已截断。' : '')
       + (task.details_truncated ? '共享材料已截断。' : '')
-    : routed && typeof routed.task_id === 'string'
-      ? `\n已自动归入历史任务上下文：${routed.summary || routed.task_id}（#${routed.task_id.slice(0, 8)}）。`
-      : '';
+    : '';
   forgetTurn();
   if (current(context) && !project) handleTaskAction(context, response.task_action, requestId);
   if (recovered || expectedTask || expectedProject || expectedAgent) {
