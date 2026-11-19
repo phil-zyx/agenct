@@ -19,7 +19,7 @@ use axum::{
     Json, Router,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
@@ -60,6 +60,7 @@ pub struct Hub {
     pub attachments_dir: PathBuf,
     pub scheduler_notify: Arc<tokio::sync::Notify>,
     gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    compacting: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Hub {
@@ -88,6 +89,7 @@ impl Hub {
             attachments_dir,
             scheduler_notify: Arc::new(tokio::sync::Notify::new()),
             gates: Arc::new(Mutex::new(HashMap::new())),
+            compacting: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -96,6 +98,16 @@ impl Hub {
         map.entry(user_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    pub fn try_begin_compaction(&self, user_id: &str) -> bool {
+        let mut set = self.compacting.lock().expect("compacting mutex");
+        set.insert(user_id.to_owned())
+    }
+
+    pub fn end_compaction(&self, user_id: &str) {
+        let mut set = self.compacting.lock().expect("compacting mutex");
+        set.remove(user_id);
     }
 }
 

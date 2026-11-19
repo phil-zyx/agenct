@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA_V1: &str = r#"
+const SCHEMA_V2: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     gitlab_id INTEGER UNIQUE,
@@ -35,8 +35,23 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     name TEXT NOT NULL,
     soul_md TEXT NOT NULL,
     memory_md TEXT NOT NULL,
+    rolling_summary TEXT NOT NULL DEFAULT '',
+    compacted_msg_id INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS threads (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+    summary TEXT NOT NULL DEFAULT '',
+    node_id TEXT,
+    node_session_id TEXT,
+    turn_count INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id, status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS ledgers (
     id TEXT PRIMARY KEY,
@@ -52,6 +67,7 @@ CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     peer_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+    thread_id TEXT,
     role TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
     content TEXT NOT NULL,
     request_id TEXT,
@@ -60,11 +76,13 @@ CREATE TABLE IF NOT EXISTS messages (
     UNIQUE(user_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(user_id, thread_id, id DESC);
 
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     requester_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    thread_id TEXT,
     title TEXT NOT NULL,
     instruction TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('pending','running','done','failed','canceled')),
@@ -218,9 +236,9 @@ impl Db {
         let writer = Connection::open(path)?;
         writer.busy_timeout(Duration::from_millis(5000))?;
         let current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if current_version != 0 && current_version != SCHEMA_VERSION {
+        if !matches!(current_version, 0 | 1 | SCHEMA_VERSION) {
             return Err(format!(
-                "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a fresh database"
+                "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
             )
             .into());
         }
@@ -229,9 +247,34 @@ impl Db {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )?;
-        writer.execute_batch(SCHEMA_V1)?;
-        if current_version == 0 {
-            writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        if current_version == 1 {
+            writer.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE agent_profiles ADD COLUMN rolling_summary TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE agent_profiles ADD COLUMN compacted_msg_id INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE messages ADD COLUMN thread_id TEXT;
+                 ALTER TABLE tasks ADD COLUMN thread_id TEXT;
+                 CREATE TABLE IF NOT EXISTS threads (
+                     id TEXT PRIMARY KEY,
+                     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                     title TEXT NOT NULL,
+                     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+                     summary TEXT NOT NULL DEFAULT '',
+                     node_id TEXT,
+                     node_session_id TEXT,
+                     turn_count INTEGER NOT NULL DEFAULT 0,
+                     updated_at INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id, status, updated_at DESC);
+                 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(user_id, thread_id, id DESC);
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        } else {
+            writer.execute_batch(SCHEMA_V2)?;
+            if current_version == 0 {
+                writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
         }
         // On startup, mark any orphaned running node jobs without a valid future lease as failed.
         let now = crate::config::now_unix();
@@ -321,4 +364,59 @@ pub fn record_audit(
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Db;
+    use rusqlite::Connection;
+
+    #[test]
+    fn migrates_v1_database_to_v2_preserving_data() {
+        let dir =
+            std::env::temp_dir().join(format!("agenct-mig-test-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("agenct.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, gitlab_id INTEGER UNIQUE, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL);
+                 CREATE TABLE agent_profiles (user_id TEXT PRIMARY KEY, name TEXT NOT NULL, soul_md TEXT NOT NULL, memory_md TEXT NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, peer_id TEXT, role TEXT NOT NULL, content TEXT NOT NULL, request_id TEXT, status TEXT NOT NULL DEFAULT 'complete', created_at INTEGER NOT NULL);
+                 CREATE TABLE tasks (id TEXT PRIMARY KEY, requester_id TEXT NOT NULL, owner_id TEXT NOT NULL, title TEXT NOT NULL, instruction TEXT NOT NULL, status TEXT NOT NULL, result TEXT, revision INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE node_jobs (task_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, node_id TEXT NOT NULL, task_revision INTEGER NOT NULL, authorization TEXT NOT NULL DEFAULT 'manual', status TEXT NOT NULL, lease_hash TEXT, lease_until INTEGER, submission_hash TEXT, stage TEXT NOT NULL DEFAULT '', log_tail TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+                 INSERT INTO users VALUES ('u1', 1, 'alice', 'Alice', 1, 'active', 100);
+                 INSERT INTO agent_profiles VALUES ('u1', 'Agenct', 'soul', 'mem', 100);
+                 INSERT INTO messages(user_id, role, content, created_at) VALUES ('u1', 'user', 'hello v1', 100);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        drop(db);
+        let conn = Connection::open(&db_path).unwrap();
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 2);
+        let content: String = conn
+            .query_row("SELECT content FROM messages WHERE user_id='u1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(content, "hello v1");
+        let summary: String = conn
+            .query_row(
+                "SELECT rolling_summary FROM agent_profiles WHERE user_id='u1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(summary, "");
+        let thr_count: i64 = conn
+            .query_row("SELECT count(*) FROM threads", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(thr_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

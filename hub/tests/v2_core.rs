@@ -605,3 +605,150 @@ async fn gitlab_webhook_requires_auth_and_respects_gitlab_execute_flag() {
         serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["triggered"][0]["status"], "notified_only");
 }
+
+#[tokio::test]
+async fn implicit_threads_session_resume_and_rolling_compaction_work() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    // 1. Register a PC node.
+    let (st, created) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"name": "homelab", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_token = created["token"].as_str().unwrap().to_owned();
+
+    // 2. Dispatch first task -> automatically binds an implicit thread_id.
+    let (st, chat1) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node check tmux"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let thread_id = chat1["thread_id"]
+        .as_str()
+        .expect("implicit thread_id created")
+        .to_owned();
+    assert!(thread_id.starts_with("thr_"));
+
+    // 3. Node polls work, receives job with thread_id and no session yet, then submits with agent_session_id.
+    let poll1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(poll1.status(), StatusCode::OK);
+    let work1: Value =
+        serde_json::from_slice(&poll1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(work1["job"]["thread_id"].as_str(), Some(thread_id.as_str()));
+    assert!(work1["job"]["agent_session_id"].is_null());
+
+    let tid1 = work1["job"]["task_id"].as_str().unwrap();
+    let lease1 = work1["job"]["lease_token"].as_str().unwrap();
+    let rev1 = work1["job"]["task_revision"].as_i64().unwrap();
+    let sub1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{tid1}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease1,
+                        "request_id": "sub-1",
+                        "expected_revision": rev1,
+                        "status": "completed",
+                        "content": "agy: 3 windows",
+                        "agent_session_id": "ses_homelab_999"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub1.status(), StatusCode::OK);
+
+    // 4. Brain routes follow-up into the same implicit thread -> node receives agent_session_id to resume!
+    let (st, chat2) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": format!("/node_thread {thread_id} inspect agy pane")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(chat2["thread_id"].as_str(), Some(thread_id.as_str()));
+
+    let poll2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let work2: Value =
+        serde_json::from_slice(&poll2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(work2["job"]["thread_id"].as_str(), Some(thread_id.as_str()));
+    assert_eq!(
+        work2["job"]["agent_session_id"].as_str(),
+        Some("ses_homelab_999")
+    );
+
+    // 5. Rolling context compaction compresses older messages once threshold is exceeded.
+    for i in 0..10 {
+        let (st, _) = req_json(
+            &router,
+            "POST",
+            "/api/chat",
+            Some(&cookie),
+            Some(&csrf),
+            Some(json!({"message": format!("普通日常对话第 {i} 轮")})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+    let compacted = agenct_hub::brain::compact_user_context(&hub, "u-alice")
+        .await
+        .unwrap();
+    // Background task might already have compacted; either way rolling_summary & watermark must be populated.
+    let (summary, watermark) = hub
+        .db
+        .read(|conn| agenct_hub::brain::read_compaction_state_sync(conn, "u-alice"))
+        .await
+        .unwrap();
+    assert!(compacted || watermark > 0);
+    assert!(summary.contains("已压缩历史摘要"));
+    assert!(watermark > 0);
+}

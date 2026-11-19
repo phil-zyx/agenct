@@ -85,16 +85,18 @@ class TestUnifiedNode(unittest.TestCase):
 
     def test_parse_opencode_json_extracts_final_message_text_only(self) -> None:
         stream = "\n".join([
-            '{"type":"step_start","part":{"type":"step-start","messageID":"m1"}}',
-            '{"type":"text","part":{"type":"text","messageID":"m1","text":"先查一下 tmux..."}}',
-            '{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"title":"tmux ls","input":{"command":"tmux ls"}}}}',
-            '{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls"}}',
-            '{"type":"step_start","part":{"type":"step-start","messageID":"m2"}}',
-            '{"type":"text","part":{"type":"text","messageID":"m2","text":"\\u001b[0m当前活跃会话：\\n- `agy` (3 windows)\\n- `cc` (5 windows)"}}',
-            '{"type":"step_finish","part":{"type":"step-finish","reason":"stop"}}',
+            '{"type":"step_start","sessionID":"ses_abc12345","part":{"type":"step-start","messageID":"m1"}}',
+            '{"type":"text","sessionID":"ses_abc12345","part":{"type":"text","messageID":"m1","text":"先查一下 tmux..."}}',
+            '{"type":"tool_use","sessionID":"ses_abc12345","part":{"type":"tool","tool":"bash","state":{"title":"tmux ls","input":{"command":"tmux ls"}}}}',
+            '{"type":"step_finish","sessionID":"ses_abc12345","part":{"type":"step-finish","reason":"tool-calls"}}',
+            '{"type":"step_start","sessionID":"ses_abc12345","part":{"type":"step-start","messageID":"m2"}}',
+            '{"type":"text","sessionID":"ses_abc12345","part":{"type":"text","messageID":"m2","text":"\\u001b[0m当前活跃会话：\\n- `agy` (3 windows)\\n- `cc` (5 windows)"}}',
+            '{"type":"step_finish","sessionID":"ses_abc12345","part":{"type":"step-finish","reason":"stop"}}',
         ])
-        parsed = node.parse_opencode_json(stream)
+        parsed, sid = node.parse_opencode_json_result(stream)
         self.assertEqual(parsed, "当前活跃会话：\n- `agy` (3 windows)\n- `cc` (5 windows)")
+        self.assertEqual(sid, "ses_abc12345")
+        self.assertEqual(node.parse_opencode_json(stream), parsed)
         self.assertIsNone(node.parse_opencode_json("plain text output"))
 
     def test_summarize_progress_line_formats_opencode_events(self) -> None:

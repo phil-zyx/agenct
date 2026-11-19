@@ -56,18 +56,21 @@ def strip_ansi(text: str) -> str:
     return _CTRL_CHARS_RE.sub("", cleaned)
 
 
-def parse_opencode_json(raw: str) -> str | None:
-    """Extract the final assistant text from `opencode run --format json` JSONL output.
+_SAFE_SESSION_RE = re.compile(r"^[A-Za-z0-9._-]{4,128}$")
+
+
+def parse_opencode_json_result(raw: str) -> tuple[str | None, str | None]:
+    """Extract (final_text, session_id) from `opencode run --format json` JSONL output.
 
     Returns:
-      - Final assistant text (str) when JSON events contain text or error messages.
-      - "" when valid JSON events were parsed but carried no text.
-      - None when stdout is not opencode JSONL (caller should fall back to plain text).
+      - (text, session_id) when JSON events were parsed (text may be "" if none emitted).
+      - (None, None) when stdout is not opencode JSONL (caller should fall back to plain text).
     """
     parsed_any = False
     msg_order: list[str] = []
     msg_texts: dict[str, list[str]] = {}
     errors: list[str] = []
+    session_id: str | None = None
 
     for line in raw.splitlines():
         line = line.strip()
@@ -80,6 +83,13 @@ def parse_opencode_json(raw: str) -> str | None:
         if not isinstance(ev, dict) or "type" not in ev:
             continue
         parsed_any = True
+        sid = ev.get("sessionID")
+        if not isinstance(sid, str):
+            part_obj = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+            sid = part_obj.get("sessionID")
+        if isinstance(sid, str) and _SAFE_SESSION_RE.match(sid.strip()):
+            session_id = sid.strip()
+
         ev_type = ev.get("type")
         if ev_type == "text":
             part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
@@ -103,13 +113,19 @@ def parse_opencode_json(raw: str) -> str | None:
                 errors.append(str(ev["message"]))
 
     if not parsed_any:
-        return None
+        return None, None
     if msg_order:
         last_mid = msg_order[-1]
-        return strip_ansi("".join(msg_texts[last_mid])).strip()
+        return strip_ansi("".join(msg_texts[last_mid])).strip(), session_id
     if errors:
-        return strip_ansi("\n".join(errors)).strip()
-    return ""
+        return strip_ansi("\n".join(errors)).strip(), session_id
+    return "", session_id
+
+
+def parse_opencode_json(raw: str) -> str | None:
+    """Backward-compatible helper returning only the extracted final text."""
+    text, _ = parse_opencode_json_result(raw)
+    return text
 
 
 def summarize_progress_line(agent: str, raw_line: str) -> str:
@@ -451,6 +467,7 @@ def execute_job(
     timeout: int,
     cancel_event: threading.Event,
     progress_cb,
+    meta_out: dict | None = None,
 ) -> tuple[str, str, list[dict]]:
     input_files, in_dir = materialize_attachments(job.get("attachments") or [])
     evidence_dir = tempfile.mkdtemp(prefix="agenct-ev-")
@@ -517,7 +534,12 @@ def execute_job(
                 elif agent == "gemini":
                     argv = [exe, "-p", prompt]
                 else:
-                    argv = [exe, "run", "--format", "json", prompt]
+                    resume_sid = str(job.get("agent_session_id") or "").strip()
+                    if resume_sid and _SAFE_SESSION_RE.match(resume_sid):
+                        argv = [exe, "run", "--format", "json", "--session", resume_sid, prompt]
+                    else:
+                        resume_sid = ""
+                        argv = [exe, "run", "--format", "json", prompt]
 
                 rc, out, err, cancelled = run_monitored(
                     argv,
@@ -532,6 +554,24 @@ def execute_job(
                 )
                 if cancelled:
                     return "failed", "Job cancelled because Hub lease expired or was revoked.", []
+                # If resuming an opencode session failed or produced empty output, fall back cleanly to a fresh session.
+                if agent == "opencode" and resume_sid:
+                    raw_probe = decode_bytes(out)
+                    probe_text, _ = parse_opencode_json_result(raw_probe)
+                    if rc != 0 or not (probe_text or "").strip():
+                        rc, out, err, cancelled = run_monitored(
+                            [exe, "run", "--format", "json", prompt],
+                            shell=False,
+                            cwd=workdir,
+                            env=env,
+                            timeout=timeout,
+                            cancel_event=cancel_event,
+                            progress_cb=progress_cb,
+                            stage_label=f"Running {agent}",
+                            agent_hint=agent,
+                        )
+                        if cancelled:
+                            return "failed", "Job cancelled because Hub lease expired or was revoked.", []
                 file_text = ""
                 if out_file and os.path.exists(out_file):
                     with open(out_file, "rb") as fh:
@@ -539,7 +579,9 @@ def execute_job(
                 raw_out = decode_bytes(out)
                 raw_err = decode_bytes(err)
                 if agent == "opencode":
-                    parsed = parse_opencode_json(raw_out)
+                    parsed, captured_sid = parse_opencode_json_result(raw_out)
+                    if captured_sid and meta_out is not None:
+                        meta_out["agent_session_id"] = captured_sid
                     out_text = parsed if parsed is not None else strip_ansi(raw_out).strip()
                 else:
                     out_text = strip_ansi(raw_out).strip()
@@ -699,9 +741,10 @@ def run_node_loop(args: argparse.Namespace) -> int:
 
         hb = threading.Thread(target=heartbeat, daemon=True)
         hb.start()
+        meta_out: dict = {}
         try:
             status, content, attachments = execute_job(
-                agent, job, workdir, sandbox, args.timeout, cancel_event, on_progress
+                agent, job, workdir, sandbox, args.timeout, cancel_event, on_progress, meta_out=meta_out
             )
         finally:
             stop_heartbeat.set()
@@ -715,6 +758,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
             "content": content,
             "attachments": attachments,
         }
+        if meta_out.get("agent_session_id"):
+            payload["agent_session_id"] = meta_out["agent_session_id"]
         journal.write(
             task_id,
             rev,

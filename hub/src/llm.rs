@@ -36,7 +36,7 @@ impl LlmClient {
         json_mode: bool,
     ) -> Result<String> {
         match &self.config {
-            LlmConfig::Stub => Ok(stub_reply(user_message, json_mode)),
+            LlmConfig::Stub => Ok(stub_reply(system, user_message, json_mode)),
             LlmConfig::OpenAi {
                 url,
                 api_key,
@@ -95,10 +95,32 @@ impl LlmClient {
 }
 
 /// Deterministic stub for offline unit/integration tests without hitting external APIs.
-fn stub_reply(user_message: &str, json_mode: bool) -> String {
+fn stub_reply(system: &str, user_message: &str, json_mode: bool) -> String {
+    if system.contains("CONTEXT_COMPACTION_TASK") {
+        let snippet: String = user_message.chars().take(120).collect();
+        return json!({
+            "rolling_summary": format!("已压缩历史摘要：{}", snippet.replace('\n', " ")),
+            "memory_md": Value::Null,
+            "archive_thread_ids": []
+        })
+        .to_string();
+    }
     let trimmed = user_message.trim();
     if !json_mode {
         return format!("[STUB] 收到：{trimmed}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("/node_thread ") {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let tid = parts.next().unwrap_or("").trim();
+        let instr = parts.next().unwrap_or("").trim();
+        if !tid.is_empty() && !instr.is_empty() {
+            return json!({
+                "reply": format!("已沿用上下文线程 {tid} 派发任务：{instr}"),
+                "thread_id": tid,
+                "tools": [{"tool": "dispatch_node", "thread_id": tid, "instruction": instr, "title": instr}]
+            })
+            .to_string();
+        }
     }
     if let Some(rest) = trimmed.strip_prefix("/node ") {
         return json!({

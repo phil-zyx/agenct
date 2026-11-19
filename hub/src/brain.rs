@@ -21,6 +21,22 @@ const DEFAULT_AGENT_NAME: &str = "Agenct";
 const DEFAULT_SOUL_MD: &str = "- 身份：你的 7×24h 个人超级智能体 Agenct。\n- 风格：干练、直接、结论先行，用第一人称自然沟通。\n- 原则：云端能直接解决的直接解决；涉及本机代码或终端时调度在线节点；跨人承诺或高危操作主动说明边界。";
 const DEFAULT_MEMORY_MD: &str =
     "暂无长期记忆。在对话中告诉我你的习惯、规矩或环境事实，我会自动整理记住。";
+const THREAD_IDLE_ARCHIVE_SECS: i64 = 48 * 3600;
+const COMPACT_KEEP_RECENT: usize = 8;
+const COMPACT_MIN_BATCH: usize = 10;
+const COMPACT_MAX_BATCH: usize = 24;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThreadView {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub summary: String,
+    pub node_id: Option<String>,
+    pub has_session: bool,
+    pub turn_count: i64,
+    pub updated_at: i64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentProfile {
@@ -80,6 +96,41 @@ pub fn list_ledgers_sync(conn: &Connection, user_id: &str) -> Result<Vec<Ledger>
             status: r.get(2)?,
             notes: r.get(3)?,
             updated_at: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn read_compaction_state_sync(conn: &Connection, user_id: &str) -> Result<(String, i64)> {
+    Ok(conn
+        .query_row(
+            "SELECT rolling_summary, compacted_msg_id FROM agent_profiles WHERE user_id = ?1",
+            [user_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or_else(|| (String::new(), 0)))
+}
+
+pub fn list_active_threads_sync(conn: &Connection, user_id: &str) -> Result<Vec<ThreadView>> {
+    let cutoff = now_unix().saturating_sub(THREAD_IDLE_ARCHIVE_SECS);
+    let mut stmt = conn.prepare(
+        "SELECT id, title, status, summary, node_id, node_session_id, turn_count, updated_at
+         FROM threads
+         WHERE user_id = ?1 AND status = 'active' AND updated_at >= ?2
+         ORDER BY updated_at DESC LIMIT 6",
+    )?;
+    let rows = stmt.query_map(params![user_id, cutoff], |r| {
+        let sid: Option<String> = r.get(5)?;
+        Ok(ThreadView {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            status: r.get(2)?,
+            summary: r.get(3)?,
+            node_id: r.get(4)?,
+            has_session: sid.as_deref().is_some_and(|s| !s.is_empty()),
+            turn_count: r.get(6)?,
+            updated_at: r.get(7)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -353,6 +404,10 @@ pub struct ChatInput {
 struct BrainResponse {
     reply: String,
     #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    thread_title: Option<String>,
+    #[serde(default)]
     tools: Vec<ToolCall>,
 }
 
@@ -371,6 +426,8 @@ struct ToolCall {
     memory_replace: Option<String>,
     #[serde(default)]
     ledger_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -477,6 +534,8 @@ pub async fn run_turn(
         .db
         .write(move |conn| {
             let profile = read_profile_sync(conn, &uid)?;
+            let (rolling_summary, _) = read_compaction_state_sync(conn, &uid)?;
+            let threads = list_active_threads_sync(conn, &uid)?;
             let ledgers = list_ledgers_sync(conn, &uid)?;
             let nodes = nodes::list_nodes_sync(conn, &uid)?;
             let crons = automation::list_crons_sync(conn, &uid)?;
@@ -484,20 +543,33 @@ pub async fn run_turn(
             let matched_rule = automation::match_rule_sync(conn, &uid, &msg_owned)?;
 
             let mut hist_stmt = conn.prepare(
-                "SELECT role, content FROM (
-                    SELECT id, role, content FROM messages
+                "SELECT role, content, thread_id FROM (
+                    SELECT id, role, content, thread_id FROM messages
                     WHERE user_id = ?1 AND status = 'complete' AND role IN ('user','assistant')
-                    ORDER BY id DESC LIMIT 12
+                    ORDER BY id DESC LIMIT 10
                  ) ORDER BY id ASC",
             )?;
-            let history: Vec<ChatMessage> = hist_stmt
-                .query_map([&uid], |r| {
-                    Ok(ChatMessage {
-                        role: r.get(0)?,
-                        content: truncate_bytes(&r.get::<_, String>(1)?, 1200),
-                    })
-                })?
+            let raw_hist: Vec<(String, String, Option<String>)> = hist_stmt
+                .query_map([&uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
+            let total_hist = raw_hist.len();
+            let history: Vec<ChatMessage> = raw_hist
+                .into_iter()
+                .enumerate()
+                .map(|(idx, (role, content, thr_id))| {
+                    // Keep the newest 2 turns detailed; trim older turns tightly so long node outputs don't bloat context.
+                    let budget = if idx + 2 >= total_hist { 1200 } else { 480 };
+                    let trimmed = truncate_bytes(&content, budget);
+                    let tagged = match thr_id.as_deref().filter(|s| !s.is_empty()) {
+                        Some(tid) => format!("[{tid}] {trimmed}"),
+                        None => trimmed,
+                    };
+                    ChatMessage {
+                        role,
+                        content: tagged,
+                    }
+                })
+                .collect();
 
             let mut contact_stmt = conn.prepare(
                 "SELECT username, display_name FROM users WHERE status='active' AND id != ?1 ORDER BY username ASC LIMIT 30",
@@ -513,16 +585,49 @@ pub async fn run_turn(
                  VALUES (?1, 'user', ?2, ?3, 'complete', ?4)",
                 params![uid, msg_owned, rid_owned, now_unix()],
             )?;
+            let user_msg_id = conn.last_insert_rowid();
 
-            Ok((profile, ledgers, nodes, crons, rules, matched_rule, history, contacts))
+            Ok((
+                profile,
+                rolling_summary,
+                threads,
+                ledgers,
+                nodes,
+                crons,
+                rules,
+                matched_rule,
+                history,
+                contacts,
+                user_msg_id,
+            ))
         })
         .await?;
 
-    let (profile, ledgers, node_list, crons, rules, matched_rule, history, contacts) = snapshot;
+    let (
+        profile,
+        rolling_summary,
+        threads,
+        ledgers,
+        node_list,
+        crons,
+        rules,
+        matched_rule,
+        history,
+        contacts,
+        user_msg_id,
+    ) = snapshot;
 
     // Build structured system prompt with per-section budgets (system rules & tools are NEVER truncated).
-    let system_prompt =
-        build_system_prompt(&profile, &ledgers, &node_list, &crons, &rules, &contacts);
+    let system_prompt = build_system_prompt(
+        &profile,
+        &rolling_summary,
+        &threads,
+        &ledgers,
+        &node_list,
+        &crons,
+        &rules,
+        &contacts,
+    );
 
     let raw_llm = hub
         .llm
@@ -532,6 +637,14 @@ pub async fn run_turn(
     let parsed = parse_brain_response(&raw_llm);
     let mut final_reply = parsed.reply;
     let mut dispatched_tasks: Vec<Value> = Vec::new();
+    let mut active_thread_id = resolve_or_create_thread(
+        hub,
+        user_id,
+        parsed.thread_id.as_deref(),
+        parsed.thread_title.as_deref(),
+        message,
+    )
+    .await?;
 
     for call in parsed.tools {
         match call.tool.as_str() {
@@ -540,6 +653,17 @@ pub async fn run_turn(
             }
             "update_ledger" => {
                 apply_update_ledger(hub, user_id, &call).await?;
+            }
+            "close_thread" => {
+                if let Some(tid) = call
+                    .thread_id
+                    .as_deref()
+                    .or(active_thread_id.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    archive_thread(hub, user_id, tid).await?;
+                }
             }
             "manage_cron" => {
                 apply_manage_cron(hub, user_id, &call).await?;
@@ -586,6 +710,23 @@ pub async fn run_turn(
                     .or_else(|| matched_rule.as_ref().map(|r| r.target_node_id.as_str()))
                     .map(str::to_owned);
                 let prefer_cloud = call.prefer_cloud.unwrap_or(false);
+                // Ensure every node dispatch belongs to an implicit backend thread for future session resume.
+                let task_thread_id = if let Some(tid) = resolve_or_create_thread(
+                    hub,
+                    user_id,
+                    call.thread_id.as_deref().or(active_thread_id.as_deref()),
+                    Some(&title),
+                    &title,
+                )
+                .await?
+                {
+                    active_thread_id = Some(tid.clone());
+                    tid
+                } else {
+                    let created = create_thread(hub, user_id, &title).await?;
+                    active_thread_id = Some(created.clone());
+                    created
+                };
                 if let Some(info) = dispatch_to_node(
                     hub,
                     user_id,
@@ -593,6 +734,7 @@ pub async fn run_turn(
                     prefer_cloud,
                     &title,
                     &instr,
+                    Some(&task_thread_id),
                 )
                 .await?
                 {
@@ -635,16 +777,40 @@ pub async fn run_turn(
         }
     }
 
-    // Persist assistant reply.
+    // Persist assistant reply + tag both messages with resolved implicit thread_id.
     let uid = user_id.to_owned();
     let reply_db = truncate_bytes(final_reply.trim(), 16_000);
     let reply_ret = reply_db.clone();
+    let thr_db = active_thread_id.clone();
+    let thr_summary_snippet = truncate_bytes(
+        &format!(
+            "{} -> {}",
+            truncate_bytes(message, 80),
+            truncate_bytes(&reply_db, 120)
+        ),
+        220,
+    );
     hub.db
         .write(move |conn| {
+            let now = now_unix();
+            if let Some(ref tid) = thr_db {
+                conn.execute(
+                    "UPDATE messages SET thread_id = ?1 WHERE id = ?2 AND user_id = ?3",
+                    params![tid, user_msg_id, uid],
+                )?;
+                conn.execute(
+                    "UPDATE threads
+                     SET turn_count = turn_count + 1,
+                         summary = CASE WHEN summary = '' THEN ?3 ELSE summary END,
+                         updated_at = ?4
+                     WHERE id = ?1 AND user_id = ?2",
+                    params![tid, uid, thr_summary_snippet, now],
+                )?;
+            }
             conn.execute(
-                "INSERT INTO messages(user_id, role, content, status, created_at)
-                 VALUES (?1, 'assistant', ?2, 'complete', ?3)",
-                params![uid, reply_db, now_unix()],
+                "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
+                 VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
+                params![uid, thr_db, reply_db, now],
             )?;
             Ok(())
         })
@@ -655,14 +821,21 @@ pub async fn run_turn(
     hub.events
         .emit(user_id.to_owned(), "message", json!({"done": true}));
 
+    // Non-blocking background rolling context compaction & Active Memory pruning.
+    maybe_spawn_compaction(hub.clone(), user_id.to_owned());
+
     Ok(json!({
         "reply": reply_ret,
+        "thread_id": active_thread_id,
         "tasks": dispatched_tasks,
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_system_prompt(
     profile: &AgentProfile,
+    rolling_summary: &str,
+    threads: &[ThreadView],
     ledgers: &[Ledger],
     node_list: &[nodes::NodeView],
     crons: &[automation::CronJob],
@@ -671,6 +844,37 @@ fn build_system_prompt(
 ) -> String {
     let soul = truncate_bytes(&profile.soul_md, 1500);
     let memory = truncate_bytes(&profile.memory_md, 2000);
+    let summary_section = if rolling_summary.trim().is_empty() {
+        "（暂无早期历史摘要）".into()
+    } else {
+        truncate_bytes(rolling_summary.trim(), 2000)
+    };
+
+    let threads_str = if threads.is_empty() {
+        "（无近期活跃线程）".into()
+    } else {
+        truncate_bytes(
+            &threads
+                .iter()
+                .map(|t| {
+                    let node_info = match (&t.node_id, t.has_session) {
+                        (Some(nid), true) => format!(" | 节点={nid}(可续接session)"),
+                        (Some(nid), false) => format!(" | 节点={nid}"),
+                        _ => String::new(),
+                    };
+                    format!(
+                        "- id=`{}` | 「{}」{} | {}",
+                        t.id,
+                        t.title,
+                        node_info,
+                        truncate_bytes(&t.summary, 180)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            1400,
+        )
+    };
 
     let ledgers_str = if ledgers.is_empty() {
         "（无）".into()
@@ -760,7 +964,14 @@ fn build_system_prompt(
     format!(
         r#"你是用户的 7×24h 个人超级智能体「{name}」。请始终用第一人称、干练、结论先行的中文交流。
 
-=== 自动维护记忆与持续事项（核心纪律） ===
+=== 自动语义归类、防串台与必要时反问（核心纪律） ===
+- 用户只在单一聊天框里自然说话，不手动选线程；由你判断这句话在承接哪个隐式线程（`thread_id`）、还是开启新主题（`"new"`）、还是普通闲聊（`null`）。
+- 近期对话中 `[thr_xxx]` 标注了每条消息所属的隐式线程，下方【隐式上下文线程】列出了活跃线程和是否可续接节点 session。
+- **指代清晰时直接承接**：如语义明确对应某个活跃线程，直接填该 `thread_id`；若调用 `dispatch_node` 继续排查或修改，必须带上同一 `thread_id`（系统会自动续接该节点上次的 `opencode --session`）。
+- **真正存在歧义时必须先简短反问，禁止盲猜执行**：例如同时有 2 个以上近期活跃线程/节点回执，用户只说「帮我改一下」「继续查」「把刚才那个关了」且无法从语义唯一判断指向哪一个时，**禁止调用 `dispatch_node` 或变更类工具**，直接在 `reply` 中用一句话自然反问确认（例如「你是指刚才的 A 还是 B？」），并设 `thread_id` 为 `null`。
+- 明确完结的临时话题可顺手调用 `close_thread` 归档，保持线程列表清爽。
+
+=== 自动维护记忆与持续事项 ===
 - 用户不需要手工填表维护人设、记忆、持续事项或定时任务；你负责在对话中自动维护。
 - 只要用户在对话中表达称呼偏好（如「以后叫你…」）、沟通风格要求、纠偏规矩、长期工作事实或明确说「记住…」，当轮必须顺手调用 `update_memory` 落盘，并在回复末尾用一句简短自然的话交代（如「已记住」）。
 - 只要用户跟进某个持续推进的事项、提出新进展/待办或要求某件事别再提醒（静默挂起），当轮顺手调用 `update_ledger` 维护对应持续事项。
@@ -772,7 +983,13 @@ fn build_system_prompt(
 === 当前长期记忆 (MEMORY) ===
 {memory}
 
+=== 早期历史对话压缩摘要 ===
+{summary_section}
+
 === 实时工作台快照 ===
+【隐式上下文线程 (threads，仅后台语义与节点 session 隔离，勿向用户暴露 thread_id)】
+{threads_str}
+
 【持续事项 (ledgers)】
 {ledgers_str}
 
@@ -789,7 +1006,7 @@ fn build_system_prompt(
 {contacts_str}
 
 === 输出格式（严格合法 JSON，勿加 Markdown 代码块） ===
-{{"reply":"直接展示给用户的自然中文回复","tools":[]}}
+{{"reply":"直接展示给用户的自然中文回复","thread_id":"thr_xxx 或 new 或 null","thread_title":"仅当 thread_id=new 时给简短标题，否则 null","tools":[]}}
 
 === 可组合调用的工具（tools 数组可为空或多项） ===
 1. update_memory: {{"tool":"update_memory","name":null,"soul_md":null,"memory_append":"追加一条长期记忆/规矩","memory_replace":null}}
@@ -797,9 +1014,10 @@ fn build_system_prompt(
 3. manage_cron: {{"tool":"manage_cron","action":"add|delete","cron_id":null,"daily_time_cst":"HH:MM或null","interval_minutes":60,"target":"cloud|auto|node_id","instruction":"完整指令"}}
 4. manage_rule: {{"tool":"manage_rule","action":"add|delete","rule_id":null,"keyword":"关键词","node_id":"目标节点或cloud"}}
 5. fetch_gitlab_commits: {{"tool":"fetch_gitlab_commits"}}
-6. dispatch_node: {{"tool":"dispatch_node","node_id":null,"prefer_cloud":false,"title":"简短标题","instruction":"补全全部上下文指代后的自包含执行指令"}}
+6. dispatch_node: {{"tool":"dispatch_node","thread_id":"沿用的 thr_xxx 或 null","node_id":null,"prefer_cloud":false,"title":"简短标题","instruction":"补全全部上下文指代后的自包含执行指令"}}
    - 涉及本机代码/tmux/私有环境时 prefer_cloud=false；通用云端脚本/分析/爬虫/截图任务可设 prefer_cloud=true。
-7. delegate_colleague: {{"tool":"delegate_colleague","peer":"同事username或姓名","instruction":"需要同事协助的清晰事项"}}"#,
+7. close_thread: {{"tool":"close_thread","thread_id":"已完结的 thr_xxx"}}
+8. delegate_colleague: {{"tool":"delegate_colleague","peer":"同事username或姓名","instruction":"需要同事协助的清晰事项"}}"#,
         name = profile.name,
     )
 }
@@ -815,6 +1033,8 @@ fn parse_brain_response(raw: &str) -> BrainResponse {
     }
     BrainResponse {
         reply: trimmed.to_owned(),
+        thread_id: None,
+        thread_title: None,
         tools: Vec::new(),
     }
 }
@@ -1038,6 +1258,88 @@ async fn apply_manage_rule(hub: &Hub, user_id: &str, call: &ToolCall) -> Result<
     Ok(())
 }
 
+async fn create_thread(hub: &Hub, user_id: &str, title: &str) -> Result<String> {
+    let uid = user_id.to_owned();
+    let clean_title = truncate_bytes(title.lines().next().unwrap_or("新话题").trim(), 80);
+    let final_title = if clean_title.is_empty() {
+        "新话题".to_owned()
+    } else {
+        clean_title
+    };
+    let tid = format!("thr_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let tid_db = tid.clone();
+    hub.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO threads(id, user_id, title, status, summary, turn_count, updated_at)
+                 VALUES (?1, ?2, ?3, 'active', '', 0, ?4)",
+                params![tid_db, uid, final_title, now_unix()],
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(tid)
+}
+
+async fn resolve_or_create_thread(
+    hub: &Hub,
+    user_id: &str,
+    raw_thread_id: Option<&str>,
+    thread_title: Option<&str>,
+    fallback_title: &str,
+) -> Result<Option<String>> {
+    let Some(candidate) = raw_thread_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("null"))
+    else {
+        return Ok(None);
+    };
+    if candidate.eq_ignore_ascii_case("new") {
+        let title = thread_title
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fallback_title);
+        return Ok(Some(create_thread(hub, user_id, title).await?));
+    }
+    let uid = user_id.to_owned();
+    let cid = candidate.to_owned();
+    let found: Option<String> = hub
+        .db
+        .write(move |conn| {
+            let exists: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM threads WHERE id = ?1 AND user_id = ?2",
+                    params![cid, uid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(ref id) = exists {
+                conn.execute(
+                    "UPDATE threads SET status = 'active', updated_at = ?3 WHERE id = ?1 AND user_id = ?2",
+                    params![id, uid, now_unix()],
+                )?;
+            }
+            Ok(exists)
+        })
+        .await?;
+    Ok(found)
+}
+
+async fn archive_thread(hub: &Hub, user_id: &str, thread_id: &str) -> Result<()> {
+    let uid = user_id.to_owned();
+    let tid = thread_id.to_owned();
+    hub.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE threads SET status = 'archived', updated_at = ?3 WHERE id = ?1 AND user_id = ?2",
+                params![tid, uid, now_unix()],
+            )?;
+            Ok(())
+        })
+        .await?;
+    Ok(())
+}
+
 async fn dispatch_to_node(
     hub: &Hub,
     user_id: &str,
@@ -1045,11 +1347,13 @@ async fn dispatch_to_node(
     prefer_cloud: bool,
     title: &str,
     instruction: &str,
+    thread_id: Option<&str>,
 ) -> Result<Option<Value>> {
     let uid = user_id.to_owned();
     let pref = preferred_node.map(str::to_owned);
     let t = title.to_owned();
     let instr = instruction.to_owned();
+    let thr = thread_id.map(str::to_owned);
     let res = hub
         .db
         .write(move |conn| {
@@ -1057,9 +1361,23 @@ async fn dispatch_to_node(
             else {
                 return Ok(None);
             };
-            let (task_id, _) = nodes::create_task_and_enqueue_sync(
-                conn, &uid, &uid, &node.id, &t, &instr, "manual",
+            let (task_id, _) = nodes::create_task_and_enqueue_in_thread_sync(
+                conn,
+                &uid,
+                &uid,
+                &node.id,
+                &t,
+                &instr,
+                "manual",
+                thr.as_deref(),
             )?;
+            if let Some(ref tid) = thr {
+                conn.execute(
+                    "UPDATE threads SET node_id = COALESCE(node_id, ?3), updated_at = ?4
+                     WHERE id = ?1 AND user_id = ?2",
+                    params![tid, uid, node.id, now_unix()],
+                )?;
+            }
             record_audit(
                 conn,
                 &uid,
@@ -1070,6 +1388,7 @@ async fn dispatch_to_node(
             )?;
             Ok(Some(json!({
                 "task_id": task_id,
+                "thread_id": thr,
                 "node_id": node.id,
                 "node_name": node.name,
                 "node_kind": node.kind,
@@ -1081,4 +1400,214 @@ async fn dispatch_to_node(
         hub.events.emit(user_id.to_owned(), "task", info.clone());
     }
     Ok(res)
+}
+
+#[derive(Deserialize)]
+struct CompactionOutput {
+    rolling_summary: String,
+    #[serde(default)]
+    memory_md: Option<String>,
+    #[serde(default)]
+    archive_thread_ids: Vec<String>,
+}
+
+const COMPACTION_SYSTEM_PROMPT: &str = r#"CONTEXT_COMPACTION_TASK: 你是个人智能体的后台上下文压缩与 Active Memory 剪枝器。
+任务：
+1. 把「旧历史摘要」与「待压缩对话批次」合并成一份紧凑的 `rolling_summary`（中文，不超过 1200 字）：
+   - 保留：未完结事项、明确做出的决定、正在排查的项目上下文。
+   - 剔除：寒暄、已经过期的一次性查询输出（如旧的 tmux 列表或临时日志）、重复过程。
+2. 审视当前 `MEMORY`：
+   - 仅当待压缩对话中出现新的长期偏好/规矩/环境事实，或 `MEMORY` 中有明显重复/过时条目时，输出整理后的完整 `memory_md`；否则填 `null`。
+3. 审视活跃线程列表：把已经明确结束或过时的线程 ID 放进 `archive_thread_ids`（无则 `[]`）。
+
+严格输出合法 JSON（勿加 Markdown 代码块）：
+{"rolling_summary":"...","memory_md":null,"archive_thread_ids":[]}"#;
+
+fn maybe_spawn_compaction(hub: Hub, user_id: String) {
+    if !hub.try_begin_compaction(&user_id) {
+        return;
+    }
+    tokio::spawn(async move {
+        let _ = compact_user_context(&hub, &user_id).await;
+        hub.end_compaction(&user_id);
+    });
+}
+
+/// Incrementally compacts older completed messages into `agent_profiles.rolling_summary`,
+/// prunes stale Active Memory entries, and archives finished/idle implicit threads.
+pub async fn compact_user_context(hub: &Hub, user_id: &str) -> Result<bool> {
+    let uid = user_id.to_owned();
+    let candidate = hub
+        .db
+        .read(move |conn| {
+            let profile = read_profile_sync(conn, &uid)?;
+            let (old_summary, compacted_id) = read_compaction_state_sync(conn, &uid)?;
+            let threads = list_active_threads_sync(conn, &uid)?;
+
+            let mut stmt = conn.prepare(
+                "SELECT id, role, content, thread_id FROM messages
+                 WHERE user_id = ?1 AND status = 'complete' AND id > ?2
+                 ORDER BY id ASC",
+            )?;
+            let uncompacted: Vec<(i64, String, String, Option<String>)> = stmt
+                .query_map(params![uid, compacted_id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+
+            if uncompacted.len() < COMPACT_KEEP_RECENT + COMPACT_MIN_BATCH {
+                return Ok(None);
+            }
+            let eligible = uncompacted.len() - COMPACT_KEEP_RECENT;
+            let take_n = eligible.min(COMPACT_MAX_BATCH);
+            let batch: Vec<(i64, String, String, Option<String>)> =
+                uncompacted.into_iter().take(take_n).collect();
+            let new_watermark = batch.last().map(|r| r.0).unwrap_or(compacted_id);
+
+            Ok(Some((profile, old_summary, threads, batch, new_watermark)))
+        })
+        .await?;
+
+    let Some((profile, old_summary, threads, batch, new_watermark)) = candidate else {
+        // Even if message batch isn't large enough yet, quietly archive stale threads >48h idle.
+        let uid = user_id.to_owned();
+        let cutoff = now_unix().saturating_sub(THREAD_IDLE_ARCHIVE_SECS);
+        let _ = hub
+            .db
+            .write(move |conn| {
+                conn.execute(
+                    "UPDATE threads SET status = 'archived'
+                     WHERE user_id = ?1 AND status = 'active' AND updated_at < ?2",
+                    params![uid, cutoff],
+                )?;
+                Ok(())
+            })
+            .await;
+        return Ok(false);
+    };
+
+    let transcript = batch
+        .iter()
+        .map(|(_, role, content, thr_id)| {
+            let tag = thr_id
+                .as_deref()
+                .map(|t| format!("[{t}] "))
+                .unwrap_or_default();
+            format!("{role}: {tag}{}", truncate_bytes(content.trim(), 480))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let threads_txt = if threads.is_empty() {
+        "（无）".into()
+    } else {
+        threads
+            .iter()
+            .map(|t| {
+                format!(
+                    "- {} | {} | {}",
+                    t.id,
+                    t.title,
+                    truncate_bytes(&t.summary, 120)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let payload = format!(
+        "【旧历史摘要】\n{}\n\n【当前 MEMORY】\n{}\n\n【活跃线程】\n{}\n\n【待压缩对话批次（共 {} 条）】\n{}",
+        if old_summary.trim().is_empty() { "（空）" } else { old_summary.trim() },
+        truncate_bytes(&profile.memory_md, 3000),
+        threads_txt,
+        batch.len(),
+        truncate_bytes(&transcript, 8000),
+    );
+
+    let raw = hub
+        .llm
+        .complete(COMPACTION_SYSTEM_PROMPT, &[], &payload, true)
+        .await?;
+
+    let trimmed = raw.trim();
+    let parsed: Option<CompactionOutput> = trimmed
+        .find('{')
+        .zip(trimmed.rfind('}'))
+        .and_then(|(s, e)| serde_json::from_str::<CompactionOutput>(&trimmed[s..=e]).ok());
+
+    let Some(out) = parsed else {
+        return Ok(false);
+    };
+    let clean_summary = truncate_bytes(out.rolling_summary.trim(), 2000);
+    if clean_summary.is_empty() {
+        return Ok(false);
+    }
+    let pruned_memory = out
+        .memory_md
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| truncate_bytes(s, 8000));
+    let archive_ids = out.archive_thread_ids;
+
+    let uid = user_id.to_owned();
+    let default_name = profile.name.clone();
+    let default_soul = profile.soul_md.clone();
+    let fallback_mem = profile.memory_md.clone();
+    let memory_changed = pruned_memory.is_some();
+
+    hub.db
+        .write(move |conn| {
+            let now = now_unix();
+            let final_mem = pruned_memory.unwrap_or(fallback_mem);
+            conn.execute(
+                "INSERT INTO agent_profiles(user_id, name, soul_md, memory_md, rolling_summary, compacted_msg_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                   memory_md = excluded.memory_md,
+                   rolling_summary = excluded.rolling_summary,
+                   compacted_msg_id = MAX(agent_profiles.compacted_msg_id, excluded.compacted_msg_id),
+                   updated_at = excluded.updated_at",
+                params![
+                    uid,
+                    default_name,
+                    default_soul,
+                    final_mem,
+                    clean_summary,
+                    new_watermark,
+                    now
+                ],
+            )?;
+            for tid in archive_ids {
+                let t = tid.trim();
+                if !t.is_empty() {
+                    conn.execute(
+                        "UPDATE threads SET status = 'archived', updated_at = ?3 WHERE id = ?1 AND user_id = ?2",
+                        params![t, uid, now],
+                    )?;
+                }
+            }
+            let cutoff = now.saturating_sub(THREAD_IDLE_ARCHIVE_SECS);
+            conn.execute(
+                "UPDATE threads SET status = 'archived'
+                 WHERE user_id = ?1 AND status = 'active' AND updated_at < ?2",
+                params![uid, cutoff],
+            )?;
+            record_audit(
+                conn,
+                &uid,
+                "context_compact",
+                "ok",
+                "自动压缩上下文摘要",
+                &format!("watermark={new_watermark}"),
+            )?;
+            Ok(())
+        })
+        .await?;
+
+    if memory_changed {
+        hub.events
+            .emit(user_id.to_owned(), "brain", json!({"updated": "profile"}));
+    }
+    Ok(true)
 }

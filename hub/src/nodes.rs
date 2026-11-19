@@ -183,15 +183,47 @@ pub fn create_task_and_enqueue_sync(
     instruction: &str,
     authorization: &str,
 ) -> Result<(String, i64)> {
+    create_task_and_enqueue_in_thread_sync(
+        conn,
+        requester_id,
+        owner_id,
+        node_id,
+        title,
+        instruction,
+        authorization,
+        None,
+    )
+}
+
+/// Creates a task (optionally bound to an implicit backend thread) and queues a node job atomically.
+#[allow(clippy::too_many_arguments)]
+pub fn create_task_and_enqueue_in_thread_sync(
+    conn: &mut Connection,
+    requester_id: &str,
+    owner_id: &str,
+    node_id: &str,
+    title: &str,
+    instruction: &str,
+    authorization: &str,
+    thread_id: Option<&str>,
+) -> Result<(String, i64)> {
     let now = now_unix();
     let task_id = format!("tsk_{}", &Uuid::new_v4().simple().to_string()[..12]);
     let clean_title = truncate_bytes(title.trim(), 160);
     let clean_instr = truncate_bytes(instruction.trim(), 8000);
     let tx = conn.transaction()?;
     tx.execute(
-        "INSERT INTO tasks(id, requester_id, owner_id, title, instruction, status, revision, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'running', 1, ?6, ?6)",
-        params![task_id, requester_id, owner_id, clean_title, clean_instr, now],
+        "INSERT INTO tasks(id, requester_id, owner_id, thread_id, title, instruction, status, revision, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', 1, ?7, ?7)",
+        params![
+            task_id,
+            requester_id,
+            owner_id,
+            thread_id,
+            clean_title,
+            clean_instr,
+            now
+        ],
     )?;
     tx.execute(
         "INSERT INTO node_jobs(task_id, user_id, node_id, task_revision, authorization, status, updated_at)
@@ -443,21 +475,33 @@ pub async fn work(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Val
                    AND (lease_until IS NULL OR lease_until <= ?3)",
                 params![uid, nid, now],
             )?;
-            let pending: Option<(String, i64, String, String)> = tx
+            let pending: Option<(String, i64, String, String, Option<String>)> = tx
                 .query_row(
-                    "SELECT j.task_id, j.task_revision, t.title, t.instruction
+                    "SELECT j.task_id, j.task_revision, t.title, t.instruction, t.thread_id
                      FROM node_jobs j
                      JOIN tasks t ON t.id = j.task_id
                      WHERE j.user_id = ?1 AND j.node_id = ?2
                        AND j.status = 'queued' AND t.status = 'running' AND t.revision = j.task_revision
                      ORDER BY j.updated_at ASC LIMIT 1",
                     params![uid, nid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
                 )
                 .optional()?;
-            let Some((task_id, task_revision, title, instruction)) = pending else {
+            let Some((task_id, task_revision, title, instruction, thread_id)) = pending else {
                 tx.commit()?;
                 return Ok(None);
+            };
+            let agent_session_id: Option<String> = if let Some(ref thr_id) = thread_id {
+                tx.query_row(
+                    "SELECT node_session_id FROM threads
+                     WHERE id = ?1 AND user_id = ?2 AND node_id = ?3
+                       AND node_session_id IS NOT NULL AND node_session_id != ''",
+                    params![thr_id, uid, nid],
+                    |r| r.get(0),
+                )
+                .optional()?
+            } else {
+                None
             };
             let lease_token = random_token();
             let lease_until = now + LEASE_TTL_SECS;
@@ -469,11 +513,29 @@ pub async fn work(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Val
                 params![task_id, sha256_hex(&lease_token), lease_until, now],
             )?;
             tx.commit()?;
-            Ok(Some((task_id, task_revision, lease_token, lease_until, title, instruction)))
+            Ok(Some((
+                task_id,
+                task_revision,
+                lease_token,
+                lease_until,
+                title,
+                instruction,
+                thread_id,
+                agent_session_id,
+            )))
         })
         .await?;
 
-    let Some((task_id, task_revision, lease_token, lease_until, title, instruction)) = claimed
+    let Some((
+        task_id,
+        task_revision,
+        lease_token,
+        lease_until,
+        title,
+        instruction,
+        thread_id,
+        agent_session_id,
+    )) = claimed
     else {
         return Ok(Json(json!({
             "node": {"id": node_id, "name": node_name},
@@ -497,6 +559,8 @@ pub async fn work(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Val
             "lease_until": lease_until,
             "title": title,
             "instruction": instruction,
+            "thread_id": thread_id,
+            "agent_session_id": agent_session_id,
             "attachments": atts,
         }
     })))
@@ -587,6 +651,22 @@ pub struct SubmitResultInput {
     content: String,
     #[serde(default)]
     attachments: Vec<SubmitAttachment>,
+    #[serde(default)]
+    agent_session_id: Option<String>,
+}
+
+fn valid_session_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 4
+        && trimmed.len() <= 128
+        && trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        Some(trimmed.to_owned())
+    } else {
+        None
+    }
 }
 
 pub async fn submit_result(
@@ -669,6 +749,7 @@ pub async fn submit_result(
     let content_db = content.clone();
     let rev = input.expected_revision;
     let node_name_db = node_name.clone();
+    let agent_sid_db = input.agent_session_id.as_deref().and_then(valid_session_id);
 
     let req_for_tx = requester_id.clone();
     let (title, is_cross_user, auto_deliver, already_submitted) = hub
@@ -733,23 +814,47 @@ pub async fn submit_result(
                  WHERE task_id = ?1",
                 params![tid, job_status, submission_hash, final_status, now],
             )?;
-            let (title, req_id): (String, String) = tx.query_row(
-                "SELECT title, requester_id FROM tasks WHERE id = ?1",
+            let (title, req_id, task_thread_id): (String, String, Option<String>) = tx.query_row(
+                "SELECT title, requester_id, thread_id FROM tasks WHERE id = ?1",
                 [&tid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
             tx.execute(
                 "UPDATE tasks SET status = ?2, result = ?3, revision = revision + 1, updated_at = ?4
                  WHERE id = ?1",
                 params![tid, final_status, content_db, now],
             )?;
-            // Post result back to owner's chat stream.
+            // Post result back to owner's chat stream (tagged with implicit thread_id if present).
             let msg_body = format!("**[节点 {node_name_db} · {title}]**\n\n{content_db}");
             tx.execute(
-                "INSERT INTO messages(user_id, role, content, status, created_at)
-                 VALUES (?1, 'assistant', ?2, 'complete', ?3)",
-                params![uid, msg_body, now],
+                "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
+                 VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
+                params![uid, task_thread_id, msg_body, now],
             )?;
+            // Update implicit thread metadata & persist node CLI session ID for seamless follow-up.
+            if let Some(ref thr_id) = task_thread_id {
+                let compact_outcome = truncate_bytes(
+                    &content_db
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .take(3)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    220,
+                );
+                tx.execute(
+                    "UPDATE threads
+                     SET node_id = ?3,
+                         node_session_id = COALESCE(?4, node_session_id),
+                         summary = CASE WHEN ?5 != '' THEN ?5 ELSE summary END,
+                         status = 'active',
+                         turn_count = turn_count + 1,
+                         updated_at = ?6
+                     WHERE id = ?1 AND user_id = ?2",
+                    params![thr_id, uid, nid, agent_sid_db, compact_outcome, now],
+                )?;
+            }
             // If cross-user task and owner opted into auto_deliver, share result to requester too.
             if req_id != uid && perms.auto_deliver && final_status == "done" {
                 let peer_msg = format!("**[协作交付 · {title}]**\n\n{content_db}");
