@@ -50,7 +50,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     dispatch_node: '派发节点',
     cron_run: '定时执行',
     update_memory: '更新记忆',
-    update_ledger: '更新台账',
+    update_ledger: '更新事项',
     permissions: '修改授权',
     delegate: '发起协作',
     task_deliver: '交付结果',
@@ -251,7 +251,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
               </div>`,
           )
           .join('')
-      : '<p class="note">暂无专项台账，对话跟进时自动记录</p>';
+      : '<p class="note">暂无持续事项，对话跟进时自动记录</p>';
 
     bodyEl.innerHTML = `
       <section class="panel-card">
@@ -280,13 +280,13 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
       </section>
 
       <section class="panel-card">
-        <h3>专项台账 (${ledgers.length})</h3>
+        <h3>持续事项 (${ledgers.length})</h3>
         ${ledgersHtml}
         <details class="node-repos mt-10">
-          <summary>+ 手动添加台账</summary>
+          <summary>+ 手动添加事项</summary>
           <form id="add-ledger-form" class="mt-6">
-            <input type="text" name="title" placeholder="台账标题" required>
-            <textarea name="notes" rows="2" placeholder="要点 / 规则…" class="mt-6"></textarea>
+            <input type="text" name="title" placeholder="事项名称" required>
+            <textarea name="notes" rows="2" placeholder="进展 / 备忘…" class="mt-6"></textarea>
             <div class="row"><button type="submit" class="primary sm">保存</button></div>
           </form>
         </details>
@@ -351,7 +351,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
         method: 'POST',
         body: { title: fd.get('title'), notes: fd.get('notes'), status: 'active' },
       });
-      showToast('台账已保存');
+      showToast('事项已保存');
       await onRefresh();
     };
     document.getElementById('add-cron-form').onsubmit = async (ev) => {
