@@ -2525,7 +2525,7 @@ pub(super) async fn work(State(h): State<Hub>, headers: HeaderMap) -> Result<Jso
                 let speaker = if role == "user" {
                     "用户"
                 } else {
-                    "Muse"
+                    "Agenct"
                 };
                 let snippet: String = strip_attachment_markers(&content)
                     .chars()

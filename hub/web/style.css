@@ -468,7 +468,7 @@ article select { appearance: auto; }
 .activity-list .day.collapsed::after { content: "›"; }
 .activity-list .day:first-child { margin-top: 6px; }
 .activity-list:empty::before {
-  content: "还没有历史任务脉络。与 Muse 的每次协作与任务进展都会自动归档在这里。";
+  content: "还没有历史任务脉络。与 Agenct 的每次协作与任务进展都会自动归档在这里。";
   color: var(--muted); font-size: 14px; padding: 20px; text-align: center;
 }
 .activity-item {

@@ -126,11 +126,11 @@ pub(crate) struct MuseProfileConfig {
 }
 
 fn default_muse_name() -> String {
-    "Muse".to_owned()
+    "Agenct".to_owned()
 }
 
 fn default_soul_md() -> String {
-    "# SOUL.md · 核心人设与行事准则\n- 身份：我是你的 7×24h 个人超级智能体 Muse。\n- 沟通风格：干练、直接、结论先行，绝不说生硬的客服套话。\n- 自主性准则：能直接调用工具或联动本机节点解决的事务一步到位；涉及生产高危操作或跨人承诺时主动请示。".to_owned()
+    "# SOUL.md · 核心人设与行事准则\n- 身份：我是你的 7×24h 个人超级智能体 Agenct。\n- 沟通风格：干练、直接、结论先行，绝不说生硬的客服套话。\n- 自主性准则：能直接调用工具或联动本机节点解决的事务一步到位；涉及生产高危操作或跨人承诺时主动请示。".to_owned()
 }
 
 fn default_memory_md() -> String {
@@ -249,11 +249,21 @@ pub(crate) fn load_automation_merged(db: &Connection, path: Option<&Path>) -> Au
     let from_file: Option<AutomationStore> = path
         .and_then(|p| std::fs::read(p).ok())
         .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-    let store = match (from_file, from_db) {
+    let mut store = match (from_file, from_db) {
         (Some(file_store), _) => file_store,
         (None, Some(db_store)) => db_store,
         (None, None) => AutomationStore::default(),
     };
+    for prof in store.muse_profiles.values_mut() {
+        if prof.name == "Muse" {
+            prof.name = default_muse_name();
+        }
+        if prof.soul_md.contains("个人超级智能体 Muse。") {
+            prof.soul_md = prof
+                .soul_md
+                .replace("个人超级智能体 Muse。", "个人超级智能体 Agenct。");
+        }
+    }
     persist_automation_db(db, &store);
     store
 }
@@ -3741,7 +3751,7 @@ async fn try_handle_muse_agent_loop(
         recent_msgs
             .iter()
             .map(|(role, content)| {
-                let speaker = if role == "user" { "用户" } else { "Muse" };
+                let speaker = if role == "user" { "用户" } else { "Agenct" };
                 let snippet: String = nodes::strip_attachment_markers(content)
                     .chars()
                     .take(360)

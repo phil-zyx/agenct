@@ -223,7 +223,7 @@ if ($('save-muse-soul')) {
     if (statusNote) statusNote.textContent = '正在保存…';
     try {
       const saved = await api(context, 'automation/muse', 'POST', {
-        name: $('muse-name-input')?.value || 'Muse',
+        name: $('muse-name-input')?.value || 'Agenct',
         soul_md: $('muse-soul-input')?.value || '',
         memory_md: $('muse-memory-input')?.value || ''
       });

@@ -220,7 +220,7 @@ function renderMuseDrawer(context, automation, proposals, tasks) {
     lastMuseAutomation = automation;
   }
   const auto = lastMuseAutomation || { rules: [], crons: [], muse: null };
-  const museName = (auto.muse?.name || 'Muse').trim() || 'Muse';
+  const museName = (auto.muse?.name || 'Agenct').trim() || 'Agenct';
   const drawerName = $('muse-drawer-name');
   if (drawerName) drawerName.textContent = museName;
   const avatarName = $('muse-avatar-name');
@@ -231,7 +231,7 @@ function renderMuseDrawer(context, automation, proposals, tasks) {
   if (connText && connStatus) {
     const onlineNode = Array.isArray(userNodes) ? userNodes.find(n => n.online) : null;
     connText.textContent = onlineNode ? '已连接' : '已连接';
-    connStatus.title = onlineNode ? `已连接节点：${onlineNode.name || onlineNode.id}` : '云端 Muse 已连接';
+    connStatus.title = onlineNode ? `已连接节点：${onlineNode.name || onlineNode.id}` : `云端 ${museName} 已连接`;
   }
 
   // 1. Tab 1 top: Scheduled Tasks (预定任务) + Live Ledgers (专项活账本 / 静默挂起)
