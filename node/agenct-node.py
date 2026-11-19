@@ -301,11 +301,28 @@ class ExecutionJournal:
         return out
 
 
-def materialize_attachments(attachments: list[dict]) -> tuple[list[str], str | None]:
+def make_scoped_tempdir(prefix: str, workdir: str | None = None, sandbox: str = "workspace-write") -> str:
+    """Create a private temp dir inside workdir when writable to avoid CLI external_directory rejections."""
+    if workdir and sandbox != "readonly" and os.path.isdir(workdir):
+        try:
+            path = tempfile.mkdtemp(prefix=f".{prefix}", dir=workdir)
+            os.chmod(path, 0o700)
+            return path
+        except OSError:
+            pass
+    path = tempfile.mkdtemp(prefix=prefix)
+    os.chmod(path, 0o700)
+    return path
+
+
+def materialize_attachments(
+    attachments: list[dict],
+    workdir: str | None = None,
+    sandbox: str = "workspace-write",
+) -> tuple[list[str], str | None]:
     if not attachments:
         return [], None
-    temp_dir = tempfile.mkdtemp(prefix="agenct-in-")
-    os.chmod(temp_dir, 0o700)
+    temp_dir = make_scoped_tempdir("agenct-in-", workdir, sandbox)
     paths: list[str] = []
     for idx, att in enumerate(attachments[:4]):
         b64 = att.get("data_base64") or ""
@@ -376,7 +393,8 @@ def build_prompt(job: dict, input_files: list[str], evidence_dir: str, workdir: 
     if input_files:
         parts.append("Input attachments saved locally:\n" + "\n".join(f"- {p}" for p in input_files))
     parts.append(
-        f"Optional verification evidence (screenshots/logs/reports) may be saved to: {evidence_dir}"
+        f"For text queries, output the final Markdown answer directly without creating files. "
+        f"Only save screenshots or downloadable artifact files to {evidence_dir} if explicitly requested."
     )
     return "\n\n".join(parts)
 
@@ -469,9 +487,8 @@ def execute_job(
     progress_cb,
     meta_out: dict | None = None,
 ) -> tuple[str, str, list[dict]]:
-    input_files, in_dir = materialize_attachments(job.get("attachments") or [])
-    evidence_dir = tempfile.mkdtemp(prefix="agenct-ev-")
-    os.chmod(evidence_dir, 0o700)
+    input_files, in_dir = materialize_attachments(job.get("attachments") or [], workdir, sandbox)
+    evidence_dir = make_scoped_tempdir("agenct-ev-", workdir, sandbox)
     try:
         prompt = build_prompt(job, input_files, evidence_dir, workdir)
         env = dict(os.environ)
