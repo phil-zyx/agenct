@@ -1,5 +1,5 @@
 // Agenct v2 entrypoint with classic left-rail + centered-chat + floating-avatar Muse drawer layout.
-import { api, setCsrfToken, showToast } from './api.js';
+import { api, avatarById, setCsrfToken, showToast } from './api.js';
 import { initChat } from './chat.js';
 import { initDrawer } from './drawer.js';
 import { connectEvents } from './sse.js';
@@ -36,10 +36,26 @@ const museToggle = document.getElementById('muse-head-toggle');
 
 const agentNameEl = document.getElementById('agent-name');
 const drawerAgentNameEl = document.getElementById('drawer-agent-name');
+const headAvatarEl = document.getElementById('head-avatar');
+const drawerAvatarEl = document.getElementById('drawer-avatar');
+const heroAvatarWrapEl = document.getElementById('hero-avatar-wrap');
 const settingsIdentity = document.getElementById('settings-identity');
 const nodePill = document.getElementById('node-pill');
 const ssePill = document.getElementById('sse-pill');
 const sseBolt = document.getElementById('sse-bolt');
+
+function applyAvatar(avatarId, isBusy) {
+  const item = avatarById(avatarId);
+  for (const img of [headAvatarEl, drawerAvatarEl]) {
+    if (!img) continue;
+    if (img.getAttribute('src') !== item.src) img.setAttribute('src', item.src);
+    img.classList.toggle('is-portrait', item.animated);
+  }
+  museToggle?.classList.toggle('has-portrait', item.animated);
+  museToggle?.classList.toggle('is-thinking', Boolean(isBusy));
+  heroAvatarWrapEl?.classList.toggle('has-portrait', item.animated);
+  heroAvatarWrapEl?.classList.toggle('is-thinking', Boolean(isBusy));
+}
 
 let chatUI = null;
 let drawerUI = null;
@@ -86,6 +102,7 @@ async function refresh() {
       (t) => t.status === 'pending' || t.status === 'running',
     ).length;
     railBadge.textContent = activeTasks > 0 ? String(activeTasks) : '';
+    applyAvatar(state.profile?.avatar_id, activeTasks > 0);
     chatUI.render();
     drawerUI.render();
   })().finally(() => {

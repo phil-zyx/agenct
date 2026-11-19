@@ -98,6 +98,8 @@ export function initChat({ state, onRefresh }) {
     sending = true;
     sendBtn.disabled = true;
     typingEl.classList.remove('hide');
+    document.getElementById('muse-head-toggle')?.classList.add('is-thinking');
+    document.getElementById('hero-avatar-wrap')?.classList.add('is-thinking');
     inputEl.value = '';
     pendingAtts = [];
     renderPendingAtts();
@@ -116,6 +118,11 @@ export function initChat({ state, onRefresh }) {
       sending = false;
       sendBtn.disabled = false;
       typingEl.classList.add('hide');
+      const hasRunning = (state.tasks || []).some((t) => t.status === 'running');
+      if (!hasRunning) {
+        document.getElementById('muse-head-toggle')?.classList.remove('is-thinking');
+        document.getElementById('hero-avatar-wrap')?.classList.remove('is-thinking');
+      }
       inputEl.focus();
     }
   };

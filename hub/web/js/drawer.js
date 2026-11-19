@@ -1,5 +1,5 @@
 // Right Muse Drawer (Tasks/Nodes, Ledgers/Crons/Audit, SOUL/MEMORY) + Settings Pane + Contacts.
-import { api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
+import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 
 export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
   const bodyEl = document.getElementById('drawer-body');
@@ -588,13 +588,31 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
   }
 
   function renderSoulTab() {
-    const p = state.profile || { name: 'Agenct', soul_md: '', memory_md: '', updated_at: 0 };
+    const p = state.profile || { name: 'Agenct', soul_md: '', memory_md: '', avatar_id: 'agenct', updated_at: 0 };
+    const currentAvatar = p.avatar_id || 'agenct';
     const audits = state.audit_logs || [];
     const soulText = stripMdHeading(p.soul_md);
     const memText = stripMdHeading(p.memory_md);
     const updatedHint = p.updated_at ? `更新于 ${fmtTime(p.updated_at)}` : '系统自动维护';
 
+    const avatarChoicesHtml = AVATAR_CATALOG.map((av) => {
+      const selected = av.id === currentAvatar;
+      return `
+        <button type="button" class="avatar-choice ${selected ? 'on' : ''}" data-pick-avatar="${esc(av.id)}" aria-pressed="${selected ? 'true' : 'false'}">
+          <span class="avatar-choice-ring">
+            <img class="avatar-choice-img ${av.animated ? 'is-portrait' : ''}" src="${esc(av.src)}" alt="${esc(av.name)}" width="54" height="54" loading="lazy">
+          </span>
+          <span class="avatar-choice-name">${esc(av.name)}</span>
+          ${av.animated ? '<span class="avatar-choice-tag">动态</span>' : '<span class="avatar-choice-tag muted">静态</span>'}
+        </button>`;
+    }).join('');
+
     bodyEl.innerHTML = `
+      <section class="panel-card">
+        <h3><span>形象与动态头像</span><span class="note">点选即刻生效</span></h3>
+        <div class="avatar-grid">${avatarChoicesHtml}</div>
+      </section>
+
       <section class="panel-card">
         <h3><span>行事风格</span><span class="note">${esc(updatedHint)}</span></h3>
         <div class="memory-prose">${renderMarkdown(soulText || '默认干练直接风格')}</div>
@@ -639,6 +657,21 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
             : '<p class="note">暂无记录</p>'
         }
       </section>`;
+
+    bodyEl.querySelectorAll('[data-pick-avatar]').forEach((btn) => {
+      btn.onclick = async () => {
+        const id = btn.dataset.pickAvatar;
+        if (!id || id === currentAvatar) return;
+        try {
+          await api('/api/brain', { method: 'PUT', body: { avatar_id: id } });
+          const picked = AVATAR_CATALOG.find((a) => a.id === id);
+          showToast(`已切换头像：${picked?.name || id}`);
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
 
     document.getElementById('chat-tune-memory').onclick = () => {
       if (onPromptChat) onPromptChat('记住：');

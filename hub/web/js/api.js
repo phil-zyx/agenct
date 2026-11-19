@@ -76,3 +76,14 @@ export function showToast(msg) {
   clearTimeout(showToast._t);
   showToast._t = setTimeout(() => el.classList.add('hide'), 3200);
 }
+
+export const AVATAR_CATALOG = [
+  { id: 'agenct', name: '默认图标', desc: '极简矢量', src: 'brand/agenct-icon.svg', animated: false },
+  { id: 'sakura', name: '樱粉巫女', desc: '动态微动', src: 'avatars/sakura.webp', animated: true },
+  { id: 'violet', name: '冷紫和风', desc: '动态微动', src: 'avatars/violet.webp', animated: true },
+  { id: 'cheshire', name: '猫耳女仆', desc: '动态微动', src: 'avatars/cheshire.webp', animated: true },
+];
+
+export function avatarById(id) {
+  return AVATAR_CATALOG.find((a) => a.id === id) || AVATAR_CATALOG[0];
+}

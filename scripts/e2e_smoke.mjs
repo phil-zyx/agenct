@@ -141,10 +141,17 @@ try {
   // 6. Verify live SSE pushed the completed node result directly into the open browser!
   await page.waitForFunction(() => document.body.textContent.includes('Node Result:'), { timeout: 10000 });
 
-  // 7. Verify 2-tab Muse drawer (Tasks + Soul/Memory) & Settings view.
+  // 7. Verify 2-tab Muse drawer (Work Threads + Soul/Memory), live dynamic avatar picker & Settings view.
   await page.waitForSelector('#drawer-body .panel-card h3');
   await page.click('.muse-seg button[data-tab="soul"]');
   await page.waitForSelector('#chat-tune-memory');
+  await page.click('[data-pick-avatar="sakura"]');
+  await page.waitForFunction(
+    () =>
+      document.getElementById('head-avatar')?.getAttribute('src') === 'avatars/sakura.webp' &&
+      document.getElementById('drawer-avatar')?.getAttribute('src') === 'avatars/sakura.webp',
+    { timeout: 5000 },
+  );
   await page.click('#rail-more');
   await page.click('#open-settings');
   await page.waitForSelector('#perms-form');

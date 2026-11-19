@@ -38,11 +38,24 @@ pub struct ThreadView {
     pub updated_at: i64,
 }
 
+const DEFAULT_AVATAR_ID: &str = "agenct";
+
+fn normalize_avatar_id(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "agenct" | "default" | "默认" => Some("agenct"),
+        "sakura" | "樱粉" | "樱粉巫女" | "八重神子" => Some("sakura"),
+        "violet" | "冷紫" | "冷紫和风" | "雷电将军" => Some("violet"),
+        "cheshire" | "柴郡" | "猫耳女仆" => Some("cheshire"),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentProfile {
     pub name: String,
     pub soul_md: String,
     pub memory_md: String,
+    pub avatar_id: String,
     pub updated_at: i64,
 }
 
@@ -52,6 +65,7 @@ impl Default for AgentProfile {
             name: DEFAULT_AGENT_NAME.into(),
             soul_md: DEFAULT_SOUL_MD.into(),
             memory_md: DEFAULT_MEMORY_MD.into(),
+            avatar_id: DEFAULT_AVATAR_ID.into(),
             updated_at: 0,
         }
     }
@@ -69,14 +83,18 @@ pub struct Ledger {
 pub fn read_profile_sync(conn: &Connection, user_id: &str) -> Result<AgentProfile> {
     Ok(conn
         .query_row(
-            "SELECT name, soul_md, memory_md, updated_at FROM agent_profiles WHERE user_id = ?1",
+            "SELECT name, soul_md, memory_md, avatar_id, updated_at FROM agent_profiles WHERE user_id = ?1",
             [user_id],
             |r| {
+                let raw_avatar: String = r.get(3)?;
                 Ok(AgentProfile {
                     name: r.get(0)?,
                     soul_md: r.get(1)?,
                     memory_md: r.get(2)?,
-                    updated_at: r.get(3)?,
+                    avatar_id: normalize_avatar_id(&raw_avatar)
+                        .unwrap_or(DEFAULT_AVATAR_ID)
+                        .to_owned(),
+                    updated_at: r.get(4)?,
                 })
             },
         )
@@ -281,9 +299,14 @@ pub async fn bootstrap(State(hub): State<Hub>, headers: HeaderMap) -> Result<Jso
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SaveProfileInput {
-    pub name: String,
-    pub soul_md: String,
-    pub memory_md: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub soul_md: Option<String>,
+    #[serde(default)]
+    pub memory_md: Option<String>,
+    #[serde(default)]
+    pub avatar_id: Option<String>,
 }
 
 pub async fn save_profile(
@@ -292,35 +315,55 @@ pub async fn save_profile(
     Json(input): Json<SaveProfileInput>,
 ) -> Result<Json<AgentProfile>> {
     let user = hub.require_user(&headers).await?;
-    let name = truncate_bytes(input.name.trim(), 48);
-    if name.is_empty() {
-        return Err(invalid("agent name cannot be empty"));
-    }
-    let profile = AgentProfile {
-        name,
-        soul_md: truncate_bytes(input.soul_md.trim(), 6000),
-        memory_md: truncate_bytes(input.memory_md.trim(), 8000),
-        updated_at: now_unix(),
+    let next_avatar = match input.avatar_id.as_deref() {
+        Some(raw) => Some(
+            normalize_avatar_id(raw)
+                .ok_or_else(|| invalid("invalid avatar_id"))?
+                .to_owned(),
+        ),
+        None => None,
     };
-    let p_db = profile.clone();
+    let next_name = match input.name {
+        Some(raw) => {
+            let trimmed = truncate_bytes(raw.trim(), 48);
+            if trimmed.is_empty() {
+                return Err(invalid("agent name cannot be empty"));
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    let next_soul = input.soul_md.map(|s| truncate_bytes(s.trim(), 6000));
+    let next_mem = input.memory_md.map(|s| truncate_bytes(s.trim(), 8000));
     let uid = user.id.clone();
-    hub.db
+
+    let profile = hub
+        .db
         .write(move |conn| {
+            let mut p = read_profile_sync(conn, &uid)?;
+            if let Some(n) = next_name {
+                p.name = n;
+            }
+            if let Some(s) = next_soul {
+                p.soul_md = s;
+            }
+            if let Some(m) = next_mem {
+                p.memory_md = m;
+            }
+            if let Some(a) = next_avatar {
+                p.avatar_id = a;
+            }
+            p.updated_at = now_unix();
             conn.execute(
-                "INSERT INTO agent_profiles(user_id, name, soul_md, memory_md, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO agent_profiles(user_id, name, soul_md, memory_md, avatar_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(user_id) DO UPDATE SET
                    name=excluded.name, soul_md=excluded.soul_md,
-                   memory_md=excluded.memory_md, updated_at=excluded.updated_at",
-                params![
-                    uid,
-                    p_db.name,
-                    p_db.soul_md,
-                    p_db.memory_md,
-                    p_db.updated_at
-                ],
+                   memory_md=excluded.memory_md, avatar_id=excluded.avatar_id,
+                   updated_at=excluded.updated_at",
+                params![uid, p.name, p.soul_md, p.memory_md, p.avatar_id, p.updated_at],
             )?;
-            Ok(())
+            Ok(p)
         })
         .await?;
     hub.events
@@ -521,6 +564,8 @@ struct ToolCall {
     action: Option<String>,
     #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
+    avatar_id: Option<String>,
     #[serde(default)]
     soul_md: Option<String>,
     #[serde(default)]
@@ -1171,7 +1216,7 @@ fn build_system_prompt(
 {{"reply":"直接展示给用户的自然中文回复（必填）","thread_id":"thr_xxx 或 new 或 null","thread_title":"仅当 thread_id=new 时给简短标题，否则 null","tools":[]}}
 
 === 可组合调用的工具（必须放在 tools 数组中，严禁单独输出） ===
-1. update_memory: {{"tool":"update_memory","name":null,"soul_md":null,"memory_append":"追加一条长期记忆/规矩","memory_replace":null}}
+1. update_memory: {{"tool":"update_memory","name":null,"avatar_id":"agenct|sakura|violet|cheshire或null","soul_md":null,"memory_append":"追加一条长期记忆/规矩","memory_replace":null}}
 2. update_ledger: {{"tool":"update_ledger","action":"upsert|mute|done|delete","ledger_id":null,"title":"专项名","status":"active|muted|done","notes_append":"增量记录","notes_replace":null}}
 3. manage_cron: {{"tool":"manage_cron","action":"add|delete","cron_id":null,"daily_time_cst":"HH:MM或null","interval_minutes":60,"target":"cloud|auto|node_id","instruction":"完整指令"}}
 4. manage_rule: {{"tool":"manage_rule","action":"add|delete","rule_id":null,"keyword":"关键词","node_id":"目标节点或cloud"}}
@@ -1292,6 +1337,7 @@ fn parse_brain_response(raw: &str) -> BrainResponse {
 async fn apply_update_memory(hub: &Hub, user_id: &str, call: &ToolCall) -> Result<()> {
     let uid = user_id.to_owned();
     let name_opt = call.name.clone();
+    let avatar_opt = call.avatar_id.clone();
     let soul_opt = call.soul_md.clone();
     let mem_rep = call.memory_replace.clone();
     let mem_app = call.memory_append.clone();
@@ -1300,6 +1346,9 @@ async fn apply_update_memory(hub: &Hub, user_id: &str, call: &ToolCall) -> Resul
             let mut p = read_profile_sync(conn, &uid)?;
             if let Some(n) = name_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 p.name = truncate_bytes(n, 48);
+            }
+            if let Some(a) = avatar_opt.as_deref().and_then(normalize_avatar_id) {
+                p.avatar_id = a.to_owned();
             }
             if let Some(s) = soul_opt.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                 p.soul_md = truncate_bytes(s, 6000);
@@ -1323,12 +1372,13 @@ async fn apply_update_memory(hub: &Hub, user_id: &str, call: &ToolCall) -> Resul
             }
             p.updated_at = now_unix();
             conn.execute(
-                "INSERT INTO agent_profiles(user_id, name, soul_md, memory_md, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO agent_profiles(user_id, name, soul_md, memory_md, avatar_id, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(user_id) DO UPDATE SET
                    name=excluded.name, soul_md=excluded.soul_md,
-                   memory_md=excluded.memory_md, updated_at=excluded.updated_at",
-                params![uid, p.name, p.soul_md, p.memory_md, p.updated_at],
+                   memory_md=excluded.memory_md, avatar_id=excluded.avatar_id,
+                   updated_at=excluded.updated_at",
+                params![uid, p.name, p.soul_md, p.memory_md, p.avatar_id, p.updated_at],
             )?;
             record_audit(conn, &uid, "update_memory", "ok", "Updated SOUL/MEMORY", "")?;
             Ok(())

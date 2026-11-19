@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
-const SCHEMA_V2: &str = r#"
+const SCHEMA_V3: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     gitlab_id INTEGER UNIQUE,
@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     name TEXT NOT NULL,
     soul_md TEXT NOT NULL,
     memory_md TEXT NOT NULL,
+    avatar_id TEXT NOT NULL DEFAULT 'agenct',
     rolling_summary TEXT NOT NULL DEFAULT '',
     compacted_msg_id INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
@@ -235,8 +236,8 @@ impl Db {
 
         let writer = Connection::open(path)?;
         writer.busy_timeout(Duration::from_millis(5000))?;
-        let current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(current_version, 0 | 1 | SCHEMA_VERSION) {
+        let mut current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if !matches!(current_version, 0 | 1 | 2 | SCHEMA_VERSION) {
             return Err(format!(
                 "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
             )
@@ -247,33 +248,42 @@ impl Db {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )?;
-        if current_version == 1 {
-            writer.execute_batch(
-                "BEGIN IMMEDIATE;
-                 ALTER TABLE agent_profiles ADD COLUMN rolling_summary TEXT NOT NULL DEFAULT '';
-                 ALTER TABLE agent_profiles ADD COLUMN compacted_msg_id INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE messages ADD COLUMN thread_id TEXT;
-                 ALTER TABLE tasks ADD COLUMN thread_id TEXT;
-                 CREATE TABLE IF NOT EXISTS threads (
-                     id TEXT PRIMARY KEY,
-                     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                     title TEXT NOT NULL,
-                     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
-                     summary TEXT NOT NULL DEFAULT '',
-                     node_id TEXT,
-                     node_session_id TEXT,
-                     turn_count INTEGER NOT NULL DEFAULT 0,
-                     updated_at INTEGER NOT NULL
-                 );
-                 CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id, status, updated_at DESC);
-                 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(user_id, thread_id, id DESC);
-                 PRAGMA user_version = 2;
-                 COMMIT;",
-            )?;
+        if current_version == 0 {
+            writer.execute_batch(SCHEMA_V3)?;
+            writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else {
-            writer.execute_batch(SCHEMA_V2)?;
-            if current_version == 0 {
-                writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            if current_version == 1 {
+                writer.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE agent_profiles ADD COLUMN rolling_summary TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE agent_profiles ADD COLUMN compacted_msg_id INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE messages ADD COLUMN thread_id TEXT;
+                     ALTER TABLE tasks ADD COLUMN thread_id TEXT;
+                     CREATE TABLE IF NOT EXISTS threads (
+                         id TEXT PRIMARY KEY,
+                         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                         title TEXT NOT NULL,
+                         status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+                         summary TEXT NOT NULL DEFAULT '',
+                         node_id TEXT,
+                         node_session_id TEXT,
+                         turn_count INTEGER NOT NULL DEFAULT 0,
+                         updated_at INTEGER NOT NULL
+                     );
+                     CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id, status, updated_at DESC);
+                     CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(user_id, thread_id, id DESC);
+                     PRAGMA user_version = 2;
+                     COMMIT;",
+                )?;
+                current_version = 2;
+            }
+            if current_version == 2 {
+                writer.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE agent_profiles ADD COLUMN avatar_id TEXT NOT NULL DEFAULT 'agenct';
+                     PRAGMA user_version = 3;
+                     COMMIT;",
+                )?;
             }
         }
         // On startup, mark any orphaned running node jobs without a valid future lease as failed.
@@ -398,7 +408,15 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 2);
+        assert_eq!(ver, 3);
+        let avatar: String = conn
+            .query_row(
+                "SELECT avatar_id FROM agent_profiles WHERE user_id='u1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(avatar, "agenct");
         let content: String = conn
             .query_row("SELECT content FROM messages WHERE user_id='u1'", [], |r| {
                 r.get(0)
