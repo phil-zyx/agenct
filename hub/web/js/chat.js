@@ -20,6 +20,8 @@ export function initChat({ state, onRefresh }) {
 
   let pendingAtts = [];
   let sending = false;
+  let optimisticMsg = null;
+  let optimisticBaseLen = 0;
 
   function renderPendingAtts() {
     if (!pendingAtts.length) {
@@ -97,12 +99,19 @@ export function initChat({ state, onRefresh }) {
     }
     sending = true;
     sendBtn.disabled = true;
-    typingEl.classList.remove('hide');
-    document.getElementById('muse-head-toggle')?.classList.add('is-thinking');
-    document.getElementById('hero-avatar-wrap')?.classList.add('is-thinking');
+    optimisticBaseLen = (state.messages || []).length;
+    optimisticMsg = {
+      role: 'user',
+      content: text,
+      created_at: Math.floor(Date.now() / 1000),
+    };
     inputEl.value = '';
     pendingAtts = [];
     renderPendingAtts();
+    render();
+    typingEl.classList.remove('hide');
+    document.getElementById('muse-head-toggle')?.classList.add('is-thinking');
+    document.getElementById('hero-avatar-wrap')?.classList.add('is-thinking');
     scrollerEl.scrollTop = scrollerEl.scrollHeight;
 
     try {
@@ -110,8 +119,11 @@ export function initChat({ state, onRefresh }) {
         method: 'POST',
         body: { message: text, request_id: `req-${randomId()}` },
       });
+      optimisticMsg = null;
       await onRefresh();
     } catch (err) {
+      optimisticMsg = null;
+      render();
       inputEl.value = text;
       showToast(`发送失败：${err.message}`);
     } finally {
@@ -128,7 +140,16 @@ export function initChat({ state, onRefresh }) {
   };
 
   function render() {
-    const msgs = state.messages || [];
+    const serverMsgs = state.messages || [];
+    let msgs = serverMsgs;
+    if (optimisticMsg) {
+      const synced = serverMsgs
+        .slice(optimisticBaseLen)
+        .some((m) => m.role === 'user' && m.content === optimisticMsg.content);
+      if (!synced) {
+        msgs = [...serverMsgs, optimisticMsg];
+      }
+    }
     if (!msgs.length) {
       listEl.innerHTML = '';
       return;
