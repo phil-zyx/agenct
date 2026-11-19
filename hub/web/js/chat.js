@@ -1,4 +1,4 @@
-// Chat message rendering, attachment upload, and single-brain message submission.
+// Chat stream, typing indicator, attachment uploads, and floating pill composer.
 import { api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 
 function randomId() {
@@ -8,6 +8,7 @@ function randomId() {
 }
 
 export function initChat({ state, onRefresh }) {
+  const scrollerEl = document.getElementById('scroller');
   const listEl = document.getElementById('messages');
   const formEl = document.getElementById('chat-form');
   const inputEl = document.getElementById('chat-input');
@@ -15,6 +16,7 @@ export function initChat({ state, onRefresh }) {
   const fileEl = document.getElementById('file-input');
   const attsEl = document.getElementById('pending-atts');
   const stageEl = document.getElementById('stage-bar');
+  const typingEl = document.getElementById('typing');
 
   let pendingAtts = [];
   let sending = false;
@@ -29,7 +31,7 @@ export function initChat({ state, onRefresh }) {
     attsEl.innerHTML = pendingAtts
       .map(
         (a, i) =>
-          `<span class="chip">${esc(a.name)} <button type="button" class="btn ghost sm" data-rm="${i}">×</button></span>`,
+          `<span class="chat-attachment-chip">${esc(a.name)} <button type="button" class="text-btn sm" data-rm="${i}">×</button></span>`,
       )
       .join('');
     attsEl.querySelectorAll('[data-rm]').forEach((btn) => {
@@ -95,9 +97,11 @@ export function initChat({ state, onRefresh }) {
     }
     sending = true;
     sendBtn.disabled = true;
+    typingEl.classList.remove('hide');
     inputEl.value = '';
     pendingAtts = [];
     renderPendingAtts();
+    scrollerEl.scrollTop = scrollerEl.scrollHeight;
 
     try {
       await api('/api/chat', {
@@ -111,6 +115,7 @@ export function initChat({ state, onRefresh }) {
     } finally {
       sending = false;
       sendBtn.disabled = false;
+      typingEl.classList.add('hide');
       inputEl.focus();
     }
   };
@@ -118,31 +123,39 @@ export function initChat({ state, onRefresh }) {
   function render() {
     const msgs = state.messages || [];
     if (!msgs.length) {
-      listEl.innerHTML =
-        '<div class="msg system">你好，我是你的个人超级智能体。可以直接聊天、管理台账与定时任务、<code>@同事</code> 协作，或调度 PC / 云端执行节点。</div>';
+      listEl.innerHTML = '';
       return;
     }
     listEl.innerHTML = msgs
       .map(
         (m) => `
-      <article class="msg ${esc(m.role)}">
+      <div class="msg msg-${esc(m.role)}">
         <div>${renderMarkdown(m.content)}</div>
         <div class="msg-meta">${esc(fmtTime(m.created_at))}</div>
-      </article>`,
+      </div>`,
       )
       .join('');
-    listEl.scrollTop = listEl.scrollHeight;
+    scrollerEl.scrollTop = scrollerEl.scrollHeight;
   }
 
   function setStage(stage) {
     if (stage) {
       stageEl.textContent = stage;
       stageEl.classList.remove('hide');
+      scrollerEl.scrollTop = scrollerEl.scrollHeight;
     } else {
       stageEl.textContent = '';
       stageEl.classList.add('hide');
     }
   }
 
-  return { render, setStage };
+  function insertMention(username) {
+    const prefix = `@${username} `;
+    if (!inputEl.value.startsWith(prefix)) {
+      inputEl.value = prefix + inputEl.value;
+    }
+    inputEl.focus();
+  }
+
+  return { render, setStage, insertMention };
 }

@@ -101,16 +101,18 @@ try {
   await page.waitForSelector('#gitlab-login-btn:not(.hide)');
   await Promise.all([page.waitForURL(`${hubOrigin}/`), page.click('#gitlab-login-btn')]);
 
-  // 2. Verify authenticated workspace & live SSE connection.
-  await page.waitForSelector('#app-view:not(.hide)');
+  // 2. Verify authenticated workspace, floating avatar header, and live SSE connection.
+  await page.waitForSelector('#room:not(.hide)');
   await page.waitForFunction(() => document.getElementById('sse-pill')?.textContent?.includes('实时同步'));
 
-  // 3. Create a Cloud Node in the drawer and capture its token from the install command.
-  await page.fill('#add-node-form input[name="name"]', 'Cloud Runner');
-  await page.selectOption('#add-node-form select[name="kind"]', 'cloud');
-  await page.click('#add-node-form button[type="submit"]');
-  await page.waitForSelector('.install-box code');
-  const installText = await page.textContent('.install-box code');
+  // 3. Open the right Muse drawer via floating Agenct avatar, create a Cloud Node, capture its token.
+  await page.click('#muse-head-toggle');
+  await page.waitForSelector('#task-pane .add-node-form');
+  await page.fill('#task-pane .add-node-form input[name="name"]', 'Cloud Runner');
+  await page.selectOption('#task-pane .add-node-form select[name="kind"]', 'cloud');
+  await page.click('#task-pane .add-node-form button[type="submit"]');
+  await page.waitForSelector('#task-pane .install-box code');
+  const installText = await page.textContent('#task-pane .install-box code');
   const tokenMatch = installText.match(/agn_[0-9a-f]{64}/);
   assert.ok(tokenMatch, `expected node token in install command: ${installText}`);
   const nodeToken = tokenMatch[0];
@@ -139,11 +141,13 @@ try {
   // 6. Verify live SSE pushed the completed node result directly into the open browser!
   await page.waitForFunction(() => document.body.textContent.includes('Node Result:'), { timeout: 10000 });
 
-  // 7. Verify Ledgers & Settings drawer tabs render cleanly.
-  await page.click('button[data-tab="memory"]');
+  // 7. Verify Muse drawer tabs + Settings view via left rail menu.
+  await page.click('.muse-seg button[data-tab="memory"]');
   await page.waitForSelector('#add-ledger-form');
-  await page.click('button[data-tab="settings"]');
+  await page.click('.muse-seg button[data-tab="soul"]');
   await page.waitForSelector('#brain-form');
+  await page.click('#rail-more');
+  await page.click('#open-settings');
   await page.waitForSelector('#perms-form');
 
   assert.deepEqual(errors, [], `unexpected browser errors: ${errors.join('; ')}`);
