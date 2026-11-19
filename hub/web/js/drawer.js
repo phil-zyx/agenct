@@ -7,7 +7,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
   const contactsList = document.getElementById('contacts-list');
   const tabBtns = Array.from(document.querySelectorAll('.muse-seg .tab'));
 
-  let activeTab = 'work';
+  let activeTab = 'tasks';
   let lastInstallCmd = '';
   let integrations = { gitlab: null, im: null };
 
@@ -183,8 +183,10 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     });
   }
 
-  function renderWorkTab() {
+  function renderTasksTab() {
     const tasks = state.tasks || [];
+    const crons = state.crons || [];
+    const ledgers = state.ledgers || [];
     const nodes = state.nodes || [];
     const uid = state.user?.id;
 
@@ -220,11 +222,76 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
           .join('')
       : '<p class="note">暂无进行中任务</p>';
 
+    const cronsHtml = crons.length
+      ? crons
+          .map((c) => {
+            const when = c.daily_time_cst ? `每天 ${c.daily_time_cst}` : `每 ${c.interval_minutes} 分钟`;
+            const target = TARGET_LABEL[c.target] || c.target;
+            return `
+              <div class="item">
+                <div class="item-head">
+                  <span>${esc(when)}</span>
+                  <span class="badge">${esc(target)}</span>
+                </div>
+                ${compactTextHtml(c.instruction, 46, '查看完整指令')}
+                <div class="row"><button type="button" class="sm danger" data-del-cron="${esc(c.id)}">删除</button></div>
+              </div>`;
+          })
+          .join('')
+      : '<p class="note">暂无预定任务，直接对话即可创建</p>';
+
+    const ledgersHtml = ledgers.length
+      ? ledgers
+          .map(
+            (l) => `
+              <div class="item">
+                <div class="item-head"><span>${esc(l.title)}</span><span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span></div>
+                ${compactTextHtml(l.notes, 56, '查看全文')}
+                <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
+              </div>`,
+          )
+          .join('')
+      : '<p class="note">暂无专项台账，对话跟进时自动记录</p>';
+
     bodyEl.innerHTML = `
       <section class="panel-card">
-        <h3>任务与协作 (${tasks.length})</h3>
+        <h3>当前任务 (${tasks.length})</h3>
         ${tasksHtml}
       </section>
+
+      <section class="panel-card">
+        <h3>预定任务 (${crons.length})</h3>
+        ${cronsHtml}
+        <details class="node-repos mt-10">
+          <summary>+ 手动添加定时</summary>
+          <form id="add-cron-form" class="mt-6">
+            <input type="text" name="instruction" placeholder="定时内容（如：汇总今日 GitLab 提交）" required>
+            <div class="row">
+              <input type="text" name="daily_time_cst" placeholder="每天 HH:MM" class="flex-1">
+              <select name="target" class="w-kind">
+                <option value="cloud">云端</option>
+                <option value="cloud-node">云端节点</option>
+                <option value="auto">自动</option>
+              </select>
+              <button type="submit" class="primary sm">添加</button>
+            </div>
+          </form>
+        </details>
+      </section>
+
+      <section class="panel-card">
+        <h3>专项台账 (${ledgers.length})</h3>
+        ${ledgersHtml}
+        <details class="node-repos mt-10">
+          <summary>+ 手动添加台账</summary>
+          <form id="add-ledger-form" class="mt-6">
+            <input type="text" name="title" placeholder="台账标题" required>
+            <textarea name="notes" rows="2" placeholder="要点 / 规则…" class="mt-6"></textarea>
+            <div class="row"><button type="submit" class="primary sm">保存</button></div>
+          </form>
+        </details>
+      </section>
+
       ${nodesCardHtml(nodes)}`;
 
     bodyEl.querySelectorAll('[data-assign]').forEach((b) => {
@@ -265,98 +332,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
         }
       };
     });
-    bindNodeHandlers(bodyEl);
-  }
-
-  function renderMemoryTab() {
-    const ledgers = state.ledgers || [];
-    const crons = state.crons || [];
-    const audits = state.audit_logs || [];
-
-    bodyEl.innerHTML = `
-      <section class="panel-card">
-        <h3>专项活账本 (${ledgers.length})</h3>
-        ${
-          ledgers.length
-            ? ledgers
-                .map(
-                  (l) => `
-              <div class="item">
-                <div class="item-head"><span>${esc(l.title)}</span><span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span></div>
-                ${compactTextHtml(l.notes, 56, '查看全文')}
-                <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
-              </div>`,
-                )
-                .join('')
-            : '<p class="note">暂无活账本，在对话中跟进专项时会自动记录</p>'
-        }
-        <details class="node-repos mt-10">
-          <summary>+ 手动添加台账</summary>
-          <form id="add-ledger-form" class="mt-6">
-            <input type="text" name="title" placeholder="台账标题" required>
-            <textarea name="notes" rows="2" placeholder="要点 / 规则…" class="mt-6"></textarea>
-            <div class="row"><button type="submit" class="primary sm">保存</button></div>
-          </form>
-        </details>
-      </section>
-
-      <section class="panel-card">
-        <h3>预定任务 (${crons.length})</h3>
-        ${
-          crons.length
-            ? crons
-                .map((c) => {
-                  const when = c.daily_time_cst ? `每天 ${c.daily_time_cst}` : `每 ${c.interval_minutes} 分钟`;
-                  const target = TARGET_LABEL[c.target] || c.target;
-                  return `
-              <div class="item">
-                <div class="item-head">
-                  <span>${esc(when)}</span>
-                  <span class="badge">${esc(target)}</span>
-                </div>
-                ${compactTextHtml(c.instruction, 46, '查看完整指令')}
-                <div class="row"><button type="button" class="sm danger" data-del-cron="${esc(c.id)}">删除</button></div>
-              </div>`;
-                })
-                .join('')
-            : '<p class="note">暂无预定任务，直接对话即可创建（如「每天 22 点汇总 GitLab 提交」）</p>'
-        }
-        <details class="node-repos mt-10">
-          <summary>+ 手动添加定时</summary>
-          <form id="add-cron-form" class="mt-6">
-            <input type="text" name="instruction" placeholder="定时内容（如：汇总今日 GitLab 提交）" required>
-            <div class="row">
-              <input type="text" name="daily_time_cst" placeholder="每天 HH:MM" class="flex-1">
-              <select name="target" class="w-kind">
-                <option value="cloud">云端</option>
-                <option value="cloud-node">云端节点</option>
-                <option value="auto">自动</option>
-              </select>
-              <button type="submit" class="primary sm">添加</button>
-            </div>
-          </form>
-        </details>
-      </section>
-
-      <section class="panel-card">
-        <h3>动态记录</h3>
-        ${
-          audits.length
-            ? audits
-                .slice(0, 12)
-                .map((a) => {
-                  const act = AUDIT_ACTION_LABEL[a.action] || a.action;
-                  return `
-              <div class="item">
-                <div class="item-head"><span>${esc(a.title)}</span><span class="note">${esc(fmtTime(a.created_at))}</span></div>
-                <div class="item-sub">${esc(act)}${a.detail ? ` · ${esc(a.detail.slice(0, 60))}` : ''}</div>
-              </div>`;
-                })
-                .join('')
-            : '<p class="note">暂无记录</p>'
-        }
-      </section>`;
-
     bodyEl.querySelectorAll('[data-del-ledger]').forEach((b) => {
       b.onclick = async () => {
         await api(`/api/ledgers/${b.dataset.delLedger}`, { method: 'DELETE' });
@@ -395,6 +370,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
       showToast('定时任务已创建');
       await onRefresh();
     };
+    bindNodeHandlers(bodyEl);
   }
 
   function stripMdHeading(raw) {
@@ -405,6 +381,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
 
   function renderSoulTab() {
     const p = state.profile || { name: 'Agenct', soul_md: '', memory_md: '', updated_at: 0 };
+    const audits = state.audit_logs || [];
     const soulText = stripMdHeading(p.soul_md);
     const memText = stripMdHeading(p.memory_md);
     const updatedHint = p.updated_at ? `更新于 ${fmtTime(p.updated_at)}` : '系统自动维护';
@@ -434,6 +411,25 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
             <div class="row"><button type="submit" class="primary sm">保存修正</button></div>
           </form>
         </details>
+      </section>
+
+      <section class="panel-card">
+        <h3>最近动态</h3>
+        ${
+          audits.length
+            ? audits
+                .slice(0, 10)
+                .map((a) => {
+                  const act = AUDIT_ACTION_LABEL[a.action] || a.action;
+                  return `
+              <div class="item">
+                <div class="item-head"><span>${esc(a.title)}</span><span class="note">${esc(fmtTime(a.created_at))}</span></div>
+                <div class="item-sub">${esc(act)}${a.detail ? ` · ${esc(a.detail.slice(0, 60))}` : ''}</div>
+              </div>`;
+                })
+                .join('')
+            : '<p class="note">暂无记录</p>'
+        }
       </section>`;
 
     document.getElementById('chat-tune-memory').onclick = () => {
@@ -583,8 +579,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
   }
 
   function renderDrawer() {
-    if (activeTab === 'work') renderWorkTab();
-    else if (activeTab === 'memory') renderMemoryTab();
+    if (activeTab === 'tasks') renderTasksTab();
     else renderSoulTab();
   }
 

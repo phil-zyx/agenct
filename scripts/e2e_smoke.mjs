@@ -141,8 +141,7 @@ try {
   // 6. Verify live SSE pushed the completed node result directly into the open browser!
   await page.waitForFunction(() => document.body.textContent.includes('Node Result:'), { timeout: 10000 });
 
-  // 7. Verify Muse drawer tabs (read-only by default + collapsible manual edit) + Settings view.
-  await page.click('.muse-seg button[data-tab="memory"]');
+  // 7. Verify 2-tab Muse drawer (Tasks + Soul/Memory) & Settings view.
   await page.waitForSelector('#drawer-body .panel-card h3');
   await page.click('.muse-seg button[data-tab="soul"]');
   await page.waitForSelector('#chat-tune-memory');
