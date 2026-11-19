@@ -159,6 +159,23 @@ pub(crate) struct MuseAuditRecord {
     pub created_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct MuseLedgerEntry {
+    pub id: String,
+    pub owner: String,
+    pub title: String,
+    /// "active" | "muted" | "completed"
+    #[serde(default = "default_ledger_status")]
+    pub status: String,
+    /// Structured notes / rules / latest progress / numbered records
+    pub notes: String,
+    pub updated_at: i64,
+}
+
+fn default_ledger_status() -> String {
+    "active".to_owned()
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct AutomationStore {
     #[serde(default)]
@@ -179,6 +196,8 @@ pub(crate) struct AutomationStore {
     pub topic_outcomes: HashMap<String, String>,
     #[serde(default)]
     pub audit_logs: Vec<MuseAuditRecord>,
+    #[serde(default)]
+    pub ledgers: Vec<MuseLedgerEntry>,
 }
 
 pub(crate) fn record_muse_audit(
@@ -2689,8 +2708,32 @@ async fn execute_cloud_cron_report(h: &Hub, owner: &str, instruction: &str) -> R
         return Ok(pulse_text);
     }
     if let crate::Runtime::Dsh { url, token } = &h.runtime {
+        let (mem_md, ledgers_summary) = h
+            .automation
+            .lock()
+            .ok()
+            .map(|g| {
+                let m = g
+                    .muse_profiles
+                    .get(owner)
+                    .map(|p| p.memory_md.clone())
+                    .unwrap_or_default();
+                let l_lines: Vec<String> = g
+                    .ledgers
+                    .iter()
+                    .filter(|l| l.owner == owner)
+                    .map(|l| format!("- [{}] {}：{}", l.status, l.title, l.notes))
+                    .collect();
+                (m, l_lines.join("\n"))
+            })
+            .unwrap_or_default();
         let prompt = format!(
-            "你是用户的 7×24h 云端 Super-Agent（管家）。现在要自动执行用户设定的定时任务：「{instruction}」。\n请结合当前系统快照直接给出清晰简洁的执行结果或提醒：\n\n{pulse_text}"
+            "[MUSE_AGENT_TURN]\n\
+             你是用户的 7×24h 云端个人超级智能体（Meta Muse）。现在要自动执行用户设定的定时任务：「{instruction}」。\n\
+             请严格遵守用户的长期规矩（MEMORY.md）与专项活账本状态（注意：状态为 `muted` 静默挂起的事项绝对不要在报告中主动提起或催促！状态为 `active` 的主线按顺延/验收规矩汇报）：\n\n\
+             【MEMORY.md】\n{mem_md}\n\n\
+             【专项活账本 (ledgers)】\n{ledgers_summary}\n\n\
+             【系统快照】\n{pulse_text}"
         );
         let runtime_profile = {
             let db = h.db()?;
@@ -3429,6 +3472,7 @@ pub(crate) async fn answer_chat(
 #[derive(Deserialize)]
 struct MuseAgentResponse {
     reply: String,
+    #[serde(default)]
     tools: Vec<MuseToolCall>,
 }
 
@@ -3463,6 +3507,18 @@ struct MuseToolCall {
     soul_md: Option<String>,
     #[serde(default)]
     memory_append: Option<String>,
+    #[serde(default)]
+    memory_replace: Option<String>,
+    #[serde(default)]
+    ledger_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    notes_append: Option<String>,
+    #[serde(default)]
+    notes_replace: Option<String>,
 }
 
 async fn try_handle_muse_agent_loop(
@@ -3503,7 +3559,7 @@ async fn try_handle_muse_agent_loop(
         return Ok(None);
     }
 
-    let (user_crons, user_rules, has_gitlab, muse_prof) = h
+    let (user_crons, user_rules, has_gitlab, muse_prof, user_ledgers, topic_outcomes_map) = h
         .automation
         .lock()
         .map(|g| {
@@ -3524,11 +3580,18 @@ async fn try_handle_muse_agent_loop(
                 .get(owner)
                 .is_some_and(|c| !c.token.is_empty());
             let mp = g.muse_profiles.get(owner).cloned().unwrap_or_default();
-            (crons, rules, gl, mp)
+            let ledgers: Vec<MuseLedgerEntry> = g
+                .ledgers
+                .iter()
+                .filter(|l| l.owner == owner)
+                .cloned()
+                .collect();
+            let outcomes = g.topic_outcomes.clone();
+            (crons, rules, gl, mp, ledgers, outcomes)
         })
         .unwrap_or_default();
 
-    let (nodes, contacts, recent_msgs, topics, default_best_node) = {
+    let (nodes, contacts, recent_msgs, topics, recent_node_jobs, default_best_node) = {
         let db = h.db()?;
         let now = nodes::now_unix();
         let mut n_stmt = db.prepare(
@@ -3543,7 +3606,12 @@ async fn try_handle_muse_agent_loop(
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        if nodes.is_empty() && user_crons.is_empty() && user_rules.is_empty() && !has_gitlab {
+        if nodes.is_empty()
+            && user_crons.is_empty()
+            && user_rules.is_empty()
+            && user_ledgers.is_empty()
+            && !has_gitlab
+        {
             return Ok(None);
         }
 
@@ -3566,7 +3634,7 @@ async fn try_handle_muse_agent_loop(
             "SELECT role, content FROM (
                 SELECT id, role, content FROM messages
                 WHERE owner=?1 AND status='complete'
-                ORDER BY id DESC LIMIT 6
+                ORDER BY id DESC LIMIT 10
              ) ORDER BY id ASC",
         )?;
         let recent_msgs: Vec<(String, String)> = m_stmt
@@ -3574,27 +3642,60 @@ async fn try_handle_muse_agent_loop(
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let mut t_stmt = db.prepare(
-            "SELECT id, summary, COALESCE(result, '') FROM tasks
+            "SELECT id, summary, status, COALESCE(result, '') FROM tasks
              WHERE requester=?1 AND owner=?1
              ORDER BY rowid DESC LIMIT 20",
         )?;
-        let topics: Vec<(String, String, String)> = t_stmt
+        let topics: Vec<(String, String, String, String)> = t_stmt
             .query_map([owner], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?
             .into_iter()
-            .filter(|(_, sum, _)| nodes::is_topic_summary(sum))
+            .filter(|(_, sum, _, _)| nodes::is_topic_summary(sum))
             .collect();
+
+        let mut j_stmt = db.prepare(
+            "SELECT task_id, node_id, status, instruction
+             FROM node_assignments
+             WHERE owner=?1
+             ORDER BY updated_at DESC LIMIT 4",
+        )?;
+        let recent_node_jobs: Vec<(String, String, String, String, String)> = j_stmt
+            .query_map([owner], |r| {
+                let tid: String = r.get(0)?;
+                let stage = h
+                    .node_progress
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.get(&tid).map(|p| p.stage.clone()))
+                    .unwrap_or_default();
+                Ok((
+                    tid,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    stage,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let default_best = nodes::select_node_with_rule(h, &db, owner, trimmed)
             .ok()
             .flatten();
-        (nodes, contacts, recent_msgs, topics, default_best)
+        (
+            nodes,
+            contacts,
+            recent_msgs,
+            topics,
+            recent_node_jobs,
+            default_best,
+        )
     };
 
     let nodes_block = if nodes.is_empty() {
@@ -3664,18 +3765,60 @@ async fn try_handle_muse_agent_loop(
     } else {
         topics
             .iter()
-            .map(|(id, sum, res)| {
-                let short_res: String = res
+            .map(|(id, sum, st, res)| {
+                let outcome = topic_outcomes_map
+                    .get(id)
+                    .map(String::as_str)
+                    .unwrap_or(res.as_str());
+                let short_res: String = outcome
                     .split_whitespace()
                     .collect::<Vec<_>>()
                     .join(" ")
                     .chars()
-                    .take(60)
+                    .take(80)
                     .collect();
                 if short_res.is_empty() {
-                    format!("- `{id}`：{sum}")
+                    format!("- `{id}` [{st}]：{sum}")
                 } else {
-                    format!("- `{id}`：{sum}（最近：{short_res}）")
+                    format!("- `{id}` [{st}]：{sum}（进展/结论：{short_res}）")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let ledgers_block = if user_ledgers.is_empty() {
+        "（当前尚无专项活账本，可在对话中随时通过 `update_ledger` 创建或追加项目台账、欠账队列、静默挂起项或健康/工作清单）".to_owned()
+    } else {
+        user_ledgers
+            .iter()
+            .map(|l| {
+                let st_label = match l.status.as_str() {
+                    "muted" => "🔇 静默挂起（除非用户主动提及或硬期限触发，否则不在早报/周报/顺带提醒中主动催促）",
+                    "completed" => "✅ 已完结归档",
+                    _ => "🟢 活跃跟进中",
+                };
+                let notes_preview: String = l.notes.chars().take(360).collect();
+                format!(
+                    "- ledger_id=`{}` | 专项=「{}」 | 状态={st_label}\n  台账内容：{notes_preview}",
+                    l.id, l.title
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let active_jobs_block = if recent_node_jobs.is_empty() {
+        "（当前无近期节点作业记录）".to_owned()
+    } else {
+        recent_node_jobs
+            .iter()
+            .map(|(tid, nid, st, instr, stage)| {
+                let short_instr: String = instr.chars().take(72).collect();
+                if stage.is_empty() {
+                    format!("- task=`{tid}` | node=`{nid}` | status=`{st}` | 指令=「{short_instr}」")
+                } else {
+                    format!(
+                        "- task=`{tid}` | node=`{nid}` | status=`{st}` ({stage}) | 指令=「{short_instr}」"
+                    )
                 }
             })
             .collect::<Vec<_>>()
@@ -3689,48 +3832,57 @@ async fn try_handle_muse_agent_loop(
         clean_msg.as_str()
     };
 
-    let soul_snippet: String = muse_prof.soul_md.chars().take(600).collect();
-    let memory_snippet: String = muse_prof.memory_md.chars().take(800).collect();
+    let soul_snippet: String = muse_prof.soul_md.chars().take(800).collect();
+    let memory_snippet: String = muse_prof.memory_md.chars().take(1200).collect();
 
     let prompt = format!(
         "[MUSE_AGENT_TURN]\n\
-         你是用户的 7×24h 个人超级智能体「{}」（Meta Muse 架构：单一大脑 + 多工具自由组合调用）。\n\
-         你是唯一与用户直接对话的大脑，你的 `reply` 字段会直接展示给用户，请始终用自然、干练、聪明的中文与用户交流，绝不要使用冷冰冰的客服模板，也绝不要要求用户按特定格式复述。\n\
-         你可以根据上下文在单轮思考中调用 0 个、1 个或多个后台工具（放入 `tools` 数组）。\n\n\
+         你是用户的 7×24h 个人超级智能体「{}」（Meta Muse 核心大脑：多线意图消歧 + 活账本状态感知 + 单轮多工具联动）。\n\
+         你是唯一与用户直接对话的大脑，你的 `reply` 字段会直接展示给用户，请始终用第一人称（「我」）、自然、干练、结论先行的中文与用户交流，绝不要使用冷冰冰的客服模板，也绝不要要求用户按特定格式复述。\n\n\
+         === 核心认知纪律（Meta Muse 精髓，必须严格遵守） ===\n\
+         1. **单会话多线精准消歧（跨时间/无主语指代解析）**：\n\
+            用户在同一个主对话流里会同时交叉推进多件完全不同的事（代码开发、定时早报、商务项目、个人生活/健康、长期计划），且说话常省略主语或跨了几小时突然指代前面某条消息里的一个词（如「有些不用你继续提醒的怎么处理，比如这个抖音」「而且昨日没做的咋整」「答题试卷这个可以删掉了」「部署到线上」）。\n\
+            你必须综合对比【最近对话历史】、【专项活账本 (ledgers)】、【已有任务脉络 (topics)】与【7×24h 定时任务 (crons)】，精准锁定用户当前这句话到底在指哪条线，绝不张冠李戴！\n\
+         2. **个人约束与老规矩跨线自动套用 + 顺手后台收尾**：\n\
+            回答任何问题（如安排事情、排查方案、日常规划）时，必须自动检索并套用 `SOUL.md`、`MEMORY.md` 和 `ledgers` 里的隐性个人约束与老规矩；如果用户的话里透露出某条专项的新进展或待办（例如聊日常时提到身体状况、提到某个项目的新线索、定下新规矩），你不仅要正面回答当前问题，还必须在同一轮的 `tools` 里顺手调用 `update_ledger` 或 `update_memory` 把它记进对应台账，并在回复末尾用一句话自然交代（「顺带交代一句后台收尾：已记入《...》」）。\n\
+         3. **新规矩与「静默挂起 (muted)」立竿见影**：\n\
+            每当用户纠正你的行为、立下新规矩（如「以后只顺延一条不催债」「必须有可核验的证据才算完成」）或要求某件事别再主动提（「这个别再提了」「静默挂起」），你必须在同一轮里同时调用 `update_memory`（写入长期规矩）、`update_ledger`（将该事项状态设为 `\"muted\"` 或更新台账规则）、以及必要时调用 `manage_cron`（同步修改定时任务的执行规则）。\n\n\
          === 核心人设 (SOUL.md) ===\n{soul_snippet}\n\n\
-         === 长期记忆 (MEMORY.md) ===\n{memory_snippet}\n\n\
-         === 实时环境状态快照 ===\n\
+         === 长期记忆与个人规矩 (MEMORY.md) ===\n{memory_snippet}\n\n\
+         === 全景工作台实时快照 (Workbench Snapshot) ===\n\
+         【专项活账本与长期台账 (ledgers)】\n{ledgers_block}\n\n\
          【7×24h 定时任务 (crons)】\n{crons_block}\n\n\
-         【个人管家规则 (rules)】\n{rules_block}\n\n\
+         【已有任务脉络与最近成果 (topics)】\n{topics_block}\n\n\
+         【近期节点作业执行状态 (active_node_jobs)】\n{active_jobs_block}\n\n\
          【绑定的 PC 节点与本地 Agent (nodes)】\n{nodes_block}\n\
          （注：agy、agy1、agy2、codex、claude、tmux、screen 等均是运行在用户 PC 节点上的本地开发 Agent 或终端窗口，不是外部人类同事。）\n\n\
+         【个人管家规则 (rules)】\n{rules_block}\n\n\
          【通讯录同事】\n{contacts_block}\n\n\
-         【已有任务脉络 (topics)】\n{topics_block}\n\n\
          【最近对话历史】\n{history_block}\n\n\
          【用户最新消息】\n「{msg_for_prompt}」\n\n\
-         === 可自由组合调用的工具列表 (`tools` 数组元素格式) ===\n\
-         1. **管理定时任务 (`manage_cron`)**：\n\
-            `{{\"tool\":\"manage_cron\",\"action\":\"add|update|delete\",\"cron_id\":\"目标cron_id或null\",\"daily_time_cst\":\"HH:MM或null\",\"interval_minutes\":1440,\"instruction\":\"融合用户新要求后的完整定时任务指令\",\"deduplicate_ids\":[\"同时间段重复的cron_id\"]}}`\n\
-            - **复合意图黄金准则**：当用户针对【最近对话历史】中的定时汇总报告说「提交汇总这个简化一下」「只列核心要点」「太长了精简一点」时，你应该在**同一轮**里同时做两件事：\n\
-              (a) 直接在你的 `reply` 中根据历史消息把那份报告浓缩精简好展示给用户，并自然告知已同步更新每晚的定时任务格式；\n\
-              (b) 在 `tools` 中调用 `manage_cron`（`action: \"update\"`）修改定时任务的 `instruction`（并把同时间重复的 cron 填入 `deduplicate_ids` 清理掉），**绝不要**把这种文本精简+改定时配置的需求派给 `dispatch_pc_node`！\n\
-         2. **实时拉取云端 GitLab 提交 (`fetch_gitlab_commits`)**：\n\
+         === 可在单轮自由组合调用的工具列表 (`tools` 数组可含 0、1 或多个工具) ===\n\
+         1. **管理专项活账本与台账 (`update_ledger`)**：\n\
+            `{{\"tool\":\"update_ledger\",\"action\":\"upsert|mute|complete|delete\",\"ledger_id\":\"已有ledger_id或null\",\"title\":\"专项或台账名称（如：中标项目信息 / Go回炉计划 / 待问清单 / 抖音植入报价）\",\"status\":\"active|muted|completed\",\"notes_append\":\"要增量追加到该台账的一条记录或新规矩（保留历史）或null\",\"notes_replace\":\"当需要重排整份台账/盘清欠账队列时覆写的完整台账内容或null\"}}`\n\
+            - 当用户说某件事「别再主动提醒 / 静默挂起」时，调用 `update_ledger` 将该事项设为 `\"status\":\"muted\"`；\n\
+            - 当用户跟进某个专项、新增记录、盘清欠账、或顺带提到需记录的事项时，调用 `update_ledger` 落盘台账。\n\
+         2. **更新管家命名、SOUL.md 或 MEMORY.md (`update_memory`)**：\n\
+            `{{\"tool\":\"update_memory\",\"name\":\"新名字或null\",\"soul_md\":\"更新后的完整SOUL.md或null\",\"memory_append\":\"要追加写入MEMORY.md的一条长期规矩/个人偏好/环境事实或null\",\"memory_replace\":\"重整后的完整MEMORY.md或null\"}}`\n\
+         3. **管理定时任务 (`manage_cron`)**：\n\
+            `{{\"tool\":\"manage_cron\",\"action\":\"add|update|delete\",\"cron_id\":\"目标cron_id或null\",\"daily_time_cst\":\"HH:MM或null\",\"interval_minutes\":1440,\"instruction\":\"融合用户新规矩/顺延规则/精简要求后的完整定时任务指令\",\"deduplicate_ids\":[\"同时间段重复的cron_id\"]}}`\n\
+            - 当用户要求简化/修改定时报告，或定下涉及每日推送的新规矩（如「只顺延一条不覆盖」「静默挂起某项不在早报提」）时，直接在 `reply` 给出处理结果，并在 `tools` 中同步调用 `manage_cron` 更新对应定时任务的 `instruction`（切勿派给 `dispatch_pc_node`）。\n\
+         4. **实时拉取云端 GitLab 提交 (`fetch_gitlab_commits`)**：\n\
             `{{\"tool\":\"fetch_gitlab_commits\",\"instruction\":\"汇总要求\"}}`\n\
-            - 仅当用户要求现在立刻拉取最新的 GitLab 提交（且对话历史里还没有最新报告）时调用。\n\
-         3. **管理个人分发规则 (`manage_rule`)**：\n\
+         5. **管理个人分发规则 (`manage_rule`)**：\n\
             `{{\"tool\":\"manage_rule\",\"action\":\"add|delete\",\"rule_id\":\"要删除的ID或null\",\"rule_body\":\"包含 <关键词> 的任务需要真人接手 | 别人委派任务必须提供 <材料> | 包含 <关键词> 的任务派给 <节点>\"}}`\n\
-         4. **调度 PC 节点执行本机/代码/部署/终端任务 (`dispatch_pc_node`)**：\n\
-            `{{\"tool\":\"dispatch_pc_node\",\"node_id\":\"homelab\",\"instruction\":\"结合对话历史补全指代后的完整自包含本机指令\",\"topic_id\":\"匹配的已有脉络ID或null\",\"topic_title\":\"匹配的脉络标题或新提炼的6~14字标题（以 📁 / 🖥️ / 💬 开头）\"}}`\n\
-            - 当用户要求查看、运行、修改、构建、测试或部署本机/代码仓库/终端窗口（tmux）/本地 Agent（agy/agy1/codex）时调用；\n\
-            - 当用户接着上文说简短的「更新」「部署到线上」「让 agy1 部署到线上」「哪些是活跃窗口」「继续」且上文确实是本机开发/节点任务时，你**必须**从【最近对话历史】中提取指代的具体提交号（如 13dba7c）、仓库名或 Agent 补全进 `instruction`！\n\
-            - 若只是纯问答、闲聊、或对对话历史中已有文本做总结/改写/翻译，请保持 `tools: []` 直接在 `reply` 中回答，不要调用 `dispatch_pc_node`。\n\
-         5. **更新管家命名、SOUL.md 或 MEMORY.md (`update_memory`)**：\n\
-            `{{\"tool\":\"update_memory\",\"name\":\"新名字或null\",\"soul_md\":\"更新后的完整SOUL.md或null\",\"memory_append\":\"要追加写入MEMORY.md的一条长期记忆事实或null\"}}`\n\n\
-         请保持内部思考极度简短（最多两三句，不要反复起草或数字数），并立刻只输出一个严格合法的 JSON 对象（不要 Markdown 代码块包裹）：\n\
+         6. **调度 PC 节点执行本机/代码/部署/终端任务 (`dispatch_pc_node`)**：\n\
+            `{{\"tool\":\"dispatch_pc_node\",\"node_id\":\"homelab\",\"instruction\":\"结合对话历史、活账本与MEMORY补全所有省略指代后的完整自包含本机指令\",\"topic_id\":\"匹配的已有脉络ID或null\",\"topic_title\":\"匹配的脉络标题或新提炼的6~14字标题（以 📁 / 🖥️ / 💬 开头）\"}}`\n\
+            - 仅当确实需要操作、查看、构建、测试或部署用户的 PC 节点 / 代码仓库 / 终端窗口（tmux） / 本地 Agent（agy/agy1/codex）时调用；\n\
+            - 当用户说简短的「更新」「部署到线上」「继续」「帮我改一下」时，**必须**从【最近对话历史】与【已有任务脉络】中把指代的提交号（如 13dba7c）、仓库路径、具体问题和验收要求完整补全进 `instruction`！\n\n\
+         请保持内部思考极度简短（最多两三句，不要反复起草），并立刻只输出一个严格合法的 JSON 对象（不要 Markdown 代码块包裹）：\n\
          `{{\"reply\":\"你直接对用户说的自然中文回复\",\"tools\":[]}}`",
         muse_prof.name
     );
-    let prompt: String = prompt.chars().take(7500).collect();
+    let prompt: String = prompt.chars().take(8000).collect();
 
     let dsh = crate::runtime::DshRuntime {
         client: &h.client,
@@ -3985,7 +4137,7 @@ async fn try_handle_muse_agent_loop(
                             .filter(|id| {
                                 !id.is_empty()
                                     && *id != "null"
-                                    && topics.iter().any(|(t, _, _)| t == id)
+                                    && topics.iter().any(|(t, _, _, _)| t == id)
                             })
                             .map(str::to_owned)
                     });
@@ -4004,6 +4156,130 @@ async fn try_handle_muse_agent_loop(
                         });
                     node_dispatch = Some((node_id, node_name, online, instr, tid, title));
                 }
+            }
+            "update_ledger" => {
+                let act = call.action.as_deref().unwrap_or("upsert").trim();
+                let target_id = call
+                    .ledger_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "null")
+                    .map(str::to_owned);
+                let target_title = call
+                    .title
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && *s != "null")
+                    .map(|s| nodes::truncate_bytes(s, 96));
+
+                if act == "delete" {
+                    with_store_mut(h, |store| {
+                        store.ledgers.retain(|l| {
+                            if l.owner != owner {
+                                return true;
+                            }
+                            let id_match = target_id.as_deref().is_some_and(|id| l.id == id);
+                            let title_match =
+                                target_title.as_deref().is_some_and(|t| l.title == t);
+                            !(id_match || title_match)
+                        });
+                    })?;
+                } else {
+                    let next_status = match act {
+                        "mute" => Some("muted".to_owned()),
+                        "complete" => Some("completed".to_owned()),
+                        _ => call
+                            .status
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| matches!(*s, "active" | "muted" | "completed"))
+                            .map(str::to_owned),
+                    };
+                    with_store_mut(h, |store| {
+                        let existing = store.ledgers.iter_mut().find(|l| {
+                            l.owner == owner
+                                && (target_id.as_deref().is_some_and(|id| l.id == id)
+                                    || target_title.as_deref().is_some_and(|t| {
+                                        l.title.eq_ignore_ascii_case(t)
+                                            || l.title.contains(t)
+                                            || t.contains(&l.title)
+                                    }))
+                        });
+                        if let Some(entry) = existing {
+                            if let Some(ref t) = target_title {
+                                entry.title = t.clone();
+                            }
+                            if let Some(ref st) = next_status {
+                                entry.status = st.clone();
+                            }
+                            if let Some(rep) = call
+                                .notes_replace
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty() && *s != "null")
+                            {
+                                entry.notes = nodes::truncate_bytes(rep, 6000);
+                            } else if let Some(app) = call
+                                .notes_append
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty() && *s != "null")
+                            {
+                                let line = if app.starts_with('-') || app.starts_with('#') {
+                                    app.to_owned()
+                                } else {
+                                    format!("- {app}")
+                                };
+                                if !entry.notes.contains(&line) {
+                                    entry.notes = if entry.notes.trim().is_empty() {
+                                        nodes::truncate_bytes(&line, 6000)
+                                    } else {
+                                        nodes::truncate_bytes(
+                                            &format!("{}\n{line}", entry.notes.trim_end()),
+                                            6000,
+                                        )
+                                    };
+                                }
+                            }
+                            entry.updated_at = nodes::now_unix();
+                        } else if let Some(title) = target_title.clone() {
+                            let notes = call
+                                .notes_replace
+                                .as_deref()
+                                .or(call.notes_append.as_deref())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty() && *s != "null")
+                                .map(|s| nodes::truncate_bytes(s, 6000))
+                                .unwrap_or_default();
+                            store.ledgers.push(MuseLedgerEntry {
+                                id: format!("ldg-{}", &Uuid::new_v4().simple().to_string()[..6]),
+                                owner: owner.to_owned(),
+                                title,
+                                status: next_status.unwrap_or_else(|| "active".to_owned()),
+                                notes,
+                                updated_at: nodes::now_unix(),
+                            });
+                        }
+                    })?;
+                }
+                record_muse_audit(
+                    h,
+                    owner,
+                    "update_ledger",
+                    "auto_approved",
+                    &format!(
+                        "更新专项活账本「{}」",
+                        call.title
+                            .as_deref()
+                            .or(call.ledger_id.as_deref())
+                            .unwrap_or("专项台账")
+                    ),
+                    call.notes_append
+                        .as_deref()
+                        .or(call.notes_replace.as_deref())
+                        .or(call.status.as_deref())
+                        .unwrap_or("已同步更新台账状态"),
+                );
             }
             "update_memory" => {
                 with_store_mut(h, |store| {
@@ -4024,7 +4300,14 @@ async fn try_handle_muse_agent_loop(
                     {
                         entry.soul_md = nodes::truncate_bytes(s, 8000);
                     }
-                    if let Some(m) = call
+                    if let Some(rep) = call
+                        .memory_replace
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && *s != "null")
+                    {
+                        entry.memory_md = nodes::truncate_bytes(rep, 12000);
+                    } else if let Some(m) = call
                         .memory_append
                         .as_deref()
                         .map(str::trim)
@@ -4052,6 +4335,7 @@ async fn try_handle_muse_agent_loop(
                     "更新管家命名与 SOUL / MEMORY",
                     call.memory_append
                         .as_deref()
+                        .or(call.memory_replace.as_deref())
                         .or(call.name.as_deref())
                         .unwrap_or("已同步更新长期记忆与人设"),
                 );
@@ -5609,12 +5893,19 @@ pub(super) async fn get_automation(
         .collect();
     audit_logs.reverse();
     audit_logs.truncate(30);
+    let ledgers: Vec<_> = guard
+        .ledgers
+        .iter()
+        .filter(|l| l.owner == owner)
+        .cloned()
+        .collect();
     Ok(Json(json!({
         "rules": rules,
         "crons": crons,
         "muse": muse,
         "topic_outcomes": topic_outcomes,
         "audit_logs": audit_logs,
+        "ledgers": ledgers,
     })))
 }
 
@@ -8134,6 +8425,8 @@ mod tests {
                     assert!(msg.contains("node_id=`homelab`"));
                     if msg.contains("【用户最新消息】\n「提交汇总这个简化一下」") {
                         r#"{"reply":"已经帮你把刚才那份汇总精简成以下 3 点，同时也把每晚 22:00 的定时任务改成了精简速览模式：\n- xixing：完成 A/B 反馈与 0.1.5 部署\n- orbit：注册 lab3 CLI\n- ansible：更新网络配置","tools":[{"tool":"manage_cron","action":"update","cron_id":"cron-7d2629","daily_time_cst":"22:00","instruction":"汇总一下 GitLab 上的提交总结给我（精简速览版：每个项目只列 1~2 条核心进展）","deduplicate_ids":["cron-1f1b46"]}]}"#
+                    } else if msg.contains("【用户最新消息】\n「有些不用你继续去提醒的怎么处理，比如这个抖音」") {
+                        r#"{"reply":"处理办法我定成一条规矩，叫**静默挂起**，已经记下来了：记录保留、事情不关闭，但我不再在主动消息、早报和顺带提醒里带它。抖音这件已经挂起了。","tools":[{"tool":"update_memory","memory_append":"静默挂起规矩：用户点名不需继续提醒的事项标为 muted，保留记录但绝不在早报或顺带提醒中主动催促"},{"tool":"update_ledger","action":"mute","title":"抖音植入报价","status":"muted","notes_append":"待确认账号/粉丝/播放三个数，平时静默不提醒"}]}"#
                     } else if msg.contains("【用户最新消息】\n「部署到线上」") {
                         r#"{"reply":"明白，正在让办公主力机（homelab）把刚完成的本地提交 13dba7c 同步部署到线上 Hub，完成后结果会自动发回这里。","tools":[{"tool":"dispatch_pc_node","node_id":"homelab","instruction":"将 agy1 刚在本地完成的提交 13dba7c 同步部署到线上运行的 Hub 服务","topic_id":"t-agenct","topic_title":"📁 agenct 仓库上下文"}]}"#
                     } else {
@@ -8252,5 +8545,26 @@ mod tests {
             instr,
             "将 agy1 刚在本地完成的提交 13dba7c 同步部署到线上运行的 Hub 服务"
         );
+
+        // 3. Multi-action rule + live ledger mute turn ("有些不用你继续去提醒的怎么处理，比如这个抖音")
+        let (s, chat3) = call(
+            &r,
+            &token("alice"),
+            "POST",
+            "/api/messages",
+            Some(json!({ "message": "有些不用你继续去提醒的怎么处理，比如这个抖音" })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(chat3["reply"].as_str().unwrap().contains("静默挂起"));
+
+        let (s, auto_state2) = call(&r, &token("alice"), "GET", "/api/automation", None).await;
+        assert_eq!(s, StatusCode::OK);
+        let mem_md = auto_state2["muse"]["memory_md"].as_str().unwrap();
+        assert!(mem_md.contains("静默挂起规矩"));
+        let ledgers = auto_state2["ledgers"].as_array().unwrap();
+        assert_eq!(ledgers.len(), 1);
+        assert_eq!(ledgers[0]["title"], "抖音植入报价");
+        assert_eq!(ledgers[0]["status"], "muted");
     }
 }

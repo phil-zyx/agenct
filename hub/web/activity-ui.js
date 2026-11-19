@@ -234,60 +234,94 @@ function renderMuseDrawer(context, automation, proposals, tasks) {
     connStatus.title = onlineNode ? `已连接节点：${onlineNode.name || onlineNode.id}` : '云端 Muse 已连接';
   }
 
-  // 1. Tab 1 top: Scheduled Tasks (预定任务)
+  // 1. Tab 1 top: Scheduled Tasks (预定任务) + Live Ledgers (专项活账本 / 静默挂起)
   const schedBox = $('muse-scheduled-box');
   const crons = Array.isArray(auto.crons) ? auto.crons : [];
+  const ledgers = Array.isArray(auto.ledgers) ? auto.ledgers : [];
   if (schedBox) {
     schedBox.replaceChildren();
-    if (!crons.length || activeMusePaneTab !== 'activity') {
+    if ((!crons.length && !ledgers.length) || activeMusePaneTab !== 'activity') {
       schedBox.classList.add('hide');
     } else {
       schedBox.classList.remove('hide');
-      const headBtn = el('button', 'muse-sec-head');
-      headBtn.type = 'button';
-      headBtn.append(
-        el('span', 'muse-sec-title', `${crons.length}项预定任务`),
-        el('span', 'muse-sec-chevron', museCronsCollapsed ? '›' : '⌄')
-      );
-      headBtn.onclick = () => {
-        museCronsCollapsed = !museCronsCollapsed;
-        renderMuseDrawer(context, auto, proposals, tasks);
-      };
-      schedBox.append(headBtn);
-      if (!museCronsCollapsed) {
-        const list = el('div', 'muse-cron-list');
-        const visibleCrons = museShowAllCrons ? crons : crons.slice(0, 3);
-        for (const c of visibleCrons) {
+      if (crons.length) {
+        const headBtn = el('button', 'muse-sec-head');
+        headBtn.type = 'button';
+        headBtn.append(
+          el('span', 'muse-sec-title', `${crons.length}项预定任务`),
+          el('span', 'muse-sec-chevron', museCronsCollapsed ? '›' : '⌄')
+        );
+        headBtn.onclick = () => {
+          museCronsCollapsed = !museCronsCollapsed;
+          renderMuseDrawer(context, auto, proposals, tasks);
+        };
+        schedBox.append(headBtn);
+        if (!museCronsCollapsed) {
+          const list = el('div', 'muse-cron-list');
+          const visibleCrons = museShowAllCrons ? crons : crons.slice(0, 3);
+          for (const c of visibleCrons) {
+            const item = el('div', 'muse-cron-item');
+            const isDaily = Boolean(c.daily_time_cst);
+            const icon = el('span', 'muse-cron-icon ' + (isDaily ? 'daily' : 'heartbeat'), isDaily ? '🗓️' : '♡');
+            const body = el('div', 'muse-cron-body');
+            body.append(
+              el('div', 'muse-cron-title', formatCronShortTitle(c.instruction)),
+              el('div', 'muse-cron-sub', c.daily_time_cst ? c.daily_time_cst : `每${c.interval_minutes}分钟`)
+            );
+            item.append(icon, body);
+            item.title = c.instruction || '';
+            item.onclick = () => {
+              const input = $('text');
+              if (input) {
+                input.value = `修改定时任务（${formatCronShortTitle(c.instruction)}）：`;
+                input.focus?.();
+                returnToChatOnNarrowScreen();
+              }
+            };
+            list.append(item);
+          }
+          if (crons.length > 3) {
+            const moreBtn = el('button', 'muse-cron-more', museShowAllCrons ? '收起预定任务' : '查看所有预定任务');
+            moreBtn.type = 'button';
+            moreBtn.onclick = () => {
+              museShowAllCrons = !museShowAllCrons;
+              renderMuseDrawer(context, auto, proposals, tasks);
+            };
+            list.append(moreBtn);
+          }
+          schedBox.append(list);
+        }
+      }
+      if (ledgers.length) {
+        const lHead = el('div', 'muse-sec-head');
+        lHead.append(el('span', 'muse-sec-title', `${ledgers.length}项专项活账本`));
+        schedBox.append(lHead);
+        const lList = el('div', 'muse-cron-list');
+        for (const l of ledgers.slice(0, 6)) {
           const item = el('div', 'muse-cron-item');
-          const isDaily = Boolean(c.daily_time_cst);
-          const icon = el('span', 'muse-cron-icon ' + (isDaily ? 'daily' : 'heartbeat'), isDaily ? '🗓️' : '♡');
+          const isMuted = l.status === 'muted';
+          const isDone = l.status === 'completed';
+          const icon = el('span', 'muse-cron-icon ' + (isMuted ? 'heartbeat' : 'daily'), isMuted ? '🔇' : isDone ? '✅' : '📒');
           const body = el('div', 'muse-cron-body');
+          const stText = isMuted ? '静默挂起 · 不主动提醒' : isDone ? '已归档' : '活跃跟进';
+          const noteLine = String(l.notes || '').split('\n').filter(Boolean).pop() || stText;
           body.append(
-            el('div', 'muse-cron-title', formatCronShortTitle(c.instruction)),
-            el('div', 'muse-cron-sub', c.daily_time_cst ? c.daily_time_cst : `每${c.interval_minutes}分钟`)
+            el('div', 'muse-cron-title', `${l.title || '专项台账'}${isMuted ? '（静默挂起）' : ''}`),
+            el('div', 'muse-cron-sub', noteLine.replace(/^[-#\s]+/, '').slice(0, 38))
           );
           item.append(icon, body);
-          item.title = c.instruction || '';
+          item.title = `${l.title} [${stText}]\n${l.notes || ''}`;
           item.onclick = () => {
             const input = $('text');
             if (input) {
-              input.value = `修改定时任务（${formatCronShortTitle(c.instruction)}）：`;
+              input.value = `关于「${l.title}」：`;
               input.focus?.();
               returnToChatOnNarrowScreen();
             }
           };
-          list.append(item);
+          lList.append(item);
         }
-        if (crons.length > 3) {
-          const moreBtn = el('button', 'muse-cron-more', museShowAllCrons ? '收起预定任务' : '查看所有预定任务');
-          moreBtn.type = 'button';
-          moreBtn.onclick = () => {
-            museShowAllCrons = !museShowAllCrons;
-            renderMuseDrawer(context, auto, proposals, tasks);
-          };
-          list.append(moreBtn);
-        }
-        schedBox.append(list);
+        schedBox.append(lList);
       }
     }
   }
