@@ -45,10 +45,7 @@ export function initChat({ state, onRefresh }) {
     });
   }
 
-  fileEl.onchange = async () => {
-    const file = fileEl.files?.[0];
-    fileEl.value = '';
-    if (!file) return;
+  async function uploadFile(file, name = file.name) {
     if (file.size > 5 * 1024 * 1024) {
       showToast('附件不能超过 5 MiB');
       return;
@@ -63,7 +60,7 @@ export function initChat({ state, onRefresh }) {
       const meta = await api('/api/attachments', {
         method: 'POST',
         body: {
-          name: file.name,
+          name,
           mime_type: file.type || 'text/plain',
           data_base64: btoa(binary),
         },
@@ -74,7 +71,29 @@ export function initChat({ state, onRefresh }) {
     } catch (err) {
       showToast(`上传失败：${err.message}`);
     }
+  }
+
+  fileEl.onchange = async () => {
+    const file = fileEl.files?.[0];
+    fileEl.value = '';
+    if (file) await uploadFile(file);
   };
+
+  // Paste screenshots / copied images straight into the composer. Plain-text paste is untouched.
+  const PASTE_IMAGE_TYPES = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp' };
+  inputEl.addEventListener('paste', async (ev) => {
+    const images = Array.from(ev.clipboardData?.items || [])
+      .filter((it) => it.kind === 'file' && PASTE_IMAGE_TYPES[it.type])
+      .map((it) => it.getAsFile())
+      .filter(Boolean);
+    if (!images.length) return;
+    ev.preventDefault();
+    const stamp = new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14);
+    for (const [i, file] of images.entries()) {
+      const suffix = images.length > 1 ? `-${i + 1}` : '';
+      await uploadFile(file, `paste-${stamp}${suffix}.${PASTE_IMAGE_TYPES[file.type]}`);
+    }
+  });
 
   inputEl.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {

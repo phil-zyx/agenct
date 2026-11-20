@@ -105,6 +105,22 @@ try {
   await page.waitForSelector('#room:not(.hide)');
   await page.waitForFunction(() => document.getElementById('sse-pill')?.textContent?.includes('实时同步'));
 
+  // 2b. Pasting a clipboard image into the composer uploads it as an attachment chip.
+  await page.focus('#chat-input');
+  await page.evaluate(() => {
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+    const dt = new DataTransfer();
+    dt.items.add(new File([png], 'image.png', { type: 'image/png' }));
+    const ev = new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true });
+    document.getElementById('chat-input').dispatchEvent(ev);
+  });
+  await page.waitForFunction(
+    () => /paste-\d{14}\.png/.test(document.getElementById('pending-atts')?.textContent || ''),
+    { timeout: 5000 },
+  );
+  await page.click('#pending-atts [data-rm="0"]');
+  await page.waitForSelector('#pending-atts.hide', { state: 'attached' });
+
   // 3. Open the right Muse drawer via floating Agenct avatar, create a Cloud Node, capture its token.
   await page.click('#muse-head-toggle');
   await page.waitForSelector('#task-pane .add-node-form');
