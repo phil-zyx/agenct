@@ -59,6 +59,7 @@ pub struct Hub {
     pub oauth_pending: auth::OAuthPendingStore,
     pub attachments_dir: PathBuf,
     pub scheduler_notify: Arc<tokio::sync::Notify>,
+    pub scheduler: Arc<automation::SchedulerState>,
     gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     compacting: Arc<Mutex<HashSet<String>>>,
 }
@@ -88,6 +89,7 @@ impl Hub {
             oauth_pending: auth::OAuthPendingStore::default(),
             attachments_dir,
             scheduler_notify: Arc::new(tokio::sync::Notify::new()),
+            scheduler: Arc::new(automation::SchedulerState::default()),
             gates: Arc::new(Mutex::new(HashMap::new())),
             compacting: Arc::new(Mutex::new(HashSet::new())),
         })

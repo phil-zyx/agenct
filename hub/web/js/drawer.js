@@ -437,6 +437,17 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
           .map((c) => {
             const when = c.daily_time_cst ? `每天 ${c.daily_time_cst}` : `每 ${c.interval_minutes} 分钟`;
             const target = TARGET_LABEL[c.target] || c.target;
+            let runInfo = '';
+            if (c.last_status === 'running') {
+              runInfo = '<p class="note">执行中…</p>';
+            } else if (c.last_status === 'ok') {
+              runInfo = `<p class="note">上次执行成功 · ${esc(fmtTime(c.last_run_at))}</p>`;
+            } else if (c.last_status === 'failed') {
+              const retry = c.next_retry_at
+                ? `，将于 ${esc(fmtTime(c.next_retry_at))} 重试`
+                : '，已停止重试，等待下个周期';
+              runInfo = `<p class="note cron-failed">连续失败 ${esc(String(c.fail_count))} 次${retry}：${esc(c.last_error)}</p>`;
+            }
             return `
               <div class="item">
                 <div class="item-head">
@@ -444,6 +455,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
                   <span class="badge">${esc(target)}</span>
                 </div>
                 ${compactTextHtml(c.instruction, 46, '查看完整指令')}
+                ${runInfo}
                 <div class="row"><button type="button" class="sm danger" data-del-cron="${esc(c.id)}">删除</button></div>
               </div>`;
           })

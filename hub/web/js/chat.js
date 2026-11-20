@@ -19,6 +19,7 @@ export function initChat({ state, onRefresh }) {
   const typingEl = document.getElementById('typing');
 
   let pendingAtts = [];
+  let lastFailed = null;
   let sending = false;
   let optimisticMsg = null;
   let optimisticBaseLen = 0;
@@ -114,16 +115,22 @@ export function initChat({ state, onRefresh }) {
     document.getElementById('hero-avatar-wrap')?.classList.add('is-thinking');
     scrollerEl.scrollTop = scrollerEl.scrollHeight;
 
+    // Retrying the exact same text after a failure reuses its request_id, so the server
+    // revives the failed message instead of storing a duplicate.
+    const requestId =
+      lastFailed && lastFailed.text === text ? lastFailed.requestId : `req-${randomId()}`;
     try {
       await api('/api/chat', {
         method: 'POST',
-        body: { message: text, request_id: `req-${randomId()}` },
+        body: { message: text, request_id: requestId },
       });
+      lastFailed = null;
       optimisticMsg = null;
       await onRefresh();
     } catch (err) {
+      lastFailed = { text, requestId };
       optimisticMsg = null;
-      render();
+      await onRefresh().catch(() => render());
       inputEl.value = text;
       showToast(`发送失败：${err.message}`);
     } finally {
@@ -157,9 +164,11 @@ export function initChat({ state, onRefresh }) {
     listEl.innerHTML = msgs
       .map(
         (m) => `
-      <div class="msg msg-${esc(m.role)}">
+      <div class="msg msg-${esc(m.role)}${m.status === 'failed' ? ' msg-failed' : ''}">
         <div>${renderMarkdown(m.content)}</div>
-        <div class="msg-meta">${esc(fmtTime(m.created_at))}</div>
+        <div class="msg-meta">${esc(fmtTime(m.created_at))}${
+          m.status === 'failed' ? ' · 未送达，可重新发送' : ''
+        }</div>
       </div>`,
       )
       .join('');

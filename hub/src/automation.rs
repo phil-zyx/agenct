@@ -12,7 +12,15 @@ use axum::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tokio::{sync::Semaphore, task::JoinHandle};
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -46,7 +54,34 @@ pub struct CronJob {
     pub target: String,
     pub enabled: bool,
     pub last_run_at: Option<i64>,
+    /// '' (never run) | 'running' | 'ok' | 'failed'
+    pub last_status: String,
+    pub last_error: String,
+    /// Consecutive failures since the last success.
+    pub fail_count: i64,
+    /// When set, the job is retried at this time regardless of its normal schedule.
+    pub next_retry_at: Option<i64>,
     pub created_at: i64,
+}
+
+const CRON_COLUMNS: &str = "id, interval_minutes, daily_time_cst, instruction, target, enabled,
+     last_run_at, last_status, last_error, fail_count, next_retry_at, created_at";
+
+fn cron_from_row(r: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<CronJob> {
+    Ok(CronJob {
+        id: r.get(offset)?,
+        interval_minutes: r.get(offset + 1)?,
+        daily_time_cst: r.get(offset + 2)?,
+        instruction: r.get(offset + 3)?,
+        target: r.get(offset + 4)?,
+        enabled: r.get::<_, i64>(offset + 5)? != 0,
+        last_run_at: r.get(offset + 6)?,
+        last_status: r.get(offset + 7)?,
+        last_error: r.get(offset + 8)?,
+        fail_count: r.get(offset + 9)?,
+        next_retry_at: r.get(offset + 10)?,
+        created_at: r.get(offset + 11)?,
+    })
 }
 
 pub fn read_permissions_sync(conn: &Connection, user_id: &str) -> Result<Permissions> {
@@ -105,22 +140,10 @@ pub fn list_rules_sync(conn: &Connection, user_id: &str) -> Result<Vec<DispatchR
 }
 
 pub fn list_crons_sync(conn: &Connection, user_id: &str) -> Result<Vec<CronJob>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, interval_minutes, daily_time_cst, instruction, target, enabled, last_run_at, created_at
-         FROM cron_jobs WHERE user_id = ?1 ORDER BY created_at DESC",
-    )?;
-    let rows = stmt.query_map([user_id], |r| {
-        Ok(CronJob {
-            id: r.get(0)?,
-            interval_minutes: r.get(1)?,
-            daily_time_cst: r.get(2)?,
-            instruction: r.get(3)?,
-            target: r.get(4)?,
-            enabled: r.get::<_, i64>(5)? != 0,
-            last_run_at: r.get(6)?,
-            created_at: r.get(7)?,
-        })
-    })?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {CRON_COLUMNS} FROM cron_jobs WHERE user_id = ?1 ORDER BY created_at DESC"
+    ))?;
+    let rows = stmt.query_map([user_id], |r| cron_from_row(r, 0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -336,6 +359,10 @@ pub async fn create_cron(
         target: truncate_bytes(input.target.trim(), 48),
         enabled: true,
         last_run_at: None,
+        last_status: String::new(),
+        last_error: String::new(),
+        fail_count: 0,
+        next_retry_at: None,
         created_at: now_unix(),
     };
     let j_db = job.clone();
@@ -385,9 +412,83 @@ pub async fn delete_cron(
     Ok(Json(json!({"ok": true, "id": id})))
 }
 
+/// Max concurrent cron executions (LLM / network bound).
+const CRON_CONCURRENCY: usize = 4;
+/// Retries after a failed run before falling back to the regular schedule.
+pub const CRON_MAX_RETRIES: i64 = 3;
+const CRON_RETRY_BASE_SECS: i64 = 60;
+const CRON_RETRY_MAX_SECS: i64 = 1800;
+
+/// Tools a cron-triggered brain run may call: no self-replicating crons/rules, no memory edits,
+/// no cross-user delegation.
+const CRON_ALLOWED_TOOLS: &[&str] = &[
+    "fetch_gitlab_commits",
+    "dispatch_node",
+    "update_ledger",
+    "close_thread",
+];
+
+const CRON_PROMPT_SUFFIX: &str = "
+
+=== 当前运行模式：定时任务自动触发 ===
+- 这不是用户的实时发言，用户此刻不在线等待；本轮「用户消息」就是定时任务指令本身。
+- 直接执行并输出简洁的 Markdown 汇报结论，不要反问、不要寒暄。
+- 需要数据时调用工具（如 fetch_gitlab_commits / dispatch_node），只基于工具真实结果汇报；拿不到数据就如实说明。
+- 本模式只允许调用：fetch_gitlab_commits、dispatch_node、update_ledger、close_thread。";
+
+/// In-process scheduler bookkeeping (single Hub instance by design).
+pub struct SchedulerState {
+    /// Cron ids currently executing; a slow run is never started twice concurrently.
+    inflight: Mutex<HashSet<String>>,
+    slots: Arc<Semaphore>,
+    polling_todos: AtomicBool,
+}
+
+impl Default for SchedulerState {
+    fn default() -> Self {
+        Self {
+            inflight: Mutex::new(HashSet::new()),
+            slots: Arc::new(Semaphore::new(CRON_CONCURRENCY)),
+            polling_todos: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Releases an in-flight cron id even if the run panics.
+struct InflightGuard {
+    state: Arc<SchedulerState>,
+    id: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.state.inflight.lock() {
+            set.remove(&self.id);
+        }
+    }
+}
+
+/// Clears the GitLab todo polling flag even if the poll panics.
+struct PollGuard(Arc<SchedulerState>);
+
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        self.0.polling_todos.store(false, Ordering::Release);
+    }
+}
+
+/// Exponential backoff for the n-th consecutive failure: 1m, 2m, 4m, … capped at 30m.
+pub fn retry_delay_secs(fail_count: i64) -> i64 {
+    let exp = u32::try_from((fail_count - 1).clamp(0, 10)).unwrap_or(0);
+    (CRON_RETRY_BASE_SECS * 2_i64.pow(exp)).min(CRON_RETRY_MAX_SECS)
+}
+
 fn is_cron_due(job: &CronJob, now: i64) -> bool {
     if !job.enabled {
         return false;
+    }
+    if job.next_retry_at.is_some_and(|t| t <= now) {
+        return true;
     }
     if let Some(hhmm) = &job.daily_time_cst {
         // UTC+8 (Asia/Shanghai)
@@ -418,92 +519,111 @@ fn is_cron_due(job: &CronJob, now: i64) -> bool {
     now.saturating_sub(last) >= job.interval_minutes * 60
 }
 
-pub async fn run_due_crons(hub: &Hub) -> Result<usize> {
+/// Atomically claims due jobs (skipping ones still in flight) and marks them `running`.
+async fn claim_due_crons(hub: &Hub) -> Result<Vec<(String, CronJob)>> {
     let now = now_unix();
-    let due: Vec<(String, CronJob)> = hub
-        .db
+    let state = hub.scheduler.clone();
+    hub.db
         .write(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT c.user_id, c.id, c.interval_minutes, c.daily_time_cst, c.instruction,
-                        c.target, c.enabled, c.last_run_at, c.created_at
-                 FROM cron_jobs c
-                 JOIN users u ON u.id = c.user_id
-                 WHERE c.enabled = 1 AND u.status = 'active'",
-            )?;
-            let all = stmt
-                .query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        CronJob {
-                            id: r.get(1)?,
-                            interval_minutes: r.get(2)?,
-                            daily_time_cst: r.get(3)?,
-                            instruction: r.get(4)?,
-                            target: r.get(5)?,
-                            enabled: r.get::<_, i64>(6)? != 0,
-                            last_run_at: r.get(7)?,
-                            created_at: r.get(8)?,
-                        },
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-
+            let mut inflight = state
+                .inflight
+                .lock()
+                .map_err(|_| crate::Error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "scheduler state poisoned"))?;
+            let tx = conn.transaction()?;
+            let all: Vec<(String, CronJob)> = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT user_id, {CRON_COLUMNS} FROM cron_jobs
+                     WHERE enabled = 1 AND user_id IN (SELECT id FROM users WHERE status = 'active')"
+                ))?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, cron_from_row(r, 1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            };
             let mut claimed = Vec::new();
-            for (uid, job) in all {
-                if is_cron_due(&job, now) {
-                    conn.execute(
-                        "UPDATE cron_jobs SET last_run_at = ?2 WHERE id = ?1",
-                        params![job.id, now],
-                    )?;
-                    claimed.push((uid, job));
+            for (uid, mut job) in all {
+                if inflight.contains(&job.id) || !is_cron_due(&job, now) {
+                    continue;
                 }
+                tx.execute(
+                    "UPDATE cron_jobs SET last_run_at = ?2, last_status = 'running', next_retry_at = NULL
+                     WHERE id = ?1",
+                    params![job.id, now],
+                )?;
+                job.last_run_at = Some(now);
+                job.last_status = "running".into();
+                job.next_retry_at = None;
+                claimed.push((uid, job));
+            }
+            tx.commit()?;
+            for (_, job) in &claimed {
+                inflight.insert(job.id.clone());
             }
             Ok(claimed)
         })
-        .await?;
+        .await
+}
 
+fn spawn_cron(hub: &Hub, user_id: String, job: CronJob) -> JoinHandle<()> {
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        let _inflight = InflightGuard {
+            state: hub.scheduler.clone(),
+            id: job.id.clone(),
+        };
+        let _permit = hub.scheduler.slots.clone().acquire_owned().await.ok();
+        let result = execute_cron_job(&hub, &user_id, &job).await;
+        record_cron_result(&hub, &user_id, &job, result).await;
+    })
+}
+
+/// Claims all due crons and runs them concurrently, waiting until every run has finished.
+pub async fn run_due_crons(hub: &Hub) -> Result<usize> {
+    let due = claim_due_crons(hub).await?;
     let count = due.len();
-    for (uid, job) in due {
-        execute_cron_job(hub, &uid, &job).await;
+    let handles: Vec<_> = due
+        .into_iter()
+        .map(|(uid, job)| spawn_cron(hub, uid, job))
+        .collect();
+    for handle in handles {
+        let _ = handle.await;
     }
     Ok(count)
 }
 
-async fn execute_cron_job(hub: &Hub, user_id: &str, job: &CronJob) {
-    let lower = job.instruction.to_ascii_lowercase();
-    let wants_gitlab = lower.contains("gitlab") || job.instruction.contains("提交");
-
-    if job.target == "cloud" || wants_gitlab {
-        let report = if wants_gitlab {
-            crate::integrations::gitlab::fetch_commit_summary(hub, user_id)
-                .await
-                .unwrap_or_else(|| "暂无新的 GitLab 提交记录或尚未配置 GitLab PAT。".into())
-        } else {
-            hub.llm
-                .complete(
-                    "你是用户的 7x24h 个人超级管家，请简洁执行以下定时汇报指令并输出 Markdown 结论。",
-                    &[],
-                    &job.instruction,
-                    false,
-                )
-                .await
-                .unwrap_or_else(|_| format!("定时任务执行失败：{}", job.instruction))
-        };
+/// Executes one cron run. `Ok` carries a short summary for the audit log, `Err` the failure reason.
+async fn execute_cron_job(
+    hub: &Hub,
+    user_id: &str,
+    job: &CronJob,
+) -> std::result::Result<String, String> {
+    if job.target == "cloud" {
+        // Cloud crons run through the same agent loop as chat (tools + result feedback),
+        // restricted to a safe tool set. No keyword routing.
+        let out = crate::brain::run_headless(
+            hub,
+            user_id,
+            &job.instruction,
+            CRON_PROMPT_SUFFIX,
+            CRON_ALLOWED_TOOLS,
+        )
+        .await
+        .map_err(|e| e.1.to_owned())?;
+        let report = out.reply;
         let msg = format!("**[定时汇报]** {}\n\n{}", job.instruction, report);
         let uid = user_id.to_owned();
-        let instr = job.instruction.clone();
-        let _ = hub
-            .db
+        let thread_id = out.thread_id;
+        hub.db
             .write(move |conn| {
                 conn.execute(
-                    "INSERT INTO messages(user_id, role, content, status, created_at)
-                     VALUES (?1, 'assistant', ?2, 'complete', ?3)",
-                    params![uid, msg, now_unix()],
+                    "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
+                     VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
+                    params![uid, thread_id, truncate_bytes(&msg, 16_000), now_unix()],
                 )?;
-                record_audit(conn, &uid, "cron_run", "ok", &instr, "Cloud cron completed")?;
                 Ok(())
             })
-            .await;
+            .await
+            .map_err(|e| e.1.to_owned())?;
         hub.events
             .emit(user_id.to_owned(), "message", json!({"cron_id": job.id}));
         crate::integrations::im::maybe_notify(
@@ -514,38 +634,141 @@ async fn execute_cron_job(hub: &Hub, user_id: &str, job: &CronJob) {
             &report,
         )
         .await;
-        return;
+        let dispatched = if out.tasks.is_empty() {
+            String::new()
+        } else {
+            format!("（派发 {} 个任务）", out.tasks.len())
+        };
+        return Ok(truncate_bytes(&format!("{dispatched}{report}"), 240));
     }
 
-    // Dispatch to targeted or online execution node (PC or Cloud Runner).
+    // Explicit node target: enqueue directly on the targeted (or any online) execution node.
     let uid = user_id.to_owned();
     let target = job.target.clone();
     let instr = job.instruction.clone();
-    let _ = hub
+    let picked = hub
         .db
         .write(move |conn| {
             let prefer_cloud = target == "cloud-node";
             let explicit =
                 (!matches!(target.as_str(), "auto" | "cloud-node")).then_some(target.as_str());
-            if let Some(node) = nodes::pick_node_sync(conn, &uid, explicit, prefer_cloud)? {
-                nodes::create_task_and_enqueue_sync(
-                    conn,
-                    &uid,
-                    &uid,
-                    &node.id,
-                    &format!("定时：{}", truncate_bytes(&instr, 48)),
-                    &instr,
-                    "cron",
-                )?;
-            }
-            Ok(())
+            let Some(node) = nodes::pick_node_sync(conn, &uid, explicit, prefer_cloud)? else {
+                return Ok(None);
+            };
+            nodes::create_task_and_enqueue_sync(
+                conn,
+                &uid,
+                &uid,
+                &node.id,
+                &format!("定时：{}", truncate_bytes(&instr, 48)),
+                &instr,
+                "cron",
+            )?;
+            Ok(Some(node.name))
         })
+        .await
+        .map_err(|e| e.1.to_owned())?;
+    match picked {
+        Some(node_name) => {
+            hub.events
+                .emit(user_id.to_owned(), "task", json!({"cron_id": job.id}));
+            Ok(format!("已派发到节点 {node_name}"))
+        }
+        None => Err(format!("没有可用的执行节点（target={}）", job.target)),
+    }
+}
+
+/// Records the outcome: success resets the failure streak; failure schedules a backoff retry
+/// (up to `CRON_MAX_RETRIES`) and notifies the user once when retries are exhausted.
+async fn record_cron_result(
+    hub: &Hub,
+    user_id: &str,
+    job: &CronJob,
+    result: std::result::Result<String, String>,
+) {
+    let now = now_unix();
+    let uid = user_id.to_owned();
+    let id = job.id.clone();
+    let instr = job.instruction.clone();
+    let err_text = result.as_ref().err().cloned();
+    let gave_up = hub
+        .db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let gave_up = match &result {
+                Ok(summary) => {
+                    tx.execute(
+                        "UPDATE cron_jobs SET last_status = 'ok', last_error = '', fail_count = 0,
+                                next_retry_at = NULL
+                         WHERE id = ?1",
+                        [&id],
+                    )?;
+                    record_audit(&tx, &uid, "cron_run", "ok", &instr, summary)?;
+                    false
+                }
+                Err(err) => {
+                    let fails = tx
+                        .query_row("SELECT fail_count FROM cron_jobs WHERE id = ?1", [&id], |r| {
+                            r.get::<_, i64>(0)
+                        })
+                        .optional()?
+                        .unwrap_or(0)
+                        + 1;
+                    let next_retry = (fails <= CRON_MAX_RETRIES).then(|| now + retry_delay_secs(fails));
+                    tx.execute(
+                        "UPDATE cron_jobs SET last_status = 'failed', last_error = ?2, fail_count = ?3,
+                                next_retry_at = ?4
+                         WHERE id = ?1",
+                        params![id, truncate_bytes(err, 300), fails, next_retry],
+                    )?;
+                    record_audit(&tx, &uid, "cron_run", "failed", &instr, err)?;
+                    let gave_up = fails == CRON_MAX_RETRIES + 1;
+                    if gave_up {
+                        tx.execute(
+                            "INSERT INTO messages(user_id, role, content, status, created_at)
+                             VALUES (?1, 'assistant', ?2, 'complete', ?3)",
+                            params![
+                                uid,
+                                format!(
+                                    "**[定时任务失败]** {instr}\n\n已连续失败 {fails} 次（最近错误：{}），停止重试，将在下一个正常周期再执行。",
+                                    truncate_bytes(err, 200)
+                                ),
+                                now
+                            ],
+                        )?;
+                    }
+                    gave_up
+                }
+            };
+            tx.commit()?;
+            Ok(gave_up)
+        })
+        .await
+        .unwrap_or(false);
+
+    hub.events.emit(
+        user_id.to_owned(),
+        "automation",
+        json!({"updated": "crons"}),
+    );
+    if gave_up {
+        hub.events
+            .emit(user_id.to_owned(), "message", json!({"cron_id": job.id}));
+        crate::integrations::im::maybe_notify(
+            hub,
+            user_id,
+            "delivery",
+            &format!("定时任务失败：{}", job.instruction),
+            err_text.as_deref().unwrap_or(""),
+        )
         .await;
-    hub.events
-        .emit(user_id.to_owned(), "task", json!({"cron_id": job.id}));
+    }
 }
 
 impl Hub {
+    /// Background loop: every 30s (or when poked) claims due crons and starts them as
+    /// independent bounded tasks, and kicks off GitLab todo polling if it isn't already running.
+    /// Nothing here awaits a slow run, so one stuck job never delays the others.
     pub async fn run_scheduler(&self) {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -553,8 +776,18 @@ impl Hub {
                 _ = interval.tick() => {}
                 _ = self.scheduler_notify.notified() => {}
             }
-            let _ = run_due_crons(self).await;
-            crate::integrations::gitlab::poll_all_todos(self).await;
+            if let Ok(due) = claim_due_crons(self).await {
+                for (uid, job) in due {
+                    drop(spawn_cron(self, uid, job));
+                }
+            }
+            if !self.scheduler.polling_todos.swap(true, Ordering::AcqRel) {
+                let hub = self.clone();
+                tokio::spawn(async move {
+                    let _guard = PollGuard(hub.scheduler.clone());
+                    crate::integrations::gitlab::poll_all_todos(&hub).await;
+                });
+            }
         }
     }
 }

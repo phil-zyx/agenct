@@ -10,6 +10,11 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// Prefix of the synthetic message that feeds tool execution results back into the model.
+pub const TOOL_RESULTS_MARKER: &str = "TOOL_RESULTS";
+/// Stub-only command that simulates an upstream LLM failure (for offline tests).
+const STUB_FAIL_COMMAND: &str = "/stub_fail";
+
 #[derive(Clone)]
 pub struct LlmClient {
     config: LlmConfig,
@@ -36,6 +41,10 @@ impl LlmClient {
         json_mode: bool,
     ) -> Result<String> {
         match &self.config {
+            LlmConfig::Stub if user_message.trim() == STUB_FAIL_COMMAND => Err(Error(
+                StatusCode::BAD_GATEWAY,
+                "LLM provider returned error",
+            )),
             LlmConfig::Stub => Ok(stub_reply(system, user_message, json_mode)),
             LlmConfig::OpenAi {
                 url,
@@ -108,6 +117,28 @@ fn stub_reply(system: &str, user_message: &str, json_mode: bool) -> String {
     let trimmed = user_message.trim();
     if !json_mode {
         return format!("[STUB] 收到：{trimmed}");
+    }
+    if let Some(rest) = trimmed.strip_prefix(TOOL_RESULTS_MARKER) {
+        let first = rest
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("- "))
+            .unwrap_or("")
+            .trim_start_matches("- ");
+        let snippet: String = first.chars().take(160).collect();
+        return json!({
+            "reply": format!("已根据工具结果整理：{snippet}"),
+            "thread_id": Value::Null,
+            "tools": []
+        })
+        .to_string();
+    }
+    if trimmed.starts_with("/gitlab") {
+        return json!({
+            "reply": "我来查一下 GitLab 提交记录。",
+            "tools": [{"tool": "fetch_gitlab_commits"}]
+        })
+        .to_string();
     }
     if let Some(rest) = trimmed.strip_prefix("/node_thread ") {
         let mut parts = rest.splitn(2, char::is_whitespace);

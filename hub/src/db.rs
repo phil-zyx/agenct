@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 
-const SCHEMA_V3: &str = r#"
+const SCHEMA_V5: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     gitlab_id INTEGER UNIQUE,
@@ -73,11 +73,13 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     request_id TEXT,
     status TEXT NOT NULL DEFAULT 'complete' CHECK(status IN ('pending','complete','failed')),
+    reply_to INTEGER,
     created_at INTEGER NOT NULL,
     UNIQUE(user_id, request_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id, id DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(user_id, thread_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(user_id, reply_to);
 
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
@@ -151,6 +153,10 @@ CREATE TABLE IF NOT EXISTS cron_jobs (
     target TEXT NOT NULL DEFAULT 'cloud',
     enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0,1)),
     last_run_at INTEGER,
+    last_status TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER,
     created_at INTEGER NOT NULL
 );
 
@@ -237,7 +243,7 @@ impl Db {
         let writer = Connection::open(path)?;
         writer.busy_timeout(Duration::from_millis(5000))?;
         let mut current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(current_version, 0 | 1 | 2 | SCHEMA_VERSION) {
+        if !matches!(current_version, 0 | 1 | 2 | 3 | 4 | SCHEMA_VERSION) {
             return Err(format!(
                 "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
             )
@@ -249,7 +255,7 @@ impl Db {
              PRAGMA foreign_keys = ON;",
         )?;
         if current_version == 0 {
-            writer.execute_batch(SCHEMA_V3)?;
+            writer.execute_batch(SCHEMA_V5)?;
             writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else {
             if current_version == 1 {
@@ -284,13 +290,57 @@ impl Db {
                      PRAGMA user_version = 3;
                      COMMIT;",
                 )?;
+                current_version = 3;
             }
+            if current_version == 3 {
+                writer.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE messages ADD COLUMN reply_to INTEGER;
+                     CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(user_id, reply_to);
+                     PRAGMA user_version = 4;
+                     COMMIT;",
+                )?;
+                current_version = 4;
+            }
+            if current_version == 4 {
+                let has_crons: bool = writer.query_row(
+                    "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='cron_jobs'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let alter = if has_crons {
+                    "ALTER TABLE cron_jobs ADD COLUMN last_status TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE cron_jobs ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE cron_jobs ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0;
+                     ALTER TABLE cron_jobs ADD COLUMN next_retry_at INTEGER;"
+                } else {
+                    ""
+                };
+                writer.execute_batch(&format!(
+                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 5; COMMIT;"
+                ))?;
+            }
+            // Idempotent: creates any table/index/trigger an older database never had.
+            writer.execute_batch(SCHEMA_V5)?;
         }
         // On startup, mark any orphaned running node jobs without a valid future lease as failed.
         let now = crate::config::now_unix();
         writer.execute(
             "UPDATE node_jobs SET status='failed', updated_at=?1
              WHERE status='running' AND (lease_until IS NULL OR lease_until <= ?1)",
+            [now],
+        )?;
+        // A chat turn still `pending` at startup was interrupted by a crash/restart: mark it failed
+        // so the client can retry with the same request_id instead of hanging forever.
+        writer.execute(
+            "UPDATE messages SET status='failed' WHERE status='pending'",
+            [],
+        )?;
+        // Cron runs interrupted by a restart are failed and retried right away.
+        writer.execute(
+            "UPDATE cron_jobs SET last_status='failed', last_error='interrupted by restart',
+                    fail_count=fail_count+1, next_retry_at=?1
+             WHERE last_status='running'",
             [now],
         )?;
 
@@ -408,7 +458,15 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 3);
+        assert_eq!(ver, 5);
+        let reply_to_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('messages') WHERE name='reply_to'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reply_to_cols, 1);
         let avatar: String = conn
             .query_row(
                 "SELECT avatar_id FROM agent_profiles WHERE user_id='u1'",
@@ -435,6 +493,48 @@ mod tests {
             .query_row("SELECT count(*) FROM threads", [], |r| r.get(0))
             .unwrap();
         assert_eq!(thr_count, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pending_chat_turns_are_failed_on_restart() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenct-pend-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("agenct.sqlite3");
+        drop(Db::open(&db_path).unwrap());
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "INSERT INTO users(id, username, display_name, created_at) VALUES ('u1', 'alice', 'Alice', 1);
+                 INSERT INTO messages(user_id, role, content, request_id, status, created_at)
+                 VALUES ('u1', 'user', 'interrupted', 'req-1', 'pending', 1);
+                 INSERT INTO cron_jobs(id, user_id, interval_minutes, instruction, last_status, created_at)
+                 VALUES ('crn_1', 'u1', 60, 'report', 'running', 1);",
+            )
+            .unwrap();
+        }
+        drop(Db::open(&db_path).unwrap());
+        let conn = Connection::open(&db_path).unwrap();
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM messages WHERE request_id='req-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        let (cron_status, fails, retry): (String, i64, Option<i64>) = conn
+            .query_row(
+                "SELECT last_status, fail_count, next_retry_at FROM cron_jobs WHERE id='crn_1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((cron_status.as_str(), fails), ("failed", 1));
+        assert!(retry.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

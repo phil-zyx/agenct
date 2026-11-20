@@ -15,6 +15,7 @@ use axum::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const DEFAULT_AGENT_NAME: &str = "Agenct";
@@ -630,41 +631,92 @@ pub async fn chat(
     Ok(Json(out))
 }
 
+/// Maximum LLM calls per chat turn (initial call + tool-result follow-ups).
+const MAX_AGENT_STEPS: usize = 3;
+/// Per-tool observation budget fed back into the model.
+const TOOL_OBSERVATION_MAX_BYTES: usize = 4000;
+
+/// State of a previously seen client `request_id`.
+enum RequestState {
+    New,
+    Replay(String),
+    InFlight,
+    Failed,
+}
+
+async fn lookup_request(hub: &Hub, user_id: &str, request_id: &str) -> Result<RequestState> {
+    let uid = user_id.to_owned();
+    let rid = request_id.to_owned();
+    hub.db
+        .read(move |conn| {
+            let row: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT id, status FROM messages WHERE user_id=?1 AND request_id=?2",
+                    params![uid, rid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((mid, status)) = row else {
+                return Ok(RequestState::New);
+            };
+            match status.as_str() {
+                "pending" => Ok(RequestState::InFlight),
+                "failed" => Ok(RequestState::Failed),
+                _ => {
+                    let reply: Option<String> = conn
+                        .query_row(
+                            "SELECT content FROM messages
+                             WHERE user_id=?1 AND reply_to=?2 AND role='assistant'
+                             ORDER BY id ASC LIMIT 1",
+                            params![uid, mid],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    // A completed request without a linked reply predates schema v4; never guess.
+                    Ok(reply.map_or(RequestState::InFlight, RequestState::Replay))
+                }
+            }
+        })
+        .await
+}
+
+/// Everything the brain needs for one turn, loaded in a single DB transaction.
+struct TurnSnapshot {
+    profile: AgentProfile,
+    rolling_summary: String,
+    threads: Vec<ThreadView>,
+    ledgers: Vec<Ledger>,
+    nodes: Vec<nodes::NodeView>,
+    crons: Vec<automation::CronJob>,
+    rules: Vec<automation::DispatchRule>,
+    matched_rule: Option<automation::DispatchRule>,
+    gitlab_configured: bool,
+    history: Vec<ChatMessage>,
+    contacts: Vec<String>,
+    user_msg_id: i64,
+}
+
 /// Unified single-brain turn execution used by both Web UI and inbound IM webhook.
+///
+/// Lifecycle of the user message: inserted as `pending` → `complete` together with the
+/// assistant reply (linked via `reply_to`), or `failed` if the turn cannot produce a reply.
+/// A failed `request_id` may be retried; a completed one is replayed idempotently.
 pub async fn run_turn(
     hub: &Hub,
     user_id: &str,
     message: &str,
     request_id: Option<&str>,
 ) -> Result<Value> {
-    // Idempotent replay if request_id already completed.
     if let Some(rid) = request_id {
-        let uid = user_id.to_owned();
-        let rid_s = rid.to_owned();
-        let existing: Option<String> = hub
-            .db
-            .read(move |conn| {
-                let user_msg_id: Option<i64> = conn
-                    .query_row(
-                        "SELECT id FROM messages WHERE user_id=?1 AND request_id=?2",
-                        params![uid, rid_s],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                let Some(mid) = user_msg_id else {
-                    return Ok(None);
-                };
-                Ok(conn
-                    .query_row(
-                        "SELECT content FROM messages WHERE user_id=?1 AND id > ?2 AND role='assistant' ORDER BY id ASC LIMIT 1",
-                        params![uid, mid],
-                        |r| r.get(0),
-                    )
-                    .optional()?)
-            })
-            .await?;
-        if let Some(reply) = existing {
-            return Ok(json!({"reply": reply, "replayed": true}));
+        match lookup_request(hub, user_id, rid).await? {
+            RequestState::Replay(reply) => return Ok(json!({"reply": reply, "replayed": true})),
+            RequestState::InFlight => {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "request is already being processed",
+                ))
+            }
+            RequestState::New | RequestState::Failed => {}
         }
     }
 
@@ -674,311 +726,434 @@ pub async fn run_turn(
         .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, "another chat turn is already running"))?;
 
-    // Persist user message + load structured workbench snapshot cleanly in one DB read/write.
-    let uid = user_id.to_owned();
-    let msg_owned = message.to_owned();
-    let rid_owned = request_id.map(str::to_owned);
-    let snapshot = hub
-        .db
-        .write(move |conn| {
-            let profile = read_profile_sync(conn, &uid)?;
-            let (rolling_summary, _) = read_compaction_state_sync(conn, &uid)?;
-            let threads = list_active_threads_sync(conn, &uid)?;
-            let ledgers = list_ledgers_sync(conn, &uid)?;
-            let nodes = nodes::list_nodes_sync(conn, &uid)?;
-            let crons = automation::list_crons_sync(conn, &uid)?;
-            let rules = automation::list_rules_sync(conn, &uid)?;
-            let matched_rule = automation::match_rule_sync(conn, &uid, &msg_owned)?;
-            let gitlab_configured: bool = conn
-                .query_row(
-                    "SELECT config_json FROM integrations WHERE user_id = ?1 AND kind = 'gitlab'",
-                    [&uid],
-                    |r| r.get::<_, String>(0),
-                )
-                .optional()?
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v["token"].as_str().map(|t| !t.trim().is_empty()))
-                .unwrap_or(false);
+    let snapshot = load_snapshot_and_claim(hub, user_id, message, request_id).await?;
+    let user_msg_id = snapshot.user_msg_id;
+    hub.events
+        .emit(user_id.to_owned(), "message", json!({"pending": true}));
 
-            let mut hist_stmt = conn.prepare(
-                "SELECT role, content, thread_id FROM (
-                    SELECT id, role, content, thread_id FROM messages
-                    WHERE user_id = ?1 AND status = 'complete' AND role IN ('user','assistant')
-                    ORDER BY id DESC LIMIT 10
-                 ) ORDER BY id ASC",
-            )?;
-            let raw_hist: Vec<(String, String, Option<String>)> = hist_stmt
-                .query_map([&uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let total_hist = raw_hist.len();
-            let history: Vec<ChatMessage> = raw_hist
-                .into_iter()
-                .enumerate()
-                .map(|(idx, (role, content, thr_id))| {
-                    // Keep the newest 2 turns detailed; trim older turns tightly so long node outputs don't bloat context.
-                    let budget = if idx + 2 >= total_hist { 1200 } else { 480 };
-                    let trimmed = truncate_bytes(&content, budget);
-                    let tagged = match thr_id.as_deref().filter(|s| !s.is_empty()) {
-                        Some(tid) => format!("[{tid}] {trimmed}"),
-                        None => trimmed,
-                    };
-                    ChatMessage {
-                        role,
-                        content: tagged,
-                    }
-                })
-                .collect();
+    match drive_turn(hub, user_id, message, snapshot).await {
+        Ok(out) => Ok(out),
+        Err(err) => {
+            mark_turn_failed(hub, user_id, user_msg_id).await;
+            Err(err)
+        }
+    }
+}
 
-            let mut contact_stmt = conn.prepare(
-                "SELECT username, display_name FROM users WHERE status='active' AND id != ?1 ORDER BY username ASC LIMIT 30",
-            )?;
-            let contacts: Vec<String> = contact_stmt
-                .query_map([&uid], |r| {
-                    Ok(format!("{} ({})", r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+/// Reads everything the brain needs for one turn (`user_msg_id` is filled in by the caller).
+fn build_snapshot_sync(
+    conn: &Connection,
+    uid: &str,
+    message: &str,
+    with_history: bool,
+) -> Result<TurnSnapshot> {
+    let profile = read_profile_sync(conn, uid)?;
+    let (rolling_summary, _) = read_compaction_state_sync(conn, uid)?;
+    let threads = list_active_threads_sync(conn, uid)?;
+    let ledgers = list_ledgers_sync(conn, uid)?;
+    let nodes = nodes::list_nodes_sync(conn, uid)?;
+    let crons = automation::list_crons_sync(conn, uid)?;
+    let rules = automation::list_rules_sync(conn, uid)?;
+    let matched_rule = automation::match_rule_sync(conn, uid, message)?;
+    let gitlab_configured: bool = conn
+        .query_row(
+            "SELECT config_json FROM integrations WHERE user_id = ?1 AND kind = 'gitlab'",
+            [uid],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v["token"].as_str().map(|t| !t.trim().is_empty()))
+        .unwrap_or(false);
 
-            conn.execute(
-                "INSERT INTO messages(user_id, role, content, request_id, status, created_at)
-                 VALUES (?1, 'user', ?2, ?3, 'complete', ?4)",
-                params![uid, msg_owned, rid_owned, now_unix()],
-            )?;
-            let user_msg_id = conn.last_insert_rowid();
+    let history = if !with_history {
+        Vec::new()
+    } else {
+        let mut hist_stmt = conn.prepare(
+            "SELECT role, content, thread_id FROM (
+                SELECT id, role, content, thread_id FROM messages
+                WHERE user_id = ?1 AND status = 'complete' AND role IN ('user','assistant')
+                ORDER BY id DESC LIMIT 10
+             ) ORDER BY id ASC",
+        )?;
+        let raw_hist: Vec<(String, String, Option<String>)> = hist_stmt
+            .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let total_hist = raw_hist.len();
+        raw_hist
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (role, content, thr_id))| {
+                // Keep the newest 2 turns detailed; trim older turns tightly so long node outputs don't bloat context.
+                let budget = if idx + 2 >= total_hist { 1200 } else { 480 };
+                let trimmed = truncate_bytes(&content, budget);
+                let tagged = match thr_id.as_deref().filter(|s| !s.is_empty()) {
+                    Some(tid) => format!("[{tid}] {trimmed}"),
+                    None => trimmed,
+                };
+                ChatMessage {
+                    role,
+                    content: tagged,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
 
-            Ok((
-                profile,
-                rolling_summary,
-                threads,
-                ledgers,
-                nodes,
-                crons,
-                rules,
-                matched_rule,
-                gitlab_configured,
-                history,
-                contacts,
-                user_msg_id,
-            ))
-        })
-        .await?;
+    let contacts = {
+        let mut contact_stmt = conn.prepare(
+            "SELECT username, display_name FROM users WHERE status='active' AND id != ?1 ORDER BY username ASC LIMIT 30",
+        )?;
+        let rows = contact_stmt
+            .query_map([uid], |r| {
+                Ok(format!(
+                    "{} ({})",
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
 
-    let (
+    Ok(TurnSnapshot {
         profile,
         rolling_summary,
         threads,
         ledgers,
-        node_list,
+        nodes,
         crons,
         rules,
         matched_rule,
         gitlab_configured,
         history,
         contacts,
-        user_msg_id,
-    ) = snapshot;
+        user_msg_id: 0,
+    })
+}
 
-    // Build structured system prompt with per-section budgets (system rules & tools are NEVER truncated).
-    let system_prompt = build_system_prompt(
-        &profile,
-        &rolling_summary,
-        &threads,
-        &ledgers,
-        &node_list,
-        &crons,
-        &rules,
-        &contacts,
-        gitlab_configured,
-    );
-
-    let raw_llm = hub
-        .llm
-        .complete(&system_prompt, &history, message, true)
-        .await?;
-
-    let parsed = parse_brain_response(&raw_llm);
-    let mut final_reply = parsed.reply;
-    let mut dispatched_tasks: Vec<Value> = Vec::new();
-    let mut active_thread_id = resolve_or_create_thread(
-        hub,
-        user_id,
-        parsed.thread_id.as_deref(),
-        parsed.thread_title.as_deref(),
-        message,
-    )
-    .await?;
-
-    for call in parsed.tools {
-        match call.tool.as_str() {
-            "update_memory" => {
-                apply_update_memory(hub, user_id, &call).await?;
-            }
-            "update_ledger" => {
-                apply_update_ledger(hub, user_id, &call).await?;
-            }
-            "close_thread" => {
-                if let Some(tid) = call
-                    .thread_id
-                    .as_deref()
-                    .or(active_thread_id.as_deref())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    archive_thread(hub, user_id, tid).await?;
-                }
-            }
-            "manage_cron" => {
-                apply_manage_cron(hub, user_id, &call).await?;
-            }
-            "manage_rule" => {
-                apply_manage_rule(hub, user_id, &call).await?;
-            }
-            "fetch_gitlab_commits" => {
-                hub.events.emit(
-                    user_id.to_owned(),
-                    "stage",
-                    json!({"stage": "正在拉取 GitLab 提交记录…"}),
-                );
-                if let Some(summary) =
-                    crate::integrations::gitlab::fetch_commit_summary(hub, user_id).await
-                {
-                    final_reply.push_str("\n\n");
-                    final_reply.push_str(&summary);
-                } else if node_list.iter().any(|n| n.online && n.kind == "pc") {
-                    // GitLab PAT is not configured: seamlessly fall back to online PC node git log.
-                    hub.events.emit(
-                        user_id.to_owned(),
-                        "stage",
-                        json!({"stage": "未配置 GitLab 令牌，改派到在线节点查询仓库提交…"}),
-                    );
-                    let title = truncate_bytes(message, 48);
-                    let thr_id = match active_thread_id.clone() {
-                        Some(id) => id,
-                        None => {
-                            let created = create_thread(hub, user_id, &title).await?;
-                            active_thread_id = Some(created.clone());
-                            created
-                        }
-                    };
-                    if let Some(info) = dispatch_to_node(
-                        hub,
-                        user_id,
-                        None,
-                        false,
-                        &title,
-                        &format!("用户请求：{message}\n请在工作目录中定位对应本地 git 仓库并运行 git log 查看提交记录，用简洁中文汇总结果。"),
-                        Some(&thr_id),
+/// Loads the workbench snapshot and records the user message as `pending` in one transaction.
+/// Retrying a failed `request_id` revives the same row instead of inserting a duplicate.
+async fn load_snapshot_and_claim(
+    hub: &Hub,
+    user_id: &str,
+    message: &str,
+    request_id: Option<&str>,
+) -> Result<TurnSnapshot> {
+    let uid = user_id.to_owned();
+    let msg_owned = message.to_owned();
+    let rid_owned = request_id.map(str::to_owned);
+    hub.db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let mut snap = build_snapshot_sync(&tx, &uid, &msg_owned, true)?;
+            let now = now_unix();
+            let existing: Option<(i64, String)> = match rid_owned.as_deref() {
+                Some(rid) => tx
+                    .query_row(
+                        "SELECT id, status FROM messages WHERE user_id=?1 AND request_id=?2",
+                        params![uid, rid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
                     )
-                    .await?
-                    {
-                        dispatched_tasks.push(info);
-                        if final_reply.contains("GitLab") || final_reply == "好的，我来查一下 GitLab 提交记录。" {
-                            final_reply = "尚未配置 GitLab 访问令牌，已改派给在线本机节点查询本地仓库提交，稍后发回结果。".into();
-                        }
-                    }
-                } else {
-                    final_reply.push_str(
-                        "\n\n（尚未在设置中配置 GitLab 访问令牌，且当前没有在线的本机节点可查本地仓库。）",
-                    );
+                    .optional()?,
+                None => None,
+            };
+            let user_msg_id = match existing {
+                Some((id, status)) if status == "failed" => {
+                    tx.execute(
+                        "UPDATE messages SET status='pending', content=?2, thread_id=NULL, created_at=?3
+                         WHERE id=?1",
+                        params![id, msg_owned, now],
+                    )?;
+                    id
                 }
-            }
-            "dispatch_node" => {
-                hub.events.emit(
-                    user_id.to_owned(),
-                    "stage",
-                    json!({"stage": "正在派发到执行节点…"}),
-                );
-                let instr = call
-                    .instruction
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(message)
-                    .to_owned();
-                let title = call
-                    .title
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| instr.lines().next().unwrap_or("节点任务"))
-                    .to_owned();
-                let preferred_node = call
-                    .node_id
-                    .as_deref()
-                    .or_else(|| matched_rule.as_ref().map(|r| r.target_node_id.as_str()))
-                    .map(str::to_owned);
-                let prefer_cloud = call.prefer_cloud.unwrap_or(false);
-                // Ensure every node dispatch belongs to an implicit backend thread for future session resume.
-                let task_thread_id = if let Some(tid) = resolve_or_create_thread(
-                    hub,
-                    user_id,
-                    call.thread_id.as_deref().or(active_thread_id.as_deref()),
-                    Some(&title),
-                    &title,
-                )
-                .await?
-                {
-                    active_thread_id = Some(tid.clone());
-                    tid
-                } else {
-                    let created = create_thread(hub, user_id, &title).await?;
-                    active_thread_id = Some(created.clone());
-                    created
-                };
-                if let Some(info) = dispatch_to_node(
-                    hub,
-                    user_id,
-                    preferred_node.as_deref(),
-                    prefer_cloud,
-                    &title,
-                    &instr,
-                    Some(&task_thread_id),
-                )
-                .await?
-                {
-                    dispatched_tasks.push(info);
-                } else {
-                    final_reply.push_str(
-                        "\n\n（当前没有已注册的 PC 或云端执行节点，请先在设置中接入节点。）",
-                    );
+                Some(_) => {
+                    return Err(Error(
+                        StatusCode::CONFLICT,
+                        "request is already being processed",
+                    ))
                 }
-            }
-            "delegate_colleague" => {
-                if let Some(peer) = call
-                    .peer
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    let instr = call
-                        .instruction
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(message);
-                    match collab::delegate_to_peer(hub, user_id, peer, instr).await {
-                        Ok((peer_name, task_id, mode)) => {
-                            dispatched_tasks.push(json!({
-                                "task_id": task_id,
-                                "peer": peer_name,
-                                "mode": mode,
-                            }));
-                        }
-                        Err(_) => {
-                            final_reply
-                                .push_str(&format!("\n\n（未找到名为 `{peer}` 的活跃同事。）"));
-                        }
-                    }
+                None => {
+                    tx.execute(
+                        "INSERT INTO messages(user_id, role, content, request_id, status, created_at)
+                         VALUES (?1, 'user', ?2, ?3, 'pending', ?4)",
+                        params![uid, msg_owned, rid_owned, now],
+                    )?;
+                    tx.last_insert_rowid()
                 }
-            }
-            _ => {}
+            };
+            tx.commit()?;
+            snap.user_msg_id = user_msg_id;
+            Ok(snap)
+        })
+        .await
+}
+
+async fn mark_turn_failed(hub: &Hub, user_id: &str, user_msg_id: i64) {
+    let uid = user_id.to_owned();
+    let _ = hub
+        .db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE messages SET status='failed' WHERE id=?1 AND user_id=?2 AND status='pending'",
+                params![user_msg_id, uid],
+            )?;
+            Ok(())
+        })
+        .await;
+    hub.events
+        .emit(user_id.to_owned(), "stage", json!({"stage": ""}));
+    hub.events
+        .emit(user_id.to_owned(), "message", json!({"failed": true}));
+}
+
+/// Result of executing one tool call, reported back to the model in the next agent step.
+struct ToolOutcome {
+    tool: String,
+    ok: bool,
+    /// Factual result for the model (fed back as a TOOL_RESULTS message).
+    observation: String,
+    /// Text appended to the user-facing reply if the agent loop ends before the model
+    /// could incorporate this outcome itself.
+    user_note: String,
+    /// Whether the model must see this result before the turn can be answered well
+    /// (query results and failures). Successful fire-and-forget mutations don't.
+    needs_followup: bool,
+}
+
+impl ToolOutcome {
+    fn done(tool: &str, observation: impl Into<String>) -> Self {
+        Self {
+            tool: tool.to_owned(),
+            ok: true,
+            observation: observation.into(),
+            user_note: String::new(),
+            needs_followup: false,
         }
     }
 
-    // Persist assistant reply + tag both messages with resolved implicit thread_id.
+    fn failed(tool: &str, observation: impl Into<String>, user_note: impl Into<String>) -> Self {
+        Self {
+            tool: tool.to_owned(),
+            ok: false,
+            observation: observation.into(),
+            user_note: user_note.into(),
+            needs_followup: true,
+        }
+    }
+}
+
+/// Mutable per-turn state shared across agent steps.
+struct TurnContext<'a> {
+    hub: &'a Hub,
+    user_id: &'a str,
+    message: &'a str,
+    node_list: &'a [nodes::NodeView],
+    matched_rule_target: Option<String>,
+    active_thread_id: Option<String>,
+    dispatched_tasks: Vec<Value>,
+    /// Keys of side-effecting calls that already succeeded this turn (prevents follow-up
+    /// steps from re-dispatching the same job).
+    done_keys: HashSet<String>,
+    /// Interactive chat turns stream `stage` progress to the UI; headless runs stay silent.
+    interactive: bool,
+    /// Optional tool allow-list (headless/cron runs must not e.g. create more crons).
+    allowed_tools: Option<&'a [&'a str]>,
+}
+
+impl TurnContext<'_> {
+    fn stage(&self, text: &str) {
+        if self.interactive {
+            self.hub
+                .events
+                .emit(self.user_id.to_owned(), "stage", json!({ "stage": text }));
+        }
+    }
+}
+
+/// Final result of one agent loop run.
+pub struct AgentOutput {
+    pub reply: String,
+    pub thread_id: Option<String>,
+    pub tasks: Vec<Value>,
+}
+
+/// How an agent loop run is driven.
+struct AgentMode<'a> {
+    /// Extra system prompt section appended after the standard prompt.
+    prompt_suffix: &'a str,
+    interactive: bool,
+    allowed_tools: Option<&'a [&'a str]>,
+}
+
+/// Runs an interactive chat turn: agent loop, then atomically persists the final reply.
+async fn drive_turn(hub: &Hub, user_id: &str, message: &str, snap: TurnSnapshot) -> Result<Value> {
+    let mode = AgentMode {
+        prompt_suffix: "",
+        interactive: true,
+        allowed_tools: None,
+    };
+    let out = agent_loop(hub, user_id, message, &snap, &mode).await?;
+    let reply = persist_turn(
+        hub,
+        user_id,
+        message,
+        snap.user_msg_id,
+        out.thread_id.clone(),
+        &out.reply,
+    )
+    .await?;
+    // Non-blocking background rolling context compaction & Active Memory pruning.
+    maybe_spawn_compaction(hub.clone(), user_id.to_owned());
+    Ok(json!({
+        "reply": reply,
+        "thread_id": out.thread_id,
+        "tasks": out.tasks,
+    }))
+}
+
+/// Runs the brain without a chat turn (e.g. cron jobs): no user message is stored, no
+/// history is used, and only `allowed_tools` may be called. The caller persists the reply.
+pub async fn run_headless(
+    hub: &Hub,
+    user_id: &str,
+    instruction: &str,
+    prompt_suffix: &str,
+    allowed_tools: &[&str],
+) -> Result<AgentOutput> {
+    let uid = user_id.to_owned();
+    let instr = instruction.to_owned();
+    let snap = hub
+        .db
+        .read(move |conn| build_snapshot_sync(conn, &uid, &instr, false))
+        .await?;
+    let mode = AgentMode {
+        prompt_suffix,
+        interactive: false,
+        allowed_tools: Some(allowed_tools),
+    };
+    agent_loop(hub, user_id, instruction, &snap, &mode).await
+}
+
+/// The agent loop: LLM → tools → feed results back → … (at most `MAX_AGENT_STEPS` calls).
+async fn agent_loop(
+    hub: &Hub,
+    user_id: &str,
+    message: &str,
+    snap: &TurnSnapshot,
+    mode: &AgentMode<'_>,
+) -> Result<AgentOutput> {
+    // Build structured system prompt with per-section budgets (system rules & tools are NEVER truncated).
+    let mut system_prompt = build_system_prompt(
+        &snap.profile,
+        &snap.rolling_summary,
+        &snap.threads,
+        &snap.ledgers,
+        &snap.nodes,
+        &snap.crons,
+        &snap.rules,
+        &snap.contacts,
+        snap.gitlab_configured,
+    );
+    system_prompt.push_str(mode.prompt_suffix);
+
+    let mut ctx = TurnContext {
+        hub,
+        user_id,
+        message,
+        node_list: &snap.nodes,
+        matched_rule_target: snap.matched_rule.as_ref().map(|r| r.target_node_id.clone()),
+        active_thread_id: None,
+        dispatched_tasks: Vec::new(),
+        done_keys: HashSet::new(),
+        interactive: mode.interactive,
+        allowed_tools: mode.allowed_tools,
+    };
+
+    let mut convo = snap.history.clone();
+    let mut prompt_msg = message.to_owned();
+    let mut final_reply = String::new();
+    let mut unresolved: Vec<ToolOutcome> = Vec::new();
+
+    for step in 0..MAX_AGENT_STEPS {
+        let raw_llm = match hub
+            .llm
+            .complete(&system_prompt, &convo, &prompt_msg, true)
+            .await
+        {
+            Ok(raw) => raw,
+            // Without a first reply there is nothing to show: the turn fails.
+            Err(err) if step == 0 => return Err(err),
+            // A failed follow-up keeps the previous reply plus the unresolved tool notes.
+            Err(_) => break,
+        };
+        let parsed = parse_brain_response(&raw_llm);
+        final_reply = parsed.reply;
+
+        let resolved = resolve_or_create_thread(
+            hub,
+            user_id,
+            parsed.thread_id.as_deref(),
+            parsed.thread_title.as_deref(),
+            message,
+        )
+        .await?;
+        if step == 0 || resolved.is_some() {
+            ctx.active_thread_id = resolved;
+        }
+
+        let mut outcomes = Vec::with_capacity(parsed.tools.len());
+        for call in &parsed.tools {
+            outcomes.push(execute_tool(&mut ctx, call).await);
+        }
+        if !outcomes.iter().any(|o| o.needs_followup) {
+            unresolved.clear();
+            break;
+        }
+        let last_step = step + 1 == MAX_AGENT_STEPS;
+        if !last_step {
+            ctx.stage("正在根据工具结果整理回复…");
+            convo.push(ChatMessage {
+                role: "user".into(),
+                content: truncate_bytes(&prompt_msg, 8000),
+            });
+            convo.push(ChatMessage {
+                role: "assistant".into(),
+                content: truncate_bytes(raw_llm.trim(), 4000),
+            });
+            prompt_msg = format_tool_results(&outcomes);
+        }
+        unresolved = outcomes;
+    }
+
+    for o in unresolved.iter().filter(|o| o.needs_followup) {
+        if !o.user_note.trim().is_empty() {
+            final_reply.push_str("\n\n");
+            final_reply.push_str(o.user_note.trim());
+        }
+    }
+    if final_reply.trim().is_empty() {
+        final_reply = "好的，已处理。".into();
+    }
+
+    Ok(AgentOutput {
+        reply: final_reply,
+        thread_id: ctx.active_thread_id,
+        tasks: ctx.dispatched_tasks,
+    })
+}
+
+/// Atomically completes the user message and stores the assistant reply linked via `reply_to`.
+async fn persist_turn(
+    hub: &Hub,
+    user_id: &str,
+    message: &str,
+    user_msg_id: i64,
+    thread_id: Option<String>,
+    final_reply: &str,
+) -> Result<String> {
     let uid = user_id.to_owned();
     let reply_db = truncate_bytes(final_reply.trim(), 16_000);
     let reply_ret = reply_db.clone();
-    let thr_db = active_thread_id.clone();
     let thr_summary_snippet = truncate_bytes(
         &format!(
             "{} -> {}",
@@ -989,13 +1164,21 @@ pub async fn run_turn(
     );
     hub.db
         .write(move |conn| {
+            let tx = conn.transaction()?;
             let now = now_unix();
-            if let Some(ref tid) = thr_db {
-                conn.execute(
-                    "UPDATE messages SET thread_id = ?1 WHERE id = ?2 AND user_id = ?3",
-                    params![tid, user_msg_id, uid],
-                )?;
-                conn.execute(
+            let claimed = tx.execute(
+                "UPDATE messages SET status = 'complete', thread_id = ?3
+                 WHERE id = ?1 AND user_id = ?2 AND status = 'pending'",
+                params![user_msg_id, uid, thread_id],
+            )?;
+            if claimed != 1 {
+                return Err(Error(
+                    StatusCode::CONFLICT,
+                    "chat turn was superseded",
+                ));
+            }
+            if let Some(ref tid) = thread_id {
+                tx.execute(
                     "UPDATE threads
                      SET turn_count = turn_count + 1,
                          summary = CASE WHEN summary = '' THEN ?3 ELSE summary END,
@@ -1004,11 +1187,12 @@ pub async fn run_turn(
                     params![tid, uid, thr_summary_snippet, now],
                 )?;
             }
-            conn.execute(
-                "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
-                 VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
-                params![uid, thr_db, reply_db, now],
+            tx.execute(
+                "INSERT INTO messages(user_id, thread_id, role, content, status, reply_to, created_at)
+                 VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4, ?5)",
+                params![uid, thread_id, reply_db, user_msg_id, now],
             )?;
+            tx.commit()?;
             Ok(())
         })
         .await?;
@@ -1017,15 +1201,266 @@ pub async fn run_turn(
         .emit(user_id.to_owned(), "stage", json!({"stage": ""}));
     hub.events
         .emit(user_id.to_owned(), "message", json!({"done": true}));
+    Ok(reply_ret)
+}
 
-    // Non-blocking background rolling context compaction & Active Memory pruning.
-    maybe_spawn_compaction(hub.clone(), user_id.to_owned());
+fn format_tool_results(outcomes: &[ToolOutcome]) -> String {
+    let mut out = format!(
+        "{}\n以下是你上一步调用工具的执行结果（由系统自动回传，不是用户发言）：\n",
+        crate::llm::TOOL_RESULTS_MARKER
+    );
+    for o in outcomes {
+        out.push_str(&format!(
+            "- [{}] {}：{}\n",
+            o.tool,
+            if o.ok { "成功" } else { "失败" },
+            truncate_bytes(o.observation.trim(), TOOL_OBSERVATION_MAX_BYTES)
+        ));
+    }
+    out.push_str(
+        "\n请基于以上结果给出面向用户的最终完整回复（会替换上一步的 reply）。\
+         如确有必要可继续调用工具，但不要重复已成功的调用。仍严格按同样的 JSON 格式输出。",
+    );
+    out
+}
 
-    Ok(json!({
-        "reply": reply_ret,
-        "thread_id": active_thread_id,
-        "tasks": dispatched_tasks,
-    }))
+/// Identity of a side-effecting call, used to skip exact repeats within one turn.
+fn side_effect_key(call: &ToolCall) -> Option<String> {
+    let non_idempotent = matches!(
+        call.tool.as_str(),
+        "dispatch_node" | "delegate_colleague" | "manage_cron" | "manage_rule"
+    );
+    non_idempotent.then(|| {
+        [
+            call.tool.as_str(),
+            call.action.as_deref().unwrap_or(""),
+            call.peer.as_deref().unwrap_or(""),
+            call.keyword.as_deref().unwrap_or(""),
+            call.instruction.as_deref().unwrap_or("").trim(),
+        ]
+        .join("\u{1f}")
+    })
+}
+
+async fn execute_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> ToolOutcome {
+    if ctx
+        .allowed_tools
+        .is_some_and(|allowed| !allowed.contains(&call.tool.as_str()))
+    {
+        return ToolOutcome::failed(
+            &call.tool,
+            format!(
+                "当前运行模式不允许调用 `{}`，请改用其它方式完成。",
+                call.tool
+            ),
+            String::new(),
+        );
+    }
+    let key = side_effect_key(call);
+    if key.as_ref().is_some_and(|k| ctx.done_keys.contains(k)) {
+        return ToolOutcome::done(&call.tool, "本轮已执行过相同调用，已跳过以避免重复。");
+    }
+    let outcome = match run_tool(ctx, call).await {
+        Ok(o) => o,
+        Err(err) => ToolOutcome::failed(
+            &call.tool,
+            format!("执行出错：{}", err.1),
+            format!("（{} 执行失败：{}）", call.tool, err.1),
+        ),
+    };
+    if outcome.ok {
+        if let Some(k) = key {
+            ctx.done_keys.insert(k);
+        }
+    }
+    outcome
+}
+
+async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutcome> {
+    let hub = ctx.hub;
+    let user_id = ctx.user_id;
+    let tool = call.tool.as_str();
+    match tool {
+        "update_memory" => {
+            apply_update_memory(hub, user_id, call).await?;
+            Ok(ToolOutcome::done(tool, "已更新人设/长期记忆。"))
+        }
+        "update_ledger" => {
+            apply_update_ledger(hub, user_id, call).await?;
+            Ok(ToolOutcome::done(tool, "已更新持续事项。"))
+        }
+        "close_thread" => {
+            let target = call
+                .thread_id
+                .as_deref()
+                .or(ctx.active_thread_id.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            match target {
+                Some(tid) => {
+                    archive_thread(hub, user_id, &tid).await?;
+                    Ok(ToolOutcome::done(tool, format!("已归档线程 {tid}。")))
+                }
+                None => Ok(ToolOutcome::done(tool, "没有可归档的线程，已忽略。")),
+            }
+        }
+        "manage_cron" => {
+            apply_manage_cron(hub, user_id, call).await?;
+            Ok(ToolOutcome::done(tool, "已更新定时任务。"))
+        }
+        "manage_rule" => {
+            apply_manage_rule(hub, user_id, call).await?;
+            Ok(ToolOutcome::done(tool, "已更新分发规则。"))
+        }
+        "fetch_gitlab_commits" => {
+            ctx.stage("正在拉取 GitLab 提交记录…");
+            if let Some(summary) =
+                crate::integrations::gitlab::fetch_commit_summary(hub, user_id).await
+            {
+                return Ok(ToolOutcome {
+                    tool: tool.to_owned(),
+                    ok: true,
+                    observation: summary.clone(),
+                    user_note: summary,
+                    needs_followup: true,
+                });
+            }
+            let online_pc: Vec<String> = ctx
+                .node_list
+                .iter()
+                .filter(|n| n.online && n.kind == "pc")
+                .map(|n| format!("{}（{}）", n.id, n.name))
+                .collect();
+            let observation = if online_pc.is_empty() {
+                "未能拉取 GitLab 提交：未配置 GitLab 访问令牌或请求失败；当前也没有在线的本机节点可查询本地仓库。".to_owned()
+            } else {
+                format!(
+                    "未能拉取 GitLab 提交：未配置 GitLab 访问令牌或请求失败。在线本机节点：{}。\
+                     如用户需要提交记录，可调用 dispatch_node（prefer_cloud=false）让节点在本地仓库运行 git log 并汇总。",
+                    online_pc.join("、")
+                )
+            };
+            Ok(ToolOutcome::failed(
+                tool,
+                observation,
+                "（未能拉取 GitLab 提交记录：尚未配置 GitLab 访问令牌或请求失败。）",
+            ))
+        }
+        "dispatch_node" => {
+            ctx.stage("正在派发到执行节点…");
+            let instr = call
+                .instruction
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(ctx.message)
+                .to_owned();
+            let title = call
+                .title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| instr.lines().next().unwrap_or("节点任务"))
+                .to_owned();
+            let preferred_node = call
+                .node_id
+                .clone()
+                .or_else(|| ctx.matched_rule_target.clone());
+            let prefer_cloud = call.prefer_cloud.unwrap_or(false);
+            // Ensure every node dispatch belongs to an implicit backend thread for future session resume.
+            let task_thread_id = match resolve_or_create_thread(
+                hub,
+                user_id,
+                call.thread_id
+                    .as_deref()
+                    .or(ctx.active_thread_id.as_deref()),
+                Some(&title),
+                &title,
+            )
+            .await?
+            {
+                Some(tid) => tid,
+                None => create_thread(hub, user_id, &title).await?,
+            };
+            ctx.active_thread_id = Some(task_thread_id.clone());
+            match dispatch_to_node(
+                hub,
+                user_id,
+                preferred_node.as_deref(),
+                prefer_cloud,
+                &title,
+                &instr,
+                Some(&task_thread_id),
+            )
+            .await?
+            {
+                Some(info) => {
+                    let observation = format!(
+                        "已派发任务 {} 到节点 {}（{}，{}），节点完成后结果会自动发回聊天。",
+                        info["task_id"].as_str().unwrap_or(""),
+                        info["node_name"].as_str().unwrap_or(""),
+                        info["node_kind"].as_str().unwrap_or(""),
+                        if info["online"].as_bool().unwrap_or(false) {
+                            "在线"
+                        } else {
+                            "离线，上线后执行"
+                        }
+                    );
+                    ctx.dispatched_tasks.push(info);
+                    Ok(ToolOutcome::done(tool, observation))
+                }
+                None => Ok(ToolOutcome::failed(
+                    tool,
+                    "派发失败：当前没有已注册的 PC 或云端执行节点。",
+                    "（当前没有已注册的 PC 或云端执行节点，请先在设置中接入节点。）",
+                )),
+            }
+        }
+        "delegate_colleague" => {
+            let Some(peer) = call
+                .peer
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    "缺少 peer 参数。",
+                    "（协作请求缺少同事名称。）",
+                ));
+            };
+            let instr = call
+                .instruction
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(ctx.message);
+            match collab::delegate_to_peer(hub, user_id, peer, instr).await {
+                Ok((peer_name, task_id, mode)) => {
+                    ctx.dispatched_tasks.push(json!({
+                        "task_id": task_id,
+                        "peer": peer_name,
+                        "mode": mode,
+                    }));
+                    Ok(ToolOutcome::done(
+                        tool,
+                        format!("已向 {peer_name} 发起协作任务 {task_id}（模式：{mode}）。"),
+                    ))
+                }
+                Err(_) => Ok(ToolOutcome::failed(
+                    tool,
+                    format!("未找到名为 `{peer}` 的活跃同事。"),
+                    format!("（未找到名为 `{peer}` 的活跃同事。）"),
+                )),
+            }
+        }
+        other => Ok(ToolOutcome::failed(
+            other,
+            format!("未知工具 `{other}`，请只使用系统提示中列出的工具。"),
+            String::new(),
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1214,6 +1649,10 @@ fn build_system_prompt(
 
 === 输出格式（严格合法 JSON，勿加 Markdown 代码块，严禁输出 <tool_call> / </tool_call> 标签或裸工具 JSON） ===
 {{"reply":"直接展示给用户的自然中文回复（必填）","thread_id":"thr_xxx 或 new 或 null","thread_title":"仅当 thread_id=new 时给简短标题，否则 null","tools":[]}}
+
+=== 工具结果回传 ===
+- 查询类工具（如 fetch_gitlab_commits）的结果、以及任何工具执行失败，会由系统以 `TOOL_RESULTS` 开头的消息回传给你；届时请基于真实结果给出最终完整回复（替换上一步的 reply），不要编造工具没有返回的内容。
+- 调用查询类工具的那一步 reply 只需一句简短过渡语。
 
 === 可组合调用的工具（必须放在 tools 数组中，严禁单独输出） ===
 1. update_memory: {{"tool":"update_memory","name":null,"avatar_id":"agenct|sakura|violet|cheshire或null","soul_md":null,"memory_append":"追加一条长期记忆/规矩","memory_replace":null}}

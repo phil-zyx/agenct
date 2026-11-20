@@ -783,3 +783,354 @@ async fn implicit_threads_session_resume_and_rolling_compaction_work() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+async fn message_rows(hub: &Hub, user_id: &str) -> Vec<(i64, String, String, String, Option<i64>)> {
+    let uid = user_id.to_owned();
+    hub.db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, role, status, content, reply_to FROM messages WHERE user_id=?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([&uid], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn agent_loop_feeds_tool_results_back_to_the_model() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    // Query tool without a GitLab PAT: the failure is observed by the model in a second step,
+    // which writes the final reply (instead of hard-coded string patching).
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/gitlab 最近提交", "request_id": "req-gl"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let reply = chat["reply"].as_str().unwrap();
+    assert!(reply.starts_with("已根据工具结果整理"), "{reply}");
+    assert!(reply.contains("fetch_gitlab_commits"), "{reply}");
+    assert!(reply.contains("未能拉取 GitLab 提交"), "{reply}");
+    assert!(chat["tasks"].as_array().unwrap().is_empty());
+
+    // Dispatch with no registered node: failure is fed back too.
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node run cargo test"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let reply = chat["reply"].as_str().unwrap();
+    assert!(reply.contains("派发失败"), "{reply}");
+
+    // Every assistant reply is linked to its user message; no pending rows remain.
+    let rows = message_rows(&hub, "u-alice").await;
+    assert_eq!(rows.len(), 4);
+    assert!(rows.iter().all(|r| r.2 == "complete"));
+    assert_eq!(rows[1].4, Some(rows[0].0));
+    assert_eq!(rows[3].4, Some(rows[2].0));
+}
+
+#[tokio::test]
+async fn failed_turns_are_marked_failed_retryable_and_replay_uses_reply_link() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    // LLM failure: user message is kept but marked failed, no assistant reply is stored.
+    for _ in 0..2 {
+        let (st, _) = req_json(
+            &router,
+            "POST",
+            "/api/chat",
+            Some(&cookie),
+            Some(&csrf),
+            Some(json!({"message": "/stub_fail", "request_id": "req-f"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_GATEWAY);
+    }
+    let rows = message_rows(&hub, "u-alice").await;
+    assert_eq!(rows.len(), 1, "retry must reuse the failed row");
+    assert_eq!(rows[0].1, "user");
+    assert_eq!(rows[0].2, "failed");
+
+    // Retrying the same request_id with a working turn revives the same row.
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "hello again", "request_id": "req-f"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let reply = chat["reply"].as_str().unwrap().to_owned();
+    let rows = message_rows(&hub, "u-alice").await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].2.as_str(), rows[0].3.as_str()),
+        ("complete", "hello again")
+    );
+    assert_eq!(rows[1].4, Some(rows[0].0));
+
+    // An unrelated assistant message (e.g. a node result) lands afterwards; replay must still
+    // return the linked reply, not "the next assistant message".
+    hub.db
+        .write(|conn| {
+            conn.execute(
+                "INSERT INTO messages(user_id, role, content, status, created_at)
+                 VALUES ('u-alice', 'assistant', 'node result noise', 'complete', 1)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (st, replay) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "hello again", "request_id": "req-f"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["reply"].as_str().unwrap(), reply);
+
+    // Failed turns never leak into the model's history.
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/stub_fail", "request_id": "req-f2"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_GATEWAY);
+    assert!(chat["error"].is_string());
+    let (_, boot) = req_json(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
+    let last = boot["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["status"], "failed");
+}
+
+#[derive(Debug)]
+struct CronRow {
+    last_status: String,
+    last_error: String,
+    fail_count: i64,
+    next_retry_at: Option<i64>,
+}
+
+async fn cron_row(hub: &Hub, id: &str) -> CronRow {
+    let id = id.to_owned();
+    hub.db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT last_status, last_error, fail_count, next_retry_at FROM cron_jobs WHERE id=?1",
+                [&id],
+                |r| {
+                    Ok(CronRow {
+                        last_status: r.get(0)?,
+                        last_error: r.get(1)?,
+                        fail_count: r.get(2)?,
+                        next_retry_at: r.get(3)?,
+                    })
+                },
+            )?)
+        })
+        .await
+        .unwrap()
+}
+
+async fn create_due_cron(
+    router: &Router,
+    hub: &Hub,
+    cookie: &str,
+    csrf: &str,
+    instruction: &str,
+    target: &str,
+) -> String {
+    let (st, cron) = req_json(
+        router,
+        "POST",
+        "/api/automation/crons",
+        Some(cookie),
+        Some(csrf),
+        Some(json!({"interval_minutes": 60, "instruction": instruction, "target": target})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let id = cron["id"].as_str().unwrap().to_owned();
+    let id_db = id.clone();
+    hub.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET created_at = 0 WHERE id = ?1",
+                [&id_db],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    id
+}
+
+async fn force_retry_now(hub: &Hub, id: &str) {
+    let id = id.to_owned();
+    hub.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE cron_jobs SET next_retry_at = 1 WHERE id = ?1 AND next_retry_at IS NOT NULL",
+                [&id],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[test]
+fn cron_retry_backoff_is_exponential_and_capped() {
+    use agenct_hub::automation::retry_delay_secs;
+    assert_eq!(retry_delay_secs(1), 60);
+    assert_eq!(retry_delay_secs(2), 120);
+    assert_eq!(retry_delay_secs(3), 240);
+    assert_eq!(retry_delay_secs(10), 1800);
+}
+
+#[tokio::test]
+async fn cloud_cron_runs_through_agent_loop_with_restricted_tools() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    // No keyword routing: the brain calls fetch_gitlab_commits and reports on the real result.
+    let gl = create_due_cron(
+        &router,
+        &hub,
+        &cookie,
+        &csrf,
+        "/gitlab 每日提交汇总",
+        "cloud",
+    )
+    .await;
+    // A cron must not be able to create more crons.
+    let sneaky = create_due_cron(&router, &hub, &cookie, &csrf, "/cron 再建一个", "cloud").await;
+
+    assert_eq!(
+        agenct_hub::automation::run_due_crons(&hub).await.unwrap(),
+        2
+    );
+    // Already ran: nothing is due right after.
+    assert_eq!(
+        agenct_hub::automation::run_due_crons(&hub).await.unwrap(),
+        0
+    );
+
+    for id in [&gl, &sneaky] {
+        let row = cron_row(&hub, id).await;
+        assert_eq!(row.last_status, "ok", "{row:?}");
+        assert_eq!(row.fail_count, 0);
+    }
+    let rows = message_rows(&hub, "u-alice").await;
+    assert!(
+        rows.iter().all(|r| r.1 == "assistant"),
+        "cron must not fake user messages"
+    );
+    let gl_report = rows
+        .iter()
+        .find(|r| r.3.contains("每日提交汇总"))
+        .expect("gitlab report");
+    assert!(gl_report.3.starts_with("**[定时汇报]**"));
+    assert!(
+        gl_report.3.contains("已根据工具结果整理"),
+        "{}",
+        gl_report.3
+    );
+    assert!(gl_report.3.contains("fetch_gitlab_commits"));
+    let sneaky_report = rows.iter().find(|r| r.3.contains("再建一个")).unwrap();
+    assert!(
+        sneaky_report.3.contains("manage_cron"),
+        "{}",
+        sneaky_report.3
+    );
+
+    let crons: i64 = hub
+        .db
+        .read(|conn| Ok(conn.query_row("SELECT count(*) FROM cron_jobs", [], |r| r.get(0))?))
+        .await
+        .unwrap();
+    assert_eq!(crons, 2, "blocked manage_cron must not add a cron");
+}
+
+#[tokio::test]
+async fn failing_crons_back_off_retry_and_give_up_once() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let id = create_due_cron(&router, &hub, &cookie, &csrf, "/stub_fail", "cloud").await;
+    let before = agenct_hub::config::now_unix();
+    assert_eq!(
+        agenct_hub::automation::run_due_crons(&hub).await.unwrap(),
+        1
+    );
+    let row = cron_row(&hub, &id).await;
+    assert_eq!((row.last_status.as_str(), row.fail_count), ("failed", 1));
+    assert!(!row.last_error.is_empty());
+    let retry_at = row.next_retry_at.expect("retry scheduled");
+    assert!(retry_at >= before + 60 && retry_at <= before + 62);
+
+    // Not due again until the backoff elapses.
+    assert_eq!(
+        agenct_hub::automation::run_due_crons(&hub).await.unwrap(),
+        0
+    );
+
+    for expected in 2..=4 {
+        force_retry_now(&hub, &id).await;
+        assert_eq!(
+            agenct_hub::automation::run_due_crons(&hub).await.unwrap(),
+            1
+        );
+        assert_eq!(cron_row(&hub, &id).await.fail_count, expected);
+    }
+    let row = cron_row(&hub, &id).await;
+    assert_eq!(row.next_retry_at, None, "retries exhausted");
+    let give_ups = message_rows(&hub, "u-alice")
+        .await
+        .into_iter()
+        .filter(|r| r.3.starts_with("**[定时任务失败]**"))
+        .count();
+    assert_eq!(give_ups, 1);
+
+    // Node-targeted cron with no registered node fails (and is retried) instead of silently vanishing.
+    let node_cron = create_due_cron(&router, &hub, &cookie, &csrf, "跑一下备份", "auto").await;
+    agenct_hub::automation::run_due_crons(&hub).await.unwrap();
+    let row = cron_row(&hub, &node_cron).await;
+    assert_eq!(row.last_status, "failed");
+    assert!(row.last_error.contains("没有可用的执行节点"), "{row:?}");
+    assert!(row.next_retry_at.is_some());
+}
