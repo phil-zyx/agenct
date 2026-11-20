@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
-const SCHEMA_V6: &str = r#"
+const SCHEMA_V7: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     gitlab_id INTEGER UNIQUE,
@@ -178,6 +178,12 @@ CREATE TABLE IF NOT EXISTS gitlab_reply_targets (
     noteable_iid INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS local_auth (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    token_hash TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_models (
     user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
     config_json TEXT NOT NULL,
@@ -250,7 +256,7 @@ impl Db {
         let writer = Connection::open(path)?;
         writer.busy_timeout(Duration::from_millis(5000))?;
         let mut current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(current_version, 0 | 1 | 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
+        if !matches!(current_version, 0 | 1 | 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
             return Err(format!(
                 "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
             )
@@ -262,7 +268,7 @@ impl Db {
              PRAGMA foreign_keys = ON;",
         )?;
         if current_version == 0 {
-            writer.execute_batch(SCHEMA_V6)?;
+            writer.execute_batch(SCHEMA_V7)?;
             writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else {
             if current_version == 1 {
@@ -337,9 +343,14 @@ impl Db {
                      PRAGMA user_version = 6;
                      COMMIT;",
                 )?;
+                current_version = 6;
+            }
+            if current_version == 6 {
+                // `local_auth` is created by the idempotent schema batch below.
+                writer.pragma_update(None, "user_version", 7)?;
             }
             // Idempotent: creates any table/index/trigger an older database never had.
-            writer.execute_batch(SCHEMA_V6)?;
+            writer.execute_batch(SCHEMA_V7)?;
         }
         // On startup, mark any orphaned running node jobs without a valid future lease as failed.
         let now = crate::config::now_unix();
@@ -384,6 +395,15 @@ impl Db {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Synchronous write for startup/CLI paths that run outside the async runtime.
+    pub fn write_blocking<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
+        let mut guard = self
+            .writer
+            .lock()
+            .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "storage unavailable"))?;
+        f(&mut guard)
     }
 
     /// Execute a read-only query off the Tokio async worker pool.
@@ -476,7 +496,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 6);
+        assert_eq!(ver, 7);
         let reply_to_cols: i64 = conn
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('messages') WHERE name='reply_to'",

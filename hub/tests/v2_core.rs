@@ -24,13 +24,15 @@ fn test_config(gitlab_url: &str) -> Config {
         database_path: PathBuf::from(":memory:"),
         public_origin: "http://127.0.0.1:8080".into(),
         local_http: true,
-        gitlab: GitLabOAuthConfig {
+        gitlab: Some(GitLabOAuthConfig {
             base_url: gitlab_url.into(),
             client_id: "test-client".into(),
             client_secret: "test-secret".into(),
             callback_path: "/auth/callback".into(),
-            session_ttl_seconds: 3600,
-        },
+        }),
+        local_login: false,
+        local_login_token: None,
+        session_ttl_seconds: 3600,
         llm: LlmConfig::Stub,
         llm_supports_images: false,
         vision_llm: None,
@@ -1351,4 +1353,161 @@ async fn images_reach_the_brain_inline_via_captions_or_with_an_honest_note() {
             .starts_with("（看到 1 张图片）"),
         "{chat}"
     );
+}
+
+fn local_only_config() -> Config {
+    let mut cfg = test_config("https://git.example.com");
+    cfg.gitlab = None;
+    cfg.local_login = true;
+    cfg.local_login_token = Some("local-test-token-0123456789".into());
+    cfg
+}
+
+async fn post_local_login(
+    router: &Router,
+    token: &str,
+    origin: Option<&str>,
+) -> (StatusCode, Option<String>, Value) {
+    let mut b = Request::builder()
+        .method("POST")
+        .uri("/auth/local")
+        .header(header::HOST, "127.0.0.1:8080")
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(o) = origin {
+        b = b.header(header::ORIGIN, o);
+    }
+    let resp = router
+        .clone()
+        .oneshot(
+            b.body(Body::from(json!({"token": token}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let cookie = resp
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|c| c.strip_prefix("agenct-local-session="))
+        .map(|c| c.split(';').next().unwrap_or("").to_owned())
+        .filter(|c| !c.is_empty());
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        cookie,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn local_token_login_works_without_gitlab() {
+    let hub = Hub::open(local_only_config()).unwrap();
+    let router = app(hub.clone());
+
+    // Login page advertises local login only; GitLab endpoints are disabled.
+    let (st, sess) = req_json(&router, "GET", "/auth/session", None, None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(sess["login"], json!({"gitlab": false, "local": true}));
+    let (st, _) = req_json(&router, "GET", "/auth/login", None, None, None).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    // Cross-origin / missing Origin is rejected (login CSRF), wrong token is rejected.
+    let (st, _, _) = post_local_login(&router, "local-test-token-0123456789", None).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, _, _) = post_local_login(
+        &router,
+        "local-test-token-0123456789",
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    let (st, cookie, _) = post_local_login(
+        &router,
+        "wrong-token-000000000000",
+        Some("http://127.0.0.1:8080"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert!(cookie.is_none());
+
+    // Correct token -> session cookie for the local owner (admin), usable for the app.
+    let (st, cookie, body) = post_local_login(
+        &router,
+        "local-test-token-0123456789",
+        Some("http://127.0.0.1:8080"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let cookie = cookie.expect("session cookie");
+    let csrf = body["csrf_token"].as_str().unwrap().to_owned();
+    let (st, sess) = req_json(&router, "GET", "/auth/session", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(sess["authenticated"], true);
+    assert_eq!(sess["user"]["id"], "local-owner");
+    assert_eq!(sess["user"]["is_admin"], true);
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "hello"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{chat}");
+}
+
+#[tokio::test]
+async fn local_login_is_off_by_default_when_gitlab_is_configured() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let router = app(hub);
+    let (st, sess) = req_json(&router, "GET", "/auth/session", None, None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(sess["login"], json!({"gitlab": true, "local": false}));
+    let (st, _, _) = post_local_login(
+        &router,
+        "anything-at-all-123456",
+        Some("http://127.0.0.1:8080"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn generated_local_token_is_persisted_hashed_and_rotatable() {
+    let dir = std::env::temp_dir().join(format!("agenct-local-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = local_only_config();
+    cfg.local_login_token = None;
+    cfg.data_dir = dir.clone();
+    cfg.database_path = dir.join("agenct.sqlite3");
+    let db = agenct_hub::db::Db::open(&cfg.database_path).unwrap();
+
+    let (token, path) = db
+        .write_blocking(|c| agenct_hub::auth::init_local_login(c, &cfg))
+        .unwrap()
+        .expect("first start generates a token");
+    assert!(token.starts_with("agl_") && token.len() == 68);
+    let saved = std::fs::read_to_string(path.unwrap()).unwrap();
+    assert_eq!(saved.trim(), token);
+    // Second start does not regenerate.
+    assert!(db
+        .write_blocking(|c| agenct_hub::auth::init_local_login(c, &cfg))
+        .unwrap()
+        .is_none());
+    // Only the hash is stored.
+    let stored: String = db
+        .write_blocking(|c| Ok(c.query_row("SELECT token_hash FROM local_auth", [], |r| r.get(0))?))
+        .unwrap();
+    assert_ne!(stored, token);
+    assert_eq!(stored, agenct_hub::auth::sha256_hex(&token));
+    // Rotation replaces it.
+    let (rotated, _) = db
+        .write_blocking(|c| agenct_hub::auth::rotate_local_token(c, &cfg))
+        .unwrap();
+    assert_ne!(rotated, token);
+    drop(db);
+    let _ = std::fs::remove_dir_all(&dir);
 }

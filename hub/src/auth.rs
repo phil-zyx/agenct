@@ -1,4 +1,5 @@
-//! Single authentication plane: GitLab OAuth 2.0 (PKCE S256) with SQLite-backed browser sessions.
+//! Authentication: optional GitLab OAuth 2.0 (PKCE S256) team login and/or a single-owner
+//! local token login, both issuing SQLite-backed browser sessions.
 use crate::{config::now_unix, db::record_audit, denied, invalid, Error, Hub, Result};
 use axum::{
     extract::{Path, Query, State},
@@ -218,6 +219,9 @@ pub async fn guard(
         if !origin_ok {
             return Error(StatusCode::FORBIDDEN, "origin verification failed").into_response();
         }
+    }
+    // The local login endpoint has no session yet: Origin pinning above prevents login CSRF.
+    if is_mutation && !is_external_machine && path != "/auth/local" {
         let provided_csrf = headers
             .get("x-csrf-token")
             .and_then(|v| v.to_str().ok())
@@ -273,12 +277,17 @@ pub async fn session(
         }))),
         None => Ok(Json(json!({
             "authenticated": false,
-            "gitlab_url": hub.config.gitlab.base_url,
+            "login": {
+                "gitlab": hub.config.gitlab.is_some(),
+                "local": hub.config.local_login,
+            },
+            "gitlab_url": hub.config.gitlab.as_ref().map(|g| g.base_url.clone()),
         }))),
     }
 }
 
 pub async fn login(State(hub): State<Hub>) -> Result<Response> {
+    let gl = hub.config.gitlab.as_ref().ok_or_else(denied)?;
     let verifier = random_token();
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let state = random_token();
@@ -309,22 +318,17 @@ pub async fn login(State(hub): State<Hub>) -> Result<Response> {
         );
     }
 
-    let redirect_uri = format!(
-        "{}{}",
-        hub.config.public_origin, hub.config.gitlab.callback_path
-    );
+    let redirect_uri = format!("{}{}", hub.config.public_origin, gl.callback_path);
     let mut auth_url =
-        reqwest::Url::parse(&format!("{}/oauth/authorize", hub.config.gitlab.base_url)).map_err(
-            |_| {
-                Error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "invalid gitlab authorize URL",
-                )
-            },
-        )?;
+        reqwest::Url::parse(&format!("{}/oauth/authorize", gl.base_url)).map_err(|_| {
+            Error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "invalid gitlab authorize URL",
+            )
+        })?;
     auth_url
         .query_pairs_mut()
-        .append_pair("client_id", &hub.config.gitlab.client_id)
+        .append_pair("client_id", &gl.client_id)
         .append_pair("redirect_uri", &redirect_uri)
         .append_pair("response_type", "code")
         .append_pair("scope", "read_user")
@@ -369,6 +373,11 @@ pub async fn callback(
 }
 
 async fn callback_inner(hub: &Hub, headers: &HeaderMap, q: CallbackQuery) -> Result<Response> {
+    let gl = hub
+        .config
+        .gitlab
+        .as_ref()
+        .ok_or(Error(StatusCode::NOT_FOUND, "disabled"))?;
     if q.code.is_empty() || q.code.len() > 2048 || q.state.is_empty() || q.state.len() > 256 {
         return Err(Error(StatusCode::BAD_REQUEST, "invalid"));
     }
@@ -395,16 +404,13 @@ async fn callback_inner(hub: &Hub, headers: &HeaderMap, q: CallbackQuery) -> Res
         entry
     };
 
-    let redirect_uri = format!(
-        "{}{}",
-        hub.config.public_origin, hub.config.gitlab.callback_path
-    );
+    let redirect_uri = format!("{}{}", hub.config.public_origin, gl.callback_path);
     let token_resp = hub
         .http
-        .post(format!("{}/oauth/token", hub.config.gitlab.base_url))
+        .post(format!("{}/oauth/token", gl.base_url))
         .form(&[
-            ("client_id", hub.config.gitlab.client_id.as_str()),
-            ("client_secret", hub.config.gitlab.client_secret.as_str()),
+            ("client_id", gl.client_id.as_str()),
+            ("client_secret", gl.client_secret.as_str()),
             ("code", q.code.as_str()),
             ("grant_type", "authorization_code"),
             ("redirect_uri", redirect_uri.as_str()),
@@ -427,7 +433,7 @@ async fn callback_inner(hub: &Hub, headers: &HeaderMap, q: CallbackQuery) -> Res
 
     let user_resp = hub
         .http
-        .get(format!("{}/api/v4/user", hub.config.gitlab.base_url))
+        .get(format!("{}/api/v4/user", gl.base_url))
         .bearer_auth(access_token)
         .send()
         .await
@@ -499,7 +505,7 @@ async fn callback_inner(hub: &Hub, headers: &HeaderMap, q: CallbackQuery) -> Res
     }
 
     let (session_token, _csrf) = hub
-        .issue_session(user_id, hub.config.gitlab.session_ttl_seconds)
+        .issue_session(user_id, hub.config.session_ttl_seconds)
         .await?;
     let mut resp = Redirect::to("/").into_response();
     resp.headers_mut().append(
@@ -517,7 +523,7 @@ async fn callback_inner(hub: &Hub, headers: &HeaderMap, q: CallbackQuery) -> Res
             hub.config.local_http,
             session_cookie_name(hub.config.local_http),
             session_token,
-            hub.config.gitlab.session_ttl_seconds,
+            hub.config.session_ttl_seconds,
         ),
     );
     Ok(resp)
@@ -627,4 +633,152 @@ pub async fn set_member_status(
         })
         .await?;
     Ok(Json(json!({"ok": true, "id": target_id})))
+}
+
+// ---------------------------------------------------------------------------
+// Local owner login (no external identity provider)
+// ---------------------------------------------------------------------------
+
+/// User id of the single local owner account.
+pub const LOCAL_OWNER_ID: &str = "local-owner";
+const LOCAL_TOKEN_FILE: &str = "login-token";
+
+/// Serializes local login attempts; failed attempts hold it during a penalty delay, capping
+/// brute force at roughly one guess per second regardless of concurrency.
+static LOCAL_LOGIN_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn write_token_file(cfg: &crate::config::Config, token: &str) -> Option<std::path::PathBuf> {
+    if cfg.is_memory_db() {
+        return None;
+    }
+    let path = cfg.data_dir.join(LOCAL_TOKEN_FILE);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    use std::io::Write;
+    let mut f = opts.open(&path).ok()?;
+    f.write_all(format!("{token}\n").as_bytes()).ok()?;
+    Some(path)
+}
+
+fn store_local_token(conn: &rusqlite::Connection, token: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO local_auth(id, token_hash, created_at) VALUES (1, ?1, ?2)
+         ON CONFLICT(id) DO UPDATE SET token_hash = excluded.token_hash, created_at = excluded.created_at",
+        params![sha256_hex(token), now_unix()],
+    )?;
+    Ok(())
+}
+
+/// Prepares local login at startup. Returns `(token, saved_path)` when a new token was
+/// generated and must be shown to the operator once.
+pub fn init_local_login(
+    conn: &rusqlite::Connection,
+    cfg: &crate::config::Config,
+) -> Result<Option<(String, Option<std::path::PathBuf>)>> {
+    if !cfg.local_login {
+        return Ok(None);
+    }
+    if let Some(ref fixed) = cfg.local_login_token {
+        store_local_token(conn, fixed)?;
+        return Ok(None);
+    }
+    let exists: bool = conn.query_row("SELECT count(*) > 0 FROM local_auth", [], |r| r.get(0))?;
+    if exists {
+        return Ok(None);
+    }
+    rotate_local_token(conn, cfg).map(Some)
+}
+
+/// Generates and stores a fresh local login token (invalidates the previous one).
+pub fn rotate_local_token(
+    conn: &rusqlite::Connection,
+    cfg: &crate::config::Config,
+) -> Result<(String, Option<std::path::PathBuf>)> {
+    let token = format!("agl_{}", random_token());
+    store_local_token(conn, &token)?;
+    conn.execute("DELETE FROM sessions WHERE user_id = ?1", [LOCAL_OWNER_ID])?;
+    Ok((token.clone(), write_token_file(cfg, &token)))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalLoginInput {
+    token: String,
+}
+
+pub async fn local_login(
+    State(hub): State<Hub>,
+    Json(input): Json<LocalLoginInput>,
+) -> Result<Response> {
+    if !hub.config.local_login {
+        return Err(denied());
+    }
+    let _gate = LOCAL_LOGIN_GATE.lock().await;
+    let token = input.token.trim().to_owned();
+    let stored: Option<String> = hub
+        .db
+        .read(|conn| {
+            Ok(conn
+                .query_row("SELECT token_hash FROM local_auth WHERE id = 1", [], |r| {
+                    r.get(0)
+                })
+                .optional()?)
+        })
+        .await?;
+    let valid = !token.is_empty()
+        && token.len() <= 256
+        && stored.is_some_and(|h| {
+            crate::config::constant_time_eq(h.as_bytes(), sha256_hex(&token).as_bytes())
+        });
+    if !valid {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        return Err(Error(StatusCode::UNAUTHORIZED, "invalid login token"));
+    }
+
+    let username = std::env::var("AGENCT_LOCAL_USERNAME")
+        .ok()
+        .map(|u| u.trim().to_ascii_lowercase())
+        .filter(|u| !u.is_empty() && u.len() <= 64)
+        .unwrap_or_else(|| "owner".into());
+    let active = hub
+        .db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO users(id, username, display_name, is_admin, status, created_at)
+                 VALUES (?1, ?2, ?3, 1, 'active', ?4)
+                 ON CONFLICT(id) DO NOTHING",
+                params![LOCAL_OWNER_ID, username, "Owner", now_unix()],
+            )?;
+            let status: String = conn.query_row(
+                "SELECT status FROM users WHERE id = ?1",
+                [LOCAL_OWNER_ID],
+                |r| r.get(0),
+            )?;
+            record_audit(conn, LOCAL_OWNER_ID, "login", "ok", "Local token login", "")?;
+            Ok(status == "active")
+        })
+        .await?;
+    if !active {
+        return Err(Error(StatusCode::UNAUTHORIZED, "account disabled"));
+    }
+
+    let (session_token, csrf) = hub
+        .issue_session(LOCAL_OWNER_ID.to_owned(), hub.config.session_ttl_seconds)
+        .await?;
+    let mut resp = Json(json!({"ok": true, "csrf_token": csrf})).into_response();
+    resp.headers_mut().append(
+        header::SET_COOKIE,
+        build_cookie(
+            hub.config.local_http,
+            session_cookie_name(hub.config.local_http),
+            session_token,
+            hub.config.session_ttl_seconds,
+        ),
+    );
+    Ok(resp)
 }

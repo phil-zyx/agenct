@@ -11,7 +11,6 @@ pub struct GitLabOAuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub callback_path: String,
-    pub session_ttl_seconds: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -31,7 +30,13 @@ pub struct Config {
     pub database_path: PathBuf,
     pub public_origin: String,
     pub local_http: bool,
-    pub gitlab: GitLabOAuthConfig,
+    /// GitLab OAuth team login; `None` when AGENCT_GITLAB_URL is not set.
+    pub gitlab: Option<GitLabOAuthConfig>,
+    /// Single-owner login with a secret token (no external identity provider).
+    pub local_login: bool,
+    /// Fixed login token from AGENCT_LOGIN_TOKEN; otherwise one is generated on first start.
+    pub local_login_token: Option<String>,
+    pub session_ttl_seconds: i64,
     pub llm: LlmConfig,
     /// Whether the default brain model accepts image input (AGENCT_LLM_SUPPORTS_IMAGES).
     pub llm_supports_images: bool,
@@ -57,33 +62,71 @@ impl Config {
             .unwrap_or_else(|_| data_dir.join("agenct.sqlite3"));
 
         let allow_http = env_flag("AGENCT_ALLOW_HTTP_ORIGIN");
-        let public_origin = normalize_origin(
-            &std::env::var("AGENCT_PUBLIC_ORIGIN").unwrap_or_else(|_| format!("http://{bind}")),
-            allow_http,
-        )?;
+        // Zero-config default: http://localhost:<port>. Plain HTTP is acceptable there because
+        // it is loopback-only (and a secure context in browsers); any other origin must be
+        // HTTPS unless AGENCT_ALLOW_HTTP_ORIGIN is set.
+        let public_origin = match optional_env_any(&["AGENCT_PUBLIC_ORIGIN"]) {
+            Some(raw) => normalize_origin(&raw, allow_http)?,
+            None => normalize_origin(&format!("http://localhost:{}", bind.port()), true)?,
+        };
         let local_http = public_origin.starts_with("http://");
 
-        let gitlab_base = normalize_origin(
-            &required_env_any(&["AGENCT_GITLAB_URL", "GITLAB_URL", "GITLAB_BASE_URL"])?,
-            allow_http,
-        )?;
-        let client_id = required_env_any(&["AGENCT_GITLAB_CLIENT_ID", "GITLAB_OAUTH_CLIENT_ID"])?;
-        let client_secret = match std::env::var("AGENCT_GITLAB_CLIENT_SECRET_FILE") {
-            Ok(path) if !path.trim().is_empty() => {
-                std::fs::read_to_string(path.trim())?.trim().to_owned()
+        let gitlab = match optional_env_any(&["AGENCT_GITLAB_URL", "GITLAB_URL", "GITLAB_BASE_URL"])
+        {
+            None => None,
+            Some(raw_base) => {
+                let base_url = normalize_origin(&raw_base, allow_http)?;
+                let client_id =
+                    required_env_any(&["AGENCT_GITLAB_CLIENT_ID", "GITLAB_OAUTH_CLIENT_ID"])?;
+                let client_secret = match std::env::var("AGENCT_GITLAB_CLIENT_SECRET_FILE") {
+                    Ok(path) if !path.trim().is_empty() => {
+                        std::fs::read_to_string(path.trim())?.trim().to_owned()
+                    }
+                    _ => required_env_any(&[
+                        "AGENCT_GITLAB_CLIENT_SECRET",
+                        "GITLAB_OAUTH_CLIENT_SECRET",
+                    ])?,
+                };
+                if client_secret.is_empty() || client_secret.len() > 4096 {
+                    return Err("invalid AGENCT_GITLAB_CLIENT_SECRET".into());
+                }
+                let callback_path = std::env::var("AGENCT_GITLAB_CALLBACK_PATH")
+                    .unwrap_or_else(|_| "/auth/callback".into());
+                if !matches!(
+                    callback_path.as_str(),
+                    "/auth/callback" | "/identity/v1/auth/oidc/gitlab/callback"
+                ) {
+                    return Err("AGENCT_GITLAB_CALLBACK_PATH must be /auth/callback or /identity/v1/auth/oidc/gitlab/callback".into());
+                }
+                Some(GitLabOAuthConfig {
+                    base_url,
+                    client_id,
+                    client_secret,
+                    callback_path,
+                })
             }
-            _ => required_env_any(&["AGENCT_GITLAB_CLIENT_SECRET", "GITLAB_OAUTH_CLIENT_SECRET"])?,
         };
-        if client_secret.is_empty() || client_secret.len() > 4096 {
-            return Err("invalid AGENCT_GITLAB_CLIENT_SECRET".into());
-        }
-        let callback_path = std::env::var("AGENCT_GITLAB_CALLBACK_PATH")
-            .unwrap_or_else(|_| "/auth/callback".into());
-        if !matches!(
-            callback_path.as_str(),
-            "/auth/callback" | "/identity/v1/auth/oidc/gitlab/callback"
-        ) {
-            return Err("AGENCT_GITLAB_CALLBACK_PATH must be /auth/callback or /identity/v1/auth/oidc/gitlab/callback".into());
+        // Local owner login: on by default only when there is no GitLab login, so existing
+        // GitLab deployments don't silently gain a second way in.
+        let local_login = match std::env::var("AGENCT_LOCAL_LOGIN") {
+            Ok(v) => matches!(v.trim(), "1" | "true" | "yes" | "on"),
+            Err(_) => gitlab.is_none(),
+        };
+        let local_login_token = match std::env::var("AGENCT_LOGIN_TOKEN") {
+            Ok(t) if !t.trim().is_empty() => {
+                let t = t.trim().to_owned();
+                if t.len() < 16
+                    || t.len() > 256
+                    || t.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    return Err("AGENCT_LOGIN_TOKEN must be 16..256 visible characters".into());
+                }
+                Some(t)
+            }
+            _ => None,
+        };
+        if gitlab.is_none() && !local_login {
+            return Err("no login method: set AGENCT_GITLAB_URL (+ client id/secret) or enable AGENCT_LOCAL_LOGIN=1".into());
         }
         let session_ttl_seconds: i64 = std::env::var("AGENCT_SESSION_TTL_SECONDS")
             .ok()
@@ -139,7 +182,9 @@ impl Config {
         };
 
         let mut allowed_gitlab_origins = HashSet::new();
-        allowed_gitlab_origins.insert(gitlab_base.clone());
+        if let Some(ref g) = gitlab {
+            allowed_gitlab_origins.insert(g.base_url.clone());
+        }
         if let Ok(extra) = std::env::var("AGENCT_ALLOWED_GITLAB_ORIGINS") {
             for item in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 allowed_gitlab_origins.insert(normalize_origin(item, allow_http)?);
@@ -159,13 +204,10 @@ impl Config {
             database_path,
             public_origin,
             local_http,
-            gitlab: GitLabOAuthConfig {
-                base_url: gitlab_base,
-                client_id,
-                client_secret,
-                callback_path,
-                session_ttl_seconds,
-            },
+            gitlab,
+            local_login,
+            local_login_token,
+            session_ttl_seconds,
             llm,
             llm_supports_images: env_flag("AGENCT_LLM_SUPPORTS_IMAGES"),
             vision_llm,
@@ -187,9 +229,32 @@ impl Config {
             .unwrap_or(&self.public_origin)
     }
 
+    /// Default GitLab instance for the per-user PAT integration: the OAuth instance if
+    /// configured, otherwise the first allowlisted origin (or empty).
+    pub fn default_gitlab_base(&self) -> String {
+        self.gitlab
+            .as_ref()
+            .map(|g| g.base_url.clone())
+            .or_else(|| {
+                let mut all: Vec<_> = self.allowed_gitlab_origins.iter().cloned().collect();
+                all.sort();
+                all.into_iter().next()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn is_memory_db(&self) -> bool {
         self.database_path.to_str() == Some(":memory:")
     }
+}
+
+fn optional_env_any(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 fn required_env_any(names: &[&str]) -> Result<String, Box<dyn std::error::Error>> {

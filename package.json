@@ -6,8 +6,8 @@
   "description": "Minimalist 7x24h personal super-agent Hub + unified PC/Cloud execution nodes",
   "license": "MIT",
   "scripts": {
-    "check": "node --check hub/web/js/api.js && node --check hub/web/js/sse.js && node --check hub/web/js/chat.js && node --check hub/web/js/drawer.js && node --check hub/web/js/app.js && node --check scripts/e2e_smoke.mjs",
-    "test:e2e": "node scripts/e2e_smoke.mjs"
+    "check": "node --check hub/web/js/api.js && node --check hub/web/js/sse.js && node --check hub/web/js/chat.js && node --check hub/web/js/drawer.js && node --check hub/web/js/app.js && node --check scripts/e2e_smoke.mjs && node --check scripts/e2e_local_login.mjs",
+    "test:e2e": "node scripts/e2e_smoke.mjs && node scripts/e2e_local_login.mjs"
   },
   "engines": {
     "node": ">=20"

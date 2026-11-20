@@ -43,7 +43,7 @@
 
   <p id="toast" class="toast hide" role="status" aria-live="polite"></p>
 
-  <!-- Login View (GitLab OAuth only) -->
+  <!-- Login View (GitLab OAuth and/or local owner token) -->
   <section id="login-view" class="login hide">
     <div class="login-card">
       <h1 class="login-brand">
@@ -59,7 +59,13 @@
       </h1>
       <p class="lead">和你的管家一起处理工作。</p>
       <p id="login-error" class="login-error hide" role="alert"></p>
-      <a id="gitlab-login-btn" class="primary wide btn-link" href="/auth/login">使用 GitLab 登录</a>
+      <form id="local-login-form" class="local-login hide">
+        <label class="field-label" for="local-login-token">登录令牌</label>
+        <input id="local-login-token" type="password" name="token" autocomplete="current-password" placeholder="agl_..." required>
+        <button type="submit" class="primary wide">登录</button>
+        <p class="note">首次启动时令牌会打印在 Hub 日志里，并保存在数据目录的 <code>login-token</code> 文件中。</p>
+      </form>
+      <a id="gitlab-login-btn" class="primary wide btn-link hide" href="/auth/login">使用 GitLab 登录</a>
     </div>
   </section>
 

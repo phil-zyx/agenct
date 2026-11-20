@@ -5,7 +5,9 @@ services:
       dockerfile: Dockerfile
     container_name: agenct-hub
     restart: unless-stopped
-    env_file: agenct.env
+    env_file:
+      - path: agenct.env
+        required: false
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

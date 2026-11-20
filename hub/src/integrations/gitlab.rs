@@ -67,7 +67,7 @@ fn percent_encode(s: &str) -> String {
 
 pub async fn load_config(hub: &Hub, user_id: &str) -> Result<GitLabConfig> {
     let uid = user_id.to_owned();
-    let default_base = hub.config.gitlab.base_url.clone();
+    let default_base = hub.config.default_gitlab_base();
     hub.db
         .read(move |conn| {
             let raw: Option<String> = conn
@@ -108,7 +108,7 @@ pub async fn save_config(
 ) -> Result<Json<Value>> {
     let user = hub.require_user(&headers).await?;
     let base_raw = if input.base_url.trim().is_empty() {
-        hub.config.gitlab.base_url.clone()
+        hub.config.default_gitlab_base()
     } else {
         input.base_url.trim().to_owned()
     };

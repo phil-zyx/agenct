@@ -14,7 +14,7 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite v1) ──▶
 ```
 
 **只保留一套（零双轨、零历史包袱）：**
-- **单一认证**：GitLab OAuth 2.0（PKCE S256 + SQLite 会话 + CSRF/Origin/Host 校验）+ 节点 `agn_` Bearer Token。
+- **认证**：单人模式的本地登录令牌（零配置），或可选的 GitLab OAuth 2.0 团队登录（PKCE S256）；均为 SQLite 会话 + CSRF/Origin/Host 校验；节点使用 `agn_` Bearer Token。
 - **单一运行时**：Hub 直连任意 OpenAI 兼容 `/chat/completions` 接口（支持 DeepSeek、OpenAI、Ollama）。每个用户可在「设置 → 大脑模型」配置自己的大脑模型（可标记支持图片）和可选的识图模型，未配置时使用服务器默认（`AGENCT_LLM_*` / `AGENCT_VISION_*`）。
 - **单一大脑**：`SOUL.md` + `MEMORY.md` + 专项活账本（`ledgers`）+ 定时任务 + 分发规则 + 工具调用（`update_memory` / `update_ledger` / `manage_cron` / `manage_rule` / `fetch_gitlab_commits` / `dispatch_node` / `delegate_colleague`）。
 - **单一存储**：SQLite v1（13 张规范表，WAL 模式，`spawn_blocking` 读写隔离），附件二进制落盘 + 显式 ACL 授权表，只追加审计表。
@@ -22,6 +22,16 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite v1) ──▶
 - **单一实时通道**：`/api/bootstrap` 初始加载 + `/api/events` 真 SSE 推送。
 
 ## 快速启动
+
+### 0. 最快试用（无需 GitLab）
+
+```sh
+docker run -d --name agenct -p 127.0.0.1:8080:8080 -v agenct-data:/data \
+  -e AGENCT_LLM_API_KEY=sk-... ghcr.io/phil-zyx/agenct:latest
+docker logs agenct 2>&1 | grep "login token"   # 首次启动打印的登录令牌
+```
+
+打开 http://localhost:8080 ，输入登录令牌即可。不配 GitLab 时为单人（owner）模式；令牌丢失可停掉容器后执行 `agenct-hub reset-login-token`。
 
 ### 1. Docker 部署（推荐）
 

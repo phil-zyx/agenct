@@ -131,6 +131,24 @@ async function boot() {
 
   if (!sess?.authenticated) {
     loginView.classList.remove('hide');
+    // Older Hubs don't advertise methods: they only support GitLab.
+    const methods = sess?.login || { gitlab: true, local: false };
+    document.getElementById('gitlab-login-btn').classList.toggle('hide', !methods.gitlab);
+    const localForm = document.getElementById('local-login-form');
+    localForm.classList.toggle('hide', !methods.local);
+    localForm.onsubmit = async (ev) => {
+      ev.preventDefault();
+      const btn = localForm.querySelector('button[type="submit"]');
+      btn.disabled = true;
+      try {
+        await api('/auth/local', { method: 'POST', body: { token: localForm.token.value.trim() } });
+        location.replace('/');
+      } catch (err) {
+        loginErr.textContent = err.message === 'invalid login token' ? '登录令牌不正确。' : `登录失败：${err.message}`;
+        loginErr.classList.remove('hide');
+        btn.disabled = false;
+      }
+    };
     if (sess?.reason === 'disabled') {
       loginErr.textContent = '该账号已被停用，请联系管理员。';
       loginErr.classList.remove('hide');

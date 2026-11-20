@@ -80,6 +80,17 @@ impl Hub {
             .timeout(Duration::from_secs(60))
             .build()?;
         let llm = llm::LlmClient::new(cfg.llm.clone(), http.clone());
+        if let Some((token, saved)) = db
+            .write_blocking(|conn| auth::init_local_login(conn, &cfg))
+            .map_err(|e| e.1)?
+        {
+            eprintln!("============================================================");
+            eprintln!("Agenct local login token (shown once): {token}");
+            if let Some(path) = saved {
+                eprintln!("Also saved to {}", path.display());
+            }
+            eprintln!("============================================================");
+        }
 
         Ok(Self {
             config: Arc::new(cfg),
@@ -130,6 +141,7 @@ pub fn app(hub: Hub) -> Router {
             "/identity/v1/auth/oidc/gitlab/callback",
             get(auth::callback),
         )
+        .route("/auth/local", post(auth::local_login))
         .route("/auth/logout", post(auth::logout))
         // Core Brain & Realtime Stream
         .route("/api/bootstrap", get(brain::bootstrap))
