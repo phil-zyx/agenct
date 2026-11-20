@@ -9,6 +9,7 @@ pub mod db;
 pub mod events;
 pub mod integrations;
 pub mod llm;
+pub mod models;
 pub mod nodes;
 
 use axum::{
@@ -180,6 +181,12 @@ pub fn app(hub: Hub) -> Router {
             "/api/automation/crons/{id}",
             delete(automation::delete_cron),
         )
+        // Per-user brain / vision model settings
+        .route(
+            "/api/settings/models",
+            get(models::get_settings).put(models::save_settings),
+        )
+        .route("/api/settings/models/test", post(models::test_settings))
         // Integrations (GitLab & IM)
         .route(
             "/api/integrations/gitlab",

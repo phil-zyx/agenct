@@ -10,6 +10,16 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+/// An image passed inline (base64 data URL) to a vision-capable model.
+#[derive(Clone, Debug)]
+pub struct ImageInput {
+    pub mime_type: String,
+    pub data_base64: String,
+}
+
+/// Marker in the system prompt of image-captioning calls (also used by the offline stub).
+pub const VISION_CAPTION_MARKER: &str = "VISION_CAPTION_TASK";
+
 /// Prefix of the synthetic message that feeds tool execution results back into the model.
 pub const TOOL_RESULTS_MARKER: &str = "TOOL_RESULTS";
 /// Stub-only command that simulates an upstream LLM failure (for offline tests).
@@ -33,6 +43,14 @@ impl LlmClient {
         }
     }
 
+    /// Model name shown to users (never includes the API key).
+    pub fn model_name(&self) -> &str {
+        match &self.config {
+            LlmConfig::OpenAi { model, .. } => model,
+            LlmConfig::Stub => "stub",
+        }
+    }
+
     pub async fn complete(
         &self,
         system: &str,
@@ -40,12 +58,26 @@ impl LlmClient {
         user_message: &str,
         json_mode: bool,
     ) -> Result<String> {
+        self.complete_with_images(system, history, user_message, &[], json_mode)
+            .await
+    }
+
+    /// Like `complete`, attaching `images` to the final user message as OpenAI-style
+    /// `image_url` content parts (base64 data URLs, so private Hub URLs never leave the box).
+    pub async fn complete_with_images(
+        &self,
+        system: &str,
+        history: &[ChatMessage],
+        user_message: &str,
+        images: &[ImageInput],
+        json_mode: bool,
+    ) -> Result<String> {
         match &self.config {
             LlmConfig::Stub if user_message.trim() == STUB_FAIL_COMMAND => Err(Error(
                 StatusCode::BAD_GATEWAY,
                 "LLM provider returned error",
             )),
-            LlmConfig::Stub => Ok(stub_reply(system, user_message, json_mode)),
+            LlmConfig::Stub => Ok(stub_reply(system, user_message, images.len(), json_mode)),
             LlmConfig::OpenAi {
                 url,
                 api_key,
@@ -61,7 +93,18 @@ impl LlmClient {
                     };
                     messages.push(json!({"role": role, "content": m.content}));
                 }
-                messages.push(json!({"role": "user", "content": user_message}));
+                if images.is_empty() {
+                    messages.push(json!({"role": "user", "content": user_message}));
+                } else {
+                    let mut parts = vec![json!({"type": "text", "text": user_message})];
+                    for img in images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{};base64,{}", img.mime_type, img.data_base64)}
+                        }));
+                    }
+                    messages.push(json!({"role": "user", "content": parts}));
+                }
 
                 let mut body = json!({
                     "model": model,
@@ -82,10 +125,14 @@ impl LlmClient {
                     .map_err(|_| Error(StatusCode::BAD_GATEWAY, "LLM request failed"))?;
 
                 if !resp.status().is_success() {
-                    return Err(Error(
-                        StatusCode::BAD_GATEWAY,
-                        "LLM provider returned error",
-                    ));
+                    let msg = match resp.status().as_u16() {
+                        401 | 403 => "LLM 认证失败：API Key 无效或无权限",
+                        404 => "LLM 接口地址或模型名不存在",
+                        400 | 422 => "LLM 拒绝了请求：模型可能不支持该输入（如图片）或参数",
+                        429 => "LLM 限流或额度不足",
+                        _ => "LLM provider returned error",
+                    };
+                    return Err(Error(StatusCode::BAD_GATEWAY, msg));
                 }
 
                 let val: Value = resp
@@ -104,7 +151,10 @@ impl LlmClient {
 }
 
 /// Deterministic stub for offline unit/integration tests without hitting external APIs.
-fn stub_reply(system: &str, user_message: &str, json_mode: bool) -> String {
+fn stub_reply(system: &str, user_message: &str, images: usize, json_mode: bool) -> String {
+    if system.contains(VISION_CAPTION_MARKER) {
+        return format!("[STUB 识图] {images} 张图片：终端里显示 error: connection refused");
+    }
     if system.contains("CONTEXT_COMPACTION_TASK") {
         let snippet: String = user_message.chars().take(120).collect();
         return json!({
@@ -117,6 +167,13 @@ fn stub_reply(system: &str, user_message: &str, json_mode: bool) -> String {
     let trimmed = user_message.trim();
     if !json_mode {
         return format!("[STUB] 收到：{trimmed}");
+    }
+    if images > 0 {
+        return json!({
+            "reply": format!("（看到 {images} 张图片）收到你的消息：{trimmed}"),
+            "tools": []
+        })
+        .to_string();
     }
     if let Some(rest) = trimmed.strip_prefix(TOOL_RESULTS_MARKER) {
         let first = rest

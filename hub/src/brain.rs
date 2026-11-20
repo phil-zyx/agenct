@@ -770,26 +770,33 @@ fn build_snapshot_sync(
         Vec::new()
     } else {
         let mut hist_stmt = conn.prepare(
-            "SELECT role, content, thread_id FROM (
-                SELECT id, role, content, thread_id FROM messages
+            "SELECT role, content, thread_id, context FROM (
+                SELECT id, role, content, thread_id, context FROM messages
                 WHERE user_id = ?1 AND status = 'complete' AND role IN ('user','assistant')
                 ORDER BY id DESC LIMIT 10
              ) ORDER BY id ASC",
         )?;
-        let raw_hist: Vec<(String, String, Option<String>)> = hist_stmt
-            .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        let raw_hist: Vec<(String, String, Option<String>, String)> = hist_stmt
+            .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let total_hist = raw_hist.len();
         raw_hist
             .into_iter()
             .enumerate()
-            .map(|(idx, (role, content, thr_id))| {
+            .map(|(idx, (role, content, thr_id, context))| {
                 // Keep the newest 2 turns detailed; trim older turns tightly so long node outputs don't bloat context.
                 let budget = if idx + 2 >= total_hist { 1200 } else { 480 };
-                let trimmed = truncate_bytes(&content, budget);
+                let full = if context.trim().is_empty() {
+                    content
+                } else {
+                    format!("{content}\n{}", context.trim())
+                };
+                let trimmed = truncate_bytes(&full, budget);
+                // Only user turns carry the thread tag: tagging assistant turns taught the model
+                // to start its own replies with `[thr_xxx]`, leaking internal ids to the user.
                 let tagged = match thr_id.as_deref().filter(|s| !s.is_empty()) {
-                    Some(tid) => format!("[{tid}] {trimmed}"),
-                    None => trimmed,
+                    Some(tid) if role == "user" => format!("[{tid}] {trimmed}"),
+                    _ => trimmed,
                 };
                 ChatMessage {
                     role,
@@ -975,6 +982,9 @@ pub struct AgentOutput {
     pub reply: String,
     pub thread_id: Option<String>,
     pub tasks: Vec<Value>,
+    /// Model-only context derived from the user message (e.g. image captions), persisted so
+    /// follow-up turns can still refer to it.
+    pub user_context: String,
 }
 
 /// How an agent loop run is driven.
@@ -1000,6 +1010,7 @@ async fn drive_turn(hub: &Hub, user_id: &str, message: &str, snap: TurnSnapshot)
         snap.user_msg_id,
         out.thread_id.clone(),
         &out.reply,
+        &out.user_context,
     )
     .await?;
     // Non-blocking background rolling context compaction & Active Memory pruning.
@@ -1069,15 +1080,25 @@ async fn agent_loop(
         allowed_tools: mode.allowed_tools,
     };
 
+    let models = crate::models::resolve(hub, user_id).await?;
+    let prepared = prepare_images(&ctx, &models, message).await;
+
     let mut convo = snap.history.clone();
-    let mut prompt_msg = message.to_owned();
+    let mut prompt_msg = if prepared.context.is_empty() {
+        message.to_owned()
+    } else {
+        format!("{message}\n\n{}", prepared.context)
+    };
+    let mut step_images = prepared.inline;
     let mut final_reply = String::new();
     let mut unresolved: Vec<ToolOutcome> = Vec::new();
 
     for step in 0..MAX_AGENT_STEPS {
-        let raw_llm = match hub
-            .llm
-            .complete(&system_prompt, &convo, &prompt_msg, true)
+        // Inline images ride along with the first call only; later steps see the text history.
+        let images = std::mem::take(&mut step_images);
+        let raw_llm = match models
+            .brain
+            .complete_with_images(&system_prompt, &convo, &prompt_msg, &images, true)
             .await
         {
             Ok(raw) => raw,
@@ -1131,6 +1152,7 @@ async fn agent_loop(
             final_reply.push_str(o.user_note.trim());
         }
     }
+    final_reply = strip_thread_tags(&final_reply);
     if final_reply.trim().is_empty() {
         final_reply = "好的，已处理。".into();
     }
@@ -1139,6 +1161,7 @@ async fn agent_loop(
         reply: final_reply,
         thread_id: ctx.active_thread_id,
         tasks: ctx.dispatched_tasks,
+        user_context: prepared.persist_context,
     })
 }
 
@@ -1150,8 +1173,10 @@ async fn persist_turn(
     user_msg_id: i64,
     thread_id: Option<String>,
     final_reply: &str,
+    user_context: &str,
 ) -> Result<String> {
     let uid = user_id.to_owned();
+    let context_db = truncate_bytes(user_context.trim(), 6000);
     let reply_db = truncate_bytes(final_reply.trim(), 16_000);
     let reply_ret = reply_db.clone();
     let thr_summary_snippet = truncate_bytes(
@@ -1167,9 +1192,9 @@ async fn persist_turn(
             let tx = conn.transaction()?;
             let now = now_unix();
             let claimed = tx.execute(
-                "UPDATE messages SET status = 'complete', thread_id = ?3
+                "UPDATE messages SET status = 'complete', thread_id = ?3, context = ?4
                  WHERE id = ?1 AND user_id = ?2 AND status = 'pending'",
-                params![user_msg_id, uid, thread_id],
+                params![user_msg_id, uid, thread_id, context_db],
             )?;
             if claimed != 1 {
                 return Err(Error(
@@ -1349,13 +1374,25 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
         }
         "dispatch_node" => {
             ctx.stage("正在派发到执行节点…");
-            let instr = call
+            let mut instr = call
                 .instruction
                 .as_deref()
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or(ctx.message)
                 .to_owned();
+            // Nodes only receive attachments referenced in the instruction; the model often
+            // paraphrases them away, so forward the user's attachments explicitly.
+            let missing: Vec<String> = crate::attachments::extract_attachment_ids(ctx.message)
+                .into_iter()
+                .filter(|id| !instr.contains(id.as_str()))
+                .collect();
+            if !missing.is_empty() {
+                instr.push_str("\n\n用户附件：");
+                for id in missing {
+                    instr.push_str(&format!("\n![附件](/api/attachments/{id})"));
+                }
+            }
             let title = call
                 .title
                 .as_deref()
@@ -1461,6 +1498,116 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
             String::new(),
         )),
     }
+}
+
+const VISION_CAPTION_PROMPT: &str =
+    "VISION_CAPTION_TASK：你是识图助手。用中文客观描述这张图片，供另一个只能读文字的助手理解：\
+先一句话说明图片类型（终端/报错截图、网页或应用界面、文档、照片、图表等），\
+再逐字转录图中所有关键文字（报错信息、命令、日志、标题、按钮、表格数据），最后补充布局或异常之处。\
+不要猜测图片之外的信息，不要给建议。";
+
+/// How the images in a user message reach the brain.
+struct PreparedImages {
+    /// Images sent inline to an image-capable brain.
+    inline: Vec<crate::llm::ImageInput>,
+    /// Extra text appended to the prompt (captions or an honest "can't see images" note).
+    context: String,
+    /// Part of `context` worth persisting for follow-up turns (captions only).
+    persist_context: String,
+}
+
+async fn prepare_images(
+    ctx: &TurnContext<'_>,
+    models: &crate::models::ResolvedModels,
+    message: &str,
+) -> PreparedImages {
+    let mut out = PreparedImages {
+        inline: Vec::new(),
+        context: String::new(),
+        persist_context: String::new(),
+    };
+    let atts = crate::attachments::collect_for_user(ctx.hub, ctx.user_id, message)
+        .await
+        .unwrap_or_default();
+    let images: Vec<(String, crate::llm::ImageInput)> = atts
+        .into_iter()
+        .filter(|a| {
+            a["mime_type"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("image/"))
+        })
+        .filter_map(|a| {
+            Some((
+                a["name"].as_str()?.to_owned(),
+                crate::llm::ImageInput {
+                    mime_type: a["mime_type"].as_str()?.to_owned(),
+                    data_base64: a["data_base64"].as_str()?.to_owned(),
+                },
+            ))
+        })
+        .collect();
+    if images.is_empty() {
+        return out;
+    }
+    if models.brain_sees_images {
+        out.inline = images.into_iter().map(|(_, img)| img).collect();
+        return out;
+    }
+    let Some(vision) = &models.vision else {
+        out.context = format!(
+            "（系统提示：用户附带了 {} 张图片，但当前大脑模型不能看图，也没有配置识图模型，你看不到图片内容。\
+             请如实告诉用户：可在「设置 → 大脑模型」里换用支持图片的大脑模型，或配置一个识图模型；\
+             也可以先把图中关键文字贴成文本。）",
+            images.len()
+        );
+        return out;
+    };
+    ctx.stage("正在识别图片…");
+    let mut captions = Vec::new();
+    for (name, img) in &images {
+        let caption = match vision
+            .complete_with_images(
+                VISION_CAPTION_PROMPT,
+                &[],
+                "请描述这张图片。",
+                std::slice::from_ref(img),
+                false,
+            )
+            .await
+        {
+            Ok(text) => truncate_bytes(text.trim(), 2500),
+            Err(e) => format!("（识别失败：{}）", e.1),
+        };
+        captions.push(format!("【图片 {name} 内容（由识图模型生成）】\n{caption}"));
+    }
+    out.context = captions.join("\n\n");
+    out.persist_context = out.context.clone();
+    out
+}
+
+/// Removes internal `[thr_xxx]` thread tags the model may echo at the start of lines.
+fn strip_thread_tags(reply: &str) -> String {
+    reply
+        .lines()
+        .map(|line| {
+            let mut rest = line;
+            loop {
+                let trimmed = rest.trim_start();
+                let Some(after) = trimmed.strip_prefix("[thr_") else {
+                    break;
+                };
+                let Some(end) = after.find(']') else { break };
+                if end == 0 || !after[..end].bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    break;
+                }
+                rest = after[end + 1..].trim_start();
+            }
+            rest
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1605,7 +1752,7 @@ fn build_system_prompt(
 
 === 自动语义归类、防串台与必要时反问（核心纪律） ===
 - 用户只在单一聊天框里自然说话，不手动选线程；由你判断这句话在承接哪个隐式线程（`thread_id`）、还是开启新主题（`"new"`）、还是普通闲聊（`null`）。
-- 近期对话中 `[thr_xxx]` 标注了每条消息所属的隐式线程，下方【隐式上下文线程】列出了活跃线程和是否可续接节点 session。
+- 近期对话中用户消息前的 `[thr_xxx]` 标注了该轮所属的隐式线程（仅供你内部判断，回复中绝不要输出这类标记），下方【隐式上下文线程】列出了活跃线程和是否可续接节点 session。
 - **指代清晰时直接承接**：如语义明确对应某个活跃线程，直接填该 `thread_id`；若调用 `dispatch_node` 继续排查或修改，必须带上同一 `thread_id`（系统会自动续接该节点上次的 `opencode --session`）。
 - **真正存在歧义时必须先简短反问，禁止盲猜执行**：例如同时有 2 个以上近期活跃线程/节点回执，用户只说「帮我改一下」「继续查」「把刚才那个关了」且无法从语义唯一判断指向哪一个时，**禁止调用 `dispatch_node` 或变更类工具**，直接在 `reply` 中用一句话自然反问确认（例如「你是指刚才的 A 还是 B？」），并设 `thread_id` 为 `null`。
 - 明确完结的临时话题可顺手调用 `close_thread` 归档，保持线程列表清爽。
@@ -2263,8 +2410,9 @@ pub async fn compact_user_context(hub: &Hub, user_id: &str) -> Result<bool> {
         truncate_bytes(&transcript, 8000),
     );
 
-    let raw = hub
-        .llm
+    let raw = crate::models::resolve(hub, user_id)
+        .await?
+        .brain
         .complete(COMPACTION_SYSTEM_PROMPT, &[], &payload, true)
         .await?;
 
@@ -2353,7 +2501,28 @@ pub async fn compact_user_context(hub: &Hub, user_id: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_brain_response;
+    use super::{parse_brain_response, strip_thread_tags};
+
+    #[test]
+    fn strips_leaked_thread_tags_only_at_line_start() {
+        assert_eq!(strip_thread_tags("[thr_a4e693df] 图我收到了"), "图我收到了");
+        assert_eq!(
+            strip_thread_tags("[thr_a1] [thr_b2] 你好\n第二行"),
+            "你好\n第二行"
+        );
+        assert_eq!(
+            strip_thread_tags("引用 [thr_a1] 保留"),
+            "引用 [thr_a1] 保留"
+        );
+        assert_eq!(
+            strip_thread_tags("[thr_] 非法标记保留"),
+            "[thr_] 非法标记保留"
+        );
+        assert_eq!(
+            strip_thread_tags("- 列表\n  缩进保留"),
+            "- 列表\n  缩进保留"
+        );
+    }
 
     #[test]
     fn recovers_bare_tool_call_with_hallucinated_xml_tag() {

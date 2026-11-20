@@ -33,6 +33,10 @@ pub struct Config {
     pub local_http: bool,
     pub gitlab: GitLabOAuthConfig,
     pub llm: LlmConfig,
+    /// Whether the default brain model accepts image input (AGENCT_LLM_SUPPORTS_IMAGES).
+    pub llm_supports_images: bool,
+    /// Optional default image-captioning model (AGENCT_VISION_URL / _API_KEY / _MODEL).
+    pub vision_llm: Option<LlmConfig>,
     pub gitlab_webhook_secret: Option<String>,
     pub allowed_gitlab_origins: HashSet<String>,
     pub allow_generic_im_webhook: bool,
@@ -114,6 +118,26 @@ impl Config {
             }
         };
 
+        let vision_llm = match std::env::var("AGENCT_VISION_URL") {
+            Ok(url) if !url.trim().is_empty() => {
+                let parsed = reqwest::Url::parse(url.trim())?;
+                if !matches!(parsed.scheme(), "http" | "https")
+                    || !parsed.path().ends_with("/chat/completions")
+                {
+                    return Err(
+                        "AGENCT_VISION_URL must be an http(s) .../chat/completions URL".into(),
+                    );
+                }
+                Some(LlmConfig::OpenAi {
+                    url: url.trim().to_owned(),
+                    api_key: std::env::var("AGENCT_VISION_API_KEY").unwrap_or_default(),
+                    model: std::env::var("AGENCT_VISION_MODEL")
+                        .map_err(|_| "AGENCT_VISION_MODEL is required with AGENCT_VISION_URL")?,
+                })
+            }
+            _ => None,
+        };
+
         let mut allowed_gitlab_origins = HashSet::new();
         allowed_gitlab_origins.insert(gitlab_base.clone());
         if let Ok(extra) = std::env::var("AGENCT_ALLOWED_GITLAB_ORIGINS") {
@@ -143,6 +167,8 @@ impl Config {
                 session_ttl_seconds,
             },
             llm,
+            llm_supports_images: env_flag("AGENCT_LLM_SUPPORTS_IMAGES"),
+            vision_llm,
             gitlab_webhook_secret: std::env::var("AGENCT_GITLAB_WEBHOOK_SECRET")
                 .ok()
                 .map(|s| s.trim().to_owned())
@@ -286,6 +312,53 @@ pub async fn validate_im_webhook_url(
             }
             if !saw_any {
                 return Err("webhook host resolved to no addresses");
+            }
+        }
+    }
+    Ok(trimmed.to_owned())
+}
+
+/// Validates a user-configured OpenAI-compatible `/chat/completions` URL against SSRF:
+/// HTTPS + public IP only, unless the operator set AGENCT_ALLOW_PRIVATE_OUTBOUND.
+pub async fn validate_llm_url(raw: &str, allow_private: bool) -> Result<String, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return Err("模型接口地址无效");
+    }
+    let url = reqwest::Url::parse(trimmed).map_err(|_| "模型接口地址无效")?;
+    let scheme_ok = url.scheme() == "https" || (allow_private && url.scheme() == "http");
+    if !scheme_ok
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("模型接口地址必须是干净的 https:// URL");
+    }
+    if !url.path().ends_with("/chat/completions") {
+        return Err("模型接口地址必须以 /chat/completions 结尾（OpenAI 兼容格式）");
+    }
+    let host = url.host_str().ok_or("模型接口地址缺少主机名")?.to_owned();
+    if !allow_private {
+        let host_trim = host.trim_start_matches('[').trim_end_matches(']');
+        if let Ok(ip) = host_trim.parse::<IpAddr>() {
+            if is_blocked_ip(ip) {
+                return Err("不允许指向内网/本机地址的模型接口");
+            }
+        } else {
+            let port = url.port_or_known_default().unwrap_or(443);
+            let addrs = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|_| "模型接口域名解析失败")?;
+            let mut saw_any = false;
+            for addr in addrs {
+                saw_any = true;
+                if is_blocked_ip(addr.ip()) {
+                    return Err("模型接口域名解析到了内网/本机地址");
+                }
+            }
+            if !saw_any {
+                return Err("模型接口域名解析失败");
             }
         }
     }

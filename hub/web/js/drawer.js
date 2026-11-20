@@ -9,7 +9,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
 
   let activeTab = 'tasks';
   let lastInstallCmd = '';
-  let integrations = { gitlab: null, im: null };
+  let integrations = { gitlab: null, im: null, models: null };
 
   tabBtns.forEach((btn) => {
     btn.onclick = () => {
@@ -25,11 +25,12 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
 
   async function loadIntegrations() {
     try {
-      const [gitlab, im] = await Promise.all([
+      const [gitlab, im, models] = await Promise.all([
         api('/api/integrations/gitlab'),
         api('/api/integrations/im'),
+        api('/api/settings/models'),
       ]);
-      integrations = { gitlab, im };
+      integrations = { gitlab, im, models };
     } catch {
       // ignore transient errors
     }
@@ -705,9 +706,37 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     const perms = state.permissions || {};
     const gl = integrations.gitlab || {};
     const im = integrations.im || {};
+    const models = integrations.models || {};
+    const def = models.server_default || {};
     const nodes = state.nodes || [];
+    const modelFields = (slot, ep, placeholderModel) => `
+          <label class="field-label">接口地址（OpenAI 兼容，以 /chat/completions 结尾）</label>
+          <input type="url" name="${slot}_url" value="${esc(ep?.url || '')}" placeholder="https://api.deepseek.com/v1/chat/completions">
+          <label class="field-label">模型名</label>
+          <input type="text" name="${slot}_model" value="${esc(ep?.model || '')}" placeholder="${esc(placeholderModel)}">
+          <label class="field-label">API Key ${ep?.key_preview ? `(已保存 ${esc(ep.key_preview)})` : '(未配置)'}</label>
+          <input type="password" name="${slot}_key" placeholder="${ep ? '留空保持不变' : 'sk-...'}" autocomplete="off">`;
 
     settingsBody.innerHTML = `
+      <section class="panel-card">
+        <h3>大脑模型</h3>
+        <p class="note">不配置则使用服务器默认：${esc(def.brain_model || '-')}${def.brain_supports_images ? '（支持图片）' : '（仅文字）'}${def.vision_model ? `，识图：${esc(def.vision_model)}` : ''}</p>
+        <form id="models-form">
+          ${modelFields('brain', models.brain, 'deepseek-chat / gpt-4o / qwen-vl-max')}
+          <label class="toggle"><span>该模型支持图片输入（直接看图）</span><input type="checkbox" name="brain_images" ${models.brain?.supports_images ? 'checked' : ''}></label>
+          <details class="mt-6" ${models.vision ? 'open' : ''}>
+            <summary>识图模型（可选：大脑不能看图时，先把图片转成文字）</summary>
+            ${modelFields('vision', models.vision, 'qwen-vl-plus / glm-4v-flash / gpt-4o-mini')}
+          </details>
+          <div class="row">
+            <button type="submit" class="primary sm">保存</button>
+            <button type="button" id="models-test-btn" class="sm">测试连通</button>
+            ${models.brain ? '<button type="button" id="models-clear-brain" class="sm danger">恢复默认大脑</button>' : ''}
+            ${models.vision ? '<button type="button" id="models-clear-vision" class="sm danger">移除识图模型</button>' : ''}
+          </div>
+        </form>
+      </section>
+
       <section class="panel-card">
         <h3>自动化授权（默认全部关闭）</h3>
         <form id="perms-form">
@@ -750,6 +779,51 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
       </section>`;
 
     bindNodeHandlers(settingsBody);
+    const saveModels = async (body, okMsg) => {
+      try {
+        integrations.models = await api('/api/settings/models', { method: 'PUT', body });
+        showToast(okMsg);
+        renderSettingsPane();
+      } catch (err) {
+        showToast(err.message);
+      }
+    };
+    document.getElementById('models-form').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const f = ev.target;
+      const slot = (name, extra = {}) => {
+        const url = f[`${name}_url`].value.trim();
+        const model = f[`${name}_model`].value.trim();
+        if (!url && !model) return undefined;
+        return { url, model, api_key: f[`${name}_key`].value.trim() || null, ...extra };
+      };
+      const body = {};
+      const brain = slot('brain', { supports_images: f.brain_images.checked });
+      const vision = slot('vision');
+      if (brain) body.brain = brain;
+      if (vision) body.vision = vision;
+      if (!brain && !vision) {
+        showToast('请填写接口地址和模型名');
+        return;
+      }
+      await saveModels(body, '模型配置已保存');
+    };
+    document.getElementById('models-clear-brain')?.addEventListener('click', () =>
+      saveModels({ clear_brain: true }, '已恢复默认大脑模型'),
+    );
+    document.getElementById('models-clear-vision')?.addEventListener('click', () =>
+      saveModels({ clear_vision: true }, '已移除识图模型'),
+    );
+    document.getElementById('models-test-btn').onclick = async () => {
+      try {
+        const r = await api('/api/settings/models/test', { method: 'POST' });
+        const fmt = (label, x) =>
+          x ? `${label} ${x.model}：${x.ok ? '连通 ✓' : `失败（${x.error}）`}` : '';
+        showToast([fmt('大脑', r.brain), fmt('识图', r.vision)].filter(Boolean).join('；'));
+      } catch (err) {
+        showToast(err.message);
+      }
+    };
     document.getElementById('perms-form').onsubmit = async (ev) => {
       ev.preventDefault();
       const f = ev.target;

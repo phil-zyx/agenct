@@ -32,6 +32,8 @@ fn test_config(gitlab_url: &str) -> Config {
             session_ttl_seconds: 3600,
         },
         llm: LlmConfig::Stub,
+        llm_supports_images: false,
+        vision_llm: None,
         gitlab_webhook_secret: Some("wh-secret-1234567890".into()),
         allowed_gitlab_origins: allowed,
         allow_generic_im_webhook: false,
@@ -1133,4 +1135,220 @@ async fn failing_crons_back_off_retry_and_give_up_once() {
     assert_eq!(row.last_status, "failed");
     assert!(row.last_error.contains("没有可用的执行节点"), "{row:?}");
     assert!(row.next_retry_at.is_some());
+}
+
+async fn upload_png(router: &Router, cookie: &str, csrf: &str) -> String {
+    let png = STANDARD.encode(b"\x89PNG\r\n\x1a\nfake-screenshot");
+    let (st, att) = req_json(
+        router,
+        "POST",
+        "/api/attachments",
+        Some(cookie),
+        Some(csrf),
+        Some(json!({"name": "shot.png", "mime_type": "image/png", "data_base64": png})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{att}");
+    att["id"].as_str().unwrap().to_owned()
+}
+
+#[tokio::test]
+async fn users_configure_their_own_brain_and_vision_models_safely() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, cur) = req_json(
+        &router,
+        "GET",
+        "/api/settings/models",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(cur["brain"].is_null());
+    assert_eq!(cur["server_default"]["brain_model"], "stub");
+
+    // SSRF: private / plain-http / non-chat-completions URLs are rejected.
+    for url in [
+        "https://10.0.0.11/v1/chat/completions",
+        "https://127.0.0.1/v1/chat/completions",
+        "http://1.1.1.1/v1/chat/completions",
+        "https://1.1.1.1/v1/models",
+    ] {
+        let (st, err) = req_json(
+            &router,
+            "PUT",
+            "/api/settings/models",
+            Some(&cookie),
+            Some(&csrf),
+            Some(json!({"brain": {"url": url, "model": "m", "api_key": "sk-test-123456789"}})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{url}: {err}");
+    }
+    // Key is required the first time.
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        "/api/settings/models",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"brain": {"url": "https://1.1.1.1/v1/chat/completions", "model": "m"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, saved) = req_json(
+        &router,
+        "PUT",
+        "/api/settings/models",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({
+            "brain": {"url": "https://1.1.1.1/v1/chat/completions", "model": "qwen-vl-max",
+                      "api_key": "sk-secret-abcdef123456", "supports_images": true},
+            "vision": {"url": "https://1.1.1.1/v1/chat/completions", "model": "glm-4v", "api_key": "sk-vision-999999999"}
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{saved}");
+    assert_eq!(saved["brain"]["model"], "qwen-vl-max");
+    assert_eq!(saved["brain"]["supports_images"], true);
+    assert_eq!(saved["brain"]["key_preview"], "****3456");
+    assert!(
+        !saved.to_string().contains("sk-secret"),
+        "API key must never be echoed"
+    );
+
+    // Updating without a key keeps the stored key.
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        "/api/settings/models",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"brain": {"url": "https://1.1.1.1/v1/chat/completions", "model": "qwen-max"}})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let stored = agenct_hub::models::load(&hub, "u-alice").await.unwrap();
+    let brain = stored.brain.unwrap();
+    assert_eq!(
+        (brain.model.as_str(), brain.api_key.as_str()),
+        ("qwen-max", "sk-secret-abcdef123456")
+    );
+    assert!(!brain.supports_images);
+
+    // Clearing falls back to the server default.
+    let (st, cleared) = req_json(
+        &router,
+        "PUT",
+        "/api/settings/models",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"clear_brain": true, "clear_vision": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(cleared["brain"].is_null() && cleared["vision"].is_null());
+    let (st, probe) = req_json(
+        &router,
+        "POST",
+        "/api/settings/models/test",
+        Some(&cookie),
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(probe["brain"]["ok"], true);
+    assert!(probe["vision"].is_null());
+}
+
+#[tokio::test]
+async fn images_reach_the_brain_inline_via_captions_or_with_an_honest_note() {
+    // 1. Text-only brain, no vision model: the brain is told it cannot see the image.
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+    let att = upload_png(&router, &cookie, &csrf).await;
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": format!("看下这个 ![shot.png](/api/attachments/{att})")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        chat["reply"].as_str().unwrap().contains("没有配置识图模型"),
+        "{chat}"
+    );
+
+    // 2. Vision model configured: caption is injected and persisted for follow-up turns.
+    let mut cfg = test_config("https://git.example.com");
+    cfg.vision_llm = Some(LlmConfig::Stub);
+    let hub = Hub::open(cfg).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+    let att = upload_png(&router, &cookie, &csrf).await;
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": format!("看下这个 ![shot.png](/api/attachments/{att})")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        chat["reply"]
+            .as_str()
+            .unwrap()
+            .contains("connection refused"),
+        "{chat}"
+    );
+    let context: String = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT context FROM messages WHERE role='user' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(context.contains("【图片 shot.png 内容"), "{context}");
+
+    // 3. Image-capable brain: images are sent inline, no captioning.
+    let mut cfg = test_config("https://git.example.com");
+    cfg.llm_supports_images = true;
+    let hub = Hub::open(cfg).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+    let att = upload_png(&router, &cookie, &csrf).await;
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": format!("![shot.png](/api/attachments/{att})")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        chat["reply"]
+            .as_str()
+            .unwrap()
+            .starts_with("（看到 1 张图片）"),
+        "{chat}"
+    );
 }

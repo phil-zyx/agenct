@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
-const SCHEMA_V5: &str = r#"
+const SCHEMA_V6: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     gitlab_id INTEGER UNIQUE,
@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS messages (
     request_id TEXT,
     status TEXT NOT NULL DEFAULT 'complete' CHECK(status IN ('pending','complete','failed')),
     reply_to INTEGER,
+    context TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL,
     UNIQUE(user_id, request_id)
 );
@@ -177,6 +178,12 @@ CREATE TABLE IF NOT EXISTS gitlab_reply_targets (
     noteable_iid INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS user_models (
+    user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    config_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS attachments (
     id TEXT PRIMARY KEY,
     owner_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -243,7 +250,7 @@ impl Db {
         let writer = Connection::open(path)?;
         writer.busy_timeout(Duration::from_millis(5000))?;
         let mut current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(current_version, 0 | 1 | 2 | 3 | 4 | SCHEMA_VERSION) {
+        if !matches!(current_version, 0 | 1 | 2 | 3 | 4 | 5 | SCHEMA_VERSION) {
             return Err(format!(
                 "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
             )
@@ -255,7 +262,7 @@ impl Db {
              PRAGMA foreign_keys = ON;",
         )?;
         if current_version == 0 {
-            writer.execute_batch(SCHEMA_V5)?;
+            writer.execute_batch(SCHEMA_V6)?;
             writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else {
             if current_version == 1 {
@@ -319,9 +326,20 @@ impl Db {
                 writer.execute_batch(&format!(
                     "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 5; COMMIT;"
                 ))?;
+                current_version = 5;
+            }
+            if current_version == 5 {
+                // `context` holds model-only text derived from a message (e.g. image captions).
+                // `user_models` is created by the idempotent schema batch below.
+                writer.execute_batch(
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE messages ADD COLUMN context TEXT NOT NULL DEFAULT '';
+                     PRAGMA user_version = 6;
+                     COMMIT;",
+                )?;
             }
             // Idempotent: creates any table/index/trigger an older database never had.
-            writer.execute_batch(SCHEMA_V5)?;
+            writer.execute_batch(SCHEMA_V6)?;
         }
         // On startup, mark any orphaned running node jobs without a valid future lease as failed.
         let now = crate::config::now_unix();
@@ -458,7 +476,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 5);
+        assert_eq!(ver, 6);
         let reply_to_cols: i64 = conn
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('messages') WHERE name='reply_to'",

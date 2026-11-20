@@ -172,6 +172,16 @@ try {
   await page.click('#open-settings');
   await page.waitForSelector('#perms-form');
 
+  // 7b. Per-user brain model settings: private URLs are rejected by the Hub (SSRF guard).
+  await page.waitForSelector('#models-form');
+  assert.ok((await page.textContent('#settings-body')).includes('服务器默认：stub'));
+  await page.fill('#models-form input[name="brain_url"]', 'https://10.0.0.11/v1/chat/completions');
+  await page.fill('#models-form input[name="brain_model"]', 'evil');
+  await page.fill('#models-form input[name="brain_key"]', 'sk-test-123456789');
+  const rejected = page.waitForResponse((r) => r.url().endsWith('/api/settings/models') && r.request().method() === 'PUT');
+  await page.click('#models-form button[type="submit"]');
+  assert.equal((await rejected).status(), 400);
+
   assert.deepEqual(errors, [], `unexpected browser errors: ${errors.join('; ')}`);
 
   // 8. Verify backup.py backup + restore works cleanly against live SQLite DB.
