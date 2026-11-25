@@ -9,9 +9,9 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 11;
 
-const SCHEMA_V7: &str = r#"
+const SCHEMA_V11: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     gitlab_id INTEGER UNIQUE,
@@ -41,6 +41,20 @@ CREATE TABLE IF NOT EXISTS agent_profiles (
     updated_at INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS agent_roles (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    agent TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    effort TEXT NOT NULL DEFAULT '',
+    sandbox TEXT NOT NULL DEFAULT '' CHECK(sandbox IN ('','readonly','workspace-write')),
+    node_id TEXT NOT NULL DEFAULT '',
+    prompt TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(user_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -49,6 +63,9 @@ CREATE TABLE IF NOT EXISTS threads (
     summary TEXT NOT NULL DEFAULT '',
     node_id TEXT,
     node_session_id TEXT,
+    node_session_agent TEXT NOT NULL DEFAULT '',
+    node_session_role TEXT NOT NULL DEFAULT '',
+    node_session_model TEXT NOT NULL DEFAULT '',
     turn_count INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL
 );
@@ -92,6 +109,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status TEXT NOT NULL CHECK(status IN ('pending','running','done','failed','canceled')),
     result TEXT,
     revision INTEGER NOT NULL DEFAULT 0,
+    on_complete TEXT NOT NULL DEFAULT '',
+    callback_depth INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -104,6 +123,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     name TEXT NOT NULL,
     kind TEXT NOT NULL DEFAULT 'pc' CHECK(kind IN ('pc','cloud')),
     capabilities TEXT NOT NULL DEFAULT '',
+    default_agent TEXT NOT NULL DEFAULT '',
+    allowed_agents TEXT NOT NULL DEFAULT '',
     token_hash TEXT NOT NULL UNIQUE,
     last_seen_at INTEGER,
     created_at INTEGER NOT NULL,
@@ -114,6 +135,11 @@ CREATE TABLE IF NOT EXISTS node_jobs (
     task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     node_id TEXT NOT NULL,
+    agent TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT '',
+    model TEXT NOT NULL DEFAULT '',
+    effort TEXT NOT NULL DEFAULT '',
+    sandbox TEXT NOT NULL DEFAULT '',
     task_revision INTEGER NOT NULL,
     authorization TEXT NOT NULL DEFAULT 'manual' CHECK(authorization IN ('manual','delegation','gitlab','cron')),
     status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed')),
@@ -220,6 +246,24 @@ CREATE TRIGGER IF NOT EXISTS audit_logs_no_update BEFORE UPDATE ON audit_logs
 BEGIN SELECT RAISE(ABORT, 'audit_logs are append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_logs_no_delete BEFORE DELETE ON audit_logs
 BEGIN SELECT RAISE(ABORT, 'audit_logs are append-only'); END;
+
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    context,
+    content='messages',
+    content_rowid='id',
+    tokenize='trigram'
+);
+CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content, context) VALUES (new.id, new.content, new.context);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, context) VALUES ('delete', old.id, old.content, old.context);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, context) VALUES ('delete', old.id, old.content, old.context);
+    INSERT INTO messages_fts(rowid, content, context) VALUES (new.id, new.content, new.context);
+END;
 "#;
 
 #[derive(Clone)]
@@ -256,7 +300,7 @@ impl Db {
         let writer = Connection::open(path)?;
         writer.busy_timeout(Duration::from_millis(5000))?;
         let mut current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !matches!(current_version, 0 | 1 | 2 | 3 | 4 | 5 | 6 | SCHEMA_VERSION) {
+        if !(0..=SCHEMA_VERSION).contains(&current_version) {
             return Err(format!(
                 "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
             )
@@ -267,8 +311,9 @@ impl Db {
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )?;
+        let needs_fts_rebuild = current_version > 0 && current_version < 8;
         if current_version == 0 {
-            writer.execute_batch(SCHEMA_V7)?;
+            writer.execute_batch(SCHEMA_V11)?;
             writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else {
             if current_version == 1 {
@@ -348,9 +393,100 @@ impl Db {
             if current_version == 6 {
                 // `local_auth` is created by the idempotent schema batch below.
                 writer.pragma_update(None, "user_version", 7)?;
+                current_version = 7;
+            }
+            if current_version == 7 {
+                let has_tasks: bool = writer.query_row(
+                    "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='tasks'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let alter = if has_tasks {
+                    "ALTER TABLE tasks ADD COLUMN on_complete TEXT NOT NULL DEFAULT '';
+                     ALTER TABLE tasks ADD COLUMN callback_depth INTEGER NOT NULL DEFAULT 0;"
+                } else {
+                    ""
+                };
+                writer.execute_batch(&format!(
+                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 8; COMMIT;"
+                ))?;
+                current_version = 8;
+            }
+            let table_exists = |name: &str| -> rusqlite::Result<bool> {
+                writer.query_row(
+                    "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+            };
+            if current_version == 8 {
+                let mut alter = String::new();
+                if table_exists("nodes")? {
+                    alter.push_str(
+                        "ALTER TABLE nodes ADD COLUMN default_agent TEXT NOT NULL DEFAULT '';
+                         ALTER TABLE nodes ADD COLUMN allowed_agents TEXT NOT NULL DEFAULT '';",
+                    );
+                }
+                if table_exists("node_jobs")? {
+                    alter.push_str(
+                        "ALTER TABLE node_jobs ADD COLUMN agent TEXT NOT NULL DEFAULT '';",
+                    );
+                }
+                if table_exists("threads")? {
+                    alter.push_str(
+                        "ALTER TABLE threads ADD COLUMN node_session_agent TEXT NOT NULL DEFAULT '';",
+                    );
+                }
+                writer.execute_batch(&format!(
+                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 9; COMMIT;"
+                ))?;
+                current_version = 9;
+            }
+            if current_version == 9 {
+                let mut alter = String::new();
+                if table_exists("node_jobs")? {
+                    alter.push_str(
+                        "ALTER TABLE node_jobs ADD COLUMN role TEXT NOT NULL DEFAULT '';
+                         ALTER TABLE node_jobs ADD COLUMN model TEXT NOT NULL DEFAULT '';
+                         ALTER TABLE node_jobs ADD COLUMN effort TEXT NOT NULL DEFAULT '';
+                         ALTER TABLE node_jobs ADD COLUMN sandbox TEXT NOT NULL DEFAULT '';",
+                    );
+                }
+                if table_exists("threads")? {
+                    alter.push_str(
+                        "ALTER TABLE threads ADD COLUMN node_session_role TEXT NOT NULL DEFAULT '';
+                         ALTER TABLE threads ADD COLUMN node_session_model TEXT NOT NULL DEFAULT '';",
+                    );
+                }
+                writer.execute_batch(&format!(
+                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 10; COMMIT;"
+                ))?;
+                current_version = 10;
+            }
+            if current_version == 10 {
+                let mut mig = String::new();
+                if table_exists("nodes")? {
+                    mig.push_str(
+                        "UPDATE nodes SET default_agent = 'agy' WHERE lower(default_agent) = 'gemini';
+                         UPDATE nodes SET allowed_agents = trim(replace(replace(',' || lower(allowed_agents) || ',', ',gemini,', ',agy,'), ',gemini,', ',agy,'), ',')
+                           WHERE allowed_agents != '' AND instr(',' || lower(allowed_agents) || ',', ',gemini,') > 0;",
+                    );
+                }
+                if table_exists("agent_roles")? {
+                    mig.push_str(
+                        "UPDATE agent_roles SET agent = 'agy' WHERE lower(agent) = 'gemini';",
+                    );
+                }
+                writer.execute_batch(&format!(
+                    "BEGIN IMMEDIATE; {mig} PRAGMA user_version = 11; COMMIT;"
+                ))?;
             }
             // Idempotent: creates any table/index/trigger an older database never had.
-            writer.execute_batch(SCHEMA_V7)?;
+            writer.execute_batch(SCHEMA_V11)?;
+            if needs_fts_rebuild {
+                writer
+                    .execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('rebuild');")?;
+            }
         }
         // On startup, mark any orphaned running node jobs without a valid future lease as failed.
         let now = crate::config::now_unix();
@@ -496,7 +632,55 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 7);
+        assert_eq!(ver, 11);
+        let roles_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_roles'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(roles_table, 1);
+        let node_agent_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('nodes') WHERE name IN ('default_agent','allowed_agents')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(node_agent_cols, 2);
+        let job_agent_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('node_jobs') WHERE name IN ('agent','role','model','effort','sandbox')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(job_agent_cols, 5);
+        let thr_agent_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('threads') WHERE name IN ('node_session_agent','node_session_role','node_session_model')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(thr_agent_cols, 3);
+        let on_complete_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='on_complete'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(on_complete_cols, 1);
+        let fts_hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH '\"hello\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_hits, 1);
         let reply_to_cols: i64 = conn
             .query_row(
                 "SELECT count(*) FROM pragma_table_info('messages') WHERE name='reply_to'",
@@ -573,6 +757,202 @@ mod tests {
             .unwrap();
         assert_eq!((cron_status.as_str(), fails), ("failed", 1));
         assert!(retry.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v8_database_to_v9() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenct-mig8-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("agenct.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, gitlab_id INTEGER UNIQUE, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL);
+                 CREATE TABLE nodes (id TEXT NOT NULL, user_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'pc', capabilities TEXT NOT NULL DEFAULT '', token_hash TEXT NOT NULL UNIQUE, last_seen_at INTEGER, created_at INTEGER NOT NULL, PRIMARY KEY(user_id, id));
+                 CREATE TABLE tasks (id TEXT PRIMARY KEY, requester_id TEXT NOT NULL, owner_id TEXT NOT NULL, thread_id TEXT, title TEXT NOT NULL, instruction TEXT NOT NULL, status TEXT NOT NULL, result TEXT, revision INTEGER NOT NULL DEFAULT 0, on_complete TEXT NOT NULL DEFAULT '', callback_depth INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE node_jobs (task_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, node_id TEXT NOT NULL, task_revision INTEGER NOT NULL, authorization TEXT NOT NULL DEFAULT 'manual', status TEXT NOT NULL, lease_hash TEXT, lease_until INTEGER, submission_hash TEXT, stage TEXT NOT NULL DEFAULT '', log_tail TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', summary TEXT NOT NULL DEFAULT '', node_id TEXT, node_session_id TEXT, turn_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+                 INSERT INTO users VALUES ('u1', 1, 'alice', 'Alice', 1, 'active', 100);
+                 INSERT INTO nodes VALUES ('n1', 'u1', 'HomePC', 'pc', 'agent:opencode', 'tokh1', 100, 100);
+                 INSERT INTO threads VALUES ('thr_1', 'u1', 'Work', 'active', 'sum', 'n1', 'ses_1', 1, 100);
+                 PRAGMA user_version = 8;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        drop(db);
+        let conn = Connection::open(&db_path).unwrap();
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 11);
+        let (def_ag, allow_ag): (String, String) = conn
+            .query_row(
+                "SELECT default_agent, allowed_agents FROM nodes WHERE id='n1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((def_ag.as_str(), allow_ag.as_str()), ("", ""));
+        let (ses_ag, ses_role, ses_model): (String, String, String) = conn
+            .query_row(
+                "SELECT node_session_agent, node_session_role, node_session_model FROM threads WHERE id='thr_1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (ses_ag.as_str(), ses_role.as_str(), ses_model.as_str()),
+            ("", "", "")
+        );
+        let job_ag_cols: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('node_jobs') WHERE name IN ('agent','role','model','effort','sandbox')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(job_ag_cols, 5);
+
+        // Unsupported future schema version must still be rejected.
+        conn.pragma_update(None, "user_version", 99).unwrap();
+        drop(conn);
+        assert!(Db::open(&db_path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v9_database_to_v10() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenct-mig9-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("agenct.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, gitlab_id INTEGER UNIQUE, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL);
+                 CREATE TABLE nodes (id TEXT NOT NULL, user_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'pc', capabilities TEXT NOT NULL DEFAULT '', default_agent TEXT NOT NULL DEFAULT '', allowed_agents TEXT NOT NULL DEFAULT '', token_hash TEXT NOT NULL UNIQUE, last_seen_at INTEGER, created_at INTEGER NOT NULL, PRIMARY KEY(user_id, id));
+                 CREATE TABLE tasks (id TEXT PRIMARY KEY, requester_id TEXT NOT NULL, owner_id TEXT NOT NULL, thread_id TEXT, title TEXT NOT NULL, instruction TEXT NOT NULL, status TEXT NOT NULL, result TEXT, revision INTEGER NOT NULL DEFAULT 0, on_complete TEXT NOT NULL DEFAULT '', callback_depth INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE node_jobs (task_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, node_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', task_revision INTEGER NOT NULL, authorization TEXT NOT NULL DEFAULT 'manual', status TEXT NOT NULL, lease_hash TEXT, lease_until INTEGER, submission_hash TEXT, stage TEXT NOT NULL DEFAULT '', log_tail TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', summary TEXT NOT NULL DEFAULT '', node_id TEXT, node_session_id TEXT, node_session_agent TEXT NOT NULL DEFAULT '', turn_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+                 INSERT INTO users VALUES ('u1', 1, 'alice', 'Alice', 1, 'active', 100);
+                 INSERT INTO nodes VALUES ('homelab', 'u1', 'HomeLab', 'pc', 'agent:codex', 'codex', 'codex,opencode', 'tokh9', 100, 100);
+                 INSERT INTO threads VALUES ('thr_9', 'u1', 'Deploy', 'active', 'sum', 'homelab', 'ses_9', 'codex', 2, 100);
+                 INSERT INTO tasks VALUES ('tsk_9', 'u1', 'u1', 'thr_9', 'Check', 'status', 'done', 'ok', 1, '', 0, 100, 100);
+                 INSERT INTO node_jobs VALUES ('tsk_9', 'u1', 'homelab', 'codex', 1, 'manual', 'completed', NULL, NULL, 'subh', 'done', '', 100);
+                 PRAGMA user_version = 9;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        drop(db);
+        let conn = Connection::open(&db_path).unwrap();
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 11);
+        let roles_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_roles'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(roles_table, 1);
+        let (role, model, effort, sandbox): (String, String, String, String) = conn
+            .query_row(
+                "SELECT role, model, effort, sandbox FROM node_jobs WHERE task_id='tsk_9'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                role.as_str(),
+                model.as_str(),
+                effort.as_str(),
+                sandbox.as_str()
+            ),
+            ("", "", "", "")
+        );
+        let (thr_agent, thr_role, thr_model): (String, String, String) = conn
+            .query_row(
+                "SELECT node_session_agent, node_session_role, node_session_model FROM threads WHERE id='thr_9'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (thr_agent.as_str(), thr_role.as_str(), thr_model.as_str()),
+            ("codex", "", "")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v10_database_to_v11() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenct-mig10-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("agenct.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, gitlab_id INTEGER UNIQUE, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL);
+                 CREATE TABLE agent_roles (user_id TEXT NOT NULL, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', agent TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '', sandbox TEXT NOT NULL DEFAULT '', node_id TEXT NOT NULL DEFAULT '', prompt TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, PRIMARY KEY(user_id, name));
+                 CREATE TABLE nodes (id TEXT NOT NULL, user_id TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'pc', capabilities TEXT NOT NULL DEFAULT '', default_agent TEXT NOT NULL DEFAULT '', allowed_agents TEXT NOT NULL DEFAULT '', token_hash TEXT NOT NULL UNIQUE, last_seen_at INTEGER, created_at INTEGER NOT NULL, PRIMARY KEY(user_id, id));
+                 CREATE TABLE tasks (id TEXT PRIMARY KEY, requester_id TEXT NOT NULL, owner_id TEXT NOT NULL, thread_id TEXT, title TEXT NOT NULL, instruction TEXT NOT NULL, status TEXT NOT NULL, result TEXT, revision INTEGER NOT NULL DEFAULT 0, on_complete TEXT NOT NULL DEFAULT '', callback_depth INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE node_jobs (task_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, node_id TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '', role TEXT NOT NULL DEFAULT '', model TEXT NOT NULL DEFAULT '', effort TEXT NOT NULL DEFAULT '', sandbox TEXT NOT NULL DEFAULT '', task_revision INTEGER NOT NULL, authorization TEXT NOT NULL DEFAULT 'manual', status TEXT NOT NULL, lease_hash TEXT, lease_until INTEGER, submission_hash TEXT, stage TEXT NOT NULL DEFAULT '', log_tail TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', summary TEXT NOT NULL DEFAULT '', node_id TEXT, node_session_id TEXT, node_session_agent TEXT NOT NULL DEFAULT '', node_session_role TEXT NOT NULL DEFAULT '', node_session_model TEXT NOT NULL DEFAULT '', turn_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+                 INSERT INTO users VALUES ('u1', 1, 'alice', 'Alice', 1, 'active', 100);
+                 INSERT INTO nodes VALUES ('homelab', 'u1', 'HomeLab', 'pc', 'agent:codex', 'gemini', 'codex,gemini,opencode', 'tokh10', 100, 100);
+                 INSERT INTO agent_roles VALUES ('u1', 'planner', 'Plan', 'gemini', 'claude-opus-5-5-high', 'high', 'readonly', '', '', 100);
+                 INSERT INTO agent_roles VALUES ('u1', 'executor', 'Exec', 'codex', 'gpt-6.2-sol', 'medium', 'workspace-write', '', '', 100);
+                 PRAGMA user_version = 10;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        drop(db);
+        let conn = Connection::open(&db_path).unwrap();
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, 11);
+        let (def_ag, allow_ag): (String, String) = conn
+            .query_row(
+                "SELECT default_agent, allowed_agents FROM nodes WHERE id='homelab'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (def_ag.as_str(), allow_ag.as_str()),
+            ("agy", "codex,agy,opencode")
+        );
+        let (p_ag, e_ag): (String, String) = (
+            conn.query_row(
+                "SELECT agent FROM agent_roles WHERE name='planner'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT agent FROM agent_roles WHERE name='executor'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!((p_ag.as_str(), e_ag.as_str()), ("agy", "codex"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
