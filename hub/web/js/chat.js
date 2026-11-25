@@ -7,7 +7,7 @@ function randomId() {
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
-export function initChat({ state, onRefresh }) {
+export function initChat({ state, onRefresh, onActivityChange }) {
   const scrollerEl = document.getElementById('scroller');
   const listEl = document.getElementById('messages');
   const formEl = document.getElementById('chat-form');
@@ -16,6 +16,12 @@ export function initChat({ state, onRefresh }) {
   const fileEl = document.getElementById('file-input');
   const attsEl = document.getElementById('pending-atts');
   const stageEl = document.getElementById('stage-bar');
+  const workStageEl = document.getElementById('work-stage');
+  const elapsedEl = document.getElementById('work-elapsed');
+  const workLogEl = document.getElementById('work-log');
+  const logTailEl = document.getElementById('work-log-tail');
+  const headEl = document.getElementById('muse-head-toggle');
+  const heroEl = document.getElementById('hero-avatar-wrap');
   const typingEl = document.getElementById('typing');
   const streamWrapEl = document.getElementById('stream-live');
   const streamMsgEl = document.getElementById('streaming-msg');
@@ -39,15 +45,127 @@ export function initChat({ state, onRefresh }) {
   let threadHasMore = false;
   let loadingOlder = false;
   let scrollAfterRender = true;
+  let brainWork = null;
+  let taskWork = new Map();
+  let visibleTaskId = null;
+  let visibleWork = null;
+  let elapsedTimer = null;
+  let lastActivityKey = '';
+  let lastTaskSnapshot = null;
+
+  const stageLabels = new Map([
+    ['connecting', '正在连接'],
+    ['executing', '正在执行'],
+    ['summarizing', '正在整理结果'],
+    ['queued', '等待节点接单'],
+    ['claimed by node', '节点已接单'],
+    ['starting execution', '正在启动执行'],
+  ]);
+
+  function emitActivity() {
+    if (!onActivityChange) return;
+    const payload = {
+      brainStage: typeof brainWork?.stage === 'string' ? brainWork.stage : '',
+      streaming: Boolean(streamingText),
+      taskStatus: typeof lastTaskSnapshot?.status === 'string' ? lastTaskSnapshot.status : '',
+      taskStage: typeof lastTaskSnapshot?.stage === 'string' ? lastTaskSnapshot.stage : '',
+    };
+    const key = `${payload.brainStage}|${payload.streaming ? 1 : 0}|${payload.taskStatus}|${payload.taskStage}`;
+    if (key === lastActivityKey) return;
+    lastActivityKey = key;
+    onActivityChange(payload);
+  }
+
+  function renderElapsed() {
+    elapsedEl.textContent = visibleWork
+      ? `${Math.floor((performance.now() - visibleWork.startedAt) / 1000)} 秒`
+      : '';
+  }
+
+  function renderWork() {
+    const tasks = [...taskWork.values()].map(({ work }) => work).filter(Boolean);
+    const task = tasks.find((work) => work.status === 'running') || tasks[0];
+    lastTaskSnapshot = task || null;
+    visibleWork = brainWork || task;
+    const busy = Boolean(visibleWork);
+    const stage = typeof visibleWork?.stage === 'string' ? visibleWork.stage.trim() : '';
+    const label = stageLabels.get(stage?.toLowerCase()) || stage
+      || (task?.status === 'queued' ? '等待节点接单' : '正在执行');
+    const text = busy ? `正在工作 · ${label}` : '';
+    if (workStageEl.textContent !== text) workStageEl.textContent = text;
+    stageEl.classList.toggle('hide', !busy);
+    headEl?.classList.toggle('is-thinking', busy);
+    heroEl?.classList.toggle('is-thinking', busy);
+
+    const taskId = visibleWork?.taskId;
+    const tail = visibleWork?.logTail || '';
+    if (taskId !== visibleTaskId || !tail) workLogEl.open = false;
+    visibleTaskId = taskId;
+    if (logTailEl.textContent !== tail) logTailEl.textContent = tail;
+    workLogEl.classList.toggle('hide', !tail);
+
+    renderElapsed();
+    if (busy && elapsedTimer === null) elapsedTimer = setInterval(renderElapsed, 1000);
+    if (!busy && elapsedTimer !== null) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+    emitActivity();
+  }
+
+  function onTask(event, version) {
+    const { task_id: taskId, status, stage, elapsed_secs: elapsed, log_tail: logTail } = event;
+    if (typeof taskId !== 'string' || typeof status !== 'string') return;
+    const previous = taskWork.get(taskId)?.work;
+    const now = performance.now();
+    const phase = status === 'running' && stage === undefined && event.node_id ? 'queued' : status;
+    const active = phase === 'running' || phase === 'queued';
+    const startedAt = Number.isFinite(elapsed) && elapsed >= 0
+      ? now - elapsed * 1000
+      : previous?.status === phase && stage !== 'Claimed by node' ? previous.startedAt : now;
+    taskWork.set(taskId, {
+      version,
+      work: active ? { taskId, status: phase, startedAt, stage, logTail } : null,
+    });
+    renderWork();
+  }
+
+  function syncTasks(tasks, version) {
+    const next = new Map();
+    for (const task of tasks) {
+      if (task.status !== 'running') continue;
+      const status = task.job_status || task.status;
+      if (status !== 'running' && status !== 'queued') continue;
+      const previous = taskWork.get(task.id)?.work;
+      const sameRun = previous?.status === status
+        && (previous.revision === undefined || previous.revision === task.revision);
+      next.set(task.id, {
+        version,
+        work: {
+          taskId: task.id, status, revision: task.revision,
+          startedAt: sameRun ? previous.startedAt : performance.now(),
+          stage: task.stage, logTail: status === 'running' ? task.log_tail : '',
+        },
+      });
+    }
+    // An event received during this request is newer than the snapshot may be.
+    for (const [id, entry] of taskWork) {
+      if (entry.version > version) next.set(id, entry);
+    }
+    taskWork = next;
+    renderWork();
+  }
 
   function clearStreaming() {
     if (streamRaf) {
       cancelAnimationFrame(streamRaf);
       streamRaf = 0;
     }
+    const hadText = Boolean(streamingText);
     streamingText = '';
     if (streamWrapEl) streamWrapEl.classList.add('hide');
     if (streamMsgEl) streamMsgEl.innerHTML = '';
+    if (hadText) emitActivity();
   }
 
   function flushStreamRender() {
@@ -180,8 +298,9 @@ export function initChat({ state, onRefresh }) {
     clearStreaming();
     render();
     typingEl.classList.remove('hide');
-    document.getElementById('muse-head-toggle')?.classList.add('is-thinking');
-    document.getElementById('hero-avatar-wrap')?.classList.add('is-thinking');
+    const turnWork = { stage: 'connecting', startedAt: performance.now() };
+    brainWork = turnWork;
+    renderWork();
     scrollerEl.scrollTop = scrollerEl.scrollHeight;
 
     try {
@@ -204,11 +323,7 @@ export function initChat({ state, onRefresh }) {
       sending = false;
       sendBtn.disabled = false;
       typingEl.classList.add('hide');
-      const hasRunning = (state.tasks || []).some((t) => t.status === 'running');
-      if (!hasRunning) {
-        document.getElementById('muse-head-toggle')?.classList.remove('is-thinking');
-        document.getElementById('hero-avatar-wrap')?.classList.remove('is-thinking');
-      }
+      if (brainWork === turnWork) setStage('');
       inputEl.focus();
     }
   };
@@ -341,13 +456,12 @@ export function initChat({ state, onRefresh }) {
 
   function setStage(stage) {
     if (stage) {
-      stageEl.textContent = stage;
-      stageEl.classList.remove('hide');
-      scrollerEl.scrollTop = scrollerEl.scrollHeight;
+      brainWork ??= { startedAt: performance.now() };
+      brainWork.stage = stage;
     } else {
-      stageEl.textContent = '';
-      stageEl.classList.add('hide');
+      brainWork = null;
     }
+    renderWork();
   }
 
   function onDelta(delta) {
@@ -357,7 +471,9 @@ export function initChat({ state, onRefresh }) {
       return;
     }
     if (typeof delta.text === 'string' && delta.text) {
+      const wasEmpty = !streamingText;
       streamingText += delta.text;
+      if (wasEmpty) emitActivity();
       if (!streamRaf) {
         streamRaf = requestAnimationFrame(flushStreamRender);
       }
@@ -372,5 +488,5 @@ export function initChat({ state, onRefresh }) {
     inputEl.focus();
   }
 
-  return { render, setStage, onDelta, insertMention, setThreadFilter };
+  return { render, setStage, onDelta, onTask, syncTasks, insertMention, setThreadFilter };
 }

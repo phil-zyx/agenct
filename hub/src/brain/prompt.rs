@@ -42,7 +42,7 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
                 "更新智能体名称、头像、人设 SOUL 或长期记忆 MEMORY",
                 json!({
                     "name": {"type": "string", "description": "新称呼"},
-                    "avatar_id": {"type": "string", "enum": ["agenct", "sakura", "violet", "cheshire"]},
+                    "avatar_id": {"type": "string", "enum": ["agenct", "buddy", "sakura", "violet", "cheshire"]},
                     "soul_md": {"type": "string", "description": "替换人设文本"},
                     "memory_append": {"type": "string", "description": "追加一条长期记忆或规矩"},
                     "memory_replace": {"type": "string", "description": "整体替换整理后的长期记忆"}
@@ -381,7 +381,7 @@ pub(super) fn build_system_prompt(
 - 调用查询类工具的那一步 reply 只需一句简短过渡语。
 
 === 可组合调用的工具（必须放在 tools 数组中，严禁单独输出） ===
-1. update_memory: {"tool":"update_memory","name":null,"avatar_id":"agenct|sakura|violet|cheshire或null","soul_md":null,"memory_append":"追加一条长期记忆/规矩","memory_replace":null}
+1. update_memory: {"tool":"update_memory","name":null,"avatar_id":"agenct|buddy|sakura|violet|cheshire或null","soul_md":null,"memory_append":"追加一条长期记忆/规矩","memory_replace":null}
 2. update_ledger: {"tool":"update_ledger","action":"upsert|mute|done|delete","ledger_id":null,"title":"专项名","status":"active|muted|done","notes_append":"增量记录","notes_replace":null}
 3. manage_cron: {"tool":"manage_cron","action":"add|delete","cron_id":null,"daily_time_cst":"HH:MM或null","interval_minutes":60,"target":"cloud|auto|node_id","instruction":"完整指令"}
 4. manage_rule: {"tool":"manage_rule","action":"add|delete","rule_id":null,"keyword":"关键词","node_id":"目标节点或cloud"}

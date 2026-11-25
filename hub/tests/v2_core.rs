@@ -332,6 +332,23 @@ async fn unified_node_lease_protocol_and_brain_tools_work() {
     let lease = work_json["job"]["lease_token"].as_str().unwrap().to_owned();
     let rev = work_json["job"]["task_revision"].as_i64().unwrap();
 
+    let events = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/events")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::COOKIE, format!("agenct-local-session={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(events.status(), StatusCode::OK);
+    let mut events = events.into_body();
+    let connected = events.frame().await.unwrap().unwrap().into_data().unwrap();
+    assert!(connected.starts_with(b"event: connected\n"));
+
     // Renew lease with live progress.
     let renew = router
         .clone()
@@ -358,6 +375,28 @@ async fn unified_node_lease_protocol_and_brain_tools_work() {
         .await
         .unwrap();
     assert_eq!(renew.status(), StatusCode::OK);
+    let progress = tokio::time::timeout(std::time::Duration::from_secs(1), events.frame())
+        .await
+        .expect("lease renewal emits SSE progress")
+        .unwrap()
+        .unwrap()
+        .into_data()
+        .unwrap();
+    let frame = std::str::from_utf8(&progress).unwrap();
+    let data = frame
+        .strip_prefix("event: task\ndata: ")
+        .unwrap()
+        .trim_end();
+    assert_eq!(
+        serde_json::from_str::<Value>(data).unwrap(),
+        json!({
+            "task_id": task_id,
+            "status": "running",
+            "stage": "Running tests",
+            "log_tail": "test ok",
+            "elapsed_secs": 3
+        })
+    );
 
     // Submit result with PNG evidence attachment + idempotent replay.
     let png_b64 = STANDARD.encode(b"\x89PNG\r\n\x1a\nfake-png-body");
@@ -2136,10 +2175,23 @@ async fn message_pagination_thread_filter_and_fts5_search_work() {
         "/api/brain",
         Some(&alice_c),
         Some(&alice_csrf),
-        Some(json!({"memory_md": "- 偏好 DB 参数调优\n- 喜欢先看结论"})),
+        Some(json!({"memory_md": "- 偏好 DB 参数调优\n- 喜欢先看结论", "avatar_id": "buddy"})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+    let (st, boot) = req_json(&router, "GET", "/api/bootstrap", Some(&alice_c), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(boot["profile"]["avatar_id"], "buddy");
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        "/api/brain",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"avatar_id": "invalid_avatar"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
 
     // 1. Cursor pagination: page 1 (2 newest), page 2 (next 2), page 3 (last 1).
     let (st, p1) = req_json(

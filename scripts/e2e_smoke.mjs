@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { chromium } from '@playwright/test';
+import { chromium, expect } from '@playwright/test';
 
 const ROOT = process.cwd();
 const HUB_BIN = path.join(ROOT, 'hub/target/debug/agenct-hub');
@@ -159,6 +159,77 @@ try {
   // 6. Verify live SSE pushed the completed node result directly into the open browser!
   await page.waitForFunction(() => document.body.textContent.includes('Node Result:'), { timeout: 10000 });
 
+  // Control a second node job to observe progress after the chat request returns.
+  const workBar = page.locator('#stage-bar');
+  await expect(workBar).toBeHidden();
+  await page.fill('#chat-input', '/node verify live progress');
+  await page.click('#send-btn');
+  await expect(page.locator('#send-btn')).toBeEnabled();
+  await expect(page.locator('#work-stage')).toHaveText('正在工作 · 等待节点接单');
+  await expect(page.locator('#muse-head-toggle')).toHaveAttribute('data-agent-state', 'queued');
+  const nodeRequest = async (endpoint, body) => {
+    const res = await fetch(`${hubOrigin}/node/v1/${endpoint}`, {
+      method: body ? 'POST' : 'GET',
+      headers: {
+        Authorization: `Bearer ${nodeToken}`,
+        'X-Agenct-Node-Protocol': '2',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    assert.ok(res.ok, `${endpoint} returned ${res.status}`);
+    return res.json();
+  };
+  const { job } = await nodeRequest('work');
+  const taskPath = `tasks/${job.task_id}`;
+  const lease = { lease_token: job.lease_token, expected_revision: job.task_revision };
+  const progress = { ...lease, stage: 'executing', elapsed_secs: 7, log_tail: '<b>test output</b>' };
+  await nodeRequest(`${taskPath}/lease`, progress);
+  await expect(page.locator('#work-stage')).toHaveText('正在工作 · 正在执行');
+  await expect(page.locator('#muse-head-toggle')).toHaveClass(/\bis-thinking\b/);
+  await expect(page.locator('#muse-head-toggle')).toHaveAttribute('data-agent-state', 'working');
+  await expect(page.locator('#work-elapsed')).toHaveText(/^[7-9] 秒$/);
+  const elapsed = async () => parseInt(await page.locator('#work-elapsed').textContent(), 10);
+  const firstElapsed = await elapsed();
+  await expect.poll(elapsed).toBeGreaterThan(firstElapsed);
+  await page.locator('#work-log summary').click();
+  await expect(page.locator('#work-log-tail')).toHaveText(progress.log_tail);
+  await expect(page.locator('#work-log-tail b')).toHaveCount(0);
+
+  // Hold a snapshot showing the running job until after its terminal SSE event.
+  let releaseSnapshot;
+  let snapshotReady = false;
+  const held = new Promise((resolve) => { releaseSnapshot = resolve; });
+  await page.route('**/api/bootstrap', async (route) => {
+    const response = await route.fetch();
+    snapshotReady = true;
+    await held;
+    await route.fulfill({ response });
+  }, { times: 1 });
+  try {
+    await nodeRequest(`${taskPath}/lease`, { ...progress, elapsed_secs: 10 });
+    await expect.poll(() => snapshotReady).toBe(true);
+    await nodeRequest(`${taskPath}/submit`, {
+      ...lease, request_id: 'e2e-live-progress', status: 'failed', content: 'progress test complete',
+    });
+    await expect(workBar).toBeHidden();
+    await expect(page.locator('#work-log')).not.toHaveAttribute('open', '');
+    await expect(page.locator('#muse-head-toggle')).not.toHaveClass(/\bis-thinking\b/);
+    await expect(page.locator('#muse-head-toggle')).toHaveAttribute('data-agent-state', 'idle');
+    await workBar.evaluate((bar) => {
+      new MutationObserver((records) => {
+        if (!bar.classList.contains('hide') || records.some((record) => !record.oldValue.includes('hide'))) {
+          bar.dataset.revived = 'true';
+        }
+      }).observe(bar, { attributes: true, attributeFilter: ['class'], attributeOldValue: true });
+    });
+  } finally {
+    releaseSnapshot();
+  }
+  await expect(page.locator('#messages')).toContainText('progress test complete');
+  await expect(workBar).toBeHidden();
+  assert.equal(await workBar.getAttribute('data-revived'), null);
+
   // 6b. Verify full-text search panel finds the recent chat turn via FTS5 /api/search.
   await page.click('#nav-search');
   await page.waitForSelector('#search-panel:not(.hide)');
@@ -247,7 +318,11 @@ try {
     }));
     data.messages = [...filler, ...realMsgs].slice(-60);
     data.has_more_messages = true;
-    await route.fulfill({ response: resp, json: data });
+    try {
+      await route.fulfill({ response: resp, json: data });
+    } catch (err) {
+      if (!/already handled/i.test(String(err))) throw err;
+    }
   };
   const delayChatHandler = async (route) => {
     const resp = await route.fetch();
@@ -294,6 +369,15 @@ try {
       (document.getElementById('drawer-avatar')?.getAttribute('src') || '').startsWith('avatars/sakura.webp'),
     { timeout: 5000 },
   );
+  await page.click('[data-pick-avatar="buddy"]');
+  await page.waitForSelector('#head-avatar-buddy:not(.hide) .buddy-svg');
+  await page.waitForSelector('#drawer-avatar-buddy:not(.hide) .buddy-svg');
+  await expect(page.locator('#head-avatar')).toHaveClass(/\bhide\b/);
+  await expect(page.locator('#muse-head-toggle')).toHaveClass(/\bis-live-buddy\b/);
+  await expect(page.locator('#avatar-state-pill')).toHaveText('在线待命');
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('#room:not(.hide)');
+  await page.waitForSelector('#head-avatar-buddy:not(.hide) .buddy-svg');
   await page.click('#rail-more');
   await page.click('#open-settings');
   await page.waitForSelector('#perms-form');

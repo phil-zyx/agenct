@@ -73,6 +73,11 @@ try {
   await page.fill('#chat-input', 'hello from local login');
   await page.click('#send-btn');
   await page.waitForFunction(() => document.body.textContent.includes('收到你的消息：hello from local login'));
+  await page.waitForFunction(() =>
+    !document.getElementById('send-btn').disabled
+    && document.getElementById('stage-bar').classList.contains('hide')
+    && !document.getElementById('muse-head-toggle').classList.contains('is-thinking'),
+  );
   if (SCREENSHOT) await page.screenshot({ path: path.join(SCREENSHOT, 'local-login-room.png') });
 
   assert.deepEqual(errors, [], `unexpected browser errors: ${errors.join('; ')}`);

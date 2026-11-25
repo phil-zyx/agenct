@@ -97,8 +97,12 @@
         <button type="button" id="clear-thread-filter" class="text-btn sm">返回全部对话</button>
       </div>
       <div id="scroller" class="scroller">
-        <button type="button" id="muse-head-toggle" class="stream-head" aria-label="打开管家工作台" aria-expanded="false">
-          <img id="head-avatar" class="avatar" src="brand/agenct-icon.svg" alt="" width="40" height="40">
+        <button type="button" id="muse-head-toggle" class="stream-head" data-agent-state="idle" aria-label="打开管家工作台" aria-expanded="false">
+          <span class="avatar-stage">
+            <img id="head-avatar" class="avatar" src="brand/agenct-icon.svg" alt="" width="40" height="40">
+            <span id="head-avatar-buddy" class="avatar-buddy hide" aria-hidden="true"></span>
+            <span id="head-avatar-badge" class="avatar-status-badge" aria-hidden="true"></span>
+          </span>
           <span id="agent-name" class="avatar-name">Agenct</span>
         </button>
         <div id="load-older-wrap" class="load-older-wrap hide">
@@ -108,11 +112,20 @@
         <div id="stream-live" class="stream-live hide" aria-live="polite">
           <div id="streaming-msg" class="msg msg-assistant msg-streaming"></div>
         </div>
-        <div id="stage-bar" class="stage-pill hide" role="status" aria-live="polite"></div>
         <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
       </div>
 
       <form id="chat-form" class="composer">
+        <div id="stage-bar" class="stage-pill hide">
+          <div class="stage-row">
+            <span id="work-stage" role="status"></span>
+            <span id="work-elapsed" class="work-elapsed"></span>
+          </div>
+          <details id="work-log" class="work-log hide">
+            <summary>最近日志</summary>
+            <div id="work-log-tail"></div>
+          </details>
+        </div>
         <div id="pending-atts" class="chat-attachments hide"></div>
         <div class="composer-pill">
           <label class="attach-btn" title="添加附件 (图片/PDF/ZIP/文本)">
@@ -146,11 +159,17 @@
     <aside id="task-pane" class="task-pane" aria-label="管家工作台">
       <div class="muse-hero">
         <button type="button" id="close-drawer" class="icon-btn muse-close-btn" aria-label="关闭工作台">✕</button>
-        <div id="hero-avatar-wrap" class="muse-hero-avatar-wrap">
-          <img id="drawer-avatar" class="avatar big" src="brand/agenct-icon.svg" alt="" width="88" height="88">
+        <div id="hero-avatar-wrap" class="muse-hero-avatar-wrap" data-agent-state="idle">
+          <span class="avatar-stage big">
+            <img id="drawer-avatar" class="avatar big" src="brand/agenct-icon.svg" alt="" width="88" height="88">
+            <span id="drawer-avatar-buddy" class="avatar-buddy big hide" aria-hidden="true"></span>
+            <span id="drawer-avatar-badge" class="avatar-status-badge big" aria-hidden="true"></span>
+          </span>
         </div>
         <h2 id="drawer-agent-name" class="muse-drawer-name">Agenct</h2>
         <p class="muse-conn-status">
+          <span id="avatar-state-pill" class="avatar-state-pill" data-agent-state="idle">在线待命</span>
+          <span>·</span>
           <span id="sse-bolt" class="muse-conn-bolt">⚡</span>
           <span id="sse-pill">连接中…</span>
           <span>·</span>

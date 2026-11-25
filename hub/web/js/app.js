@@ -1,5 +1,6 @@
 // Agenct v2 entrypoint with classic left-rail + centered-chat + floating-avatar Muse drawer layout.
-import { api, avatarById, esc, fmtTime, setCsrfToken, showToast } from './api.js';
+import { api, esc, fmtTime, setCsrfToken, showToast } from './api.js';
+import { createAvatarController } from './avatar.js';
 import { initChat } from './chat.js';
 import { initDrawer } from './drawer.js';
 import { connectEvents } from './sse.js';
@@ -44,31 +45,36 @@ const museToggle = document.getElementById('muse-head-toggle');
 const agentNameEl = document.getElementById('agent-name');
 const drawerAgentNameEl = document.getElementById('drawer-agent-name');
 const headAvatarEl = document.getElementById('head-avatar');
+const headBuddyEl = document.getElementById('head-avatar-buddy');
+const headBadgeEl = document.getElementById('head-avatar-badge');
 const drawerAvatarEl = document.getElementById('drawer-avatar');
+const drawerBuddyEl = document.getElementById('drawer-avatar-buddy');
+const drawerBadgeEl = document.getElementById('drawer-avatar-badge');
 const heroAvatarWrapEl = document.getElementById('hero-avatar-wrap');
+const avatarStatePill = document.getElementById('avatar-state-pill');
 const settingsIdentity = document.getElementById('settings-identity');
 const nodePill = document.getElementById('node-pill');
 const ssePill = document.getElementById('sse-pill');
 const sseBolt = document.getElementById('sse-bolt');
 
-function applyAvatar(avatarId, isBusy) {
-  const item = avatarById(avatarId);
-  for (const img of [headAvatarEl, drawerAvatarEl]) {
-    if (!img) continue;
-    if (img.getAttribute('src') !== item.src) img.setAttribute('src', item.src);
-    img.classList.toggle('is-portrait', item.animated);
-  }
-  museToggle?.classList.toggle('has-portrait', item.animated);
-  museToggle?.classList.toggle('is-thinking', Boolean(isBusy));
-  heroAvatarWrapEl?.classList.toggle('has-portrait', item.animated);
-  heroAvatarWrapEl?.classList.toggle('is-thinking', Boolean(isBusy));
-}
+const avatarUI = createAvatarController({
+  headToggleEl: museToggle,
+  headAvatarEl,
+  headBuddyEl,
+  headBadgeEl,
+  heroWrapEl: heroAvatarWrapEl,
+  drawerAvatarEl,
+  drawerBuddyEl,
+  drawerBadgeEl,
+  statusPillEl: avatarStatePill,
+});
 
 let chatUI = null;
 let drawerUI = null;
 let refreshInFlight = null;
 let refreshQueued = false;
 let syncTimer = null;
+let taskEventVersion = 0;
 
 function setTasksOpen(open) {
   roomEl.classList.toggle('tasks-open', open);
@@ -104,6 +110,7 @@ async function refresh() {
     return refreshInFlight;
   }
   refreshInFlight = (async () => {
+    const taskVersion = taskEventVersion;
     const data = await api('/api/bootstrap');
     Object.assign(state, data);
     const name = state.profile?.name || 'Agenct';
@@ -118,7 +125,8 @@ async function refresh() {
       (t) => t.status === 'pending' || t.status === 'running',
     ).length;
     railBadge.textContent = activeTasks > 0 ? String(activeTasks) : '';
-    applyAvatar(state.profile?.avatar_id, activeTasks > 0);
+    avatarUI.setAvatar(state.profile?.avatar_id);
+    chatUI.syncTasks(state.tasks || [], taskVersion);
     chatUI.render();
     drawerUI.render();
   })().finally(() => {
@@ -192,7 +200,11 @@ async function boot() {
   loginView.classList.add('hide');
   roomEl.classList.remove('hide');
 
-  chatUI = initChat({ state, onRefresh: refresh });
+  chatUI = initChat({
+    state,
+    onRefresh: refresh,
+    onActivityChange: (act) => avatarUI.setActivity(act),
+  });
   drawerUI = initDrawer({
     state,
     onRefresh: refresh,
@@ -349,6 +361,8 @@ async function boot() {
     onStatus(connected) {
       ssePill.textContent = connected ? '实时同步' : '重连中…';
       sseBolt.classList.toggle('warn', !connected);
+      avatarUI.setActivity({ sseConnected: connected });
+      if (connected) scheduleRefresh();
     },
     onStage(stage) {
       chatUI.setStage(stage);
@@ -356,7 +370,11 @@ async function boot() {
     onDelta(delta) {
       chatUI.onDelta(delta);
     },
-    onSync() {
+    onTask(task) {
+      chatUI.onTask(task, ++taskEventVersion);
+    },
+    onSync(kind) {
+      if (kind === 'resync') chatUI.setStage('');
       scheduleRefresh();
     },
   });

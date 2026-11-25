@@ -1,5 +1,5 @@
 // Single Server-Sent Events (SSE) subscription replacing 7x3s polling.
-export function connectEvents({ onStatus, onStage, onDelta, onSync }) {
+export function connectEvents({ onStatus, onStage, onDelta, onTask, onSync }) {
   let es = null;
   let retryMs = 1500;
   let closed = false;
@@ -31,7 +31,17 @@ export function connectEvents({ onStatus, onStage, onDelta, onSync }) {
         // ignore malformed delta
       }
     });
-    for (const kind of ['message', 'task', 'node', 'brain', 'automation', 'resync']) {
+    es.addEventListener('task', (ev) => {
+      let task;
+      try {
+        task = JSON.parse(ev.data);
+      } catch {
+        // A bootstrap refresh can still reconcile malformed task events.
+      }
+      if (task) onTask(task);
+      onSync('task');
+    });
+    for (const kind of ['message', 'node', 'brain', 'automation', 'resync']) {
       es.addEventListener(kind, () => onSync(kind));
     }
     es.onerror = () => {

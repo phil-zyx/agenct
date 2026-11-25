@@ -1,5 +1,7 @@
 // Right Muse Drawer (Tasks/Nodes, Ledgers/Crons/Audit, SOUL/MEMORY) + Settings Pane + Contacts.
 import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
+import { renderBuddySvg } from './avatar.js';
+import { stripNoise, triageTasks } from './triage.js';
 
 export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread }) {
   const bodyEl = document.getElementById('drawer-body');
@@ -10,6 +12,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
   let activeTab = 'tasks';
   let lastInstallCmd = '';
   let integrations = { gitlab: null, im: null, models: null };
+  const taskTimers = new Map();
+  let elapsedTimer = null;
 
   tabBtns.forEach((btn) => {
     btn.onclick = () => {
@@ -62,14 +66,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     gitlab_mention: 'GitLab 提及',
     member_status: '成员状态',
   };
-
-  function stripNoise(raw) {
-    return String(raw || '')
-      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-      .replace(/\u25af\[\d+(?:;\d+)*m/g, '')
-      .replace(/\r\n/g, '\n')
-      .trim();
-  }
 
   function cleanPreviewLine(raw, limit = 64) {
     const clean = stripNoise(raw);
@@ -332,6 +328,15 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     });
   }
 
+  function updateTaskElapsed() {
+    const now = performance.now();
+    for (const el of bodyEl.querySelectorAll('[data-triage-elapsed]')) {
+      const { elapsed, since } = taskTimers.get(el.dataset.triageElapsed);
+      const seconds = Math.floor((elapsed ?? 0) + (now - since) / 1000);
+      el.textContent = `${elapsed === null ? '已观察' : '已用时'} ${seconds} 秒`;
+    }
+  }
+
   function renderTasksTab() {
     const roles = state.roles || [];
     const threads = state.threads || [];
@@ -340,6 +345,42 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     const ledgers = state.ledgers || [];
     const nodes = state.nodes || [];
     const uid = state.user?.id;
+    const groups = triageTasks(tasks);
+    const taskViews = new Map(Object.values(groups).flat().map((view) => [view.task, view]));
+    const openLogs = new Set(
+      Array.from(bodyEl.querySelectorAll('[data-triage-log][open]'), (el) => el.dataset.triageLog),
+    );
+    const runningIds = new Set();
+
+    function renderTaskProgress(task) {
+      const view = taskViews.get(task)?.progress;
+      if (!view) return '';
+      const isRunning = task.status === 'running';
+      const stage = formatStage(view.stage) || (isRunning
+        ? (task.job_status === 'queued' ? '等待节点接单' : '执行中')
+        : '');
+      if (isRunning) {
+        const timer = taskTimers.get(task.id);
+        if (!timer || timer.revision !== task.revision || timer.jobStatus !== task.job_status || timer.elapsed !== view.elapsed) {
+          taskTimers.set(task.id, {
+            revision: task.revision, jobStatus: task.job_status, elapsed: view.elapsed, since: performance.now(),
+          });
+        }
+        runningIds.add(task.id);
+      }
+      const elapsed = isRunning ? `<span data-triage-elapsed="${esc(task.id)}"></span>`
+        : view.elapsed === null ? '' : `已用时 ${Math.floor(view.elapsed)} 秒`;
+      const progress = [
+        stage ? esc(stage) : '',
+        elapsed,
+      ].filter(Boolean).join(' · ');
+      const logKey = `${task.id}:${task.revision ?? ''}`;
+      const log = view.logTail
+        ? `<details class="node-repos" data-triage-log="${esc(logKey)}"${openLogs.has(logKey) ? ' open' : ''}><summary>日志摘要</summary><div class="item-sub detail-body">${esc(view.logTail)}</div></details>`
+        : '';
+      const links = view.links.map((url) => `<div class="item-sub"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a></div>`).join('');
+      return `${progress ? `<div class="item-sub">${progress}</div>` : ''}${log}${links}`;
+    }
 
     // Group tasks by implicit thread_id; legacy unthreaded self-tasks collapse by title.
     const tasksByThread = new Map();
@@ -436,14 +477,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       if (thr.updated_at) metaParts.push(fmtTime(thr.updated_at));
       const metaHtml = metaParts.length ? `<div class="thread-meta">${esc(metaParts.join(' · '))}</div>` : '';
 
-      const stageText = isRunning && latest ? formatStage(latest.stage) : '';
-      const progressHtml =
-        isRunning && (stageText || latest?.log_tail)
-          ? `<div class="item-sub">${esc(stageText || '执行中')}${latest?.log_tail ? `\n${esc(stripNoise(latest.log_tail))}` : ''}</div>`
-          : '';
-
-      const preview = cleanPreviewLine(latest?.result || thr.summary, 72);
-      const previewHtml = !isRunning && preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
+      const preview = taskViews.get(latest)?.preview || cleanPreviewLine(thr.summary, 72);
+      const previewHtml = preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
       const detailsHtml = renderRunsDetails(runs);
 
       const actions = taskActionsHtml(latest);
@@ -464,8 +499,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             <span class="badge ${badgeCls}">${esc(badgeText)}</span>
           </div>
           ${metaHtml}
-          ${progressHtml}
           ${previewHtml}
+          ${renderTaskProgress(latest)}
           ${detailsHtml}
           ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
         </div>`;
@@ -474,30 +509,29 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     const activeThreads = threads.filter((t) => t.status === 'active');
     const archivedThreads = threads.filter((t) => t.status !== 'active');
 
-    const activeCards = [];
+    const taskCards = new Map();
+    const otherCards = [];
     for (const thr of activeThreads) {
-      activeCards.push(renderThreadCard(thr));
+      const latest = tasksByThread.get(thr.id)?.[0];
+      const card = renderThreadCard(thr);
+      if (latest) taskCards.set(latest, card);
+      else otherCards.push(card);
     }
 
     // Cross-user delegated tasks (not tied to a thread).
     for (const t of standaloneCollab) {
       const stLabel = TASK_STATUS_LABEL[t.status] || t.status;
-      const stageText = t.status === 'running' ? formatStage(t.stage) : '';
-      const progress =
-        t.status === 'running' && (stageText || t.log_tail)
-          ? `<div class="item-sub">${esc(stageText || '执行中')}${t.log_tail ? `\n${esc(stripNoise(t.log_tail))}` : ''}</div>`
-          : '';
-      const preview = cleanPreviewLine(t.result || t.instruction, 72);
+      const { preview } = taskViews.get(t);
       const actions = taskActionsHtml(t);
-      activeCards.push(`
+      taskCards.set(t, `
         <div class="item">
           <div class="item-head">
             <span>${esc(t.title)}</span>
             <span class="badge ${t.status === 'done' ? 'ok' : t.status === 'running' || t.status === 'pending' ? 'warn' : ''}">${esc(stLabel)}</span>
           </div>
           <div class="thread-meta">同事协作 · ${esc(fmtTime(t.updated_at))}</div>
-          ${progress}
           ${preview ? `<div class="item-sub">${esc(preview)}</div>` : ''}
+          ${renderTaskProgress(t)}
           ${renderRunsDetails([t])}
           ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
         </div>`);
@@ -505,7 +539,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
 
     // Active ledgers unified into the same thread list.
     for (const l of ledgers) {
-      activeCards.push(`
+      otherCards.push(`
         <div class="item">
           <div class="item-head">
             <span>${esc(l.title)}</span>
@@ -525,30 +559,33 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       if (latest.node_id) metaParts.push(`节点 ${latest.node_id}`);
       if (runs.length > 1) metaParts.push(`${runs.length} 次执行`);
       if (latest.updated_at) metaParts.push(fmtTime(latest.updated_at));
-      const stageText = isRunning ? formatStage(latest.stage) : '';
-      const progress =
-        isRunning && (stageText || latest.log_tail)
-          ? `<div class="item-sub">${esc(stageText || '执行中')}${latest.log_tail ? `\n${esc(stripNoise(latest.log_tail))}` : ''}</div>`
-          : '';
-      const preview = !isRunning ? cleanPreviewLine(latest.result, 72) : '';
+      const { preview } = taskViews.get(latest);
       const actions = taskActionsHtml(latest);
-      activeCards.push(`
+      taskCards.set(latest, `
         <div class="item">
           <div class="item-head">
             <span>${esc(title)}</span>
             <span class="badge ${latest.status === 'done' ? 'ok' : isRunning ? 'warn' : ''}">${esc(stLabel)}</span>
           </div>
           ${metaParts.length ? `<div class="thread-meta">${esc(metaParts.join(' · '))}</div>` : ''}
-          ${progress}
           ${preview ? `<div class="item-sub">${esc(preview)}</div>` : ''}
+          ${renderTaskProgress(latest)}
           ${renderRunsDetails(runs)}
           ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
         </div>`);
     }
 
-    const threadsHtml = activeCards.length
-      ? activeCards.join('')
-      : '<p class="note">暂无活跃工作线程，在对话中发起任务或跟进事项会自动生成</p>';
+    const triageHtml = [
+      ['decision', '待决策'],
+      ['conclusion', '结论'],
+      ['summary', '摘要+外链'],
+    ].map(([group, title]) => {
+      const cards = groups[group].map(({ task }) => taskCards.get(task)).filter(Boolean);
+      if (group === 'summary') cards.push(...otherCards);
+      return cards.length
+        ? `<section class="panel-card task-triage" data-triage-group="${group}"><h3>${title} (${cards.length})</h3>${cards.join('')}</section>`
+        : '';
+    }).join('');
 
     const archivedHtml = archivedThreads.length
       ? `<details class="node-repos mt-10"><summary>已归档线程 (${archivedThreads.length})</summary><div class="mt-6">${archivedThreads.map(renderThreadCard).join('')}</div></details>`
@@ -585,11 +622,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       : '<p class="note">暂无定时任务，直接对话即可创建</p>';
 
     bodyEl.innerHTML = `
-      <section class="panel-card">
-        <h3>工作线程 (${activeCards.length})</h3>
-        ${threadsHtml}
-        ${archivedHtml}
-      </section>
+      ${triageHtml || '<p class="note">暂无活跃工作线程，在对话中发起任务或跟进事项会自动生成</p>'}
+      ${archivedHtml ? `<section class="panel-card">${archivedHtml}</section>` : ''}
 
       <section class="panel-card">
         <h3>定时任务 (${crons.length})</h3>
@@ -614,6 +648,13 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       ${rolesCardHtml(roles)}
 
       ${nodesCardHtml(nodes)}`;
+
+    for (const id of taskTimers.keys()) {
+      if (!runningIds.has(id)) taskTimers.delete(id);
+    }
+    updateTaskElapsed();
+    if (runningIds.size && elapsedTimer === null) elapsedTimer = setInterval(updateTaskElapsed, 1000);
+    if (!runningIds.size) stopTaskElapsed();
 
     bodyEl.querySelectorAll('[data-assign]').forEach((b) => {
       b.onclick = async () => {
@@ -750,13 +791,19 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
 
     const avatarChoicesHtml = AVATAR_CATALOG.map((av) => {
       const selected = av.id === currentAvatar;
+      const previewHtml = av.liveSvg
+        ? `<span class="avatar-choice-buddy" data-agent-state="idle">${renderBuddySvg()}</span>`
+        : `<img class="avatar-choice-img ${av.animated ? 'is-portrait' : ''}" src="${esc(av.src)}" alt="${esc(av.name)}" width="54" height="54" loading="lazy">`;
+      const tagHtml = av.liveSvg
+        ? '<span class="avatar-choice-tag">状态联动</span>'
+        : av.animated
+          ? '<span class="avatar-choice-tag">动态</span>'
+          : '<span class="avatar-choice-tag muted">静态</span>';
       return `
         <button type="button" class="avatar-choice ${selected ? 'on' : ''}" data-pick-avatar="${esc(av.id)}" aria-pressed="${selected ? 'true' : 'false'}">
-          <span class="avatar-choice-ring">
-            <img class="avatar-choice-img ${av.animated ? 'is-portrait' : ''}" src="${esc(av.src)}" alt="${esc(av.name)}" width="54" height="54" loading="lazy">
-          </span>
+          <span class="avatar-choice-ring">${previewHtml}</span>
           <span class="avatar-choice-name">${esc(av.name)}</span>
-          ${av.animated ? '<span class="avatar-choice-tag">动态</span>' : '<span class="avatar-choice-tag muted">静态</span>'}
+          ${tagHtml}
         </button>`;
     }).join('');
 
@@ -1047,7 +1094,16 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
 
   function renderDrawer() {
     if (activeTab === 'tasks') renderTasksTab();
-    else renderSoulTab();
+    else {
+      stopTaskElapsed();
+      renderSoulTab();
+    }
+  }
+
+  function stopTaskElapsed() {
+    if (elapsedTimer === null) return;
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
   }
 
   function renderAll() {

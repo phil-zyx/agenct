@@ -50,6 +50,7 @@ const DEFAULT_AVATAR_ID: &str = "agenct";
 fn normalize_avatar_id(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "agenct" | "default" | "默认" => Some("agenct"),
+        "buddy" | "muse" | "动态管家" | "状态管家" => Some("buddy"),
         "sakura" | "樱粉" | "樱粉巫女" | "八重神子" => Some("sakura"),
         "violet" | "冷紫" | "冷紫和风" | "雷电将军" => Some("violet"),
         "cheshire" | "柴郡" | "猫耳女仆" => Some("cheshire"),
