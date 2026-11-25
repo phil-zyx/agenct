@@ -485,3 +485,44 @@ pub fn truncate_bytes(s: &str, max_bytes: usize) -> String {
     }
     s[..end].to_owned()
 }
+
+/// Keeps both the leading context (`head_bytes`) and the newest/trailing lines (`tail_bytes`).
+pub fn truncate_head_tail_bytes(s: &str, head_bytes: usize, tail_bytes: usize) -> String {
+    if s.len() <= head_bytes.saturating_add(tail_bytes).saturating_add(16) {
+        return s.to_owned();
+    }
+    let mut head_end = head_bytes.min(s.len());
+    while head_end > 0 && !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len().saturating_sub(tail_bytes);
+    while tail_start < s.len() && !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if head_end >= tail_start {
+        return s.to_owned();
+    }
+    format!(
+        "{}\n…(省略中间)…\n{}",
+        s[..head_end].trim_end(),
+        s[tail_start..].trim_start()
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_head_tail_bytes;
+
+    #[test]
+    fn truncate_head_tail_preserves_utf8_boundaries_and_both_ends() {
+        let short = "短消息测试";
+        assert_eq!(truncate_head_tail_bytes(short, 100, 100), short);
+
+        let middle = "中".repeat(100);
+        let long = format!("头部结论：准备发布。\n{middle}\n尾部下一步：继续啃 P0-1 崩溃修复。");
+        let out = truncate_head_tail_bytes(&long, 25, 35);
+        assert!(out.starts_with("头部结论"));
+        assert!(out.contains("…(省略中间)…"));
+        assert!(out.ends_with("继续啃 P0-1 崩溃修复。"));
+    }
+}

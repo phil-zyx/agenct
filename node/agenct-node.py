@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Callable
 import urllib.error
 import urllib.request
 import uuid
@@ -41,6 +42,50 @@ MAX_EVIDENCE_BYTES = 5 * 1024 * 1024
 MAX_EVIDENCE_COUNT = 4
 _SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/@][A-Za-z0-9._:/@-]{0,127}$")
 _SANDBOX_RANK = {"readonly": 0, "workspace-write": 1, "unsafe-full": 2}
+_AGY_READONLY_DENY_RULES = [
+    "write_file(*)",
+    "unsandboxed(*)",
+    "command(git commit)",
+    "command(git push)",
+    "command(git add)",
+    "command(git checkout)",
+    "command(git reset)",
+    "command(git clean)",
+    "command(rm)",
+    "command(mv)",
+    "command(sed -i)",
+]
+
+
+def _build_agy_readonly_settings(workdir: str, in_dir: str | None = None) -> str:
+    allow = [f"read_file({workdir})"]
+    if in_dir:
+        allow.append(f"read_file({in_dir})")
+    return json.dumps(
+        {
+            "enableTerminalSandbox": True,
+            "toolPermission": "proceed-in-sandbox",
+            "permissions": {
+                "allow": allow,
+                "deny": _AGY_READONLY_DENY_RULES,
+            },
+        },
+        separators=(",", ":"),
+    )
+
+
+_AGY_WORKSPACE_SETTINGS = json.dumps(
+    {
+        "enableTerminalSandbox": True,
+        "toolPermission": "proceed-in-sandbox",
+    },
+    separators=(",", ":"),
+)
+_OPENCODE_READONLY_PERMISSION = json.dumps({"edit": "deny", "bash": "deny"}, separators=(",", ":"))
+_OPENCODE_DENIAL_LINE_RE = re.compile(
+    r"^\s*!\s*permission requested:.*auto-rejecting",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 _ANSI_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -83,13 +128,41 @@ def _iter_json_events(raw: str):
             yield ev
 
 
-def parse_opencode_json_result(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, session_id) from `opencode run --format json` JSONL output.
+def _extract_error_message(err_obj: object, fallback_msg: object = None) -> str:
+    if isinstance(err_obj, dict):
+        data = err_obj.get("data") if isinstance(err_obj.get("data"), dict) else {}
+        msg = data.get("message") or err_obj.get("message") or err_obj.get("name")
+        if msg:
+            return str(msg)
+    elif err_obj:
+        return str(err_obj)
+    if fallback_msg:
+        return str(fallback_msg)
+    return ""
 
-    Returns:
-      - (text, session_id) when JSON events were parsed (text may be "" if none emitted).
-      - (None, None) when stdout is not opencode JSONL (caller should fall back to plain text).
-    """
+
+def _format_denied_actions(denied: object, prefix: str = "Action denied in headless mode") -> str:
+    if not isinstance(denied, list) or not denied:
+        return ""
+    labels = [
+        str(d.get("display_name") or d.get("tool_name") or d.get("tool") or d.get("action") or d)
+        if isinstance(d, dict)
+        else str(d)
+        for d in denied
+    ]
+    return f"{prefix}: {', '.join(labels)}"
+
+
+def _combine_stream_body_and_errors(body: str | None, errors: list[str]) -> str:
+    clean_body = strip_ansi(body).strip() if body else ""
+    clean_err = strip_ansi("\n".join(errors)).strip()
+    if clean_body and clean_err:
+        return f"{clean_body}\n\n{clean_err}"
+    return clean_body or clean_err
+
+
+def _parse_opencode_stream(raw: str) -> tuple[str | None, str | None, bool]:
+    """Extract (final_text, session_id, has_error) from `opencode run --format json`."""
     parsed_any = False
     msg_order: list[str] = []
     msg_texts: dict[str, list[str]] = {}
@@ -111,25 +184,20 @@ def parse_opencode_json_result(raw: str) -> tuple[str | None, str | None]:
                     msg_texts[mid] = []
                 msg_texts[mid].append(txt)
         elif ev_type == "error":
-            err_obj = ev.get("error")
-            if isinstance(err_obj, dict):
-                data = err_obj.get("data") if isinstance(err_obj.get("data"), dict) else {}
-                msg = data.get("message") or err_obj.get("message") or err_obj.get("name")
-                if msg:
-                    errors.append(str(msg))
-            elif err_obj:
-                errors.append(str(err_obj))
-            elif ev.get("message"):
-                errors.append(str(ev["message"]))
+            msg = _extract_error_message(ev.get("error"), ev.get("message"))
+            if msg:
+                errors.append(msg)
 
     if not parsed_any:
-        return None, None
-    if msg_order:
-        last_mid = msg_order[-1]
-        return strip_ansi("".join(msg_texts[last_mid])).strip(), session_id
-    if errors:
-        return strip_ansi("\n".join(errors)).strip(), session_id
-    return "", session_id
+        return None, None, False
+    body = "".join(msg_texts[msg_order[-1]]) if msg_order else None
+    return _combine_stream_body_and_errors(body, errors), session_id, bool(errors)
+
+
+def parse_opencode_json_result(raw: str) -> tuple[str | None, str | None]:
+    """Extract (final_text, session_id) from `opencode run --format json` JSONL output."""
+    text, sid, _ = _parse_opencode_stream(raw)
+    return text, sid
 
 
 def parse_opencode_json(raw: str) -> str | None:
@@ -138,13 +206,14 @@ def parse_opencode_json(raw: str) -> str | None:
     return text
 
 
-def parse_claude_stream_json(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, session_id) from `claude -p --output-format stream-json --verbose` JSONL."""
+def _parse_claude_stream(raw: str) -> tuple[str | None, str | None, bool]:
+    """Extract (final_text, session_id, has_error) from `claude -p --output-format stream-json --verbose`."""
     parsed_any = False
     session_id: str | None = None
     result_text: str | None = None
     last_assistant_text: str | None = None
     errors: list[str] = []
+    has_err = False
 
     for ev in _iter_json_events(raw):
         parsed_any = True
@@ -165,39 +234,50 @@ def parse_claude_stream_json(raw: str) -> tuple[str | None, str | None]:
             res = ev.get("result")
             if isinstance(res, str) and res.strip():
                 result_text = res
+            is_error = bool(ev.get("is_error"))
+            subtype = str(ev.get("subtype") or "").strip().lower()
+            if is_error or subtype.startswith("error"):
+                has_err = True
             errs = ev.get("errors")
             if isinstance(errs, list):
                 for item in errs:
-                    if isinstance(item, dict) and item.get("message"):
-                        errors.append(str(item["message"]))
-                    elif item:
-                        errors.append(str(item))
+                    msg = _extract_error_message(item)
+                    if msg:
+                        errors.append(msg)
             elif ev.get("error"):
-                errors.append(str(ev["error"]))
+                msg = _extract_error_message(ev.get("error"))
+                if msg:
+                    errors.append(msg)
+            denied_msg = _format_denied_actions(ev.get("permission_denials"))
+            if denied_msg:
+                errors.append(denied_msg)
         elif ev_type == "error":
-            err = ev.get("error")
-            if isinstance(err, dict) and err.get("message"):
-                errors.append(str(err["message"]))
-            elif err or ev.get("message"):
-                errors.append(str(err or ev.get("message")))
+            has_err = True
+            msg = _extract_error_message(ev.get("error"), ev.get("message"))
+            if msg:
+                errors.append(msg)
 
     if not parsed_any:
-        return None, None
-    if result_text is not None:
-        return strip_ansi(result_text).strip(), session_id
-    if last_assistant_text is not None:
-        return strip_ansi(last_assistant_text).strip(), session_id
+        return None, None, False
+    body = result_text if result_text is not None else last_assistant_text
     if errors:
-        return strip_ansi("\n".join(errors)).strip(), session_id
-    return "", session_id
+        has_err = True
+    return _combine_stream_body_and_errors(body, errors), session_id, has_err
 
 
-def parse_codex_json_result(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, thread_id) from `codex exec --json` JSONL output."""
+def parse_claude_stream_json(raw: str) -> tuple[str | None, str | None]:
+    """Extract (final_text, session_id) from `claude -p --output-format stream-json --verbose` JSONL."""
+    text, sid, _ = _parse_claude_stream(raw)
+    return text, sid
+
+
+def _parse_codex_stream(raw: str) -> tuple[str | None, str | None, bool]:
+    """Extract (final_text, thread_id, has_error) from `codex exec --json` JSONL output."""
     parsed_any = False
     session_id: str | None = None
     last_agent_msg: str | None = None
     errors: list[str] = []
+    has_err = False
 
     for ev in _iter_json_events(raw):
         parsed_any = True
@@ -208,25 +288,24 @@ def parse_codex_json_result(raw: str) -> tuple[str | None, str | None]:
             if item.get("type") == "agent_message" and isinstance(item.get("text"), str) and item["text"].strip():
                 last_agent_msg = item["text"]
         elif ev_type in ("error", "turn.failed"):
-            err = ev.get("error")
-            if isinstance(err, dict) and err.get("message"):
-                errors.append(str(err["message"]))
-            elif err:
-                errors.append(str(err))
-            elif ev.get("message"):
-                errors.append(str(ev["message"]))
+            has_err = True
+            msg = _extract_error_message(ev.get("error"), ev.get("message"))
+            if msg:
+                errors.append(msg)
 
     if not parsed_any:
-        return None, None
-    if last_agent_msg is not None:
-        return strip_ansi(last_agent_msg).strip(), session_id
-    if errors:
-        return strip_ansi("\n".join(errors)).strip(), session_id
-    return "", session_id
+        return None, None, False
+    return _combine_stream_body_and_errors(last_agent_msg, errors), session_id, has_err or bool(errors)
 
 
-def parse_agy_stream_json(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, conversation_id) from `agy -p ... --output-format stream-json` JSONL."""
+def parse_codex_json_result(raw: str) -> tuple[str | None, str | None]:
+    """Extract (final_text, thread_id) from `codex exec --json` JSONL output."""
+    text, sid, _ = _parse_codex_stream(raw)
+    return text, sid
+
+
+def _parse_agy_stream(raw: str) -> tuple[str | None, str | None, bool]:
+    """Extract (final_text, conversation_id, has_error) from `agy -p ... --output-format stream-json` JSONL."""
     parsed_any = False
     session_id: str | None = None
     chunks: list[str] = []
@@ -261,170 +340,186 @@ def parse_agy_stream_json(raw: str) -> tuple[str | None, str | None]:
             resp_txt = res.get("response")
             if isinstance(resp_txt, str) and resp_txt.strip():
                 result_fallback = resp_txt
-            err = res.get("error")
-            if isinstance(err, dict) and err.get("message"):
-                errors.append(str(err["message"]))
-            elif err:
-                errors.append(str(err))
-            denied = res.get("denied_actions")
-            if isinstance(denied, list) and denied:
-                labels = [
-                    str(d.get("display_name") or d.get("action") or d)
-                    if isinstance(d, dict)
-                    else str(d)
-                    for d in denied
-                ]
-                errors.append(f"Action denied in headless mode: {', '.join(labels)}")
+            res_status = str(res.get("status") or "").strip().upper()
+            msg = _extract_error_message(res.get("error"))
+            if msg:
+                errors.append(msg)
+            elif res_status and res_status != "SUCCESS":
+                errors.append(f"agy finished with status {res_status}")
+            denied_msg = _format_denied_actions(res.get("denied_actions"))
+            if denied_msg:
+                errors.append(denied_msg)
         elif ev_name == "error" or ev.get("error"):
-            err = ev.get("error")
-            if isinstance(err, dict) and err.get("message"):
-                errors.append(str(err["message"]))
-            elif ev.get("message"):
-                errors.append(str(ev["message"]))
-            elif err:
-                errors.append(str(err))
+            msg = _extract_error_message(ev.get("error"), ev.get("message"))
+            if msg:
+                errors.append(msg)
 
     if not parsed_any:
-        return None, None
-    if result_fallback is not None:
-        return strip_ansi(result_fallback).strip(), session_id
-    combined = strip_ansi("".join(chunks)).strip()
-    if combined:
-        return combined, session_id
-    if errors:
-        return strip_ansi("\n".join(errors)).strip(), session_id
-    return "", session_id
+        return None, None, False
+    body = result_fallback if result_fallback is not None else "".join(chunks)
+    return _combine_stream_body_and_errors(body, errors), session_id, bool(errors)
+
+
+def parse_agy_stream_json(raw: str) -> tuple[str | None, str | None]:
+    """Extract (final_text, conversation_id) from `agy -p ... --output-format stream-json` JSONL."""
+    text, sid, _ = _parse_agy_stream(raw)
+    return text, sid
 
 
 def parse_cli_output(agent: str, raw: str) -> tuple[str | None, str | None]:
-    if agent == "opencode":
-        return parse_opencode_json_result(raw)
-    if agent == "claude":
-        return parse_claude_stream_json(raw)
-    if agent == "codex":
-        return parse_codex_json_result(raw)
-    if agent == "agy":
-        return parse_agy_stream_json(raw)
+    adapter = CLI_ADAPTERS.get(agent)
+    if adapter:
+        text, sid, _ = adapter.parse_stream(raw)
+        return text, sid
     return None, None
+
+
+def detect_cli_stream_error(agent: str, raw: str, raw_err: str = "") -> bool:
+    """Detect stream-reported errors/denials even when CLI exits with code 0."""
+    adapter = CLI_ADAPTERS.get(agent)
+    parsed_text: str | None = None
+    if adapter:
+        parsed_text, _, has_err = adapter.parse_stream(raw)
+        if has_err:
+            return True
+    if _OPENCODE_DENIAL_LINE_RE.search(strip_ansi(raw_err)):
+        return True
+    if parsed_text is None and _OPENCODE_DENIAL_LINE_RE.search(strip_ansi(raw)):
+        return True
+    return False
+
+
+def _summarize_opencode_event(ev: dict) -> str:
+    ev_type = ev.get("type")
+    if ev_type == "tool_use":
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        tool = str(part.get("tool") or "tool")
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+        detail = state.get("title") or inp.get("command") or inp.get("path") or ""
+        summary = f"{tool}: {detail}" if detail else tool
+        return strip_ansi(str(summary)).strip()
+    if ev_type == "text":
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        txt = part.get("text") or ev.get("text") or ""
+        return strip_ansi(str(txt)).strip()
+    if ev_type == "error":
+        return strip_ansi(_extract_error_message(ev.get("error"), ev.get("message")) or "error").strip()
+    return ""
+
+
+def _summarize_claude_event(ev: dict) -> str:
+    ev_type = ev.get("type")
+    if ev_type == "assistant":
+        msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
+        content = msg.get("content") if isinstance(msg.get("content"), list) else []
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "tool_use":
+                name = str(blk.get("name") or "tool")
+                inp = blk.get("input") if isinstance(blk.get("input"), dict) else {}
+                detail = (
+                    inp.get("command")
+                    or inp.get("file_path")
+                    or inp.get("path")
+                    or inp.get("pattern")
+                    or inp.get("query")
+                    or ""
+                )
+                return strip_ansi(f"{name}: {detail}" if detail else name).strip()
+        for blk in content:
+            if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text"):
+                return strip_ansi(str(blk["text"])).strip()
+        return ""
+    if ev_type == "result":
+        if ev.get("is_error"):
+            return strip_ansi(str(ev.get("result") or ev.get("error") or "error")).strip()
+        denied = _format_denied_actions(ev.get("permission_denials"), prefix="Action denied")
+        if denied:
+            return strip_ansi(denied).strip()
+        if isinstance(ev.get("result"), str):
+            return strip_ansi(ev["result"]).strip()
+        return ""
+    if ev_type == "error":
+        return strip_ansi(_extract_error_message(ev.get("error"), ev.get("message")) or "error").strip()
+    return ""
+
+
+def _summarize_codex_event(ev: dict) -> str:
+    ev_type = ev.get("type")
+    if ev_type in ("item.started", "item.completed"):
+        item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+        itype = item.get("type")
+        if itype == "command_execution":
+            cmd = item.get("command") or ""
+            return strip_ansi(f"bash: {cmd}" if cmd else "bash").strip()
+        if itype == "file_change":
+            changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+            first_path = ""
+            if changes and isinstance(changes[0], dict):
+                first_path = str(changes[0].get("path") or "")
+            return strip_ansi(f"edit: {first_path}" if first_path else "file_change").strip()
+        if itype == "mcp_tool_call":
+            tool = item.get("tool") or item.get("server") or "mcp"
+            return strip_ansi(str(tool)).strip()
+        if itype == "agent_message" and isinstance(item.get("text"), str):
+            return strip_ansi(item["text"]).strip()
+        return ""
+    if ev_type in ("error", "turn.failed"):
+        return strip_ansi(_extract_error_message(ev.get("error"), ev.get("message")) or "error").strip()
+    return ""
+
+
+def _summarize_agy_event(ev: dict) -> str:
+    ev_name = ev.get("event")
+    if ev_name == "step_update":
+        su = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else {}
+        stype = su.get("step_type")
+        if stype == "tool":
+            info = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
+            name = str(su.get("tool_name") or info.get("name") or "tool")
+            parms = info.get("parameters") if isinstance(info.get("parameters"), dict) else {}
+            detail = (
+                parms.get("CommandLine")
+                or parms.get("Path")
+                or parms.get("Query")
+                or parms.get("command")
+                or parms.get("file_path")
+                or parms.get("path")
+                or parms.get("query")
+                or ""
+            )
+            return strip_ansi(f"{name}: {detail}" if detail else name).strip()
+        if stype == "agent_response":
+            return strip_ansi(str(su.get("text_delta") or "")).strip()
+        return ""
+    if ev_name == "result":
+        res = ev.get("result") if isinstance(ev.get("result"), dict) else {}
+        if res.get("error"):
+            return strip_ansi(str(res["error"])).strip()
+        denied = _format_denied_actions(res.get("denied_actions"), prefix="Action denied")
+        if denied:
+            return strip_ansi(denied).strip()
+        if isinstance(res.get("response"), str) and res["response"].strip():
+            return strip_ansi(res["response"]).strip()
+        return ""
+    if ev_name == "error" or ev.get("error"):
+        return strip_ansi(_extract_error_message(ev.get("error"), ev.get("message")) or "error").strip()
+    return ""
 
 
 def summarize_progress_line(agent: str, raw_line: str) -> str:
     """Turn a raw stdout/stderr line into clean human-readable progress text."""
     stripped = raw_line.strip()
-    if agent in CLI_AGENTS and stripped.startswith("{"):
+    adapter = CLI_ADAPTERS.get(agent)
+    if adapter and stripped.startswith("{"):
         try:
             ev = json.loads(stripped)
         except json.JSONDecodeError:
             ev = None
         if isinstance(ev, dict) and ("type" in ev or "event" in ev):
-            ev_type = ev.get("type")
-            if agent == "opencode":
-                if ev_type == "tool_use":
-                    part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
-                    tool = str(part.get("tool") or "tool")
-                    state = part.get("state") if isinstance(part.get("state"), dict) else {}
-                    inp = state.get("input") if isinstance(state.get("input"), dict) else {}
-                    detail = state.get("title") or inp.get("command") or inp.get("path") or ""
-                    summary = f"{tool}: {detail}" if detail else tool
-                    return strip_ansi(str(summary)).strip()
-                if ev_type == "text":
-                    part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
-                    txt = part.get("text") or ev.get("text") or ""
-                    return strip_ansi(str(txt)).strip()
-                if ev_type == "error":
-                    return strip_ansi(str(ev.get("error") or ev.get("message") or "error")).strip()
-                return ""
-            if agent == "claude":
-                if ev_type == "assistant":
-                    msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
-                    content = msg.get("content") if isinstance(msg.get("content"), list) else []
-                    for blk in content:
-                        if not isinstance(blk, dict):
-                            continue
-                        if blk.get("type") == "tool_use":
-                            name = str(blk.get("name") or "tool")
-                            inp = blk.get("input") if isinstance(blk.get("input"), dict) else {}
-                            detail = (
-                                inp.get("command")
-                                or inp.get("file_path")
-                                or inp.get("path")
-                                or inp.get("pattern")
-                                or inp.get("query")
-                                or ""
-                            )
-                            return strip_ansi(f"{name}: {detail}" if detail else name).strip()
-                    for blk in content:
-                        if isinstance(blk, dict) and blk.get("type") == "text" and blk.get("text"):
-                            return strip_ansi(str(blk["text"])).strip()
-                    return ""
-                if ev_type == "result":
-                    if ev.get("is_error"):
-                        return strip_ansi(str(ev.get("result") or ev.get("error") or "error")).strip()
-                    if isinstance(ev.get("result"), str):
-                        return strip_ansi(ev["result"]).strip()
-                    return ""
-                if ev_type == "error":
-                    return strip_ansi(str(ev.get("error") or ev.get("message") or "error")).strip()
-                return ""
-            if agent == "codex":
-                if ev_type in ("item.started", "item.completed"):
-                    item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
-                    itype = item.get("type")
-                    if itype == "command_execution":
-                        cmd = item.get("command") or ""
-                        return strip_ansi(f"bash: {cmd}" if cmd else "bash").strip()
-                    if itype == "file_change":
-                        changes = item.get("changes") if isinstance(item.get("changes"), list) else []
-                        first_path = ""
-                        if changes and isinstance(changes[0], dict):
-                            first_path = str(changes[0].get("path") or "")
-                        return strip_ansi(f"edit: {first_path}" if first_path else "file_change").strip()
-                    if itype == "mcp_tool_call":
-                        tool = item.get("tool") or item.get("server") or "mcp"
-                        return strip_ansi(str(tool)).strip()
-                    if itype == "agent_message" and isinstance(item.get("text"), str):
-                        return strip_ansi(item["text"]).strip()
-                    return ""
-                if ev_type in ("error", "turn.failed"):
-                    err = ev.get("error")
-                    msg = err.get("message") if isinstance(err, dict) else (err or ev.get("message") or "error")
-                    return strip_ansi(str(msg)).strip()
-                return ""
-            if agent == "agy":
-                ev_name = ev.get("event")
-                if ev_name == "step_update":
-                    su = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else {}
-                    stype = su.get("step_type")
-                    if stype == "tool":
-                        info = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
-                        name = str(su.get("tool_name") or info.get("name") or "tool")
-                        parms = info.get("parameters") if isinstance(info.get("parameters"), dict) else {}
-                        detail = (
-                            parms.get("CommandLine")
-                            or parms.get("Path")
-                            or parms.get("Query")
-                            or parms.get("command")
-                            or parms.get("file_path")
-                            or parms.get("path")
-                            or parms.get("query")
-                            or ""
-                        )
-                        return strip_ansi(f"{name}: {detail}" if detail else name).strip()
-                    if stype == "agent_response":
-                        return strip_ansi(str(su.get("text_delta") or "")).strip()
-                    return ""
-                if ev_name == "result":
-                    res = ev.get("result") if isinstance(ev.get("result"), dict) else {}
-                    if res.get("error"):
-                        return strip_ansi(str(res["error"])).strip()
-                    if isinstance(res.get("response"), str) and res["response"].strip():
-                        return strip_ansi(res["response"]).strip()
-                    return ""
-                if ev_name == "error" or ev.get("error"):
-                    err = ev.get("error")
-                    msg = err.get("message") if isinstance(err, dict) else (err or ev.get("message") or "error")
-                    return strip_ansi(str(msg)).strip()
-                return ""
+            return adapter.summarize_event(ev)
     return strip_ansi(raw_line).strip()
 
 EVIDENCE_MIME = {
@@ -730,10 +825,18 @@ def collect_evidence(evidence_dir: str) -> list[dict]:
     return out
 
 
-def build_prompt(job: dict, input_files: list[str], evidence_dir: str, workdir: str) -> str:
+def build_prompt(
+    job: dict,
+    input_files: list[str],
+    evidence_dir: str,
+    workdir: str,
+    *,
+    sandbox: str = "",
+    agent: str = "",
+) -> str:
     parts = [
         "You are an Agenct execution node handling an assigned task.",
-        "Complete the request concisely using available tools and output the final Markdown result directly.",
+        "Complete the request concisely using available tools and output a concise, conclusion-first Markdown result (prefer brief bullets; avoid bloated multi-section essays or large tables unless explicitly requested).",
         "Stay strictly scoped to the instruction; do not inspect unrelated directories or sensitive files (such as ~/.ssh, credentials, or secrets) unless explicitly requested.",
         f"Working directory: {workdir}",
         f"Title: {job.get('title') or ''}",
@@ -743,6 +846,17 @@ def build_prompt(job: dict, input_files: list[str], evidence_dir: str, workdir: 
         parts.append(f"Context:\n{job['context']}")
     if input_files:
         parts.append("Input attachments saved locally:\n" + "\n".join(f"- {p}" for p in input_files))
+    adapter = CLI_ADAPTERS.get(agent)
+    if sandbox == "readonly" and adapter and adapter.readonly_disables_shell:
+        parts.append(
+            "Read-only sandbox is active: file writes and shell commands are disabled; "
+            "use built-in read, list, and search tools directly."
+        )
+    elif sandbox == "readonly" and agent == "agy":
+        parts.append(
+            f"Read-only sandbox is active: {workdir} is mounted read-only "
+            f"(use absolute paths or 'cd {workdir}' before read-only shell commands like git log/status)."
+        )
     parts.append(
         f"For text queries, output the final Markdown answer directly without creating files. "
         f"Only save screenshots or downloadable artifact files to {evidence_dir} if explicitly requested."
@@ -855,6 +969,232 @@ def tighten_sandbox(node_sandbox: str, requested: object) -> str:
     return req if _SANDBOX_RANK[req] < _SANDBOX_RANK[base] else base
 
 
+class CliAdapter:
+    """Explicit headless contract that every supported CLI engine must satisfy."""
+
+    __slots__ = (
+        "name",
+        "readonly_disables_shell",
+        "build_argv",
+        "build_env",
+        "parse_stream",
+        "summarize_event",
+    )
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        readonly_disables_shell: bool,
+        build_argv: Callable[..., list[str]],
+        build_env: Callable[[dict[str, str], str], dict[str, str]],
+        parse_stream: Callable[[str], tuple[str | None, str | None, bool]],
+        summarize_event: Callable[[dict], str],
+    ) -> None:
+        self.name = name
+        self.readonly_disables_shell = readonly_disables_shell
+        self.build_argv = build_argv
+        self.build_env = build_env
+        self.parse_stream = parse_stream
+        self.summarize_event = summarize_event
+
+
+def _default_cli_env(base_env: dict[str, str], _sandbox: str) -> dict[str, str]:
+    return dict(base_env)
+
+
+def _opencode_cli_env(base_env: dict[str, str], sandbox: str) -> dict[str, str]:
+    env = dict(base_env)
+    if sandbox == "readonly":
+        env["OPENCODE_PERMISSION"] = _OPENCODE_READONLY_PERMISSION
+    return env
+
+
+def _build_claude_argv(
+    exe: str,
+    prompt: str,
+    workdir: str,
+    sandbox: str,
+    evidence_dir: str,
+    in_dir: str | None,
+    _out_file: str | None = None,
+    resume_sid: str = "",
+    model: str = "",
+    effort: str = "",
+) -> list[str]:
+    add_dirs = ["--add-dir", workdir, "--add-dir", evidence_dir]
+    if in_dir:
+        add_dirs.extend(["--add-dir", in_dir])
+    if sandbox == "unsafe-full":
+        add_dirs.extend(["--add-dir", os.path.expanduser("~")])
+    argv = [exe, "-p", "--output-format", "stream-json", "--verbose"]
+    if model:
+        argv.extend(["--model", model])
+    if effort:
+        cl_effort = "low" if effort == "minimal" else effort
+        argv.extend(["--effort", cl_effort])
+    if resume_sid:
+        argv.extend(["--resume", resume_sid])
+    if sandbox == "readonly":
+        argv.extend(["--allowedTools", "Read,Glob,Grep", "--disallowedTools", "Bash,Edit,Write,NotebookEdit"])
+    elif sandbox == "unsafe-full":
+        argv.append("--dangerously-skip-permissions")
+    else:
+        argv.extend(["--allowedTools", "Bash,Read,Edit,Write,Glob,Grep"])
+    argv.extend([*add_dirs, "--", prompt])
+    return argv
+
+
+def _build_codex_argv(
+    exe: str,
+    prompt: str,
+    workdir: str,
+    sandbox: str,
+    evidence_dir: str,
+    in_dir: str | None,
+    out_file: str | None = None,
+    resume_sid: str = "",
+    model: str = "",
+    effort: str = "",
+) -> list[str]:
+    sb_mode = {
+        "readonly": "read-only",
+        "workspace-write": "workspace-write",
+        "unsafe-full": "danger-full-access",
+    }.get(sandbox, "workspace-write")
+    # Codex Linux workspace-write disables network_access by default, which seccomp-blocks
+    # AF_UNIX connect() (e.g. `tmux ls` on /tmp/tmux-*/default) while FS outside workdir stays ro.
+    extra_cfg = ["-c", "sandbox_workspace_write.network_access=true"] if sandbox == "workspace-write" else []
+    model_args = ["-m", model] if model else []
+    eff_args = (
+        ["-c", f'model_reasoning_effort="{"xhigh" if effort == "max" else effort}"']
+        if effort
+        else []
+    )
+    out_args = ["-o", out_file] if out_file else []
+    if resume_sid:
+        return [
+            exe, "exec", "resume",
+            *model_args,
+            "-c", f'sandbox_mode="{sb_mode}"',
+            *extra_cfg,
+            *eff_args,
+            "--skip-git-repo-check", "--json", *out_args, resume_sid, prompt,
+        ]
+    extra = ["--add-dir", evidence_dir]
+    if in_dir:
+        extra.extend(["--add-dir", in_dir])
+    return [
+        exe, "exec", "--skip-git-repo-check", "--json",
+        *model_args,
+        "-s", sb_mode, *extra_cfg, *eff_args, "-C", workdir, *extra, *out_args, prompt,
+    ]
+
+
+def _build_agy_argv(
+    exe: str,
+    prompt: str,
+    workdir: str,
+    sandbox: str,
+    evidence_dir: str,
+    in_dir: str | None,
+    _out_file: str | None = None,
+    resume_sid: str = "",
+    model: str = "",
+    effort: str = "",
+) -> list[str]:
+    argv = [exe, "-p", prompt, "--output-format", "stream-json"]
+    if model:
+        argv.extend(["--model", model])
+    if effort:
+        ag_effort = "low" if effort == "minimal" else effort
+        argv.extend(["--effort", ag_effort])
+    if sandbox == "readonly":
+        argv.extend(["--sandbox", "--settings", _build_agy_readonly_settings(workdir, in_dir)])
+    elif sandbox == "unsafe-full":
+        argv.append("--dangerously-skip-permissions")
+        argv.extend(["--add-dir", workdir, "--add-dir", evidence_dir])
+        if in_dir:
+            argv.extend(["--add-dir", in_dir])
+    else:
+        argv.extend(["--mode", "accept-edits", "--sandbox", "--settings", _AGY_WORKSPACE_SETTINGS])
+        argv.extend(["--add-dir", workdir, "--add-dir", evidence_dir])
+        if in_dir:
+            argv.extend(["--add-dir", in_dir])
+    if resume_sid:
+        argv.extend(["--conversation", resume_sid])
+    return argv
+
+
+def _build_opencode_argv(
+    exe: str,
+    prompt: str,
+    _workdir: str,
+    sandbox: str,
+    _evidence_dir: str,
+    _in_dir: str | None,
+    _out_file: str | None = None,
+    resume_sid: str = "",
+    model: str = "",
+    effort: str = "",
+) -> list[str]:
+    argv = [exe, "run", "--format", "json"]
+    if sandbox == "unsafe-full":
+        argv.append("--auto")
+    if model:
+        argv.extend(["-m", model])
+    if effort:
+        oc_effort = "high" if effort == "xhigh" else effort
+        argv.extend(["--variant", oc_effort])
+    if resume_sid:
+        argv.extend(["--session", resume_sid])
+    argv.append(prompt)
+    return argv
+
+
+CLI_ADAPTERS: dict[str, CliAdapter] = {
+    "claude": CliAdapter(
+        name="claude",
+        readonly_disables_shell=True,
+        build_argv=_build_claude_argv,
+        build_env=_default_cli_env,
+        parse_stream=_parse_claude_stream,
+        summarize_event=_summarize_claude_event,
+    ),
+    "codex": CliAdapter(
+        name="codex",
+        readonly_disables_shell=False,
+        build_argv=_build_codex_argv,
+        build_env=_default_cli_env,
+        parse_stream=_parse_codex_stream,
+        summarize_event=_summarize_codex_event,
+    ),
+    "agy": CliAdapter(
+        name="agy",
+        readonly_disables_shell=False,
+        build_argv=_build_agy_argv,
+        build_env=_default_cli_env,
+        parse_stream=_parse_agy_stream,
+        summarize_event=_summarize_agy_event,
+    ),
+    "opencode": CliAdapter(
+        name="opencode",
+        readonly_disables_shell=True,
+        build_argv=_build_opencode_argv,
+        build_env=_opencode_cli_env,
+        parse_stream=_parse_opencode_stream,
+        summarize_event=_summarize_opencode_event,
+    ),
+}
+
+
+def build_cli_env(agent: str, base_env: dict[str, str], sandbox: str) -> dict[str, str]:
+    adapter = CLI_ADAPTERS.get(agent)
+    if adapter:
+        return adapter.build_env(base_env, sandbox)
+    return dict(base_env)
+
+
 def build_cli_argv(
     agent: str,
     exe: str,
@@ -868,88 +1208,12 @@ def build_cli_argv(
     model: str = "",
     effort: str = "",
 ) -> list[str]:
-    if agent == "claude":
-        add_dirs = ["--add-dir", workdir, "--add-dir", evidence_dir]
-        if in_dir:
-            add_dirs.extend(["--add-dir", in_dir])
-        if sandbox == "unsafe-full":
-            add_dirs.extend(["--add-dir", os.path.expanduser("~")])
-        allowed = "Read,Glob,Grep" if sandbox == "readonly" else "Bash,Read,Glob,Grep"
-        argv = [exe, "-p", "--output-format", "stream-json", "--verbose"]
-        if model:
-            argv.extend(["--model", model])
-        if effort:
-            cl_effort = "low" if effort == "minimal" else effort
-            argv.extend(["--effort", cl_effort])
-        if resume_sid:
-            argv.extend(["--resume", resume_sid])
-        argv.extend(["--allowedTools", allowed, *add_dirs, "--", prompt])
-        return argv
-
-    if agent == "codex":
-        sb_mode = {
-            "readonly": "read-only",
-            "workspace-write": "workspace-write",
-            "unsafe-full": "danger-full-access",
-        }.get(sandbox, "workspace-write")
-        # Codex Linux workspace-write disables network_access by default, which seccomp-blocks
-        # AF_UNIX connect() (e.g. `tmux ls` on /tmp/tmux-*/default) while FS outside workdir stays ro.
-        extra_cfg = ["-c", "sandbox_workspace_write.network_access=true"] if sandbox == "workspace-write" else []
-        model_args = ["-m", model] if model else []
-        eff_args = (
-            ["-c", f'model_reasoning_effort="{"xhigh" if effort == "max" else effort}"']
-            if effort
-            else []
-        )
-        out_args = ["-o", out_file] if out_file else []
-        if resume_sid:
-            return [
-                exe, "exec", "resume",
-                *model_args,
-                "-c", f'sandbox_mode="{sb_mode}"',
-                *extra_cfg,
-                *eff_args,
-                "--skip-git-repo-check", "--json", *out_args, resume_sid, prompt,
-            ]
-        extra = ["--add-dir", evidence_dir]
-        if in_dir:
-            extra.extend(["--add-dir", in_dir])
-        return [
-            exe, "exec", "--skip-git-repo-check", "--json",
-            *model_args,
-            "-s", sb_mode, *extra_cfg, *eff_args, "-C", workdir, *extra, *out_args, prompt,
-        ]
-
-    if agent == "agy":
-        argv = [exe, "-p", prompt, "--output-format", "stream-json"]
-        if model:
-            argv.extend(["--model", model])
-        if effort:
-            ag_effort = "low" if effort == "minimal" else effort
-            argv.extend(["--effort", ag_effort])
-        if sandbox == "readonly":
-            argv.extend(["--mode", "plan", "--sandbox"])
-        elif sandbox == "unsafe-full":
-            argv.append("--dangerously-skip-permissions")
-        else:
-            argv.append("--sandbox")
-        argv.extend(["--add-dir", workdir, "--add-dir", evidence_dir])
-        if in_dir:
-            argv.extend(["--add-dir", in_dir])
-        if resume_sid:
-            argv.extend(["--conversation", resume_sid])
-        return argv
-
-    argv = [exe, "run", "--format", "json"]
-    if model:
-        argv.extend(["-m", model])
-    if effort:
-        oc_effort = "high" if effort == "xhigh" else effort
-        argv.extend(["--variant", oc_effort])
-    if resume_sid:
-        argv.extend(["--session", resume_sid])
-    argv.append(prompt)
-    return argv
+    adapter = CLI_ADAPTERS.get(agent)
+    if not adapter:
+        raise ValueError(f"Unsupported CLI agent: {agent}")
+    return adapter.build_argv(
+        exe, prompt, workdir, sandbox, evidence_dir, in_dir, out_file, resume_sid, model, effort,
+    )
 
 
 def execute_job(
@@ -969,7 +1233,7 @@ def execute_job(
     input_files, in_dir = materialize_attachments(job.get("attachments") or [], workdir, eff_sandbox)
     evidence_dir = make_scoped_tempdir("agenct-ev-", workdir, eff_sandbox)
     try:
-        prompt = build_prompt(job, input_files, evidence_dir, workdir)
+        prompt = build_prompt(job, input_files, evidence_dir, workdir, sandbox=eff_sandbox, agent=agent)
         env = dict(os.environ)
         env["AGENCT_WORKDIR"] = workdir
         env["AGENCT_EVIDENCE_DIR"] = evidence_dir
@@ -1007,10 +1271,15 @@ def execute_job(
             if not exe:
                 return "failed", f"Agent CLI '{agent}' not found in PATH.", []
             out_file = None
+            ro_cwd: str | None = None
             try:
                 if agent == "codex":
                     fd, out_file = tempfile.mkstemp(prefix="agenct-codex-", suffix=".txt")
                     os.close(fd)
+                if agent == "agy" and eff_sandbox == "readonly":
+                    ro_cwd = tempfile.mkdtemp(prefix="agenct-ro-")
+                    os.chmod(ro_cwd, 0o700)
+                cli_cwd = ro_cwd or workdir
                 resume_sid = _valid_session_id(job.get("agent_session_id")) or ""
                 role_prefix = f"{job_role}/" if job_role else ""
                 model_suffix = f" ({job_model})" if job_model else ""
@@ -1019,12 +1288,13 @@ def execute_job(
                     agent, exe, prompt, workdir, eff_sandbox, evidence_dir, in_dir, out_file, resume_sid,
                     model=job_model, effort=job_effort,
                 )
+                cli_env = build_cli_env(agent, env, eff_sandbox)
 
                 rc, out, err, cancelled = run_monitored(
                     argv,
                     shell=False,
-                    cwd=workdir,
-                    env=env,
+                    cwd=cli_cwd,
+                    env=cli_env,
                     timeout=timeout,
                     cancel_event=cancel_event,
                     progress_cb=progress_cb,
@@ -1054,8 +1324,8 @@ def execute_job(
                         rc, out, err, cancelled = run_monitored(
                             fresh_argv,
                             shell=False,
-                            cwd=workdir,
-                            env=env,
+                            cwd=cli_cwd,
+                            env=cli_env,
                             timeout=timeout,
                             cancel_event=cancel_event,
                             progress_cb=progress_cb,
@@ -1075,9 +1345,12 @@ def execute_job(
                     meta_out["agent_session_id"] = captured_sid
                 out_text = parsed if parsed is not None else strip_ansi(raw_out).strip()
                 text = file_text or out_text or strip_ansi(raw_err).strip()
-                status = "completed" if rc == 0 and text else "failed"
+                stream_err = detect_cli_stream_error(agent, raw_out, raw_err)
+                status = "completed" if rc == 0 and not stream_err and text else "failed"
                 return status, truncate_utf8(text or f"{agent} exited with code {rc}"), collect_evidence(evidence_dir)
             finally:
+                if ro_cwd:
+                    shutil.rmtree(ro_cwd, ignore_errors=True)
                 if out_file and os.path.exists(out_file):
                     try:
                         os.unlink(out_file)
@@ -1294,9 +1567,97 @@ def run_node_loop(args: argparse.Namespace) -> int:
             return 0
 
 
+def run_self_check(args: argparse.Namespace) -> int:
+    """Run minimal real headless pre-flight checks for every enabled CLI engine."""
+    workdir = os.path.abspath(args.workdir or os.environ.get("AGENCT_WORKDIR") or os.getcwd())
+    if not os.path.isdir(workdir):
+        print(f"Error: workdir does not exist: {workdir}", file=sys.stderr)
+        return 2
+    node_sandbox = "unsafe-full" if args.unsafe_full_access else args.sandbox
+    _, allowed_agents = resolve_node_agents(args.agent, args.agents, args.cmd)
+    cli_engines = [a for a in allowed_agents if a in CLI_AGENTS]
+    if not cli_engines:
+        print("No CLI engines enabled to self-check.", file=sys.stderr)
+        return 2
+
+    probe_timeout = max(15, min(int(args.timeout or 90), 180))
+    all_ok = True
+    probe_dir = tempfile.mkdtemp(prefix=".agenct-selfcheck-", dir=workdir)
+    os.chmod(probe_dir, 0o700)
+    try:
+        ro_token = f"AGENCT_RO_{uuid.uuid4().hex[:8]}"
+        probe_path = os.path.join(probe_dir, "probe.txt")
+        with open(probe_path, "w", encoding="utf-8") as fh:
+            fh.write(f"{ro_token}\n")
+
+        for eng in cli_engines:
+            t0 = time.monotonic()
+            ro_status, ro_out, _ = execute_job(
+                eng,
+                {
+                    "task_id": f"sc_ro_{eng}",
+                    "title": "Self-check readonly",
+                    "instruction": (
+                        f"Read {probe_path} and reply with ONLY the exact token inside it. "
+                        "Do not create or modify any files."
+                    ),
+                    "sandbox": "readonly",
+                },
+                workdir,
+                node_sandbox,
+                probe_timeout,
+                threading.Event(),
+                lambda _s, _t: None,
+            )
+            ro_dt = time.monotonic() - t0
+            dir_clean = sorted(os.listdir(probe_dir)) == ["probe.txt"]
+            ro_ok = ro_status == "completed" and ro_token in ro_out and dir_clean
+            ro_label = f"PASS ({ro_dt:.1f}s)" if ro_ok else f"FAIL ({ro_dt:.1f}s)"
+            fail_notes: list[str] = []
+            if not ro_ok:
+                all_ok = False
+                why = "modified probe dir" if not dir_clean else ro_out.replace("\n", " ")[:180]
+                fail_notes.append(f"ro={ro_status}: {why}")
+
+            if node_sandbox == "readonly":
+                wr_label = "SKIP (node=readonly)"
+            else:
+                wr_token = f"AGENCT_WR_{uuid.uuid4().hex[:8]}"
+                t1 = time.monotonic()
+                wr_status, wr_out, _ = execute_job(
+                    eng,
+                    {
+                        "task_id": f"sc_wr_{eng}",
+                        "title": "Self-check workspace-write",
+                        "instruction": (
+                            f"Run a shell command to print {wr_token} (e.g. printf '%s\\n' {wr_token}) "
+                            "and reply with ONLY that exact token."
+                        ),
+                        "sandbox": "workspace-write",
+                    },
+                    workdir,
+                    node_sandbox,
+                    probe_timeout,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                )
+                wr_dt = time.monotonic() - t1
+                wr_ok = wr_status == "completed" and wr_token in wr_out
+                wr_label = f"PASS ({wr_dt:.1f}s)" if wr_ok else f"FAIL ({wr_dt:.1f}s)"
+                if not wr_ok:
+                    all_ok = False
+                    fail_notes.append(f"wr={wr_status}: {wr_out.replace(chr(10), ' ')[:180]}")
+
+            detail = f" | {'; '.join(fail_notes)}" if fail_notes else ""
+            print(f"[self-check] {eng}: readonly={ro_label} workspace-write={wr_label}{detail}", flush=True)
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    return 0 if all_ok else 1
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Unified Agenct Node (PC or Cloud Runner)")
-    p.add_argument("--hub", required=True, help="Agenct Hub origin URL (e.g. https://agenct.example.com)")
+    p.add_argument("--hub", default="", help="Agenct Hub origin URL (e.g. https://agenct.example.com)")
     p.add_argument("--token", default="", help="Node bearer token (or set AGENCT_NODE_TOKEN)")
     p.add_argument("--kind", choices=("pc", "cloud"), default=os.environ.get("AGENCT_NODE_KIND", "pc"))
     p.add_argument("--agent", choices=VALID_AGENTS, default=os.environ.get("AGENCT_NODE_AGENT", "auto"))
@@ -1314,9 +1675,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--wait", type=int, default=25, help="Long-poll wait seconds (0 disables long-polling)")
     p.add_argument("--timeout", type=int, default=300, help="Per-job execution timeout in seconds")
     p.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
-    return p.parse_args(argv)
+    p.add_argument(
+        "--self-check",
+        action="store_true",
+        help="Run real headless pre-flight checks for enabled CLI engines and exit",
+    )
+    parsed = p.parse_args(argv)
+    if not parsed.self_check and not parsed.hub:
+        p.error("the following arguments are required: --hub")
+    return parsed
 
 
 if __name__ == "__main__":
     configure_stdio()
-    sys.exit(run_node_loop(parse_args()))
+    cli_args = parse_args()
+    if cli_args.self_check:
+        sys.exit(run_self_check(cli_args))
+    sys.exit(run_node_loop(cli_args))

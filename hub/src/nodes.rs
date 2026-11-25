@@ -1562,7 +1562,16 @@ pub async fn submit_result(
         .to_owned();
 
     let req_for_tx = requester_id.clone();
-    let (title, is_cross_user, auto_deliver, already_submitted, task_thread_id, on_complete, cb_depth) = hub
+    let (
+        title,
+        node_label,
+        is_cross_user,
+        auto_deliver,
+        already_submitted,
+        task_thread_id,
+        on_complete,
+        cb_depth,
+    ) = hub
         .db
         .write(move |conn| {
             let tx = conn.transaction()?;
@@ -1616,7 +1625,16 @@ pub async fn submit_result(
                 let title: String =
                     tx.query_row("SELECT title FROM tasks WHERE id=?1", [&tid], |r| r.get(0))?;
                 tx.commit()?;
-                return Ok((title, req_for_tx != uid, perms.auto_deliver, true, None, String::new(), 0));
+                return Ok((
+                    title,
+                    node_name_db,
+                    req_for_tx != uid,
+                    perms.auto_deliver,
+                    true,
+                    None,
+                    String::new(),
+                    0,
+                ));
             }
             if cur_status != "running"
                 || stored_lease.as_deref() != Some(lease_hash.as_str())
@@ -1651,12 +1669,16 @@ pub async fn submit_result(
                 [&tid],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?;
+            let will_callback =
+                !on_complete.trim().is_empty() && cb_depth < crate::brain::MAX_CALLBACK_DEPTH;
             tx.execute(
                 "UPDATE tasks SET status = ?2, result = ?3, revision = revision + 1, updated_at = ?4
                  WHERE id = ?1",
                 params![tid, final_status, content_db, now],
             )?;
-            // Post result back to owner's chat stream (tagged with implicit thread_id if present).
+            // Post raw result to chat immediately only when there is no automatic callback;
+            // when `on_complete` triggers, keep the raw output in tasks.result / drawer and let
+            // the brain post a single concise digest (falling back to raw if the callback fails).
             let mut label_parts: Vec<&str> = Vec::new();
             if !role_trim.is_empty() {
                 label_parts.push(role_trim);
@@ -1672,12 +1694,14 @@ pub async fn submit_result(
             } else {
                 format!("{node_name_db} ({})", label_parts.join(" / "))
             };
-            let msg_body = format!("**[节点 {node_label} · {title}]**\n\n{content_db}");
-            tx.execute(
-                "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
-                 VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
-                params![uid, task_thread_id, msg_body, now],
-            )?;
+            if !will_callback {
+                let msg_body = format!("**[节点 {node_label} · {title}]**\n\n{content_db}");
+                tx.execute(
+                    "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
+                     VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
+                    params![uid, task_thread_id, msg_body, now],
+                )?;
+            }
             // Update implicit thread metadata & persist (role, engine, model)-bound CLI session ID.
             if let Some(ref thr_id) = task_thread_id {
                 let compact_outcome = truncate_bytes(
@@ -1735,6 +1759,7 @@ pub async fn submit_result(
             tx.commit()?;
             Ok((
                 title,
+                node_label,
                 req_id != uid,
                 perms.auto_deliver,
                 false,
@@ -1746,13 +1771,23 @@ pub async fn submit_result(
         .await?;
 
     if !already_submitted {
+        let will_callback =
+            !on_complete.trim().is_empty() && cb_depth < crate::brain::MAX_CALLBACK_DEPTH;
         hub.events.emit(
             user_id.clone(),
             "task",
             json!({"task_id": task_id, "status": final_status, "result": content}),
         );
-        hub.events
-            .emit(user_id.clone(), "message", json!({"task_id": task_id}));
+        if will_callback {
+            hub.events.emit(
+                user_id.clone(),
+                "stage",
+                json!({"stage": "节点已完成，正在提炼结论…"}),
+            );
+        } else {
+            hub.events
+                .emit(user_id.clone(), "message", json!({"task_id": task_id}));
+        }
         if is_cross_user && auto_deliver && final_status == "done" {
             hub.events
                 .emit(requester_id.clone(), "message", json!({"task_id": task_id}));
@@ -1767,26 +1802,27 @@ pub async fn submit_result(
         tokio::spawn(async move {
             crate::integrations::gitlab::maybe_reply_task(&h_bg, &tid_bg, &node_name, &content_bg)
                 .await;
-            crate::integrations::im::maybe_notify(
-                &h_bg,
-                &uid_bg,
-                "delivery",
-                &format!("任务完成：{title_bg}"),
-                &content_bg,
-            )
-            .await;
-            if !on_complete.trim().is_empty() && cb_depth < crate::brain::MAX_CALLBACK_DEPTH {
+            if will_callback {
                 crate::brain::run_task_callback(
                     h_bg,
                     uid_bg,
                     tid_bg,
                     title_bg,
-                    node_name,
+                    node_label,
                     status_bg,
                     content_bg,
                     on_complete,
                     task_thread_id,
                     cb_depth,
+                )
+                .await;
+            } else {
+                crate::integrations::im::maybe_notify(
+                    &h_bg,
+                    &uid_bg,
+                    "delivery",
+                    &format!("任务完成：{title_bg}"),
+                    &content_bg,
                 )
                 .await;
             }

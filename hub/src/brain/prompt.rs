@@ -1,10 +1,14 @@
 //! Brain system prompt construction and native OpenAI tool schema definitions.
 use super::{roles::AgentRole, threads::ThreadView, AgentProfile, Ledger};
-use crate::{automation, config::truncate_bytes, nodes};
+use crate::{
+    automation,
+    config::{truncate_bytes, truncate_head_tail_bytes},
+    nodes,
+};
 use serde_json::{json, Value};
 
 pub(super) const DEFAULT_AGENT_NAME: &str = "Agenct";
-pub(super) const DEFAULT_SOUL_MD: &str = "- 身份：你的 7×24h 个人超级智能体 Agenct。\n- 风格：干练、直接、结论先行，用第一人称自然沟通。\n- 原则：云端能直接解决的直接解决；涉及本机代码或终端时调度在线节点；跨人承诺或高危操作主动说明边界。";
+pub(super) const DEFAULT_SOUL_MD: &str = "- 身份：你的 7×24h 个人超级智能体 Agenct。\n- 风格：极简、干练、结论先行，默认 3–5 句（≤8–10 行）说清结论、关键事实与下一步；不主动堆多级标题、大表格或冗长清单。\n- 原则：云端能直接解决的直接解决；涉及本机代码或终端时调度在线节点；跨人承诺或高危操作主动说明边界。";
 pub(super) const DEFAULT_MEMORY_MD: &str =
     "暂无长期记忆。在对话中告诉我你的习惯、规矩或环境事实，我会自动整理记住。";
 pub(super) const VISION_CAPTION_PROMPT: &str =
@@ -187,11 +191,11 @@ pub(super) fn build_system_prompt(
     native_tools: bool,
 ) -> String {
     let soul = truncate_bytes(&profile.soul_md, 1500);
-    let memory = truncate_bytes(&profile.memory_md, 2000);
+    let memory = truncate_head_tail_bytes(&profile.memory_md, 1400, 2200);
     let summary_section = if rolling_summary.trim().is_empty() {
         "（暂无早期历史摘要）".into()
     } else {
-        truncate_bytes(rolling_summary.trim(), 2000)
+        truncate_head_tail_bytes(rolling_summary.trim(), 900, 1100)
     };
 
     let roles_str = if roles.is_empty() {
@@ -252,12 +256,12 @@ pub(super) fn build_system_prompt(
                         t.id,
                         t.title,
                         node_info,
-                        truncate_bytes(&t.summary, 180)
+                        truncate_bytes(&t.summary, 260)
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            1400,
+            1800,
         )
     };
 
@@ -274,12 +278,12 @@ pub(super) fn build_system_prompt(
                         l.id,
                         l.title,
                         l.status,
-                        truncate_bytes(&l.notes, 240)
+                        truncate_head_tail_bytes(&l.notes, 240, 720)
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            2000,
+            3600,
         )
     };
 
@@ -401,6 +405,10 @@ pub(super) fn build_system_prompt(
 - **真正存在歧义时必须先简短反问，禁止盲猜执行**：例如同时有 2 个以上近期活跃线程/节点回执，用户只说「帮我改一下」「继续查」「把刚才那个关了」且无法从语义唯一判断指向哪一个时，**禁止调用 `dispatch_node` 或变更类工具**，直接用一句话自然反问确认（例如「你是指刚才的 A 还是 B？」）。
 - 明确完结的临时话题可顺手调用 `close_thread` 归档，保持线程列表清爽。
 
+=== 回复篇幅与事实优先级（必须遵守） ===
+- **默认极简**：除用户明确要详版外，日常回复控制在 **3–5 句（≤10 行）**，结论先行 + 关键事实 + 下一步建议；不要默认堆多级标题、大表格或冗长清单。
+- **实时工作台快照永远优先于旧记忆与历史摘要**：下方【实时工作台快照】及工具 schema 反映当前真实系统能力（如节点启用引擎列表、`agy` / `claude` / `codex` / `opencode`、军团角色、账本最新记录）。若旧 `MEMORY.md` 或早期摘要与实时快照冲突（如旧记忆写「不支持 agy」或旧沙箱报错），**必须以实时快照为准，并当轮顺手调用 `update_memory` 清理过时条目**，严禁用旧记忆否定当前能力。
+
 === 自动维护记忆与持续事项 ===
 - 用户不需要手工填表维护人设、记忆、持续事项或定时任务；你负责在对话中自动维护。
 - 只要用户在对话中表达称呼偏好（如「以后叫你…」）、沟通风格要求、纠偏规矩、长期工作事实或明确说「记住…」，当轮必须顺手调用 `update_memory` 落盘，并在回复末尾用一句简短自然的话交代（如「已记住」）。
@@ -449,4 +457,48 @@ pub(super) fn build_system_prompt(
 {io_section}"#,
         name = profile.name,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_system_prompt;
+    use crate::brain::{AgentProfile, Ledger};
+
+    #[test]
+    fn prompt_retains_tail_of_long_memory_and_appended_ledgers() {
+        let long_mem = format!(
+            "# 长期记忆\n{}\n- 新规则：默认 3–5 句简洁输出，且支持 agy 引擎。",
+            "- 历史习惯记录。\n".repeat(120)
+        );
+        let profile = AgentProfile {
+            memory_md: long_mem,
+            ..Default::default()
+        };
+        let long_ledger = Ledger {
+            id: "ldg_test".into(),
+            title: "agenct v2 收尾".into(),
+            status: "active".into(),
+            notes: format!(
+                "开头背景摘要。\n{}\n- 遗留待办 P0-1：DB 版本推进与 FTS 崩溃恢复能力。",
+                "中间流水账记录非常长用于测试尾部保留。".repeat(45)
+            ),
+            updated_at: 100,
+        };
+        let prompt = build_system_prompt(
+            &profile,
+            "",
+            &[],
+            &[],
+            &[long_ledger],
+            &[],
+            &[],
+            &[],
+            &[],
+            false,
+            true,
+        );
+        assert!(prompt.contains("新规则：默认 3–5 句简洁输出"));
+        assert!(prompt.contains("遗留待办 P0-1：DB 版本推进与 FTS 崩溃恢复能力"));
+        assert!(prompt.contains("实时工作台快照永远优先于旧记忆与历史摘要"));
+    }
 }

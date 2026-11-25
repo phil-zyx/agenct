@@ -93,9 +93,10 @@ cargo fmt --manifest-path hub/Cargo.toml -- --check
 cargo clippy --manifest-path hub/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path hub/Cargo.toml
 
-# 2. Python 节点测试与语法检查
+# 2. Python 节点测试、语法检查与无头引擎实测体检
 python3 -m unittest discover -s node -p 'test_*.py' -v
 python3 -m py_compile node/agenct-node.py scripts/backup.py
+python3 node/agenct-node.py --self-check --workdir . --agents codex,agy,opencode --timeout 90
 
 # 3. 前端 ESM 与脚本语法检查
 npm run check
@@ -115,6 +116,7 @@ AGENCT_LLM_STUB=1 cargo run --manifest-path hub/Cargo.toml
 ## 5. 变更与协作约定
 
 - **回归测试**：任何状态流转、权限边界、协议解析或模型交互改动，均应在 `hub/tests/v2_core.rs` 或 `node/test_node.py` 补充对应回归测试。
+- **新增 / 升级 CLI 引擎契约**：新增 `CLI_AGENTS` 引擎必须在 `node/agenct-node.py` 的 `CLI_ADAPTERS` 中实现完整无头权限隔离（区分 `readonly` / `workspace-write` / `unsafe-full`）与流式错误/拒权检测，并通过 `node/test_node.py` 契约测试及 `--self-check` 真实无头冒烟后再部署。
 - **UI 验证**：修改 `hub/web/` 后，除 `npm run check` 外，应关注重复触发、关闭/重开抽屉、刷新持久化、失败态与取消态的表现。
 - **敏感信息**：严禁提交真实 Token、API Key、个人聊天记录、本地数据库/备份包或部署私有配置（`deploy/agenct.env`、`deploy/data/` 等）。
 - **诚实边界**：不要用硬编码脚本冒充真实模型能力、账号体系或安全隔离边界。

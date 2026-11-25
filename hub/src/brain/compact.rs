@@ -32,6 +32,7 @@ const COMPACTION_SYSTEM_PROMPT: &str = r#"CONTEXT_COMPACTION_TASK: 你是个人�
    - 剔除：寒暄、已经过期的一次性查询输出（如旧的 tmux 列表或临时日志）、重复过程。
 2. 审视当前 `MEMORY`：
    - 仅当待压缩对话中出现新的长期偏好/规矩/环境事实，或 `MEMORY` 中有明显重复/过时条目时，输出整理后的完整 `memory_md`；否则填 `null`。
+   - **主动剔除已过时或被后续推翻的系统/环境限制结论**（例如旧的支持引擎清单、已修复的沙箱/socket/cli 报错，以免与实时系统能力冲突）。
 3. 审视活跃线程列表：把已经明确结束或过时的线程 ID 放进 `archive_thread_ids`（无则 `[]`）。
 
 严格输出合法 JSON（勿加 Markdown 代码块）：

@@ -13,7 +13,7 @@ pub use threads::{list_active_threads_sync, list_threads_sync, ThreadView};
 use crate::{
     auth::AuthUser,
     automation,
-    config::{now_unix, truncate_bytes},
+    config::{now_unix, truncate_bytes, truncate_head_tail_bytes},
     db::record_audit,
     denied, invalid,
     llm::{ChatMessage, LlmTurnError},
@@ -916,14 +916,23 @@ fn build_snapshot_sync(
             .into_iter()
             .enumerate()
             .map(|(idx, (role, content, thr_id, context))| {
-                // Keep the newest 2 turns detailed; trim older turns tightly so long node outputs don't bloat context.
-                let budget = if idx + 2 >= total_hist { 1200 } else { 480 };
                 let full = if context.trim().is_empty() {
                     content
                 } else {
                     format!("{content}\n{}", context.trim())
                 };
-                let trimmed = truncate_bytes(&full, budget);
+                // Keep the newest 6 turns rich and preserve both head & tail so trailing action items aren't lost.
+                let trimmed = if idx + 6 >= total_hist {
+                    if full.len() <= 1800 {
+                        full
+                    } else {
+                        truncate_head_tail_bytes(&full, 700, 900)
+                    }
+                } else if full.len() <= 800 {
+                    full
+                } else {
+                    truncate_head_tail_bytes(&full, 300, 450)
+                };
                 // Only user turns carry the thread tag: tagging assistant turns taught the model
                 // to start its own replies with `[thr_xxx]`, leaking internal ids to the user.
                 let tagged = match thr_id.as_deref().filter(|s| !s.is_empty()) {
@@ -1151,6 +1160,31 @@ pub async fn run_headless(
     agent_loop(hub, user_id, instruction, &snap, &mode).await
 }
 
+fn append_missing_attachments(reply: &str, source: &str) -> String {
+    let missing: Vec<String> = crate::attachments::extract_attachment_ids(source)
+        .into_iter()
+        .filter(|id| !reply.contains(id.as_str()))
+        .collect();
+    if missing.is_empty() {
+        return reply.to_owned();
+    }
+    let mut out = reply.to_owned();
+    for id in missing {
+        let needle = format!("/api/attachments/{id})");
+        let snippet = source
+            .lines()
+            .map(str::trim)
+            .find(|line| line.contains(&needle))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("[附件](/api/attachments/{id})"));
+        if !out.trim().is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&snippet);
+    }
+    out
+}
+
 /// Invokes the brain asynchronously when a node completes a task with `on_complete` set.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_task_callback(
@@ -1189,7 +1223,7 @@ pub async fn run_task_callback(
         "{}\n任务「{}」（id=`{}`，执行节点：{}，状态：{}）已返回结果。\n\
          既定后续验收/跟进要求：{}\n\n\
          【节点执行结果】\n{}\n\n\
-         请根据结果判断任务是否达到目标、给出简练结论；如需要可调用允许的工具更新账本、更新记忆、归档线程{}。",
+         请用极简中文总结给用户（结论先行，3–5 句说清结果、关键事实与下一步；节点原始报告已保存在右侧抽屉「查看结果」，切勿重复粘贴）；如需要可调用允许的工具更新账本、更新记忆、归档线程{}。",
         crate::llm::TASK_CALLBACK_MARKER,
         task_title,
         task_id,
@@ -1216,7 +1250,7 @@ pub async fn run_task_callback(
     };
 
     let mode = AgentMode {
-        prompt_suffix: "\n\n=== 当前运行模式：异步任务回流自动验收 ===\n- 这是节点完成任务后的自动回流验收，用户此刻可能不在屏幕前；直接给出简洁的中文结论并执行必要的账本/记忆/后续处理，不要寒暄或反问。",
+        prompt_suffix: "\n\n=== 当前运行模式：异步任务回流自动验收 ===\n- 这是节点完成任务后的唯一面向用户的汇总回执，用户可能不在屏幕前；**默认只用 3–5 句话**，先给结论再列关键事实和下一步建议，严禁堆砌多级标题或大表格，严禁复述节点原始全文，不要寒暄或反问。",
         interactive: false,
         allowed_tools: Some(allowed_tools),
         callback_depth: next_depth,
@@ -1225,7 +1259,8 @@ pub async fn run_task_callback(
 
     match agent_loop(&hub, &user_id, &instruction, &snap, &mode).await {
         Ok(out) => {
-            let reply = truncate_bytes(out.reply.trim(), 16_000);
+            let merged_reply = append_missing_attachments(out.reply.trim(), &result_content);
+            let reply = truncate_bytes(&merged_reply, 16_000);
             let msg = format!("**[自动跟进 · {task_title}]**\n\n{reply}");
             let thread_db = out.thread_id.or(task_thread_id);
             let uid_db = user_id.clone();
@@ -1252,6 +1287,7 @@ pub async fn run_task_callback(
                     Ok(())
                 })
                 .await;
+            hub.events.emit(&user_id, "stage", json!({"stage": ""}));
             hub.events.emit(
                 &user_id,
                 "message",
@@ -1270,12 +1306,44 @@ pub async fn run_task_callback(
             let uid_db = user_id.clone();
             let title_db = task_title.clone();
             let detail = err.1.to_owned();
+            let fallback_body = format!(
+                "**[节点 {node_name} · {task_title}]**\n\n{}",
+                truncate_bytes(result_content.trim(), 15_000)
+            );
+            let thread_db = task_thread_id.clone();
             let _ = hub
                 .db
                 .write(move |conn| {
-                    record_audit(conn, &uid_db, "task_callback", "failed", &title_db, &detail)
+                    let tx = conn.transaction()?;
+                    tx.execute(
+                        "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
+                         VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
+                        params![
+                            uid_db,
+                            thread_db,
+                            truncate_bytes(&fallback_body, 16_000),
+                            now_unix()
+                        ],
+                    )?;
+                    record_audit(&tx, &uid_db, "task_callback", "failed", &title_db, &detail)?;
+                    tx.commit()?;
+                    Ok(())
                 })
                 .await;
+            hub.events.emit(&user_id, "stage", json!({"stage": ""}));
+            hub.events.emit(
+                &user_id,
+                "message",
+                json!({"task_id": task_id, "callback_failed": true}),
+            );
+            crate::integrations::im::maybe_notify(
+                &hub,
+                &user_id,
+                "delivery",
+                &format!("任务完成：{task_title}"),
+                &result_content,
+            )
+            .await;
         }
     }
 }

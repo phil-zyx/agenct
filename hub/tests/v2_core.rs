@@ -2393,35 +2393,86 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
     .await
     .expect("async task callback should emit message event");
 
-    let (msgs, ledgers, audit_cnt): (Vec<String>, Vec<String>, i64) = hub
-        .db
-        .read(|conn| {
-            let mut ms = conn.prepare("SELECT content FROM messages WHERE user_id='u-alice' ORDER BY id")?;
-            let msgs = ms
-                .query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<String>>>()?;
-            let mut ls = conn.prepare("SELECT title FROM ledgers WHERE user_id='u-alice'")?;
-            let ledgers = ls
-                .query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<Vec<String>>>()?;
-            let audit_cnt: i64 = conn.query_row(
-                "SELECT count(*) FROM audit_logs WHERE user_id='u-alice' AND action='task_callback' AND status='ok'",
-                [],
-                |r| r.get(0),
-            )?;
-            Ok((msgs, ledgers, audit_cnt))
-        })
-        .await
-        .unwrap();
+    let (msgs, ledgers, audit_cnt, saved_result): (Vec<String>, Vec<String>, i64, Option<String>) =
+        hub.db
+            .read({
+                let tid = task_id.clone();
+                move |conn| {
+                    let mut ms = conn.prepare(
+                        "SELECT content FROM messages WHERE user_id='u-alice' ORDER BY id",
+                    )?;
+                    let msgs = ms
+                        .query_map([], |r| r.get(0))?
+                        .collect::<rusqlite::Result<Vec<String>>>()?;
+                    let mut ls = conn.prepare("SELECT title FROM ledgers WHERE user_id='u-alice'")?;
+                    let ledgers = ls
+                        .query_map([], |r| r.get(0))?
+                        .collect::<rusqlite::Result<Vec<String>>>()?;
+                    let audit_cnt: i64 = conn.query_row(
+                        "SELECT count(*) FROM audit_logs WHERE user_id='u-alice' AND action='task_callback' AND status='ok'",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    let saved_result: Option<String> = conn.query_row(
+                        "SELECT result FROM tasks WHERE id=?1",
+                        [&tid],
+                        |r| r.get(0),
+                    )?;
+                    Ok((msgs, ledgers, audit_cnt, saved_result))
+                }
+            })
+            .await
+            .unwrap();
 
+    assert_eq!(saved_result.as_deref(), Some("All 25 tests passed."));
     assert!(msgs.iter().any(
         |m| m.contains("**[自动跟进 · run tests]**") && m.contains("已验收节点结果并完成跟进")
     ));
+    // Tasks with `on_complete` must not spam chat with a duplicate raw node essay alongside the callback digest.
+    assert!(!msgs.iter().any(|m| m.starts_with("**[节点 ")));
     assert!(ledgers.iter().any(|t| t == "自动跟进事项"));
     assert_eq!(audit_cnt, 1);
 
+    // Evidence attachment links from node output are preserved inside the concise callback message.
+    agenct_hub::brain::run_task_callback(
+        hub.clone(),
+        "u-alice".into(),
+        task_id.clone(),
+        "capture ui".into(),
+        "pc-cb".into(),
+        "done".into(),
+        "Captured.\n\n![ev](/api/attachments/att_0123456789abcdef0123456789abcdef)".into(),
+        "总结截图结论".into(),
+        None,
+        0,
+    )
+    .await;
+    let att_msg: String = hub
+        .db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT content FROM messages WHERE user_id='u-alice' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(att_msg.contains("**[自动跟进 · capture ui]**"));
+    assert!(att_msg.contains("![ev](/api/attachments/att_0123456789abcdef0123456789abcdef)"));
+
     // Depth cap: running callback at MAX_CALLBACK_DEPTH must be a no-op.
-    let before_msgs = msgs.len();
+    let before_msgs: i64 = hub
+        .db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM messages WHERE user_id='u-alice'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
     agenct_hub::brain::run_task_callback(
         hub.clone(),
         "u-alice".into(),
@@ -2446,7 +2497,59 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
         })
         .await
         .unwrap();
-    assert_eq!(after_msgs as usize, before_msgs);
+    assert_eq!(after_msgs, before_msgs);
+
+    // Callback failure fallback: if the brain LLM fails during callback, post the raw node output instead of dropping it.
+    let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap();
+    drop(dead_listener);
+    let mut err_cfg = test_config("https://git.example.com");
+    err_cfg.allow_private_outbound = true;
+    let err_hub = Hub::open(err_cfg).unwrap();
+    let (err_c, err_csrf) = seed_user(&err_hub, "u-alice", "alice", "Alice", true).await;
+    let err_router = app(err_hub.clone());
+    let (st, _) = req_json(
+        &err_router,
+        "PUT",
+        "/api/settings/models",
+        Some(&err_c),
+        Some(&err_csrf),
+        Some(json!({
+            "brain": {
+                "url": format!("http://{dead_addr}/v1/chat/completions"),
+                "model": "broken-brain",
+                "api_key": "sk-broken"
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    agenct_hub::brain::run_task_callback(
+        err_hub.clone(),
+        "u-alice".into(),
+        "tsk_fb".into(),
+        "fallback task".into(),
+        "pc-cb (codex)".into(),
+        "done".into(),
+        "RAW_NODE_RESULT_SAFE".into(),
+        "总结".into(),
+        None,
+        0,
+    )
+    .await;
+    let fb_msg: String = err_hub
+        .db
+        .read(|c| {
+            Ok(c.query_row(
+                "SELECT content FROM messages WHERE user_id='u-alice' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(fb_msg.contains("**[节点 pc-cb (codex) · fallback task]**"));
+    assert!(fb_msg.contains("RAW_NODE_RESULT_SAFE"));
 }
 
 #[tokio::test]
