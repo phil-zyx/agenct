@@ -22,6 +22,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -38,6 +39,8 @@ VALID_AGENTS = ("auto", "claude", "codex", "agy", "opencode", "ollama", "openai"
 CLI_AGENTS = ("claude", "codex", "agy", "opencode")
 VALID_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 MAX_RESULT_BYTES = 16_000
+DEFAULT_NODE_TIMEOUT = 3600
+NODE_TIMEOUT_ENV = "AGENCT_NODE_TIMEOUT"
 MAX_EVIDENCE_BYTES = 5 * 1024 * 1024
 MAX_EVIDENCE_COUNT = 4
 _SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/@][A-Za-z0-9._:/@-]{0,127}$")
@@ -875,7 +878,10 @@ def run_monitored(
     progress_cb,
     stage_label: str,
     agent_hint: str = "",
+    started_at: float | None = None,
 ) -> tuple[int, bytes, bytes, bool]:
+    if started_at is None:
+        started_at = time.monotonic()
     proc = subprocess.Popen(
         argv,
         shell=shell,
@@ -884,6 +890,7 @@ def run_monitored(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
@@ -894,19 +901,17 @@ def run_monitored(
         if stream is None:
             return
         try:
-            while True:
-                line = stream.readline()
-                if not line:
-                    break
-                sink.append(line)
-                text = summarize_progress_line(agent_hint, decode_bytes(line))
-                if text:
-                    with tail_lock:
-                        recent.append(text[-160:])
-                        if len(recent) > 4:
-                            recent.pop(0)
-                        tail = " | ".join(recent)[-360:]
-                    progress_cb(stage_label, tail)
+            with stream:
+                for line in stream:
+                    sink.append(line)
+                    text = summarize_progress_line(agent_hint, decode_bytes(line))
+                    if text:
+                        with tail_lock:
+                            recent.append(text[-160:])
+                            if len(recent) > 4:
+                                recent.pop(0)
+                            tail = " | ".join(recent)[-360:]
+                        progress_cb(stage_label, tail)
         except Exception:
             pass
 
@@ -915,7 +920,6 @@ def run_monitored(
     t_out.start()
     t_err.start()
 
-    deadline = time.monotonic() + max(1, timeout)
     cancelled = False
     while proc.poll() is None:
         if cancel_event.is_set():
@@ -926,15 +930,16 @@ def run_monitored(
             except subprocess.TimeoutExpired:
                 proc.kill()
             break
-        if time.monotonic() >= deadline:
-            proc.terminate()
+        if time.monotonic() - started_at >= timeout:
+            # start_new_session makes the child PID the process group ID.
             try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
             t_out.join(timeout=1)
             t_err.join(timeout=1)
-            raise subprocess.TimeoutExpired(argv, timeout)
+            raise subprocess.TimeoutExpired(argv, timeout, b"".join(out_chunks), b"".join(err_chunks))
         time.sleep(0.2)
 
     t_out.join(timeout=2)
@@ -1232,6 +1237,7 @@ def execute_job(
     job_role = str(job.get("role") or "").strip()[:32]
     input_files, in_dir = materialize_attachments(job.get("attachments") or [], workdir, eff_sandbox)
     evidence_dir = make_scoped_tempdir("agenct-ev-", workdir, eff_sandbox)
+    resume_sid = ""
     try:
         prompt = build_prompt(job, input_files, evidence_dir, workdir, sandbox=eff_sandbox, agent=agent)
         env = dict(os.environ)
@@ -1290,6 +1296,7 @@ def execute_job(
                 )
                 cli_env = build_cli_env(agent, env, eff_sandbox)
 
+                started_at = time.monotonic()
                 rc, out, err, cancelled = run_monitored(
                     argv,
                     shell=False,
@@ -1300,6 +1307,7 @@ def execute_job(
                     progress_cb=progress_cb,
                     stage_label=stage_label,
                     agent_hint=agent,
+                    started_at=started_at,
                 )
                 if cancelled:
                     return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1315,6 +1323,9 @@ def execute_job(
                         probe_parsed if probe_parsed is not None else strip_ansi(raw_probe).strip()
                     )
                     if rc != 0 or not probe_text.strip():
+                        if time.monotonic() - started_at >= timeout:
+                            raise subprocess.TimeoutExpired(argv, timeout, out, err)
+                        resume_sid = ""
                         if out_file and os.path.exists(out_file):
                             open(out_file, "wb").close()
                         fresh_argv = build_cli_argv(
@@ -1331,6 +1342,7 @@ def execute_job(
                             progress_cb=progress_cb,
                             stage_label=stage_label,
                             agent_hint=agent,
+                            started_at=started_at,
                         )
                         if cancelled:
                             return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1388,8 +1400,28 @@ def execute_job(
             f"Instruction received:\n> {job.get('instruction') or ''}"
         )
         return "completed", truncate_utf8(content), []
-    except subprocess.TimeoutExpired:
-        return "failed", f"Execution timed out after {timeout}s.", collect_evidence(evidence_dir)
+    except subprocess.TimeoutExpired as exc:
+        raw_out = decode_bytes(exc.stdout)
+        _, captured_sid = parse_cli_output(agent, raw_out)
+        session_id = captured_sid or resume_sid
+        content = f"[timeout] Execution timed out after {timeout}s. Adjust {NODE_TIMEOUT_ENV} or --timeout."
+        if session_id:
+            if meta_out is not None:
+                meta_out["agent_session_id"] = session_id
+            content += f"\nAgent session: {session_id}"
+        tmux_session = job.get("tmux_session") or job.get("tmux_session_name")
+        if isinstance(tmux_session, str) and tmux_session.strip():
+            content += f"\nTmux session: {strip_ansi(tmux_session).strip()[:128]}"
+        streams = [
+            (f"\n\n{label}:\n", output)
+            for label, raw in (("stdout", raw_out), ("stderr", decode_bytes(exc.stderr)))
+            if (output := strip_ansi(raw).strip())
+        ]
+        if streams:
+            budget = MAX_RESULT_BYTES - len(content.encode("utf-8")) - sum(len(header) for header, _ in streams)
+            for header, output in streams:
+                content += header + truncate_utf8(output, budget // len(streams))
+        return "timeout", content, collect_evidence(evidence_dir)
     except Exception as exc:
         return "failed", f"Execution error: {type(exc).__name__}", []
     finally:
@@ -1544,7 +1576,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
             "lease_token": lease_token,
             "request_id": request_id,
             "expected_revision": rev,
-            "status": status,
+            # Protocol 2 accepts completed/failed. The content carries the timeout marker.
+            "status": "failed" if status == "timeout" else status,
             "content": content,
             "attachments": attachments,
             "agent": submitted_agent,
@@ -1569,6 +1602,12 @@ def run_node_loop(args: argparse.Namespace) -> int:
 
 def run_self_check(args: argparse.Namespace) -> int:
     """Run minimal real headless pre-flight checks for every enabled CLI engine."""
+    probe_timeout = max(15, min(args.timeout, 180))
+    print(
+        f"[self-check] job timeout={args.timeout}s (--timeout overrides {NODE_TIMEOUT_ENV}, "
+        f"default {DEFAULT_NODE_TIMEOUT}s); probe timeout={probe_timeout}s",
+        flush=True,
+    )
     workdir = os.path.abspath(args.workdir or os.environ.get("AGENCT_WORKDIR") or os.getcwd())
     if not os.path.isdir(workdir):
         print(f"Error: workdir does not exist: {workdir}", file=sys.stderr)
@@ -1580,7 +1619,6 @@ def run_self_check(args: argparse.Namespace) -> int:
         print("No CLI engines enabled to self-check.", file=sys.stderr)
         return 2
 
-    probe_timeout = max(15, min(int(args.timeout or 90), 180))
     all_ok = True
     probe_dir = tempfile.mkdtemp(prefix=".agenct-selfcheck-", dir=workdir)
     os.chmod(probe_dir, 0o700)
@@ -1655,6 +1693,18 @@ def run_self_check(args: argparse.Namespace) -> int:
     return 0 if all_ok else 1
 
 
+def positive_timeout(value: str) -> int:
+    if re.fullmatch(r"\+?[0-9]+", value.strip()):
+        try:
+            seconds = int(value)
+        except ValueError:
+            pass
+        else:
+            if seconds > 0:
+                return seconds
+    raise argparse.ArgumentTypeError("expected a positive integer number of seconds")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Unified Agenct Node (PC or Cloud Runner)")
     p.add_argument("--hub", default="", help="Agenct Hub origin URL (e.g. https://agenct.example.com)")
@@ -1673,7 +1723,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--state-dir", default="", help="Local state/journal directory")
     p.add_argument("--poll", type=float, default=3.0, help="Fallback idle poll interval in seconds")
     p.add_argument("--wait", type=int, default=25, help="Long-poll wait seconds (0 disables long-polling)")
-    p.add_argument("--timeout", type=int, default=300, help="Per-job execution timeout in seconds")
+    p.add_argument(
+        "--timeout", type=positive_timeout,
+        help=f"Per-job timeout in seconds (positive integer). Overrides {NODE_TIMEOUT_ENV}. "
+        f"Default: {DEFAULT_NODE_TIMEOUT}; invalid environment values use the default.",
+    )
     p.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
     p.add_argument(
         "--self-check",
@@ -1681,6 +1735,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run real headless pre-flight checks for enabled CLI engines and exit",
     )
     parsed = p.parse_args(argv)
+    if parsed.timeout is None:
+        parsed.timeout = DEFAULT_NODE_TIMEOUT
+        if NODE_TIMEOUT_ENV in os.environ:
+            try:
+                parsed.timeout = positive_timeout(os.environ[NODE_TIMEOUT_ENV])
+            except argparse.ArgumentTypeError as exc:
+                print(f"Warning: invalid {NODE_TIMEOUT_ENV}: {exc}; using {DEFAULT_NODE_TIMEOUT}s.", file=sys.stderr)
     if not parsed.self_check and not parsed.hub:
         p.error("the following arguments are required: --hub")
     return parsed

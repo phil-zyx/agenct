@@ -3,11 +3,16 @@ from __future__ import annotations
 
 import base64
 import importlib.util
+import io
 import json
 import os
+import shlex
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -25,6 +30,87 @@ class TestUnifiedNode(unittest.TestCase):
         self.assertFalse(args.unsafe_full_access)
         self.assertEqual(args.kind, "pc")
         self.assertEqual(args.wait, 25)
+
+    def test_node_timeout_default_and_overrides(self) -> None:
+        argv = ["--self-check"]
+        with mock.patch.dict(os.environ, clear=True):
+            self.assertEqual(node.parse_args(argv).timeout, 3600)
+        with mock.patch.dict(os.environ, {"AGENCT_NODE_TIMEOUT": "7200"}):
+            self.assertEqual(node.parse_args(argv).timeout, 7200)
+            self.assertEqual(node.parse_args([*argv, "--timeout", "45"]).timeout, 45)
+
+    def test_node_timeout_invalid_configuration(self) -> None:
+        argv = ["--self-check"]
+        for value in ("", "invalid", "1.5", "0", "-1"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"AGENCT_NODE_TIMEOUT": value}),
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.assertEqual(node.parse_args(argv).timeout, 3600)
+                self.assertIn("invalid AGENCT_NODE_TIMEOUT", stderr.getvalue())
+                self.assertEqual(node.parse_args([*argv, "--timeout", "30"]).timeout, 30)
+                with self.assertRaises(SystemExit) as exc:
+                    node.parse_args([*argv, "--timeout", value])
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn("expected a positive integer", stderr.getvalue())
+
+    def test_job_timeout_kills_process_group_and_returns_partial_output(self) -> None:
+        script = (
+            "import sys, time; "
+            "print('partial stdout', end='', flush=True); "
+            "print('partial stderr', end='', file=sys.stderr, flush=True); "
+            "time.sleep(5)"
+        )
+        command = shlex.join([sys.executable, "-c", script]) + " & wait"
+        with tempfile.TemporaryDirectory() as workdir, mock.patch.object(node.os, "killpg", wraps=os.killpg) as killpg:
+            status, content, _ = node.execute_job(
+                f"custom:{command}", {"tmux_session": "job-123"}, workdir, "workspace-write",
+                1, threading.Event(), lambda _s, _t: None,
+            )
+        killpg.assert_called_once()
+        pgid, sig = killpg.call_args.args
+        self.assertNotEqual(pgid, os.getpgrp())
+        self.assertEqual(sig, node.signal.SIGKILL)
+        self.assertEqual(status, "timeout")
+        self.assertIn("[timeout] Execution timed out after 1s. Adjust AGENCT_NODE_TIMEOUT", content)
+        self.assertIn("stdout:\npartial stdout", content)
+        self.assertIn("stderr:\npartial stderr", content)
+        self.assertIn("Tmux session: job-123", content)
+
+    def test_node_submits_timeout_with_partial_output_and_agent_session(self) -> None:
+        job = {"task_id": "tsk_timeout", "task_revision": 1, "lease_token": "lease", "agent": "codex"}
+        partial = b'{"type":"thread.started","thread_id":"thread-1234"}\n'
+
+        def fake_http(url, _token, *, method, **kwargs):
+            if url.endswith("/work"):
+                return {"job": job}
+            if url.endswith("/submit"):
+                self.assertEqual(method, "POST")
+                payload = kwargs["body"]
+                self.assertEqual(payload["status"], "failed")
+                self.assertEqual(payload["agent_session_id"], "thread-1234")
+                self.assertIn("[timeout] Execution timed out after 2s", payload["content"])
+                self.assertIn(partial.decode().strip(), payload["content"])
+                self.assertIn("partial stderr", payload["content"])
+                return {}
+            self.fail(f"Unexpected request: {url}")
+
+        with tempfile.TemporaryDirectory() as workdir:
+            args = node.parse_args([
+                "--hub", "https://agenct.example.com", "--token", "test-token", "--once",
+                "--agent", "codex", "--agents", "codex", "--workdir", workdir,
+                "--state-dir", workdir, "--timeout", "2",
+            ])
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/codex"),
+                mock.patch.object(node, "run_monitored",
+                                  side_effect=subprocess.TimeoutExpired("codex", 2, partial, b"partial stderr")),
+                mock.patch.object(node, "http_json", side_effect=fake_http) as http,
+            ):
+                self.assertEqual(node.run_node_loop(args), 0)
+                self.assertEqual(http.call_args.args[0], "https://agenct.example.com/node/v1/tasks/tsk_timeout/submit")
+            self.assertEqual(node.ExecutionJournal(workdir).pending_submissions(), [])
 
     def test_journal_replays_ready_submissions_and_ignores_uncertain_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -530,12 +616,15 @@ class TestUnifiedNode(unittest.TestCase):
                 token = inst.split("print ", 1)[1].split(" (e.g.", 1)[0]
                 return ("completed", token, [])
 
-            args = node.parse_args(["--self-check", "--workdir", workdir, "--agents", "codex,agy"])
+            args = node.parse_args(["--self-check", "--workdir", workdir, "--agents", "codex,agy", "--timeout", "240"])
             with (
                 mock.patch.object(node, "execute_job", side_effect=fake_exec),
                 mock.patch.object(node, "resolve_node_agents", return_value=("codex", ["codex", "agy"])),
+                redirect_stdout(io.StringIO()) as stdout,
             ):
                 self.assertEqual(node.run_self_check(args), 0)
+                self.assertIn("job timeout=240s (--timeout overrides AGENCT_NODE_TIMEOUT, default 3600s)", stdout.getvalue())
+                self.assertIn("probe timeout=180s", stdout.getvalue())
 
             with (
                 mock.patch.object(node, "execute_job", return_value=("failed", "Action denied", [])),
