@@ -1,5 +1,5 @@
 // Agenct v2 entrypoint with classic left-rail + centered-chat + floating-avatar Muse drawer layout.
-import { api, avatarById, setCsrfToken, showToast } from './api.js';
+import { api, avatarById, esc, fmtTime, setCsrfToken, showToast } from './api.js';
 import { initChat } from './chat.js';
 import { initDrawer } from './drawer.js';
 import { connectEvents } from './sse.js';
@@ -7,8 +7,10 @@ import { connectEvents } from './sse.js';
 const state = {
   user: null,
   profile: null,
+  roles: [],
   threads: [],
   messages: [],
+  has_more_messages: false,
   tasks: [],
   nodes: [],
   ledgers: [],
@@ -29,6 +31,11 @@ const loginErr = document.getElementById('login-error');
 const navChat = document.getElementById('nav-chat');
 const navTasks = document.getElementById('nav-tasks');
 const navContacts = document.getElementById('nav-contacts');
+const navSearch = document.getElementById('nav-search');
+const searchPanel = document.getElementById('search-panel');
+const searchInput = document.getElementById('search-input');
+const closeSearch = document.getElementById('close-search');
+const searchResults = document.getElementById('search-results');
 const railBadge = document.getElementById('rail-badge');
 const railMore = document.getElementById('rail-more');
 const railMenu = document.getElementById('rail-menu');
@@ -60,6 +67,8 @@ function applyAvatar(avatarId, isBusy) {
 let chatUI = null;
 let drawerUI = null;
 let refreshInFlight = null;
+let refreshQueued = false;
+let syncTimer = null;
 
 function setTasksOpen(open) {
   roomEl.classList.toggle('tasks-open', open);
@@ -86,7 +95,14 @@ function setSettingsOpen(open) {
 }
 
 async function refresh() {
-  if (refreshInFlight) return refreshInFlight;
+  if (syncTimer) {
+    clearTimeout(syncTimer);
+    syncTimer = null;
+  }
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return refreshInFlight;
+  }
   refreshInFlight = (async () => {
     const data = await api('/api/bootstrap');
     Object.assign(state, data);
@@ -107,8 +123,24 @@ async function refresh() {
     drawerUI.render();
   })().finally(() => {
     refreshInFlight = null;
+    if (refreshQueued) {
+      refreshQueued = false;
+      refresh().catch((e) => showToast(e.message));
+    }
   });
   return refreshInFlight;
+}
+
+function scheduleRefresh() {
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return;
+  }
+  if (syncTimer) return;
+  syncTimer = setTimeout(() => {
+    syncTimer = null;
+    refresh().catch((e) => showToast(e.message));
+  }, 80);
 }
 
 async function boot() {
@@ -178,6 +210,94 @@ async function boot() {
         input.focus();
       }
     },
+    onFilterThread(threadId, title) {
+      setSettingsOpen(false);
+      if (window.innerWidth <= 900) setTasksOpen(false);
+      chatUI.setThreadFilter(threadId, title);
+    },
+  });
+
+  let searchTimer = null;
+  function setSearchOpen(open) {
+    if (!searchPanel) return;
+    searchPanel.classList.toggle('hide', !open);
+    navSearch?.classList.toggle('active', open);
+    navSearch?.setAttribute('aria-expanded', String(open));
+    if (open) {
+      setSettingsOpen(false);
+      searchInput?.focus();
+    }
+  }
+
+  async function runSearch(q) {
+    if (!searchResults) return;
+    const trimmed = q.trim();
+    if (!trimmed) {
+      searchResults.innerHTML = '';
+      return;
+    }
+    try {
+      const res = await api(`/api/search?q=${encodeURIComponent(trimmed)}`);
+      const parts = [];
+      if ((res.messages || []).length) {
+        parts.push('<div class="search-group-title">对话记录</div>');
+        for (const m of res.messages) {
+          const thrTitle =
+            (state.threads || []).find((t) => t.id === m.thread_id)?.title || m.thread_id || '';
+          parts.push(`
+            <button type="button" class="search-hit" data-hit-thread="${esc(m.thread_id || '')}" data-hit-title="${esc(thrTitle)}">
+              <div class="search-hit-meta">
+                <span>${esc(m.role === 'user' ? '我' : 'Agenct')}</span>
+                <span>${esc(fmtTime(m.created_at))}</span>
+                ${thrTitle ? `<span class="badge">${esc(thrTitle)}</span>` : ''}
+              </div>
+              <div>${esc(m.snippet)}</div>
+            </button>`);
+        }
+      }
+      if ((res.ledgers || []).length) {
+        parts.push('<div class="search-group-title">持续事项</div>');
+        for (const l of res.ledgers) {
+          parts.push(`
+            <div class="search-hit">
+              <div class="search-hit-meta"><strong>${esc(l.title)}</strong><span class="badge">${esc(l.status)}</span></div>
+              <div>${esc((l.notes || '').slice(0, 160))}</div>
+            </div>`);
+        }
+      }
+      if ((res.memory_matches || []).length) {
+        parts.push('<div class="search-group-title">长期记忆</div>');
+        for (const line of res.memory_matches) {
+          parts.push(`<div class="search-hit"><div>${esc(line)}</div></div>`);
+        }
+      }
+      searchResults.innerHTML = parts.length ? parts.join('') : '<p class="note">未找到匹配内容</p>';
+      searchResults.querySelectorAll('[data-hit-thread]').forEach((btn) => {
+        if (!btn.dataset.hitThread) return;
+        btn.onclick = () => {
+          setSearchOpen(false);
+          chatUI.setThreadFilter(btn.dataset.hitThread, btn.dataset.hitTitle);
+        };
+      });
+    } catch (err) {
+      searchResults.innerHTML = `<p class="note">搜索失败：${esc(err.message)}</p>`;
+    }
+  }
+
+  navSearch && (navSearch.onclick = () => setSearchOpen(searchPanel.classList.contains('hide')));
+  closeSearch && (closeSearch.onclick = () => setSearchOpen(false));
+  searchInput?.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => runSearch(searchInput.value), 220);
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (roomEl.classList.contains('hide')) return;
+    if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'k') {
+      ev.preventDefault();
+      setSearchOpen(searchPanel.classList.contains('hide'));
+    } else if (ev.key === 'Escape' && searchPanel && !searchPanel.classList.contains('hide')) {
+      setSearchOpen(false);
+    }
   });
 
   // Left rail & floating avatar navigation
@@ -233,8 +353,11 @@ async function boot() {
     onStage(stage) {
       chatUI.setStage(stage);
     },
+    onDelta(delta) {
+      chatUI.onDelta(delta);
+    },
     onSync() {
-      refresh().catch((e) => showToast(e.message));
+      scheduleRefresh();
     },
   });
 }

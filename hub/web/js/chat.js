@@ -17,12 +17,56 @@ export function initChat({ state, onRefresh }) {
   const attsEl = document.getElementById('pending-atts');
   const stageEl = document.getElementById('stage-bar');
   const typingEl = document.getElementById('typing');
+  const streamWrapEl = document.getElementById('stream-live');
+  const streamMsgEl = document.getElementById('streaming-msg');
+  const loadOlderWrap = document.getElementById('load-older-wrap');
+  const loadOlderBtn = document.getElementById('load-older-btn');
+  const threadFilterBar = document.getElementById('thread-filter-bar');
+  const threadFilterTitle = document.getElementById('thread-filter-title');
+  const clearThreadFilterBtn = document.getElementById('clear-thread-filter');
 
   let pendingAtts = [];
   let lastFailed = null;
   let sending = false;
   let optimisticMsg = null;
-  let optimisticBaseLen = 0;
+  let optimisticBaseLastId = 0;
+  let streamingText = '';
+  let streamRaf = 0;
+  let olderMessages = [];
+  let hasMoreGlobal = false;
+  let activeThread = null;
+  let threadMessages = [];
+  let threadHasMore = false;
+  let loadingOlder = false;
+  let scrollAfterRender = true;
+
+  function clearStreaming() {
+    if (streamRaf) {
+      cancelAnimationFrame(streamRaf);
+      streamRaf = 0;
+    }
+    streamingText = '';
+    if (streamWrapEl) streamWrapEl.classList.add('hide');
+    if (streamMsgEl) streamMsgEl.innerHTML = '';
+  }
+
+  function flushStreamRender() {
+    streamRaf = 0;
+    if (!streamWrapEl || !streamMsgEl) return;
+    if (!streamingText) {
+      streamWrapEl.classList.add('hide');
+      streamMsgEl.innerHTML = '';
+      return;
+    }
+    typingEl.classList.add('hide');
+    const nearBottom =
+      scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight < 120;
+    streamMsgEl.innerHTML = renderMarkdown(streamingText);
+    streamWrapEl.classList.remove('hide');
+    if (nearBottom) {
+      scrollerEl.scrollTop = scrollerEl.scrollHeight;
+    }
+  }
 
   function renderPendingAtts() {
     if (!pendingAtts.length) {
@@ -119,25 +163,27 @@ export function initChat({ state, onRefresh }) {
     }
     sending = true;
     sendBtn.disabled = true;
-    optimisticBaseLen = (state.messages || []).length;
+    // Retrying the exact same text after a failure reuses its request_id, so the server
+    // revives the failed message instead of storing a duplicate.
+    const requestId =
+      lastFailed && lastFailed.text === text ? lastFailed.requestId : `req-${randomId()}`;
+    optimisticBaseLastId = (state.messages || []).reduce((max, m) => Math.max(max, m.id || 0), 0);
     optimisticMsg = {
       role: 'user',
       content: text,
+      request_id: requestId,
       created_at: Math.floor(Date.now() / 1000),
     };
     inputEl.value = '';
     pendingAtts = [];
     renderPendingAtts();
+    clearStreaming();
     render();
     typingEl.classList.remove('hide');
     document.getElementById('muse-head-toggle')?.classList.add('is-thinking');
     document.getElementById('hero-avatar-wrap')?.classList.add('is-thinking');
     scrollerEl.scrollTop = scrollerEl.scrollHeight;
 
-    // Retrying the exact same text after a failure reuses its request_id, so the server
-    // revives the failed message instead of storing a duplicate.
-    const requestId =
-      lastFailed && lastFailed.text === text ? lastFailed.requestId : `req-${randomId()}`;
     try {
       await api('/api/chat', {
         method: 'POST',
@@ -145,10 +191,12 @@ export function initChat({ state, onRefresh }) {
       });
       lastFailed = null;
       optimisticMsg = null;
+      clearStreaming();
       await onRefresh();
     } catch (err) {
       lastFailed = { text, requestId };
       optimisticMsg = null;
+      clearStreaming();
       await onRefresh().catch(() => render());
       inputEl.value = text;
       showToast(`发送失败：${err.message}`);
@@ -165,19 +213,96 @@ export function initChat({ state, onRefresh }) {
     }
   };
 
+  function mergeById(older, newer) {
+    if (!older.length) return newer;
+    const seen = new Set(newer.map((m) => m.id));
+    const head = older.filter((m) => m.id && !seen.has(m.id));
+    return [...head, ...newer];
+  }
+
+  function currentMessages() {
+    if (activeThread) {
+      const liveThreadMsgs = (state.messages || []).filter((m) => m.thread_id === activeThread.id);
+      return mergeById(threadMessages, liveThreadMsgs);
+    }
+    return mergeById(olderMessages, state.messages || []);
+  }
+
+  if (clearThreadFilterBtn) {
+    clearThreadFilterBtn.onclick = () => {
+      activeThread = null;
+      threadMessages = [];
+      threadHasMore = false;
+      scrollAfterRender = true;
+      render();
+    };
+  }
+
+  if (loadOlderBtn) {
+    loadOlderBtn.onclick = async () => {
+      if (loadingOlder) return;
+      const list = currentMessages();
+      const oldestId = list[0]?.id;
+      if (!oldestId) return;
+      loadingOlder = true;
+      loadOlderBtn.disabled = true;
+      const prevHeight = scrollerEl.scrollHeight;
+      const prevTop = scrollerEl.scrollTop;
+      try {
+        const params = new URLSearchParams({ before_id: String(oldestId), limit: '40' });
+        if (activeThread) params.set('thread_id', activeThread.id);
+        const res = await api(`/api/messages?${params.toString()}`);
+        const older = res?.messages || [];
+        if (activeThread) {
+          threadMessages = mergeById(older, threadMessages);
+          threadHasMore = Boolean(res?.has_more);
+        } else {
+          olderMessages = mergeById(older, olderMessages);
+          hasMoreGlobal = Boolean(res?.has_more);
+        }
+        scrollAfterRender = false;
+        render();
+        scrollerEl.scrollTop = prevTop + (scrollerEl.scrollHeight - prevHeight);
+      } catch (err) {
+        showToast(`加载历史消息失败：${err.message}`);
+      } finally {
+        loadingOlder = false;
+        loadOlderBtn.disabled = false;
+      }
+    };
+  }
+
   function render() {
-    const serverMsgs = state.messages || [];
-    let msgs = serverMsgs;
-    if (optimisticMsg) {
-      const synced = serverMsgs
-        .slice(optimisticBaseLen)
-        .some((m) => m.role === 'user' && m.content === optimisticMsg.content);
+    if (!activeThread && !olderMessages.length) {
+      hasMoreGlobal = Boolean(state.has_more_messages);
+    }
+    if (threadFilterBar && threadFilterTitle) {
+      threadFilterBar.classList.toggle('hide', !activeThread);
+      threadFilterTitle.textContent = activeThread ? `正在查看线程：${activeThread.title}` : '';
+    }
+    listEl.dataset.filtered = activeThread ? 'true' : 'false';
+
+    const showOlder = activeThread ? threadHasMore : hasMoreGlobal;
+    if (loadOlderWrap) {
+      loadOlderWrap.classList.toggle('hide', !showOlder);
+    }
+
+    const baseMsgs = currentMessages();
+    let msgs = baseMsgs;
+    if (optimisticMsg && !activeThread) {
+      const synced = baseMsgs.some(
+        (m) =>
+          m.role === 'user' &&
+          ((m.request_id && m.request_id === optimisticMsg.request_id) ||
+            ((m.id || 0) > optimisticBaseLastId && m.content === optimisticMsg.content)),
+      );
       if (!synced) {
-        msgs = [...serverMsgs, optimisticMsg];
+        msgs = [...baseMsgs, optimisticMsg];
       }
     }
     if (!msgs.length) {
       listEl.innerHTML = '';
+      scrollAfterRender = true;
       return;
     }
     listEl.innerHTML = msgs
@@ -191,7 +316,27 @@ export function initChat({ state, onRefresh }) {
       </div>`,
       )
       .join('');
-    scrollerEl.scrollTop = scrollerEl.scrollHeight;
+    if (scrollAfterRender) {
+      scrollerEl.scrollTop = scrollerEl.scrollHeight;
+    }
+    scrollAfterRender = true;
+  }
+
+  async function setThreadFilter(threadId, title) {
+    if (!threadId) return;
+    activeThread = { id: threadId, title: title || threadId };
+    threadMessages = [];
+    threadHasMore = false;
+    try {
+      const params = new URLSearchParams({ thread_id: threadId, limit: '40' });
+      const res = await api(`/api/messages?${params.toString()}`);
+      threadMessages = res?.messages || [];
+      threadHasMore = Boolean(res?.has_more);
+      scrollAfterRender = true;
+      render();
+    } catch (err) {
+      showToast(`加载线程记录失败：${err.message}`);
+    }
   }
 
   function setStage(stage) {
@@ -205,6 +350,20 @@ export function initChat({ state, onRefresh }) {
     }
   }
 
+  function onDelta(delta) {
+    if (!delta) return;
+    if (delta.done || delta.reset) {
+      clearStreaming();
+      return;
+    }
+    if (typeof delta.text === 'string' && delta.text) {
+      streamingText += delta.text;
+      if (!streamRaf) {
+        streamRaf = requestAnimationFrame(flushStreamRender);
+      }
+    }
+  }
+
   function insertMention(username) {
     const prefix = `@${username} `;
     if (!inputEl.value.startsWith(prefix)) {
@@ -213,5 +372,5 @@ export function initChat({ state, onRefresh }) {
     inputEl.focus();
   }
 
-  return { render, setStage, insertMention };
+  return { render, setStage, onDelta, insertMention, setThreadFilter };
 }

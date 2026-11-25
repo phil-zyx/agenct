@@ -1,7 +1,7 @@
 // Right Muse Drawer (Tasks/Nodes, Ledgers/Crons/Audit, SOUL/MEMORY) + Settings Pane + Contacts.
 import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 
-export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
+export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread }) {
   const bodyEl = document.getElementById('drawer-body');
   const settingsBody = document.getElementById('settings-body');
   const contactsList = document.getElementById('contacts-list');
@@ -49,9 +49,11 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     node_create: '接入节点',
     node_submit: '节点完成',
     dispatch_node: '派发节点',
+    task_callback: '自动跟进',
     cron_run: '定时执行',
     update_memory: '更新记忆',
     update_ledger: '更新事项',
+    manage_role: '军团角色',
     context_compact: '压缩上下文',
     permissions: '修改授权',
     delegate: '发起协作',
@@ -106,6 +108,25 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
       <details class="node-repos"><summary>${esc(moreLabel)}</summary><div class="item-sub detail-body">${esc(clean)}</div></details>`;
   }
 
+  const NODE_ENGINES = ['claude', 'codex', 'agy', 'opencode', 'ollama', 'openai'];
+
+  function engineSelectOptions(selected = '') {
+    return [
+      `<option value=""${selected === '' ? ' selected' : ''}>默认：跟随节点</option>`,
+      ...NODE_ENGINES.map(
+        (ag) => `<option value="${ag}"${selected === ag ? ' selected' : ''}>${ag}</option>`,
+      ),
+    ].join('');
+  }
+
+  function engineCheckboxesHtml(selectedList = [], detectedList = []) {
+    return NODE_ENGINES.map((ag) => {
+      const checked = selectedList.includes(ag) ? ' checked' : '';
+      const installed = detectedList.includes(ag) ? ' <span class="engine-installed">已装</span>' : '';
+      return `<label class="engine-check"><input type="checkbox" name="engines" value="${ag}"${checked}><span>${ag}${installed}</span></label>`;
+    }).join('');
+  }
+
   function parseCapabilities(raw) {
     const info = {};
     for (const part of String(raw || '').split('|')) {
@@ -118,7 +139,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     const osMap = { linux: 'Linux', darwin: 'macOS', windows: 'Windows' };
     const summary = [];
     if (info.os) summary.push(osMap[info.os] || info.os);
-    if (info.agent) summary.push(`引擎 ${info.agent}`);
     const repos = info.repos ? info.repos.split(',').map((s) => s.trim()).filter(Boolean) : [];
     if (repos.length) summary.push(`${repos.length} 个仓库`);
     return {
@@ -127,12 +147,65 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
     };
   }
 
+  function rolesCardHtml(roles) {
+    const SANDBOX_LABEL = { readonly: '只读', 'workspace-write': '可写' };
+    const rolesHtml = roles.length
+      ? roles
+          .map((r) => {
+            const sbLabel = SANDBOX_LABEL[r.sandbox] || '默认沙箱';
+            const sbCls = r.sandbox === 'readonly' ? 'ok' : '';
+            const tags = [];
+            tags.push(`<span class="engine-tag">${esc(r.agent || '节点默认')}</span>`);
+            if (r.model) tags.push(`<span class="engine-tag is-default">${esc(r.model)}</span>`);
+            if (r.effort) tags.push(`<span class="engine-tag">推理:${esc(r.effort)}</span>`);
+            if (r.node_id) tags.push(`<span class="engine-tag">节点:${esc(r.node_id)}</span>`);
+            const promptHtml = r.prompt
+              ? `<details class="node-repos"><summary>查看角色规范</summary><div class="item-sub detail-body">${esc(r.prompt)}</div></details>`
+              : '';
+            return `
+          <div class="item" data-role-name="${esc(r.name)}">
+            <div class="item-head">
+              <span>${esc(r.name)}</span>
+              <span class="badge ${sbCls}">${esc(sbLabel)}</span>
+            </div>
+            ${r.description ? `<div class="item-sub">${esc(r.description)}</div>` : ''}
+            <div class="engine-tags">${tags.join('')}</div>
+            ${promptHtml}
+            <div class="row">
+              <button type="button" class="sm danger" data-del-role="${esc(r.name)}">删除</button>
+            </div>
+          </div>`;
+          })
+          .join('')
+      : '<p class="note">尚未配置军团角色。在对话中直接说，例如：<br>「配置 planner 用 agy / claude-opus-5-5-high（只读规划），executor 用 codex / gpt-6.2-sol（可写执行）」</p>';
+
+    return `
+      <section class="panel-card" id="roles-card">
+        <h3><span>我的军团 (${roles.length})</span><span class="note">对话配置</span></h3>
+        ${rolesHtml}
+        <div class="row">
+          <button type="button" id="chat-tune-roles" class="sm primary">去对话调整</button>
+        </div>
+      </section>`;
+  }
+
   function nodesCardHtml(nodes) {
     const nodesHtml = nodes.length
       ? nodes
           .map((n) => {
             const kindLabel = n.kind === 'cloud' ? '云端' : '本机';
             const parsed = parseCapabilities(n.capabilities);
+            const engines =
+              (n.effective_agents && n.effective_agents.length ? n.effective_agents : n.detected_agents) || [];
+            const defEngine = n.effective_default_agent || n.default_agent || '';
+            const enginesHtml = engines.length
+              ? `<div class="engine-tags">${engines
+                  .map(
+                    (ag) =>
+                      `<span class="engine-tag${ag === defEngine ? ' is-default' : ''}">${esc(ag)}${ag === defEngine ? ' · 默认' : ''}</span>`,
+                  )
+                  .join('')}</div>`
+              : '';
             const reposHtml = parsed.repos.length
               ? `<details class="node-repos"><summary>已发现仓库 (${parsed.repos.length})</summary><div class="repo-tags">${parsed.repos.map((r) => `<span class="repo-tag">${esc(r)}</span>`).join('')}</div></details>`
               : '';
@@ -143,7 +216,19 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
               <span class="badge ${n.online ? 'ok' : ''}">${n.online ? '在线' : '离线'}</span>
             </div>
             ${parsed.summary ? `<div class="item-sub">${esc(parsed.summary)}</div>` : ''}
+            ${enginesHtml}
             ${reposHtml}
+            <details class="node-repos">
+              <summary>配置引擎</summary>
+              <form class="edit-node-form mt-6" data-node-id="${esc(n.id)}">
+                <div class="engine-checks">${engineCheckboxesHtml(n.allowed_agents || [], n.detected_agents || [])}</div>
+                <div class="note mt-6">不勾选则自动开放该节点上报的全部引擎</div>
+                <div class="row engine-row">
+                  <select name="default_agent" class="flex-1">${engineSelectOptions(n.default_agent || '')}</select>
+                  <button type="submit" class="primary sm">保存配置</button>
+                </div>
+              </form>
+            </details>
             <div class="row">
               <button type="button" class="sm" data-rotate="${esc(n.id)}">重置令牌</button>
               <button type="button" class="sm danger" data-rm-node="${esc(n.id)}">移除</button>
@@ -167,6 +252,10 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
                 <option value="cloud">云端</option>
               </select>
               <button type="submit" class="primary sm">添加</button>
+            </div>
+            <div class="engine-checks mt-6">${engineCheckboxesHtml([], [])}</div>
+            <div class="row engine-row">
+              <select name="default_agent" class="flex-1">${engineSelectOptions('')}</select>
             </div>
           </form>
         </details>
@@ -198,14 +287,40 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
         }
       };
     });
+    root.querySelectorAll('.edit-node-form').forEach((form) => {
+      form.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const fd = new FormData(form);
+        const nodeId = form.dataset.nodeId;
+        const allowed = fd.getAll('engines').map(String).filter(Boolean);
+        const def = String(fd.get('default_agent') || '').trim();
+        try {
+          await api(`/api/nodes/${nodeId}`, {
+            method: 'PUT',
+            body: { allowed_agents: allowed, default_agent: def },
+          });
+          showToast('节点引擎配置已更新');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
     root.querySelectorAll('.add-node-form').forEach((form) => {
       form.onsubmit = async (ev) => {
         ev.preventDefault();
         const fd = new FormData(form);
+        const allowed = fd.getAll('engines').map(String).filter(Boolean);
+        const def = String(fd.get('default_agent') || '').trim();
         try {
           const r = await api('/api/nodes', {
             method: 'POST',
-            body: { name: fd.get('name'), kind: fd.get('kind') },
+            body: {
+              name: fd.get('name'),
+              kind: fd.get('kind'),
+              allowed_agents: allowed,
+              default_agent: def,
+            },
           });
           lastInstallCmd = r.install_unix;
           showToast('节点已创建，请复制下方接入命令');
@@ -218,6 +333,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
   }
 
   function renderTasksTab() {
+    const roles = state.roles || [];
     const threads = state.threads || [];
     const tasks = state.tasks || [];
     const crons = state.crons || [];
@@ -311,6 +427,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
       }
 
       const metaParts = [];
+      const roleParts = [latest?.role, latest?.agent, latest?.model].filter(Boolean);
+      if (roleParts.length) metaParts.push(roleParts.join(' / '));
       if (thr.node_id) {
         metaParts.push(thr.has_session ? `节点 ${thr.node_id} · 可续接` : `节点 ${thr.node_id}`);
       }
@@ -329,6 +447,9 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
       const detailsHtml = renderRunsDetails(runs);
 
       const actions = taskActionsHtml(latest);
+      actions.push(
+        `<button type="button" class="sm" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">看记录</button>`,
+      );
       if (thr.status === 'active') {
         actions.push(`<button type="button" class="sm" data-archive-thread="${esc(thr.id)}">归档</button>`);
       } else {
@@ -490,6 +611,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
         </details>
       </section>
 
+      ${rolesCardHtml(roles)}
+
       ${nodesCardHtml(nodes)}`;
 
     bodyEl.querySelectorAll('[data-assign]').forEach((b) => {
@@ -529,6 +652,9 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
           showToast(err.message);
         }
       };
+    });
+    bodyEl.querySelectorAll('[data-filter-thread]').forEach((b) => {
+      b.onclick = () => onFilterThread?.(b.dataset.filterThread, b.dataset.threadTitle);
     });
     bodyEl.querySelectorAll('[data-archive-thread]').forEach((b) => {
       b.onclick = async () => {
@@ -591,6 +717,20 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat }) {
       showToast('定时任务已创建');
       await onRefresh();
     };
+    document.getElementById('chat-tune-roles')?.addEventListener('click', () => {
+      onPromptChat?.('帮我配置军团角色：');
+    });
+    bodyEl.querySelectorAll('[data-del-role]').forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api(`/api/roles/${encodeURIComponent(b.dataset.delRole)}`, { method: 'DELETE' });
+          showToast('军团角色已删除');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
     bindNodeHandlers(bodyEl);
   }
 

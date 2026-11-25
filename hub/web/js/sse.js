@@ -1,15 +1,19 @@
 // Single Server-Sent Events (SSE) subscription replacing 7x3s polling.
-export function connectEvents({ onStatus, onStage, onSync }) {
+export function connectEvents({ onStatus, onStage, onDelta, onSync }) {
   let es = null;
   let retryMs = 1500;
   let closed = false;
+  let hasConnectedOnce = false;
 
   function open() {
     if (closed) return;
     es = new EventSource('/api/events', { withCredentials: true });
     es.addEventListener('connected', () => {
+      const isReconnect = hasConnectedOnce;
+      hasConnectedOnce = true;
       retryMs = 1500;
       onStatus(true);
+      if (isReconnect) onSync('resync');
     });
     es.addEventListener('stage', (ev) => {
       try {
@@ -17,6 +21,14 @@ export function connectEvents({ onStatus, onStage, onSync }) {
         onStage(d.stage || '');
       } catch {
         onStage('');
+      }
+    });
+    es.addEventListener('delta', (ev) => {
+      if (!onDelta) return;
+      try {
+        onDelta(JSON.parse(ev.data));
+      } catch {
+        // ignore malformed delta
       }
     });
     for (const kind of ['message', 'task', 'node', 'brain', 'automation', 'resync']) {

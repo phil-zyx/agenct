@@ -22,6 +22,9 @@
     <button type="button" id="nav-contacts" class="rail-btn" title="联系人" aria-label="联系人" aria-expanded="false">
       <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="15" height="18" rx="3"/><path d="M3 7h4M3 12h4M3 17h4"/><circle cx="12.5" cy="9" r="2.2"/><path d="M9 17a3.5 3.5 0 0 1 7 0"/></svg>
     </button>
+    <button type="button" id="nav-search" class="rail-btn" title="搜索历史与记忆 (Ctrl+K)" aria-label="搜索历史与记忆" aria-expanded="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
+    </button>
     <div class="rail-spacer"></div>
     <div class="rail-more-wrap">
       <button type="button" id="rail-more" class="rail-btn" title="设置与账号" aria-label="设置与账号" aria-haspopup="menu" aria-expanded="false">
@@ -82,12 +85,29 @@
 
     <!-- Primary Centered Chat Column -->
     <section id="chat-pane" class="chat-pane" aria-label="与管家的对话">
+      <div id="search-panel" class="search-panel hide" aria-label="搜索对话、事项与记忆">
+        <div class="search-panel-head">
+          <input id="search-input" type="search" placeholder="搜索对话记录、持续事项或长期记忆… (Ctrl+K)" autocomplete="off">
+          <button type="button" id="close-search" class="icon-btn" aria-label="关闭搜索">✕</button>
+        </div>
+        <div id="search-results" class="search-results"></div>
+      </div>
+      <div id="thread-filter-bar" class="thread-filter-bar hide" role="status">
+        <span id="thread-filter-title"></span>
+        <button type="button" id="clear-thread-filter" class="text-btn sm">返回全部对话</button>
+      </div>
       <div id="scroller" class="scroller">
         <button type="button" id="muse-head-toggle" class="stream-head" aria-label="打开管家工作台" aria-expanded="false">
           <img id="head-avatar" class="avatar" src="brand/agenct-icon.svg" alt="" width="40" height="40">
           <span id="agent-name" class="avatar-name">Agenct</span>
         </button>
+        <div id="load-older-wrap" class="load-older-wrap hide">
+          <button type="button" id="load-older-btn" class="sm">加载更早消息</button>
+        </div>
         <div id="messages" class="stream" aria-label="对话记录"></div>
+        <div id="stream-live" class="stream-live hide" aria-live="polite">
+          <div id="streaming-msg" class="msg msg-assistant msg-streaming"></div>
+        </div>
         <div id="stage-bar" class="stage-pill hide" role="status" aria-live="polite"></div>
         <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
       </div>

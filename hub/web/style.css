@@ -184,6 +184,38 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
   content: "直接告诉我你想解决的问题。需要同事协作时，直接 @同事，或从左侧联系人点选发起。";
   align-self: center; max-width: 440px; text-align: center; color: var(--muted); font-size: 15px; margin-top: 10vh;
 }
+.stream[data-filtered="true"]:empty::before {
+  content: "该工作线程暂无对话记录。";
+}
+.load-older-wrap {
+  max-width: var(--col); margin: 0 auto 14px; display: flex; justify-content: center;
+}
+.search-panel {
+  border-bottom: 1px solid var(--line); background: var(--surface); padding: 12px 24px;
+  box-shadow: var(--shadow-sm); z-index: 12;
+}
+.search-panel-head {
+  max-width: var(--col); margin: 0 auto; display: flex; align-items: center; gap: 8px;
+}
+.search-results {
+  max-width: var(--col); margin: 10px auto 0; max-height: 46vh; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.search-group-title {
+  font-size: 12px; font-weight: 600; color: var(--muted); margin-top: 4px;
+}
+.search-hit {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 4px; width: 100%;
+  text-align: left; white-space: normal; padding: 9px 12px; border-radius: 12px;
+  background: var(--bg); border: 1px solid var(--line);
+}
+.search-hit:hover { border-color: var(--brand); background: var(--soft); }
+.search-hit-meta { font-size: 11.5px; color: var(--muted); display: flex; gap: 8px; align-items: center; }
+.thread-filter-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 8px 24px; background: var(--brand-soft); color: var(--brand);
+  border-bottom: 1px solid var(--line); font-size: 13px; font-weight: 600;
+}
 .msg {
   max-width: min(720px, 92%); padding: 13px 18px; border-radius: 18px; font-size: 15px;
   line-height: 1.68; word-break: break-word;
@@ -253,6 +285,15 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
   max-width: var(--col); margin: 10px auto 0; padding: 0 18px;
   color: var(--muted); font-size: 13px;
 }
+.stream-live {
+  max-width: var(--col); margin: 14px auto 0; display: flex; flex-direction: column; gap: 14px;
+}
+.msg-streaming::after {
+  content: ""; display: inline-block; width: 7px; height: 14px; margin-left: 4px;
+  vertical-align: text-bottom; border-radius: 2px; background: var(--brand);
+  animation: stream-blink 1s steps(2, start) infinite;
+}
+@keyframes stream-blink { 0%, 100% { opacity: .85; } 50% { opacity: .15; } }
 .typing { max-width: var(--col); margin: 12px auto 0; display: flex; gap: 5px; align-items: center; }
 .typing span { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); animation: typing 1.2s infinite ease-in-out; }
 .typing span:first-child { margin-left: 16px; }
@@ -413,6 +454,13 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
 .memory-prose { font-size: 13.5px; line-height: 1.65; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; word-break: break-word; }
 .repo-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .repo-tag { padding: 1px 7px; border-radius: 6px; background: var(--soft); color: var(--text); font-size: 11.5px; }
+.engine-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.engine-tag { padding: 1px 8px; border-radius: 999px; background: var(--soft); color: var(--muted); font-size: 11.5px; }
+.engine-tag.is-default { background: var(--done-soft); color: var(--done); font-weight: 600; }
+.engine-checks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 8px; }
+.engine-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text); cursor: pointer; }
+.engine-installed { color: var(--done); font-size: 10.5px; }
+.engine-row { margin-top: 6px; }
 label.field-label { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; }
 label.toggle { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 7px 0; font-size: 14px; cursor: pointer; }
 label.toggle input[type="checkbox"] { width: 17px; height: 17px; accent-color: var(--brand); flex: none; }
