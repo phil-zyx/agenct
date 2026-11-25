@@ -2,16 +2,16 @@
 use crate::{Error, Result};
 use axum::http::StatusCode;
 use fs2::FileExt;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
-const SCHEMA_V11: &str = r#"
+const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     gitlab_id INTEGER UNIQUE,
@@ -266,6 +266,154 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
 END;
 "#;
 
+fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let tx = writer.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let current_version: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if !(0..=SCHEMA_VERSION).contains(&current_version) {
+        return Err(format!(
+            "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
+        )
+        .into());
+    }
+    if current_version > 0 {
+        if current_version <= 1 {
+            tx.execute_batch(
+            "ALTER TABLE agent_profiles ADD COLUMN rolling_summary TEXT NOT NULL DEFAULT '';
+             ALTER TABLE agent_profiles ADD COLUMN compacted_msg_id INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE messages ADD COLUMN thread_id TEXT;
+             ALTER TABLE tasks ADD COLUMN thread_id TEXT;
+             CREATE TABLE IF NOT EXISTS threads (
+                 id TEXT PRIMARY KEY,
+                 user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
+                 summary TEXT NOT NULL DEFAULT '',
+                 node_id TEXT,
+                 node_session_id TEXT,
+                 turn_count INTEGER NOT NULL DEFAULT 0,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id, status, updated_at DESC);
+             CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(user_id, thread_id, id DESC);",
+        )?;
+        }
+        if current_version <= 2 {
+            tx.execute_batch(
+                "ALTER TABLE agent_profiles ADD COLUMN avatar_id TEXT NOT NULL DEFAULT 'agenct';",
+            )?;
+        }
+        if current_version <= 3 {
+            tx.execute_batch(
+                "ALTER TABLE messages ADD COLUMN reply_to INTEGER;
+             CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(user_id, reply_to);",
+            )?;
+        }
+        if current_version <= 4 {
+            let has_crons: bool = tx.query_row(
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='cron_jobs'",
+                [],
+                |r| r.get(0),
+            )?;
+            let alter = if has_crons {
+                "ALTER TABLE cron_jobs ADD COLUMN last_status TEXT NOT NULL DEFAULT '';
+             ALTER TABLE cron_jobs ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
+             ALTER TABLE cron_jobs ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE cron_jobs ADD COLUMN next_retry_at INTEGER;"
+            } else {
+                ""
+            };
+            tx.execute_batch(alter)?;
+        }
+        if current_version <= 5 {
+            // `context` holds model-only text derived from a message (e.g. image captions).
+            // `user_models` is created by the idempotent schema batch below.
+            tx.execute_batch("ALTER TABLE messages ADD COLUMN context TEXT NOT NULL DEFAULT '';")?;
+        }
+        if current_version <= 7 {
+            let has_tasks: bool = tx.query_row(
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='tasks'",
+                [],
+                |r| r.get(0),
+            )?;
+            let alter = if has_tasks {
+                "ALTER TABLE tasks ADD COLUMN on_complete TEXT NOT NULL DEFAULT '';
+             ALTER TABLE tasks ADD COLUMN callback_depth INTEGER NOT NULL DEFAULT 0;"
+            } else {
+                ""
+            };
+            tx.execute_batch(alter)?;
+        }
+        let table_exists = |name: &str| -> rusqlite::Result<bool> {
+            tx.query_row(
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+                [name],
+                |r| r.get(0),
+            )
+        };
+        if current_version <= 8 {
+            let mut alter = String::new();
+            if table_exists("nodes")? {
+                alter.push_str(
+                    "ALTER TABLE nodes ADD COLUMN default_agent TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE nodes ADD COLUMN allowed_agents TEXT NOT NULL DEFAULT '';",
+                );
+            }
+            if table_exists("node_jobs")? {
+                alter.push_str("ALTER TABLE node_jobs ADD COLUMN agent TEXT NOT NULL DEFAULT '';");
+            }
+            if table_exists("threads")? {
+                alter.push_str(
+                    "ALTER TABLE threads ADD COLUMN node_session_agent TEXT NOT NULL DEFAULT '';",
+                );
+            }
+            tx.execute_batch(&alter)?;
+        }
+        if current_version <= 9 {
+            let mut alter = String::new();
+            if table_exists("node_jobs")? {
+                alter.push_str(
+                    "ALTER TABLE node_jobs ADD COLUMN role TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE node_jobs ADD COLUMN model TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE node_jobs ADD COLUMN effort TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE node_jobs ADD COLUMN sandbox TEXT NOT NULL DEFAULT '';",
+                );
+            }
+            if table_exists("threads")? {
+                alter.push_str(
+                    "ALTER TABLE threads ADD COLUMN node_session_role TEXT NOT NULL DEFAULT '';
+                 ALTER TABLE threads ADD COLUMN node_session_model TEXT NOT NULL DEFAULT '';",
+                );
+            }
+            tx.execute_batch(&alter)?;
+        }
+        if current_version <= 10 {
+            let mut mig = String::new();
+            if table_exists("nodes")? {
+                mig.push_str(
+                "UPDATE nodes SET default_agent = 'agy' WHERE lower(default_agent) = 'gemini';
+                 UPDATE nodes SET allowed_agents = trim(replace(replace(',' || lower(allowed_agents) || ',', ',gemini,', ',agy,'), ',gemini,', ',agy,'), ',')
+                   WHERE allowed_agents != '' AND instr(',' || lower(allowed_agents) || ',', ',gemini,') > 0;",
+            );
+            }
+            if table_exists("agent_roles")? {
+                mig.push_str("UPDATE agent_roles SET agent = 'agy' WHERE lower(agent) = 'gemini';");
+            }
+            tx.execute_batch(&mig)?;
+        }
+    }
+    // Idempotent: creates any table/index/trigger an older database never had.
+    tx.execute_batch(SCHEMA)?;
+    // Older migrations could leave a partial index even after advancing user_version.
+    if (1..SCHEMA_VERSION).contains(&current_version) {
+        tx.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('rebuild');")?;
+    }
+    if current_version < SCHEMA_VERSION {
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Db {
     writer: Arc<Mutex<Connection>>,
@@ -297,197 +445,14 @@ impl Db {
             None
         };
 
-        let writer = Connection::open(path)?;
+        let mut writer = Connection::open(path)?;
         writer.busy_timeout(Duration::from_millis(5000))?;
-        let mut current_version: i64 = writer.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if !(0..=SCHEMA_VERSION).contains(&current_version) {
-            return Err(format!(
-                "unsupported database schema version {current_version} (expected {SCHEMA_VERSION}); v2 requires a compatible database"
-            )
-            .into());
-        }
         writer.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
         )?;
-        let needs_fts_rebuild = current_version > 0 && current_version < 8;
-        if current_version == 0 {
-            writer.execute_batch(SCHEMA_V11)?;
-            writer.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        } else {
-            if current_version == 1 {
-                writer.execute_batch(
-                    "BEGIN IMMEDIATE;
-                     ALTER TABLE agent_profiles ADD COLUMN rolling_summary TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE agent_profiles ADD COLUMN compacted_msg_id INTEGER NOT NULL DEFAULT 0;
-                     ALTER TABLE messages ADD COLUMN thread_id TEXT;
-                     ALTER TABLE tasks ADD COLUMN thread_id TEXT;
-                     CREATE TABLE IF NOT EXISTS threads (
-                         id TEXT PRIMARY KEY,
-                         user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                         title TEXT NOT NULL,
-                         status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
-                         summary TEXT NOT NULL DEFAULT '',
-                         node_id TEXT,
-                         node_session_id TEXT,
-                         turn_count INTEGER NOT NULL DEFAULT 0,
-                         updated_at INTEGER NOT NULL
-                     );
-                     CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id, status, updated_at DESC);
-                     CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(user_id, thread_id, id DESC);
-                     PRAGMA user_version = 2;
-                     COMMIT;",
-                )?;
-                current_version = 2;
-            }
-            if current_version == 2 {
-                writer.execute_batch(
-                    "BEGIN IMMEDIATE;
-                     ALTER TABLE agent_profiles ADD COLUMN avatar_id TEXT NOT NULL DEFAULT 'agenct';
-                     PRAGMA user_version = 3;
-                     COMMIT;",
-                )?;
-                current_version = 3;
-            }
-            if current_version == 3 {
-                writer.execute_batch(
-                    "BEGIN IMMEDIATE;
-                     ALTER TABLE messages ADD COLUMN reply_to INTEGER;
-                     CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(user_id, reply_to);
-                     PRAGMA user_version = 4;
-                     COMMIT;",
-                )?;
-                current_version = 4;
-            }
-            if current_version == 4 {
-                let has_crons: bool = writer.query_row(
-                    "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='cron_jobs'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let alter = if has_crons {
-                    "ALTER TABLE cron_jobs ADD COLUMN last_status TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE cron_jobs ADD COLUMN last_error TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE cron_jobs ADD COLUMN fail_count INTEGER NOT NULL DEFAULT 0;
-                     ALTER TABLE cron_jobs ADD COLUMN next_retry_at INTEGER;"
-                } else {
-                    ""
-                };
-                writer.execute_batch(&format!(
-                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 5; COMMIT;"
-                ))?;
-                current_version = 5;
-            }
-            if current_version == 5 {
-                // `context` holds model-only text derived from a message (e.g. image captions).
-                // `user_models` is created by the idempotent schema batch below.
-                writer.execute_batch(
-                    "BEGIN IMMEDIATE;
-                     ALTER TABLE messages ADD COLUMN context TEXT NOT NULL DEFAULT '';
-                     PRAGMA user_version = 6;
-                     COMMIT;",
-                )?;
-                current_version = 6;
-            }
-            if current_version == 6 {
-                // `local_auth` is created by the idempotent schema batch below.
-                writer.pragma_update(None, "user_version", 7)?;
-                current_version = 7;
-            }
-            if current_version == 7 {
-                let has_tasks: bool = writer.query_row(
-                    "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name='tasks'",
-                    [],
-                    |r| r.get(0),
-                )?;
-                let alter = if has_tasks {
-                    "ALTER TABLE tasks ADD COLUMN on_complete TEXT NOT NULL DEFAULT '';
-                     ALTER TABLE tasks ADD COLUMN callback_depth INTEGER NOT NULL DEFAULT 0;"
-                } else {
-                    ""
-                };
-                writer.execute_batch(&format!(
-                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 8; COMMIT;"
-                ))?;
-                current_version = 8;
-            }
-            let table_exists = |name: &str| -> rusqlite::Result<bool> {
-                writer.query_row(
-                    "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
-                    [name],
-                    |r| r.get(0),
-                )
-            };
-            if current_version == 8 {
-                let mut alter = String::new();
-                if table_exists("nodes")? {
-                    alter.push_str(
-                        "ALTER TABLE nodes ADD COLUMN default_agent TEXT NOT NULL DEFAULT '';
-                         ALTER TABLE nodes ADD COLUMN allowed_agents TEXT NOT NULL DEFAULT '';",
-                    );
-                }
-                if table_exists("node_jobs")? {
-                    alter.push_str(
-                        "ALTER TABLE node_jobs ADD COLUMN agent TEXT NOT NULL DEFAULT '';",
-                    );
-                }
-                if table_exists("threads")? {
-                    alter.push_str(
-                        "ALTER TABLE threads ADD COLUMN node_session_agent TEXT NOT NULL DEFAULT '';",
-                    );
-                }
-                writer.execute_batch(&format!(
-                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 9; COMMIT;"
-                ))?;
-                current_version = 9;
-            }
-            if current_version == 9 {
-                let mut alter = String::new();
-                if table_exists("node_jobs")? {
-                    alter.push_str(
-                        "ALTER TABLE node_jobs ADD COLUMN role TEXT NOT NULL DEFAULT '';
-                         ALTER TABLE node_jobs ADD COLUMN model TEXT NOT NULL DEFAULT '';
-                         ALTER TABLE node_jobs ADD COLUMN effort TEXT NOT NULL DEFAULT '';
-                         ALTER TABLE node_jobs ADD COLUMN sandbox TEXT NOT NULL DEFAULT '';",
-                    );
-                }
-                if table_exists("threads")? {
-                    alter.push_str(
-                        "ALTER TABLE threads ADD COLUMN node_session_role TEXT NOT NULL DEFAULT '';
-                         ALTER TABLE threads ADD COLUMN node_session_model TEXT NOT NULL DEFAULT '';",
-                    );
-                }
-                writer.execute_batch(&format!(
-                    "BEGIN IMMEDIATE; {alter} PRAGMA user_version = 10; COMMIT;"
-                ))?;
-                current_version = 10;
-            }
-            if current_version == 10 {
-                let mut mig = String::new();
-                if table_exists("nodes")? {
-                    mig.push_str(
-                        "UPDATE nodes SET default_agent = 'agy' WHERE lower(default_agent) = 'gemini';
-                         UPDATE nodes SET allowed_agents = trim(replace(replace(',' || lower(allowed_agents) || ',', ',gemini,', ',agy,'), ',gemini,', ',agy,'), ',')
-                           WHERE allowed_agents != '' AND instr(',' || lower(allowed_agents) || ',', ',gemini,') > 0;",
-                    );
-                }
-                if table_exists("agent_roles")? {
-                    mig.push_str(
-                        "UPDATE agent_roles SET agent = 'agy' WHERE lower(agent) = 'gemini';",
-                    );
-                }
-                writer.execute_batch(&format!(
-                    "BEGIN IMMEDIATE; {mig} PRAGMA user_version = 11; COMMIT;"
-                ))?;
-            }
-            // Idempotent: creates any table/index/trigger an older database never had.
-            writer.execute_batch(SCHEMA_V11)?;
-            if needs_fts_rebuild {
-                writer
-                    .execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('rebuild');")?;
-            }
-        }
+        migrate(&mut writer)?;
         // On startup, mark any orphaned running node jobs without a valid future lease as failed.
         let now = crate::config::now_unix();
         writer.execute(
@@ -604,6 +569,147 @@ pub fn record_audit(
 mod tests {
     use super::Db;
     use rusqlite::Connection;
+    use std::path::Path;
+
+    fn create_v11_with_partial_fts(path: &Path, rows: i64) {
+        drop(Db::open(path).unwrap());
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO users(id, username, display_name, created_at) VALUES ('u1', 'alice', 'Alice', 1);
+             DROP TRIGGER messages_ai;",
+        )
+        .unwrap();
+        conn.execute(
+            "WITH RECURSIVE seq(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM seq WHERE n < ?1)
+             INSERT INTO messages(user_id, role, content, context, created_at)
+             SELECT 'u1', 'user', 'backfill ' || hex(randomblob(64)), 'caption', n FROM seq",
+            [rows],
+        )
+        .unwrap();
+        conn.execute_batch(super::SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO messages_fts(rowid, content, context)
+             SELECT id, content, context FROM messages WHERE id = 1;
+             PRAGMA user_version = 11;",
+        )
+        .unwrap();
+    }
+
+    fn indexed_message_count(conn: &Connection) -> i64 {
+        // Without MATCH, an external-content FTS table reads through to messages.
+        conn.query_row(
+            "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'content:backfill AND context:caption'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn assert_complete_fts(conn: &Connection, expected_rows: i64) {
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 12);
+        assert_eq!(rows, expected_rows);
+        assert_eq!(indexed_message_count(conn), rows);
+        conn.execute_batch(
+            "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn migrates_v11_and_rebuilds_fts_idempotently() {
+        let dir = std::env::temp_dir().join(format!("agenct-fts-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("hub.sqlite3");
+        create_v11_with_partial_fts(&path, 8);
+
+        assert_eq!(indexed_message_count(&Connection::open(&path).unwrap()), 1);
+        for rebuild_again in [true, false] {
+            drop(Db::open(&path).unwrap());
+            let conn = Connection::open(&path).unwrap();
+            assert_complete_fts(&conn, 8);
+            if rebuild_again {
+                // Force the same migration to run against an already complete index.
+                conn.pragma_update(None, "user_version", 11).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigkill_during_fts_rebuild_rolls_back_and_retries() {
+        use rusqlite::ffi;
+        use std::{ffi::c_void, os::unix::process::ExitStatusExt, path::PathBuf, process::Command};
+
+        const CHILD_DB: &str = "AGENCT_TEST_FTS_KILL_DB";
+        const SIGKILL: i32 = 9;
+        unsafe extern "C" {
+            fn kill(pid: i32, signal: i32) -> i32;
+        }
+
+        unsafe extern "C" fn kill_on_wal_spill(context: *mut c_void) -> i32 {
+            // SAFETY: The registered callback's PathBuf lives until the connection closes.
+            let wal = unsafe { &*context.cast::<PathBuf>() };
+            if wal.metadata().is_ok_and(|metadata| metadata.len() > 32) {
+                // SAFETY: Send SIGKILL only to this test subprocess.
+                unsafe { kill(std::process::id() as i32, SIGKILL) };
+                return 1;
+            }
+            0
+        }
+
+        if let Some(path) = std::env::var_os(CHILD_DB) {
+            let path = PathBuf::from(path);
+            let mut wal = path.with_extension("sqlite3-wal");
+            let mut conn = Connection::open(path).unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA cache_size = 8;")
+                .unwrap();
+            // The v11 schema already exists. The first WAL frame after the checkpoint
+            // comes from the rebuild spilling dirty pages while the transaction is open.
+            // SAFETY: conn outlives the migration and is dropped before wal.
+            unsafe {
+                ffi::sqlite3_progress_handler(
+                    conn.handle(),
+                    100,
+                    Some(kill_on_wal_spill),
+                    (&mut wal as *mut PathBuf).cast(),
+                );
+            }
+            super::migrate(&mut conn).unwrap();
+            panic!("migration completed without a SIGKILL");
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("agenct-fts-kill-test-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("hub.sqlite3");
+        create_v11_with_partial_fts(&path, 4096);
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "db::tests::sigkill_during_fts_rebuild_rolls_back_and_retries",
+            ])
+            .env(CHILD_DB, &path)
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(SIGKILL));
+
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        assert_eq!(indexed_message_count(&conn), 1);
+        drop(conn);
+
+        drop(Db::open(&path).unwrap());
+        assert_complete_fts(&Connection::open(&path).unwrap(), 4096);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn migrates_v1_database_to_v2_preserving_data() {
@@ -632,7 +738,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 11);
+        assert_eq!(ver, 12);
         let roles_table: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_roles'",
@@ -789,7 +895,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 11);
+        assert_eq!(ver, 12);
         let (def_ag, allow_ag): (String, String) = conn
             .query_row(
                 "SELECT default_agent, allowed_agents FROM nodes WHERE id='n1'",
@@ -856,7 +962,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 11);
+        assert_eq!(ver, 12);
         let roles_table: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_roles'",
@@ -926,7 +1032,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 11);
+        assert_eq!(ver, 12);
         let (def_ag, allow_ag): (String, String) = conn
             .query_row(
                 "SELECT default_agent, allowed_agents FROM nodes WHERE id='homelab'",
