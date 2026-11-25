@@ -839,7 +839,7 @@ def build_prompt(
 ) -> str:
     parts = [
         "You are an Agenct execution node handling an assigned task.",
-        "Complete the request concisely using available tools and output a concise, conclusion-first Markdown result (prefer brief bullets; avoid bloated multi-section essays or large tables unless explicitly requested).",
+        "Complete the request concisely using available tools and write naturally in concise Markdown (≤10 lines unless detailed output is requested). If a decision or approval is needed, open with it; then state the conclusion and key facts concisely, and include concrete file:line, commits, or links briefly at the end when applicable. Do NOT wrap paragraphs in rigid form labels like 'Approval:'/'Conclusion:'/'Sources:', and avoid bloated essays or large tables unless explicitly requested.",
         "Stay strictly scoped to the instruction; do not inspect unrelated directories or sensitive files (such as ~/.ssh, credentials, or secrets) unless explicitly requested.",
         f"Working directory: {workdir}",
         f"Title: {job.get('title') or ''}",
