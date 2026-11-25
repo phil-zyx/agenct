@@ -1,13 +1,14 @@
 //! Lightweight cross-person collaboration: @colleague delegation & manual accept/deliver.
 use crate::{
-    attachments, automation,
+    attachments,
+    auth::AuthUser,
+    automation,
     config::{now_unix, truncate_bytes},
     db::record_audit,
     denied, invalid, nodes, Hub, Result,
 };
 use axum::{
     extract::{Path, State},
-    http::HeaderMap,
     Json,
 };
 use rusqlite::{params, OptionalExtension};
@@ -30,7 +31,7 @@ pub async fn delegate_to_peer(
         return Err(invalid("peer and instruction required"));
     }
 
-    let (peer_id, peer_name, task_id, mode) = hub
+    let (peer_id, peer_name, task_id, mode, queued_node_id) = hub
         .db
         .write(move |conn| {
             let peer: Option<(String, String)> = conn
@@ -56,8 +57,10 @@ pub async fn delegate_to_peer(
             let now = now_unix();
             let title = format!("来自 {req_name} 的协作：{}", truncate_bytes(&instr, 48));
 
-            let (task_id, mode) = if perms.auto_accept {
-                if let Some(node) = nodes::pick_node_sync(conn, &peer_id, None, false)? {
+            let (task_id, mode, queued_node_id) = if perms.auto_accept {
+                if let Some(node) =
+                    nodes::pick_node_for_task_sync(conn, &peer_id, None, false, Some(&instr))?
+                {
                     let (tid, _) = nodes::create_task_and_enqueue_sync(
                         conn,
                         &req_id,
@@ -67,7 +70,7 @@ pub async fn delegate_to_peer(
                         &instr,
                         "delegation",
                     )?;
-                    (tid, "auto_queued")
+                    (tid, "auto_queued", Some(node.id))
                 } else {
                     let tid = format!("tsk_{}", &Uuid::new_v4().simple().to_string()[..12]);
                     conn.execute(
@@ -75,7 +78,7 @@ pub async fn delegate_to_peer(
                          VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?6)",
                         params![tid, req_id, peer_id, title, instr, now],
                     )?;
-                    (tid, "pending_no_node")
+                    (tid, "pending_no_node", None)
                 }
             } else {
                 let tid = format!("tsk_{}", &Uuid::new_v4().simple().to_string()[..12]);
@@ -84,7 +87,7 @@ pub async fn delegate_to_peer(
                      VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?6)",
                     params![tid, req_id, peer_id, title, instr, now],
                 )?;
-                (tid, "pending_manual")
+                (tid, "pending_manual", None)
             };
 
             let peer_notice = format!("**[来自 {req_name} 的协作请求]**\n\n{instr}");
@@ -101,10 +104,13 @@ pub async fn delegate_to_peer(
                 &format!("Delegated to {peer_name}"),
                 &truncate_bytes(&instr, 200),
             )?;
-            Ok((peer_id, peer_name, task_id, mode))
+            Ok((peer_id, peer_name, task_id, mode, queued_node_id))
         })
         .await?;
 
+    if let Some(nid) = queued_node_id {
+        hub.node_waiters.notify(&peer_id, &nid);
+    }
     attachments::grant_in_text(hub, requester_id, &peer_id, instruction).await?;
 
     hub.events.emit(
@@ -147,37 +153,42 @@ pub struct TaskActionInput {
 /// Unified lightweight task action endpoint (assign to node / manually deliver / cancel).
 pub async fn task_action(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Path(task_id): Path<String>,
     Json(input): Json<TaskActionInput>,
 ) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
     let uid = user.id.clone();
     let tid = task_id.clone();
 
     match input.action.as_str() {
-        "cancel" => nodes::cancel_task(State(hub), headers, Path(task_id)).await,
+        "cancel" => nodes::cancel_task(&hub, &user, &task_id).await,
         "assign_node" => {
             let wanted_node = input.node_id.clone();
             let node_id = hub
                 .db
                 .write(move |conn| {
                     let tx = conn.transaction()?;
-                    let task: Option<(String, i64)> = tx
+                    let task: Option<(String, i64, String)> = tx
                         .query_row(
-                            "SELECT status, revision FROM tasks WHERE id = ?1 AND owner_id = ?2",
+                            "SELECT status, revision, instruction FROM tasks WHERE id = ?1 AND owner_id = ?2",
                             params![tid, uid],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .optional()?;
-                    let Some((status, rev)) = task else {
+                    let Some((status, rev, instruction)) = task else {
                         return Err(denied());
                     };
                     if !matches!(status.as_str(), "pending" | "failed") {
                         return Err(invalid("task cannot be assigned in current status"));
                     }
-                    let node = nodes::pick_node_sync(&tx, &uid, wanted_node.as_deref(), false)?
-                        .ok_or_else(|| invalid("no registered node available"))?;
+                    let node = nodes::pick_node_for_task_sync(
+                        &tx,
+                        &uid,
+                        wanted_node.as_deref(),
+                        false,
+                        Some(&instruction),
+                    )?
+                    .ok_or_else(|| invalid("no registered node available"))?;
                     let now = now_unix();
                     let next_rev = rev + 1;
                     tx.execute(
@@ -185,19 +196,20 @@ pub async fn task_action(
                         params![tid, next_rev, now],
                     )?;
                     tx.execute(
-                        "INSERT INTO node_jobs(task_id, user_id, node_id, task_revision, authorization, status, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, 'manual', 'queued', ?5)
+                        "INSERT INTO node_jobs(task_id, user_id, node_id, agent, task_revision, authorization, status, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 'manual', 'queued', ?6)
                          ON CONFLICT(task_id) DO UPDATE SET
-                           node_id=excluded.node_id, task_revision=excluded.task_revision,
+                           node_id=excluded.node_id, agent=excluded.agent, task_revision=excluded.task_revision,
                            authorization='manual', status='queued',
                            lease_hash=NULL, lease_until=NULL, submission_hash=NULL,
                            stage='Queued', updated_at=excluded.updated_at",
-                        params![tid, uid, node.id, next_rev, now],
+                        params![tid, uid, node.id, node.default_agent, next_rev, now],
                     )?;
                     tx.commit()?;
                     Ok(node.id)
                 })
                 .await?;
+            hub.node_waiters.notify(&user.id, &node_id);
             hub.events.emit(
                 user.id,
                 "task",
@@ -220,21 +232,29 @@ pub async fn task_action(
                 .db
                 .write(move |conn| {
                     let tx = conn.transaction()?;
-                    let row: Option<(String, String)> = tx
+                    let row: Option<(String, String, String)> = tx
                         .query_row(
-                            "SELECT requester_id, title FROM tasks WHERE id = ?1 AND owner_id = ?2",
+                            "SELECT requester_id, title, status FROM tasks WHERE id = ?1 AND owner_id = ?2",
                             params![tid, uid],
-                            |r| Ok((r.get(0)?, r.get(1)?)),
+                            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                         )
                         .optional()?;
-                    let Some((req_id, title)) = row else {
+                    let Some((req_id, title, status)) = row else {
                         return Err(denied());
                     };
+                    if status == "canceled" {
+                        return Err(invalid("canceled task cannot be delivered"));
+                    }
                     let now = now_unix();
                     tx.execute(
                         "UPDATE tasks SET status='done', result=?2, revision=revision+1, updated_at=?3
                          WHERE id=?1",
                         params![tid, clean_db, now],
+                    )?;
+                    tx.execute(
+                        "UPDATE node_jobs SET status='failed', lease_hash=NULL, lease_until=NULL, updated_at=?2
+                         WHERE task_id=?1 AND status IN ('queued','running')",
+                        params![tid, now],
                     )?;
                     if req_id != uid {
                         let msg = format!("**[协作交付 · {title}]**\n\n{clean_db}");

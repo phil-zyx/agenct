@@ -47,6 +47,8 @@ pub struct Config {
     pub allow_generic_im_webhook: bool,
     pub allow_private_outbound: bool,
     pub admin_usernames: HashSet<String>,
+    /// Optional master key for AEAD encryption at rest (`AGENCT_MASTER_KEY`).
+    pub master_key: Option<String>,
 }
 
 impl Config {
@@ -198,6 +200,11 @@ impl Config {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let master_key = read_secret_env("AGENCT_MASTER_KEY_FILE", "AGENCT_MASTER_KEY")?;
+        if let Some(ref key) = master_key {
+            crate::secrets::SecretCipher::from_raw(Some(key))?;
+        }
+
         Ok(Self {
             bind,
             data_dir,
@@ -219,6 +226,7 @@ impl Config {
             allow_generic_im_webhook: env_flag("AGENCT_ALLOW_GENERIC_IM_WEBHOOK"),
             allow_private_outbound: env_flag("AGENCT_ALLOW_PRIVATE_OUTBOUND"),
             admin_usernames,
+            master_key,
         })
     }
 
@@ -246,6 +254,25 @@ impl Config {
     pub fn is_memory_db(&self) -> bool {
         self.database_path.to_str() == Some(":memory:")
     }
+}
+
+pub fn read_secret_env(
+    file_var: &str,
+    env_var: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    if let Ok(path) = std::env::var(file_var) {
+        let path = path.trim();
+        if !path.is_empty() {
+            let val = std::fs::read_to_string(path)?.trim().to_owned();
+            if !val.is_empty() {
+                return Ok(Some(val));
+            }
+        }
+    }
+    Ok(std::env::var(env_var)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty()))
 }
 
 fn optional_env_any(names: &[&str]) -> Option<String> {

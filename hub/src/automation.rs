@@ -1,12 +1,12 @@
 //! Automation permissions (all default false), dispatch rules, cron jobs, and background scheduler.
 use crate::{
+    auth::AuthUser,
     config::{now_unix, truncate_bytes},
     db::record_audit,
     denied, invalid, nodes, Hub, Result,
 };
 use axum::{
     extract::{Path, State},
-    http::HeaderMap,
     Json,
 };
 use rusqlite::{params, Connection, OptionalExtension};
@@ -159,8 +159,10 @@ pub fn match_rule_sync(
         .find(|r| !r.keyword.is_empty() && lower.contains(&r.keyword.to_ascii_lowercase())))
 }
 
-pub async fn get_automation(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
+pub async fn get_automation(
+    State(hub): State<Hub>,
+    AuthUser(user): AuthUser,
+) -> Result<Json<Value>> {
     let uid = user.id;
     let payload = hub
         .db
@@ -180,10 +182,9 @@ pub async fn get_automation(State(hub): State<Hub>, headers: HeaderMap) -> Resul
 
 pub async fn update_permissions(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Json(input): Json<Permissions>,
 ) -> Result<Json<Permissions>> {
-    let user = hub.require_user(&headers).await?;
     let uid = user.id.clone();
     let next = input.clone();
     hub.db
@@ -244,10 +245,9 @@ fn default_target() -> String {
 
 pub async fn create_rule(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Json(input): Json<CreateRuleInput>,
 ) -> Result<Json<DispatchRule>> {
-    let user = hub.require_user(&headers).await?;
     let kw = input.keyword.trim();
     if kw.is_empty() || kw.len() > 64 {
         return Err(invalid("keyword must be 1..64 bytes"));
@@ -283,10 +283,9 @@ pub async fn create_rule(
 
 pub async fn delete_rule(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
     let uid = user.id;
     let rid = id.clone();
     hub.db
@@ -332,10 +331,9 @@ pub fn parse_hhmm(raw: &str) -> Option<String> {
 
 pub async fn create_cron(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Json(input): Json<CreateCronInput>,
 ) -> Result<Json<CronJob>> {
-    let user = hub.require_user(&headers).await?;
     let instr = input.instruction.trim();
     if instr.is_empty() || instr.len() > 1000 {
         return Err(invalid("cron instruction must be 1..1000 bytes"));
@@ -391,10 +389,9 @@ pub async fn create_cron(
 
 pub async fn delete_cron(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Path(id): Path<String>,
 ) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
     let uid = user.id;
     let cid = id.clone();
     hub.db
@@ -652,7 +649,9 @@ async fn execute_cron_job(
             let prefer_cloud = target == "cloud-node";
             let explicit =
                 (!matches!(target.as_str(), "auto" | "cloud-node")).then_some(target.as_str());
-            let Some(node) = nodes::pick_node_sync(conn, &uid, explicit, prefer_cloud)? else {
+            let Some(node) =
+                nodes::pick_node_for_task_sync(conn, &uid, explicit, prefer_cloud, Some(&instr))?
+            else {
                 return Ok(None);
             };
             nodes::create_task_and_enqueue_sync(
@@ -664,12 +663,13 @@ async fn execute_cron_job(
                 &instr,
                 "cron",
             )?;
-            Ok(Some(node.name))
+            Ok(Some((node.id, node.name)))
         })
         .await
         .map_err(|e| e.1.to_owned())?;
     match picked {
-        Some(node_name) => {
+        Some((node_id, node_name)) => {
+            hub.node_waiters.notify(user_id, &node_id);
             hub.events
                 .emit(user_id.to_owned(), "task", json!({"cron_id": job.id}));
             Ok(format!("已派发到节点 {node_name}"))

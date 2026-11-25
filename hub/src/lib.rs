@@ -11,6 +11,7 @@ pub mod integrations;
 pub mod llm;
 pub mod models;
 pub mod nodes;
+pub mod secrets;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -55,18 +56,21 @@ pub struct Hub {
     pub config: Arc<config::Config>,
     pub db: db::Db,
     pub llm: llm::LlmClient,
+    pub secrets: secrets::SecretCipher,
     pub events: events::EventBus,
     pub http: reqwest::Client,
     pub oauth_pending: auth::OAuthPendingStore,
     pub attachments_dir: PathBuf,
     pub scheduler_notify: Arc<tokio::sync::Notify>,
     pub scheduler: Arc<automation::SchedulerState>,
+    pub node_waiters: nodes::NodeWaiters,
     gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     compacting: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Hub {
     pub fn open(cfg: config::Config) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let secrets = secrets::SecretCipher::from_raw(cfg.master_key.as_deref())?;
         let db = db::Db::open(&cfg.database_path)?;
         let attachments_dir = if cfg.is_memory_db() {
             std::env::temp_dir().join(format!("agenct-att-{}", uuid::Uuid::new_v4().simple()))
@@ -96,12 +100,14 @@ impl Hub {
             config: Arc::new(cfg),
             db,
             llm,
+            secrets,
             events: events::EventBus::default(),
             http,
             oauth_pending: auth::OAuthPendingStore::default(),
             attachments_dir,
             scheduler_notify: Arc::new(tokio::sync::Notify::new()),
             scheduler: Arc::new(automation::SchedulerState::default()),
+            node_waiters: nodes::NodeWaiters::default(),
             gates: Arc::new(Mutex::new(HashMap::new())),
             compacting: Arc::new(Mutex::new(HashSet::new())),
         })
@@ -145,9 +151,13 @@ pub fn app(hub: Hub) -> Router {
         .route("/auth/logout", post(auth::logout))
         // Core Brain & Realtime Stream
         .route("/api/bootstrap", get(brain::bootstrap))
+        .route("/api/messages", get(brain::list_messages))
+        .route("/api/search", get(brain::search))
         .route("/api/events", get(events::stream))
         .route("/api/chat", post(brain::chat))
         .route("/api/brain", put(brain::save_profile))
+        .route("/api/roles", get(brain::list_roles))
+        .route("/api/roles/{name}", delete(brain::delete_role))
         .route("/api/ledgers", post(brain::upsert_ledger))
         .route("/api/ledgers/{id}", delete(brain::delete_ledger))
         .route(
@@ -167,7 +177,7 @@ pub fn app(hub: Hub) -> Router {
         // Unified Execution Nodes (PC & Cloud Runners)
         .route("/api/nodes", get(nodes::list).post(nodes::create))
         .route("/api/nodes/{id}/token", post(nodes::rotate_token))
-        .route("/api/nodes/{id}", delete(nodes::remove))
+        .route("/api/nodes/{id}", put(nodes::update).delete(nodes::remove))
         .route("/node/agenct-node.py", get(nodes::agent_script))
         .route("/node/install.sh", get(nodes::install_sh))
         .route("/node/install.ps1", get(nodes::install_ps1))

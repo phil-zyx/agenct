@@ -13,6 +13,7 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

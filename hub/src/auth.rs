@@ -2,8 +2,8 @@
 //! local token login, both issuing SQLite-backed browser sessions.
 use crate::{config::now_unix, db::record_audit, denied, invalid, Error, Hub, Result};
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
+    extract::{FromRequestParts, Path, Query, State},
+    http::{header, request::Parts, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
     Json,
@@ -152,17 +152,6 @@ impl Hub {
             .await
     }
 
-    pub async fn require_user(&self, headers: &HeaderMap) -> Result<User> {
-        let (user, _csrf) = self
-            .session_from_headers(headers)
-            .await?
-            .ok_or(Error(StatusCode::UNAUTHORIZED, "authentication required"))?;
-        if user.status != "active" {
-            return Err(Error(StatusCode::UNAUTHORIZED, "account disabled"));
-        }
-        Ok(user)
-    }
-
     /// Creates a browser session for an existing or new user; returns `(session_cookie, csrf_token)`.
     pub async fn issue_session(&self, user_id: String, ttl_secs: i64) -> Result<(String, String)> {
         let token = random_token();
@@ -185,57 +174,96 @@ impl Hub {
     }
 }
 
+/// Authenticated active user. Reuses the `User` already loaded and CSRF-verified by
+/// `auth::guard` on mutations, falling back to a session lookup on safe requests.
+#[derive(Clone, Debug)]
+pub struct AuthUser(pub User);
+
+impl FromRequestParts<Hub> for AuthUser {
+    type Rejection = Error;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Hub,
+    ) -> std::result::Result<Self, Self::Rejection> {
+        let user = if let Some(user) = parts.extensions.get::<User>().cloned() {
+            user
+        } else {
+            state
+                .session_from_headers(&parts.headers)
+                .await?
+                .map(|(u, _)| u)
+                .ok_or(Error(StatusCode::UNAUTHORIZED, "authentication required"))?
+        };
+        if user.status != "active" {
+            return Err(Error(StatusCode::UNAUTHORIZED, "account disabled"));
+        }
+        Ok(Self(user))
+    }
+}
+
 /// Security middleware: Host pinning, Origin + CSRF verification on mutations, CSP & security headers.
 pub async fn guard(
     State(hub): State<Hub>,
-    request: axum::extract::Request,
+    mut request: axum::extract::Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path().to_owned();
     let method = request.method().clone();
-    let headers = request.headers();
+    let mut verified_user: Option<User> = None;
 
-    // Enforce Host header pinning when Host is provided (standard HTTP/1.1).
-    let host_values: Vec<&str> = headers
-        .get_all(header::HOST)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .collect();
-    if host_values.len() == 1 && host_values[0] != hub.config.authority() {
-        return Error(StatusCode::UNAUTHORIZED, "unexpected host header").into_response();
-    }
-    if host_values.len() > 1 {
-        return Error(StatusCode::BAD_REQUEST, "multiple host headers").into_response();
-    }
+    {
+        let headers = request.headers();
 
-    let is_mutation = !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
-    let is_external_machine = path.starts_with("/node/v1/") || path.starts_with("/webhooks/");
-
-    if is_mutation && !is_external_machine {
-        let origin_ok = headers
-            .get(header::ORIGIN)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|o| o == hub.config.public_origin);
-        if !origin_ok {
-            return Error(StatusCode::FORBIDDEN, "origin verification failed").into_response();
+        // Enforce Host header pinning when Host is provided (standard HTTP/1.1).
+        let host_values: Vec<&str> = headers
+            .get_all(header::HOST)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect();
+        if host_values.len() == 1 && host_values[0] != hub.config.authority() {
+            return Error(StatusCode::UNAUTHORIZED, "unexpected host header").into_response();
         }
-    }
-    // The local login endpoint has no session yet: Origin pinning above prevents login CSRF.
-    if is_mutation && !is_external_machine && path != "/auth/local" {
-        let provided_csrf = headers
-            .get("x-csrf-token")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        match hub.session_from_headers(headers).await {
-            Ok(Some((_user, expected_csrf)))
-                if crate::config::constant_time_eq(
-                    provided_csrf.as_bytes(),
-                    expected_csrf.as_bytes(),
-                ) => {}
-            _ => {
-                return Error(StatusCode::FORBIDDEN, "CSRF verification failed").into_response();
+        if host_values.len() > 1 {
+            return Error(StatusCode::BAD_REQUEST, "multiple host headers").into_response();
+        }
+
+        let is_mutation = !matches!(method, Method::GET | Method::HEAD | Method::OPTIONS);
+        let is_external_machine = path.starts_with("/node/v1/") || path.starts_with("/webhooks/");
+
+        if is_mutation && !is_external_machine {
+            let origin_ok = headers
+                .get(header::ORIGIN)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|o| o == hub.config.public_origin);
+            if !origin_ok {
+                return Error(StatusCode::FORBIDDEN, "origin verification failed").into_response();
             }
         }
+        // The local login endpoint has no session yet: Origin pinning above prevents login CSRF.
+        if is_mutation && !is_external_machine && path != "/auth/local" {
+            let provided_csrf = headers
+                .get("x-csrf-token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            match hub.session_from_headers(headers).await {
+                Ok(Some((user, expected_csrf)))
+                    if crate::config::constant_time_eq(
+                        provided_csrf.as_bytes(),
+                        expected_csrf.as_bytes(),
+                    ) =>
+                {
+                    verified_user = Some(user);
+                }
+                _ => {
+                    return Error(StatusCode::FORBIDDEN, "CSRF verification failed")
+                        .into_response();
+                }
+            }
+        }
+    }
+    if let Some(user) = verified_user {
+        request.extensions_mut().insert(user);
     }
 
     let mut response = next.run(request).await;
@@ -558,8 +586,10 @@ pub struct UpdateMemberStatus {
     status: String,
 }
 
-pub async fn list_members(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Vec<User>>> {
-    let caller = hub.require_user(&headers).await?;
+pub async fn list_members(
+    State(hub): State<Hub>,
+    AuthUser(caller): AuthUser,
+) -> Result<Json<Vec<User>>> {
     let include_disabled = caller.is_admin;
     let users = hub
         .db
@@ -587,11 +617,10 @@ pub async fn list_members(State(hub): State<Hub>, headers: HeaderMap) -> Result<
 
 pub async fn set_member_status(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(caller): AuthUser,
     Path(target_id): Path<String>,
     Json(input): Json<UpdateMemberStatus>,
 ) -> Result<Json<serde_json::Value>> {
-    let caller = hub.require_user(&headers).await?;
     if !caller.is_admin {
         return Err(denied());
     }

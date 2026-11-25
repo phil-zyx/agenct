@@ -1,10 +1,12 @@
 //! SSRF-hardened GitLab integration: Webhook ingress, Todo polling, commit digest, and gated replies.
 use crate::{
-    auth::sha256_hex,
+    auth::{sha256_hex, AuthUser},
     automation,
     config::{constant_time_eq, normalize_origin, now_unix, truncate_bytes},
     db::record_audit,
-    denied, invalid, nodes, Hub, Result,
+    denied, invalid, nodes,
+    secrets::SCOPE_GITLAB,
+    Hub, Result,
 };
 use axum::{extract::State, http::HeaderMap, Json};
 use rusqlite::{params, OptionalExtension};
@@ -68,6 +70,7 @@ fn percent_encode(s: &str) -> String {
 pub async fn load_config(hub: &Hub, user_id: &str) -> Result<GitLabConfig> {
     let uid = user_id.to_owned();
     let default_base = hub.config.default_gitlab_base();
+    let secrets = hub.secrets.clone();
     hub.db
         .read(move |conn| {
             let raw: Option<String> = conn
@@ -77,9 +80,7 @@ pub async fn load_config(hub: &Hub, user_id: &str) -> Result<GitLabConfig> {
                     |r| r.get(0),
                 )
                 .optional()?;
-            let mut cfg: GitLabConfig = raw
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
+            let mut cfg: GitLabConfig = secrets.decrypt_json(SCOPE_GITLAB, &uid, raw)?;
             if cfg.base_url.is_empty() {
                 cfg.base_url = default_base;
             }
@@ -88,8 +89,7 @@ pub async fn load_config(hub: &Hub, user_id: &str) -> Result<GitLabConfig> {
         .await
 }
 
-pub async fn get_config(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
+pub async fn get_config(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Value>> {
     let cfg = load_config(&hub, &user.id).await?;
     Ok(Json(json!({
         "base_url": cfg.base_url,
@@ -103,10 +103,9 @@ pub async fn get_config(State(hub): State<Hub>, headers: HeaderMap) -> Result<Js
 
 pub async fn save_config(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Json(input): Json<SaveGitLabInput>,
 ) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
     let base_raw = if input.base_url.trim().is_empty() {
         hub.config.default_gitlab_base()
     } else {
@@ -139,7 +138,7 @@ pub async fn save_config(
     cfg.auto_poll_todos = input.auto_poll_todos;
 
     let uid = user.id.clone();
-    let encoded = serde_json::to_string(&cfg).map_err(|_| invalid("config encode error"))?;
+    let encoded = hub.secrets.encrypt_json(SCOPE_GITLAB, &user.id, &cfg)?;
     hub.db
         .write(move |conn| {
             conn.execute(
@@ -428,7 +427,8 @@ async fn dispatch_gitlab_mention(
     let ntype = noteable_type.to_owned();
     let origin = origin_hint.map(str::to_owned);
 
-    let result_status = hub
+    let route_hint = format!("{proj} {body_owned}");
+    let (result_status, queued_node_id) = hub
         .db
         .write(move |conn| {
             let perms = automation::read_permissions_sync(conn, &uid)?;
@@ -451,10 +451,12 @@ async fn dispatch_gitlab_mention(
                     &format!("{proj} by @{auth_name}"),
                     "gitlab_execute permission is disabled",
                 )?;
-                return Ok("notified_only");
+                return Ok(("notified_only", None));
             }
-            let Some(node) = nodes::pick_node_sync(conn, &uid, None, false)? else {
-                return Ok("no_node");
+            let Some(node) =
+                nodes::pick_node_for_task_sync(conn, &uid, None, false, Some(&route_hint))?
+            else {
+                return Ok(("no_node", None));
             };
             let (task_id, _) = nodes::create_task_and_enqueue_sync(
                 conn,
@@ -472,10 +474,13 @@ async fn dispatch_gitlab_mention(
                     params![task_id, uid, base, proj, ntype, num],
                 )?;
             }
-            Ok("queued")
+            Ok(("queued", Some(node.id)))
         })
         .await?;
 
+    if let Some(nid) = queued_node_id {
+        hub.node_waiters.notify(user_id, &nid);
+    }
     hub.events
         .emit(user_id.to_owned(), "message", json!({"source": "gitlab"}));
     if result_status == "queued" {
@@ -561,9 +566,10 @@ pub async fn maybe_reply_task(hub: &Hub, task_id: &str, node_name: &str, content
 }
 
 pub async fn poll_all_todos(hub: &Hub) {
+    let secrets = hub.secrets.clone();
     let users: Vec<(String, GitLabConfig)> = hub
         .db
-        .read(|conn| {
+        .read(move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT i.user_id, i.config_json
                  FROM integrations i JOIN users u ON u.id = i.user_id
@@ -573,9 +579,14 @@ pub async fn poll_all_todos(hub: &Hub) {
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             let mut out = Vec::new();
             for row in rows.flatten() {
-                if let Ok(cfg) = serde_json::from_str::<GitLabConfig>(&row.1) {
-                    if cfg.auto_poll_todos && !cfg.token.is_empty() {
-                        out.push((row.0, cfg));
+                match secrets.decrypt_json::<GitLabConfig>(SCOPE_GITLAB, &row.0, Some(row.1)) {
+                    Ok(cfg) => {
+                        if cfg.auto_poll_todos && !cfg.token.is_empty() {
+                            out.push((row.0, cfg));
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("gitlab: skipping todo poll for user {} ({})", row.0, e.1);
                     }
                 }
             }
@@ -641,7 +652,7 @@ pub async fn poll_all_todos(hub: &Hub) {
             .await;
         }
         if changed {
-            if let Ok(encoded) = serde_json::to_string(&cfg) {
+            if let Ok(encoded) = hub.secrets.encrypt_json(SCOPE_GITLAB, &uid, &cfg) {
                 let u_clone = uid.clone();
                 let _ = hub
                     .db

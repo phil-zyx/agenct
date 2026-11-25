@@ -1,8 +1,8 @@
 //! Binary-on-disk attachment store with explicit SQLite ACL grants (zero unbounded RAM cache).
-use crate::{config::now_unix, denied, invalid, Error, Hub, Result};
+use crate::{auth::AuthUser, config::now_unix, denied, invalid, Error, Hub, Result};
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -147,7 +147,8 @@ pub async fn store_bytes(
     let mime_db = canonical_mime.clone();
     let grants: Vec<String> = extra_grantees.to_vec();
 
-    hub.db
+    let db_res = hub
+        .db
         .write(move |conn| {
             let tx = conn.transaction()?;
             tx.execute(
@@ -168,7 +169,12 @@ pub async fn store_bytes(
             tx.commit()?;
             Ok(())
         })
-        .await?;
+        .await;
+    if let Err(err) = db_res {
+        let orphan = hub.attachments_dir.join(format!("{id}.bin"));
+        let _ = tokio::task::spawn_blocking(move || std::fs::remove_file(orphan)).await;
+        return Err(err);
+    }
 
     Ok(AttachmentMeta {
         id,
@@ -283,10 +289,9 @@ pub async fn collect_for_user(hub: &Hub, user_id: &str, text: &str) -> Result<Ve
 
 pub async fn upload(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Json(input): Json<UploadInput>,
 ) -> Result<Json<AttachmentMeta>> {
-    let user = hub.require_user(&headers).await?;
     let meta = store_bytes(
         &hub,
         &user.id,
@@ -301,10 +306,9 @@ pub async fn upload(
 
 pub async fn download(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Path(id): Path<String>,
 ) -> Result<Response> {
-    let user = hub.require_user(&headers).await?;
     if !valid_attachment_id(&id) {
         return Err(denied());
     }

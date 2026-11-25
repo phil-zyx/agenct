@@ -1,8 +1,10 @@
 //! SSRF-hardened IM integration (Feishu / WeCom / DingTalk) with per-user inbound webhook token.
 use crate::{
-    auth::{random_token, sha256_hex},
-    config::{now_unix, truncate_bytes, validate_im_webhook_url},
-    denied, invalid, Error, Hub, Result,
+    auth::{random_token, sha256_hex, AuthUser},
+    config::{constant_time_eq, now_unix, truncate_bytes, validate_im_webhook_url},
+    denied, invalid,
+    secrets::SCOPE_IM,
+    Error, Hub, Result,
 };
 use axum::{
     extract::State,
@@ -65,6 +67,7 @@ pub struct SaveImInput {
 
 async fn load_im_config(hub: &Hub, user_id: &str) -> Result<ImConfig> {
     let uid = user_id.to_owned();
+    let secrets = hub.secrets.clone();
     hub.db
         .read(move |conn| {
             let raw: Option<String> = conn
@@ -74,15 +77,12 @@ async fn load_im_config(hub: &Hub, user_id: &str) -> Result<ImConfig> {
                     |r| r.get(0),
                 )
                 .optional()?;
-            Ok(raw
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default())
+            secrets.decrypt_json(SCOPE_IM, &uid, raw)
         })
         .await
 }
 
-pub async fn get_config(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
+pub async fn get_config(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Value>> {
     let cfg = load_im_config(&hub, &user.id).await?;
     Ok(Json(json!({
         "provider": cfg.provider,
@@ -95,10 +95,9 @@ pub async fn get_config(State(hub): State<Hub>, headers: HeaderMap) -> Result<Js
 
 pub async fn save_config(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Json(input): Json<SaveImInput>,
 ) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
     let provider = input.provider.trim().to_ascii_lowercase();
     if !matches!(
         provider.as_str(),
@@ -139,8 +138,8 @@ pub async fn save_config(
     cfg.notify_delegation = input.notify_delegation;
     cfg.notify_delivery = input.notify_delivery;
 
-    let uid = user.id;
-    let encoded = serde_json::to_string(&cfg).map_err(|_| invalid("im config encode error"))?;
+    let uid = user.id.clone();
+    let encoded = hub.secrets.encrypt_json(SCOPE_IM, &user.id, &cfg)?;
     hub.db
         .write(move |conn| {
             conn.execute(
@@ -216,8 +215,7 @@ pub async fn maybe_notify(hub: &Hub, user_id: &str, event_kind: &str, title: &st
     let _ = hub.http.post(&cfg.webhook_url).json(&payload).send().await;
 }
 
-pub async fn test_webhook(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
+pub async fn test_webhook(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Value>> {
     let cfg = load_im_config(&hub, &user.id).await?;
     if cfg.webhook_url.is_empty() {
         return Err(invalid("configure IM webhook_url first"));
@@ -290,6 +288,7 @@ pub async fn inbound_webhook(
         .ok_or_else(denied)?;
     let hash = sha256_hex(token);
 
+    let secrets = hub.secrets.clone();
     let owner_id: Option<String> = hub
         .db
         .read(move |conn| {
@@ -301,8 +300,10 @@ pub async fn inbound_webhook(
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows.flatten() {
-                if let Ok(cfg) = serde_json::from_str::<ImConfig>(&row.1) {
-                    if !cfg.inbound_token_hash.is_empty() && cfg.inbound_token_hash == hash {
+                if let Ok(cfg) = secrets.decrypt_json::<ImConfig>(SCOPE_IM, &row.0, Some(row.1)) {
+                    if !cfg.inbound_token_hash.is_empty()
+                        && constant_time_eq(cfg.inbound_token_hash.as_bytes(), hash.as_bytes())
+                    {
                         return Ok(Some(row.0));
                     }
                 }

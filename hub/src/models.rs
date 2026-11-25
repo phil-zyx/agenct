@@ -2,12 +2,14 @@
 //! image-capable) and a separate image-captioning ("vision") model. Anything not configured
 //! falls back to the server defaults from the environment.
 use crate::{
+    auth::AuthUser,
     config::{now_unix, validate_llm_url, LlmConfig},
     invalid,
     llm::LlmClient,
+    secrets::SCOPE_USER_MODELS,
     Hub, Result,
 };
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::State, Json};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -51,6 +53,7 @@ fn client_for(hub: &Hub, ep: &ModelEndpoint) -> LlmClient {
 
 pub async fn load(hub: &Hub, user_id: &str) -> Result<UserModels> {
     let uid = user_id.to_owned();
+    let secrets = hub.secrets.clone();
     hub.db
         .read(move |conn| {
             let raw: Option<String> = conn
@@ -60,9 +63,7 @@ pub async fn load(hub: &Hub, user_id: &str) -> Result<UserModels> {
                     |r| r.get(0),
                 )
                 .optional()?;
-            Ok(raw
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default())
+            secrets.decrypt_json(SCOPE_USER_MODELS, &uid, raw)
         })
         .await
 }
@@ -125,8 +126,7 @@ fn settings_view(hub: &Hub, cfg: &UserModels) -> Value {
     })
 }
 
-pub async fn get_settings(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
+pub async fn get_settings(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Value>> {
     let cfg = load(&hub, &user.id).await?;
     Ok(Json(settings_view(&hub, &cfg)))
 }
@@ -190,10 +190,9 @@ async fn validated_endpoint(
 
 pub async fn save_settings(
     State(hub): State<Hub>,
-    headers: HeaderMap,
+    AuthUser(user): AuthUser,
     Json(input): Json<SaveSettingsInput>,
 ) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
     let mut cfg = load(&hub, &user.id).await?;
     if input.clear_brain {
         cfg.brain = None;
@@ -207,7 +206,9 @@ pub async fn save_settings(
     }
 
     let uid = user.id.clone();
-    let encoded = serde_json::to_string(&cfg).map_err(|_| invalid("model config encode error"))?;
+    let encoded = hub
+        .secrets
+        .encrypt_json(SCOPE_USER_MODELS, &user.id, &cfg)?;
     let summary = format!(
         "brain={} vision={}",
         cfg.brain.as_ref().map_or("默认", |b| b.model.as_str()),
@@ -228,8 +229,10 @@ pub async fn save_settings(
 }
 
 /// Sends a tiny prompt to the effective brain (and vision model, if any) and reports results.
-pub async fn test_settings(State(hub): State<Hub>, headers: HeaderMap) -> Result<Json<Value>> {
-    let user = hub.require_user(&headers).await?;
+pub async fn test_settings(
+    State(hub): State<Hub>,
+    AuthUser(user): AuthUser,
+) -> Result<Json<Value>> {
     let models = resolve(&hub, &user.id).await?;
     let probe = |client: LlmClient| async move {
         match client
@@ -240,10 +243,11 @@ pub async fn test_settings(State(hub): State<Hub>, headers: HeaderMap) -> Result
             Err(e) => json!({"ok": false, "model": client.model_name(), "error": e.1}),
         }
     };
-    let brain = probe(models.brain.clone()).await;
-    let vision = match models.vision {
-        Some(v) => probe(v).await,
-        None => Value::Null,
-    };
+    let (brain, vision) = tokio::join!(probe(models.brain), async {
+        match models.vision {
+            Some(v) => probe(v).await,
+            None => Value::Null,
+        }
+    });
     Ok(Json(json!({"brain": brain, "vision": vision})))
 }
