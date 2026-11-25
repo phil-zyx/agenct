@@ -29,3 +29,33 @@ jobs:
           python3 -m py_compile node/agenct-node.py scripts/backup.py
       - name: Frontend ESM syntax check
         run: npm run check
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            hub/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('hub/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install Playwright Chromium
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Build Hub & run E2E suite
+        run: |
+          cargo build --manifest-path hub/Cargo.toml
+          npm run test:e2e

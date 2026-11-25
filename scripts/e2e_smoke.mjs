@@ -80,6 +80,7 @@ const hub = spawn(HUB_BIN, [], {
     AGENCT_GITLAB_URL: `http://127.0.0.1:${glPort}`,
     AGENCT_GITLAB_CLIENT_ID: 'e2e-client',
     AGENCT_GITLAB_CLIENT_SECRET: 'e2e-secret',
+    AGENCT_MASTER_KEY: 'e2e-test-master-key-0123456789abcdef012345',
     AGENCT_LLM_STUB: '1',
   },
   stdio: ['ignore', 'pipe', 'pipe'],
@@ -129,6 +130,7 @@ try {
   await page.click('#task-pane .add-node-form button[type="submit"]');
   await page.waitForSelector('#task-pane .install-box code');
   const installText = await page.textContent('#task-pane .install-box code');
+  assert.ok(installText.includes('--kind cloud --agents auto'), `expected default cloud flags: ${installText}`);
   const tokenMatch = installText.match(/agn_[0-9a-f]{64}/);
   assert.ok(tokenMatch, `expected node token in install command: ${installText}`);
   const nodeToken = tokenMatch[0];
@@ -156,6 +158,130 @@ try {
 
   // 6. Verify live SSE pushed the completed node result directly into the open browser!
   await page.waitForFunction(() => document.body.textContent.includes('Node Result:'), { timeout: 10000 });
+
+  // 6b. Verify full-text search panel finds the recent chat turn via FTS5 /api/search.
+  await page.click('#nav-search');
+  await page.waitForSelector('#search-panel:not(.hide)');
+  await page.fill('#search-input', 'cloud workspace');
+  await page.waitForFunction(
+    () => (document.getElementById('search-results')?.textContent || '').includes('check cloud workspace'),
+    { timeout: 5000 },
+  );
+  await page.click('#close-search');
+  await page.waitForSelector('#search-panel.hide', { state: 'attached' });
+
+  // 6c. Add a multi-engine PC node and update its default engine via PUT /api/nodes/{id}.
+  await page.locator('#task-pane summary:has-text("+ 添加新节点")').click();
+  await page.waitForSelector('#task-pane .add-node-form');
+  await page.fill('#task-pane .add-node-form input[name="name"]', 'Multi PC');
+  await page.selectOption('#task-pane .add-node-form select[name="kind"]', 'pc');
+  await page.check('#task-pane .add-node-form input[name="engines"][value="claude"]');
+  await page.check('#task-pane .add-node-form input[name="engines"][value="opencode"]');
+  await page.selectOption('#task-pane .add-node-form select[name="default_agent"]', 'claude');
+  await page.click('#task-pane .add-node-form button[type="submit"]');
+  await page.waitForFunction(
+    () =>
+      (document.querySelector('#task-pane .install-box code')?.textContent || '').includes(
+        '--agent claude --agents claude,opencode',
+      ) && (document.getElementById('task-pane')?.textContent || '').includes('claude · 默认'),
+    { timeout: 5000 },
+  );
+
+  const multiDetails = page
+    .locator('#task-pane details.node-repos')
+    .filter({ has: page.locator('form.edit-node-form[data-node-id="multi-pc"]') });
+  await multiDetails.locator('summary').click();
+  const multiForm = page.locator('#task-pane form.edit-node-form[data-node-id="multi-pc"]');
+  await multiForm.waitFor({ state: 'visible' });
+  await multiForm.locator('select[name="default_agent"]').selectOption('opencode');
+  const updatedNode = page.waitForResponse(
+    (r) => r.url().endsWith('/api/nodes/multi-pc') && r.request().method() === 'PUT',
+  );
+  await multiForm.locator('button[type="submit"]').click();
+  assert.equal((await updatedNode).status(), 200);
+  await page.waitForFunction(
+    () => (document.getElementById('task-pane')?.textContent || '').includes('opencode · 默认'),
+    { timeout: 5000 },
+  );
+
+  // 6d. Chat-first Squad role creation, Muse drawer roster rendering, and deletion via DELETE /api/roles/{name}.
+  await page.fill('#chat-input', '/role planner agent=claude model=opus-5.5 effort=high sandbox=readonly');
+  await page.click('#send-btn');
+  await page.waitForFunction(
+    () => {
+      const item = document.querySelector('#roles-card [data-role-name="planner"]')?.textContent || '';
+      return item.includes('planner') && item.includes('opus-5.5') && item.includes('只读');
+    },
+    null,
+    { timeout: 5000 },
+  );
+  const delRole = page.waitForResponse(
+    (r) => r.url().endsWith('/api/roles/planner') && r.request().method() === 'DELETE',
+  );
+  await page.click('#roles-card [data-del-role="planner"]');
+  assert.equal((await delRole).status(), 200);
+  await page.waitForFunction(
+    () =>
+      !document.querySelector('#roles-card [data-role-name="planner"]') &&
+      (document.getElementById('roles-card')?.textContent || '').includes('我的军团 (0)'),
+    null,
+    { timeout: 5000 },
+  );
+
+  // 6e. Regression: optimistic user bubble must NOT duplicate once /api/bootstrap hits its 60-message cap.
+  const padHandler = async (route) => {
+    const resp = await route.fetch();
+    const data = await resp.json();
+    const realMsgs = data.messages || [];
+    const padCount = Math.max(0, 60 - realMsgs.length);
+    const oldestRealId = realMsgs[0]?.id || 100;
+    const filler = Array.from({ length: padCount }, (_, i) => ({
+      id: oldestRealId - padCount + i,
+      peer_id: null,
+      thread_id: null,
+      role: i % 2 === 0 ? 'user' : 'assistant',
+      content: `history-${i}`,
+      request_id: null,
+      status: 'complete',
+      created_at: 1700000000 + i,
+    }));
+    data.messages = [...filler, ...realMsgs].slice(-60);
+    data.has_more_messages = true;
+    await route.fulfill({ response: resp, json: data });
+  };
+  const delayChatHandler = async (route) => {
+    const resp = await route.fetch();
+    await new Promise((r) => setTimeout(r, 450));
+    await route.fulfill({ response: resp });
+  };
+  await page.route('**/api/bootstrap', padHandler);
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('#room:not(.hide)');
+  await page.waitForFunction(() => document.getElementById('sse-pill')?.textContent?.includes('实时同步'));
+  await page.waitForFunction(() => document.querySelectorAll('#messages .msg').length === 60, null, { timeout: 5000 });
+  await page.route('**/api/chat', delayChatHandler);
+
+  const bootDuringTurn = page.waitForResponse((r) => r.url().endsWith('/api/bootstrap'));
+  const chatDone = page.waitForResponse((r) => r.url().endsWith('/api/chat'));
+  await page.fill('#chat-input', 'dedup-window-60');
+  await page.click('#send-btn');
+  await bootDuringTurn;
+  await page.waitForTimeout(120);
+  assert.equal(
+    await page.locator('.msg-user:has-text("dedup-window-60")').count(),
+    1,
+    'in-flight SSE refresh with 60-message cap must not duplicate the optimistic user bubble',
+  );
+  await chatDone;
+  await page.waitForFunction(
+    () => (document.getElementById('messages')?.textContent || '').includes('收到你的消息：dedup-window-60'),
+    null,
+    { timeout: 5000 },
+  );
+  assert.equal(await page.locator('.msg-user:has-text("dedup-window-60")').count(), 1);
+  await page.unroute('**/api/chat', delayChatHandler);
+  await page.unroute('**/api/bootstrap', padHandler);
+  await page.click('#muse-head-toggle');
 
   // 7. Verify 2-tab Muse drawer (Work Threads + Soul/Memory), live dynamic avatar picker & Settings view.
   await page.waitForSelector('#drawer-body .panel-card h3');
