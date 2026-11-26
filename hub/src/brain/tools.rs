@@ -4,7 +4,10 @@ use super::{
     parser::ToolCall,
     read_profile_sync,
     roles::{self, AgentRole},
-    threads::{archive_thread, create_thread, resolve_or_create_thread},
+    threads::{
+        archive_thread, create_thread, delete_empty_thread, resolve_or_create_thread,
+        update_thread_meta,
+    },
     Ledger, TurnContext,
 };
 use crate::{
@@ -131,6 +134,7 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
             apply_update_ledger(hub, user_id, call).await?;
             Ok(ToolOutcome::done(tool, "已更新持续事项。"))
         }
+        "manage_thread" => apply_manage_thread(ctx, call).await,
         "close_thread" => {
             let target = call
                 .thread_id
@@ -142,6 +146,8 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
             match target {
                 Some(tid) => {
                     archive_thread(hub, user_id, &tid).await?;
+                    hub.events
+                        .emit(user_id.to_owned(), "brain", json!({"updated": "threads"}));
                     Ok(ToolOutcome::done(tool, format!("已归档线程 {tid}。")))
                 }
                 None => Ok(ToolOutcome::done(tool, "没有可归档的线程，已忽略。")),
@@ -390,22 +396,49 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                 })
                 .or_else(|| ctx.matched_rule_target.clone());
             let prefer_cloud = call.prefer_cloud.unwrap_or(false);
-            // Ensure every node dispatch belongs to an implicit backend thread for future session resume.
-            let task_thread_id = match resolve_or_create_thread(
-                hub,
-                user_id,
-                call.thread_id
-                    .as_deref()
-                    .or(ctx.active_thread_id.as_deref()),
-                Some(&title),
-                &title,
-            )
-            .await?
-            {
-                Some(tid) => tid,
-                None => create_thread(hub, user_id, &title).await?,
+            let raw_tid = call.thread_id.as_deref().map(str::trim);
+            let topic_title = call
+                .thread_title
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&title);
+            let skip_thread = raw_tid.is_some_and(|s| s.eq_ignore_ascii_case("none"))
+                || (!ctx.interactive
+                    && raw_tid.is_none_or(|s| s.is_empty())
+                    && ctx.active_thread_id.is_none());
+            let mut created_fresh_thread: Option<String> = None;
+            let task_thread_id = if skip_thread {
+                None
+            } else {
+                let candidate = raw_tid
+                    .filter(|s| !s.is_empty())
+                    .or(ctx.active_thread_id.as_deref());
+                match resolve_or_create_thread(
+                    hub,
+                    user_id,
+                    candidate,
+                    Some(topic_title),
+                    &title,
+                    call.ledger_id.as_deref(),
+                )
+                .await?
+                {
+                    Some(tid) => {
+                        if candidate.is_some_and(|c| c.eq_ignore_ascii_case("new")) {
+                            created_fresh_thread = Some(tid.clone());
+                        }
+                        Some(tid)
+                    }
+                    None => {
+                        let tid =
+                            create_thread(hub, user_id, topic_title, call.ledger_id.as_deref())
+                                .await?;
+                        created_fresh_thread = Some(tid.clone());
+                        Some(tid)
+                    }
+                }
             };
-            ctx.active_thread_id = Some(task_thread_id.clone());
             let role_name = role_opt.as_ref().map(|r| r.name.as_str()).unwrap_or("");
             let on_complete = if ctx.callback_depth < super::MAX_CALLBACK_DEPTH {
                 call.on_complete.as_deref().unwrap_or("").trim()
@@ -424,13 +457,16 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                 &requested_sandbox,
                 &title,
                 &instr,
-                Some(&task_thread_id),
+                task_thread_id.as_deref(),
                 on_complete,
                 ctx.callback_depth,
             )
             .await?
             {
                 Ok(info) => {
+                    if let Some(ref tid) = task_thread_id {
+                        ctx.active_thread_id = Some(tid.clone());
+                    }
                     let mut meta_parts: Vec<&str> = Vec::new();
                     if let Some(k) = info["node_kind"].as_str().filter(|s| !s.is_empty()) {
                         meta_parts.push(k);
@@ -459,11 +495,16 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                     ctx.dispatched_tasks.push(info);
                     Ok(ToolOutcome::done(tool, observation))
                 }
-                Err(reason) => Ok(ToolOutcome::failed(
-                    tool,
-                    format!("派发失败：{reason}。"),
-                    format!("（{reason}。）"),
-                )),
+                Err(reason) => {
+                    if let Some(ref dead_tid) = created_fresh_thread {
+                        let _ = delete_empty_thread(hub, user_id, dead_tid).await;
+                    }
+                    Ok(ToolOutcome::failed(
+                        tool,
+                        format!("派发失败：{reason}。"),
+                        format!("（{reason}。）"),
+                    ))
+                }
             }
         }
         "delegate_colleague" => {
@@ -1183,4 +1224,115 @@ async fn dispatch_to_node(
         hub.events.emit(user_id.to_owned(), "task", info.clone());
     }
     Ok(res)
+}
+
+async fn apply_manage_thread(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutcome> {
+    let tool = "manage_thread";
+    let hub = ctx.hub;
+    let user_id = ctx.user_id;
+    let act = call.action.as_deref().unwrap_or("bind").trim();
+    let target_tid = call
+        .thread_id
+        .as_deref()
+        .or(ctx.active_thread_id.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let title = call
+        .title
+        .as_deref()
+        .or(call.thread_title.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match act {
+        "create" => {
+            let topic =
+                title.unwrap_or_else(|| ctx.message.lines().next().unwrap_or("新话题").trim());
+            let tid = create_thread(hub, user_id, topic, call.ledger_id.as_deref()).await?;
+            ctx.active_thread_id = Some(tid.clone());
+            hub.events
+                .emit(user_id.to_owned(), "brain", json!({"updated": "threads"}));
+            Ok(ToolOutcome::done(
+                tool,
+                format!("已新建工作线程 {tid}（{topic}）。"),
+            ))
+        }
+        "bind" => {
+            let Some(ref tid) = target_tid else {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    "缺少要绑定的 thread_id。",
+                    "（缺少 thread_id。）",
+                ));
+            };
+            let Some(found) = resolve_or_create_thread(
+                hub,
+                user_id,
+                Some(tid),
+                title,
+                title.unwrap_or("新话题"),
+                call.ledger_id.as_deref(),
+            )
+            .await?
+            else {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    format!("未找到工作线程 `{tid}`。"),
+                    format!("（未找到工作线程 `{tid}`。）"),
+                ));
+            };
+            ctx.active_thread_id = Some(found.clone());
+            hub.events
+                .emit(user_id.to_owned(), "brain", json!({"updated": "threads"}));
+            Ok(ToolOutcome::done(
+                tool,
+                format!("已将当前对话绑定到工作线程 {found}。"),
+            ))
+        }
+        "rename" => {
+            let Some(ref tid) = target_tid else {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    "缺少要重命名的 thread_id。",
+                    "（缺少 thread_id。）",
+                ));
+            };
+            if title.is_none() && call.ledger_id.is_none() {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    "rename 需要提供新的 title 或 ledger_id。",
+                    "（缺少新标题或账本 ID。）",
+                ));
+            }
+            if !update_thread_meta(hub, user_id, tid, title, call.ledger_id.as_deref()).await? {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    format!("未找到工作线程 `{tid}`。"),
+                    format!("（未找到工作线程 `{tid}`。）"),
+                ));
+            }
+            hub.events
+                .emit(user_id.to_owned(), "brain", json!({"updated": "threads"}));
+            Ok(ToolOutcome::done(tool, format!("已更新工作线程 {tid}。")))
+        }
+        "archive" => {
+            let Some(ref tid) = target_tid else {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    "缺少要归档的 thread_id。",
+                    "（缺少 thread_id。）",
+                ));
+            };
+            archive_thread(hub, user_id, tid).await?;
+            hub.events
+                .emit(user_id.to_owned(), "brain", json!({"updated": "threads"}));
+            Ok(ToolOutcome::done(tool, format!("已归档线程 {tid}。")))
+        }
+        other => Ok(ToolOutcome::failed(
+            tool,
+            format!("不支持的线程操作 `{other}`（可选 bind/create/rename/archive）。"),
+            format!("（不支持的线程操作 `{other}`。）"),
+        )),
+    }
 }

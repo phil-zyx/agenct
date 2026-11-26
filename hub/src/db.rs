@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS threads (
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
     summary TEXT NOT NULL DEFAULT '',
+    ledger_id TEXT NOT NULL DEFAULT '',
     node_id TEXT,
     node_session_id TEXT,
     node_session_agent TEXT NOT NULL DEFAULT '',
@@ -400,9 +401,43 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
             }
             tx.execute_batch(&mig)?;
         }
+        if current_version <= 12 && table_exists("threads")? {
+            let has_ledger_id: bool = tx
+                .prepare("PRAGMA table_info(threads)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .any(|col| col == "ledger_id");
+            if !has_ledger_id {
+                tx.execute(
+                    "ALTER TABLE threads ADD COLUMN ledger_id TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+        }
     }
     // Idempotent: creates any table/index/trigger an older database never had.
     tx.execute_batch(SCHEMA)?;
+    if (1..=12).contains(&current_version) {
+        tx.execute(
+            "DELETE FROM threads
+             WHERE turn_count = 0
+               AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = threads.id)
+               AND NOT EXISTS (SELECT 1 FROM tasks t WHERE t.thread_id = threads.id)",
+            [],
+        )?;
+        let archive_cutoff = crate::config::now_unix().saturating_sub(48 * 3600);
+        tx.execute(
+            "UPDATE threads
+             SET status = 'archived'
+             WHERE status = 'active'
+               AND updated_at < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM tasks t
+                   WHERE t.thread_id = threads.id AND t.status IN ('pending', 'running')
+               )",
+            [archive_cutoff],
+        )?;
+    }
     // Older migrations could leave a partial index even after advancing user_version.
     if (1..SCHEMA_VERSION).contains(&current_version) {
         tx.execute_batch("INSERT INTO messages_fts(messages_fts) VALUES('rebuild');")?;
@@ -582,7 +617,7 @@ pub fn record_audit(
 
 #[cfg(test)]
 mod tests {
-    use super::Db;
+    use super::{Db, SCHEMA_VERSION};
     use rusqlite::Connection;
     use std::path::Path;
 
@@ -627,7 +662,7 @@ mod tests {
         let rows: i64 = conn
             .query_row("SELECT count(*) FROM messages", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(rows, expected_rows);
         assert_eq!(indexed_message_count(conn), rows);
         conn.execute_batch(
@@ -753,7 +788,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 12);
+        assert_eq!(ver, SCHEMA_VERSION);
         let roles_table: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_roles'",
@@ -910,7 +945,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 12);
+        assert_eq!(ver, SCHEMA_VERSION);
         let (def_ag, allow_ag): (String, String) = conn
             .query_row(
                 "SELECT default_agent, allowed_agents FROM nodes WHERE id='n1'",
@@ -977,7 +1012,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 12);
+        assert_eq!(ver, SCHEMA_VERSION);
         let roles_table: i64 = conn
             .query_row(
                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='agent_roles'",
@@ -1047,7 +1082,7 @@ mod tests {
         let ver: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ver, 12);
+        assert_eq!(ver, SCHEMA_VERSION);
         let (def_ag, allow_ag): (String, String) = conn
             .query_row(
                 "SELECT default_agent, allowed_agents FROM nodes WHERE id='homelab'",

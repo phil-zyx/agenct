@@ -141,9 +141,11 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
             "dispatch_node",
             fn_schema(
                 "dispatch_node",
-                "派发任务给在线 PC 或云端执行节点执行代码/命令/仓库查询；支持按军团角色与 thread_id 续接会话",
+                "派发任务给在线 PC 或云端执行节点执行代码/命令/仓库查询；支持按军团角色与 thread_id（单个具体 Topic 维度）续接会话",
                 json!({
-                    "thread_id": {"type": "string", "description": "沿用的活跃 thr_xxx 或 new"},
+                    "thread_id": {"type": "string", "description": "沿用同子话题的活跃 thr_xxx；开启新 Topic 传 new；一次性只读查询或定时检查传 none（不建线程）"},
+                    "thread_title": {"type": "string", "description": "仅当 thread_id=new 时可选：该 Topic 的简短主题名（如「移动端输入框修复」），省略则用 title"},
+                    "ledger_id": {"type": "string", "description": "可选：关联所属宏观项目账本 ID（ldg_xxx）"},
                     "role": {"type": "string", "description": "可选：按已配置的军团角色名派发（自动套用引擎/模型/推理强度/沙箱/提示词）"},
                     "node_id": {"type": "string", "description": "指定节点 ID 或名称，留空自动匹配"},
                     "agent": {"type": "string", "enum": ["claude", "codex", "agy", "opencode", "ollama", "openai", "template"], "description": "可选：指定或覆盖执行引擎"},
@@ -151,11 +153,25 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
                     "effort": {"type": "string", "enum": ["", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "可选：临时指定或覆盖推理强度"},
                     "sandbox": {"type": "string", "enum": ["", "readonly", "workspace-write"], "description": "可选：临时收紧沙箱（如 readonly）"},
                     "prefer_cloud": {"type": "boolean", "description": "本机代码/git/tmux 设 false；通用云端任务设 true"},
-                    "title": {"type": "string", "description": "简短任务标题"},
+                    "title": {"type": "string", "description": "本次具体执行任务的简短标题"},
                     "instruction": {"type": "string", "description": "补全上下文指代后的自包含执行指令"},
                     "on_complete": {"type": "string", "description": "可选：节点完成后需要自动回流大脑继续验收/更新账本/衔接后续的跟进目标"}
                 }),
                 &["title", "instruction"],
+            ),
+        ),
+        (
+            "manage_thread",
+            fn_schema(
+                "manage_thread",
+                "在纯讨论、规划或 Topic 切换时主动绑定/新建/重命名/归档工作线程（避免讨论断链或把多个子问题混在同一线程里）",
+                json!({
+                    "action": {"type": "string", "enum": ["bind", "create", "rename", "archive"], "description": "bind 绑定当前对话到已有 thr_xxx；create 开启新 Topic 线程；rename 修正线程标题/绑定账本；archive 归档已完结线程"},
+                    "thread_id": {"type": "string", "description": "目标 thr_xxx（bind/rename/archive 必填）"},
+                    "title": {"type": "string", "description": "简短精准的 Topic 标题（create/rename 使用，如「移动端输入框修复」）"},
+                    "ledger_id": {"type": "string", "description": "可选：关联所属持续事项账本 ldg_xxx"}
+                }),
+                &["action"],
             ),
         ),
         (
@@ -264,17 +280,32 @@ pub(super) fn build_system_prompt(
                         (Some(nid), false) => format!(" | 节点={nid}"),
                         _ => String::new(),
                     };
+                    let ledger_info = if t.ledger_id.is_empty() {
+                        String::new()
+                    } else if let Some(l) = ledgers.iter().find(|l| l.id == t.ledger_id) {
+                        format!(" | 所属专项=「{}」({})", l.title, l.id)
+                    } else {
+                        format!(" | 所属专项={}", t.ledger_id)
+                    };
+                    let split_hint = if t.turn_count >= 16 {
+                        " | 提示:已较长，切新子任务请开new"
+                    } else {
+                        ""
+                    };
                     format!(
-                        "- id=`{}` | 「{}」{} | {}",
+                        "- id=`{}` | 「{}」{} | 轮数={}{}{} | {}",
                         t.id,
                         t.title,
+                        ledger_info,
+                        t.turn_count,
                         node_info,
-                        truncate_bytes(&t.summary, 260)
+                        split_hint,
+                        truncate_bytes(&t.summary, 240)
                     )
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            1800,
+            2000,
         )
     };
 
@@ -383,11 +414,13 @@ pub(super) fn build_system_prompt(
     let io_section = if native_tools {
         r#"=== 输出与工具调用规范 ===
 - 直接输出面向用户的自然中文 Markdown 回复，**不要**套 JSON 外壳，也不要在回复中输出内部 `[thr_xxx]` 标记。
-- 需要持久化记忆、修改账本、调度节点、查 GitLab 或发起协作时，直接调用系统提供的函数工具（延续某话题调用 `dispatch_node` 时在参数中传入对应 `thread_id`；新话题可传 `"new"` 或留空）。
+- 需要持久化记忆、修改账本、管理线程、调度节点、查 GitLab 或发起协作时，直接调用系统提供的函数工具。
+  - 围绕具体工作 Topic 做纯讨论/追问/规划（本轮不派单）时，若对话明显延续某活跃线程或开启了新工程话题，**顺手调用 `manage_thread(action="bind"|"create", ...)`** 把本轮讨论归入对应 Topic，避免对话断链。
+  - 调用 `dispatch_node` 时：延续同一具体子问题才传对应 `thr_xxx`；同一仓库内的不同新子任务传 `thread_id="new"`（配精准 `thread_title` 与可选 `ledger_id`）；一次性只读检查/闲聊查探传 `thread_id="none"`。
 - 查询类工具或工具失败结果回传后，基于真实工具返回写出最终完整回复，不要编造未返回的信息。"#
     } else {
         r#"=== 输出格式（严格合法 JSON，勿加 Markdown 代码块，严禁输出 <tool_call> / </tool_call> 标签或裸工具 JSON） ===
-{"reply":"直接展示给用户的自然中文回复（必填）","thread_id":"thr_xxx 或 new 或 null","thread_title":"仅当 thread_id=new 时给简短标题，否则 null","tools":[]}
+{"reply":"直接展示给用户的自然中文回复（必填）","thread_id":"thr_xxx 或 new 或 null","thread_title":"仅当 thread_id=new 时给简短Topic标题，否则 null","tools":[]}
 
 === 工具结果回传 ===
 - 查询类工具（如 fetch_gitlab_commits）的结果、以及任何工具执行失败，会由系统以 `TOOL_RESULTS` 开头的消息回传给你；届时请基于真实结果给出最终完整回复（替换上一步的 reply），不要编造工具没有返回的内容。
@@ -399,25 +432,27 @@ pub(super) fn build_system_prompt(
 3. manage_cron: {"tool":"manage_cron","action":"add|delete","cron_id":null,"daily_time_cst":"HH:MM或null","interval_minutes":60,"target":"cloud|auto|node_id","instruction":"完整指令"}
 4. manage_rule: {"tool":"manage_rule","action":"add|delete","rule_id":null,"keyword":"关键词","node_id":"目标节点或cloud"}
 5. fetch_gitlab_commits: {"tool":"fetch_gitlab_commits"}（仅在 GitLab PAT 已配置时使用）
-6. dispatch_node: {"tool":"dispatch_node","thread_id":"沿用的 thr_xxx 或 null","role":null,"node_id":null,"agent":null,"model":null,"effort":null,"sandbox":null,"prefer_cloud":false,"title":"简短标题","instruction":"补全全部上下文指代后的自包含执行指令","on_complete":null}
+6. dispatch_node: {"tool":"dispatch_node","thread_id":"沿用的 thr_xxx 或 new 或 none","thread_title":null,"ledger_id":null,"role":null,"node_id":null,"agent":null,"model":null,"effort":null,"sandbox":null,"prefer_cloud":false,"title":"简短标题","instruction":"补全全部上下文指代后的自包含执行指令","on_complete":null}
    - 涉及本机代码/git 提交/tmux/私有环境时 prefer_cloud=false；通用云端脚本/分析/爬虫/截图任务可设 prefer_cloud=true。
    - 若已配置对应军团角色（如 planner/executor），优先在 `role` 中传入角色名；需要单次临时换模型/推理强度/收紧沙箱时可额外传 `agent`/`model`/`effort`/`sandbox` 覆盖。
    - 若任务完成后需要自动验收结果、更新账本或编排下一步，可填写简短 `on_complete` 跟进目标。
-7. close_thread: {"tool":"close_thread","thread_id":"已完结的 thr_xxx"}
-8. delegate_colleague: {"tool":"delegate_colleague","peer":"同事username或姓名","instruction":"需要同事协助的清晰事项"}
-9. manage_role: {"tool":"manage_role","action":"upsert|delete","name":"角色名","description":null,"agent":null,"model":null,"effort":null,"sandbox":null,"node_id":null,"prompt":null}
-10. manage_node: {"tool":"manage_node","node_id":null,"default_agent":null,"allowed_agents":null}"#
+7. manage_thread: {"tool":"manage_thread","action":"bind|create|rename|archive","thread_id":"thr_xxx","title":"Topic标题","ledger_id":null}
+8. close_thread: {"tool":"close_thread","thread_id":"已完结的 thr_xxx"}
+9. delegate_colleague: {"tool":"delegate_colleague","peer":"同事username或姓名","instruction":"需要同事协助的清晰事项"}
+10. manage_role: {"tool":"manage_role","action":"upsert|delete","name":"角色名","description":null,"agent":null,"model":null,"effort":null,"sandbox":null,"node_id":null,"prompt":null}
+11. manage_node: {"tool":"manage_node","node_id":null,"default_agent":null,"allowed_agents":null}"#
     };
 
     format!(
         r#"你是用户的 7×24h 个人超级智能体「{name}」。请始终用第一人称、干练、结论先行的中文交流。
 
-=== 自动语义归类、防串台与必要时反问（核心纪律） ===
-- 用户只在单一聊天框里自然说话，不手动选线程；由你判断这句话在承接哪个隐式线程（`thread_id`）、还是开启新主题（`"new"`）、还是普通闲聊（`null`）。
-- 近期对话中用户消息前的 `[thr_xxx]` 标注了该轮所属的隐式线程（仅供你内部判断，回复中绝不要输出这类标记），下方【隐式上下文线程】列出了活跃线程和是否可续接节点 session。
-- **指代清晰时直接承接**：如语义明确对应某个活跃线程，直接填该 `thread_id`；若调用 `dispatch_node` 继续排查或修改，必须带上同一 `thread_id`（系统会自动续接该节点上次的 CLI 会话）。
+=== Topic 分层、防黑洞归类与必要时反问（核心纪律） ===
+- 系统按三层区分粒度：**持续事项（Ledger）**对应长期宏观项目；**工作线程（Thread）**严格对应**单个具体子问题 / 排障 / 功能交付单元（Topic，通常 2～15 轮、独立 CLI session）**；**定时汇报 / 概念问答 / 一次性状态快照**不建线程。
+- 用户只在单一聊天框里自然说话（除非在某个 Topic 视图下追问）；近期对话用户消息前的 `[thr_xxx]` 标注了所属隐式线程（仅供你内部判断，回复中绝不要输出这类标记），下方【隐式上下文线程】列出了活跃 Topic、所属专项、轮数与节点 session 状态。
+- **严防把整个仓库混成“黑洞线程”**：同一个仓库/专项下只要切换了不同子问题（例如「移动端输入框」「执行后端重构」「头像动效」属于三个独立 Topic），必须新开 `thread_id="new"` 并配精准 `thread_title` 与对应 `ledger_id`，**严禁**把新子任务硬塞进一个不相关或轮数已很高（如 ≥16 轮）的老线程里。
+- **同 Topic 保持连续性（含纯讨论轮）**：只有明确在追问/排障/修改**同一个具体子问题**时才沿用原 `thr_xxx`（无论调用 `dispatch_node` 还是用 `manage_thread(action="bind")` 记录纯讨论）；一次性只读查状态/查进程/定时检查用 `thread_id="none"`。
 - 默认在已有授权范围内直接执行并给结论，不反问。仅当同时存在至少两个可续接的活跃线程或节点回执，且无法唯一判断用户指的是哪一个时，第一句用一句话反问确认（例如「你是指刚才的 A 还是 B？」），当轮禁止调用 `dispatch_node` 或其他变更类工具。普通派发或信息不足但可合理默认时，按默认规则执行。
-- 明确完结的临时话题可顺手调用 `close_thread` 归档，保持线程列表清爽。
+- 明确完结的子问题顺手调用 `manage_thread(action="archive")` 或 `close_thread` 归档，若发现某活跃线程名字太宽泛或偏离当前核心 Topic，也可顺手 `rename`。
 
 === 表达自然度、信息顺序与事实优先级（必须遵守） ===
 - **像靠谱的私人助理一样说自然人话**（除用户明确要详版外，日常回复控制在 **3～5 句、≤6 行以内**）：**禁止机械套用「待审批：」「待你选一个：」「结论：」「来源：」这类公文/表单前缀**，也不要堆多级标题、大表格、过程流水账或寒暄。

@@ -35,6 +35,8 @@ pub(super) struct ToolCall {
     #[serde(default)]
     pub(super) thread_id: Option<String>,
     #[serde(default)]
+    pub(super) thread_title: Option<String>,
+    #[serde(default)]
     pub(super) title: Option<String>,
     #[serde(default)]
     pub(super) status: Option<String>,
@@ -95,6 +97,7 @@ fn minimal_tool_call(name: &str) -> ToolCall {
         memory_replace: None,
         ledger_id: None,
         thread_id: None,
+        thread_title: None,
         title: None,
         status: None,
         notes_append: None,
@@ -182,6 +185,9 @@ pub(super) fn default_reply_for_tools(tools: &[ToolCall]) -> String {
     }
     if tools.iter().any(|t| t.tool == "manage_node") {
         return "好的，已更新执行节点配置。".into();
+    }
+    if tools.iter().any(|t| t.tool == "manage_thread") {
+        return "好的，已更新工作线程。".into();
     }
     if tools
         .iter()

@@ -360,6 +360,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     const tasks = state.tasks || [];
     const crons = state.crons || [];
     const ledgers = state.ledgers || [];
+    const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
     const nodes = state.nodes || [];
     const uid = state.user?.id;
     const groups = triageTasks(tasks);
@@ -485,14 +486,19 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       }
 
       const metaParts = [];
+      const ledger = thr.ledger_id ? ledgerById.get(thr.ledger_id) : null;
       const roleParts = [latest?.role, latest?.agent, latest?.model].filter(Boolean);
       if (roleParts.length) metaParts.push(roleParts.join(' / '));
       if (thr.node_id) {
         metaParts.push(thr.has_session ? `节点 ${thr.node_id} · 可续接` : `节点 ${thr.node_id}`);
       }
+      if (thr.turn_count > 0) metaParts.push(`${thr.turn_count} 轮`);
       if (runs.length > 1) metaParts.push(`${runs.length} 次执行`);
       if (thr.updated_at) metaParts.push(fmtTime(thr.updated_at));
       const metaHtml = metaParts.length ? `<div class="thread-meta">${esc(metaParts.join(' · '))}</div>` : '';
+      const ledgerHtml = ledger
+        ? `<div class="engine-tags"><span class="engine-tag">${esc(ledger.title)}</span></div>`
+        : '';
 
       const preview = taskViews.get(latest)?.preview || cleanPreviewLine(thr.summary, 72);
       const previewHtml = preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
@@ -500,7 +506,10 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
 
       const actions = taskActionsHtml(latest);
       actions.push(
-        `<button type="button" class="sm" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">看记录</button>`,
+        `<button type="button" class="sm" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">进入话题</button>`,
+      );
+      actions.push(
+        `<button type="button" class="sm" data-rename-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">改名</button>`,
       );
       if (thr.status === 'active') {
         actions.push(`<button type="button" class="sm" data-archive-thread="${esc(thr.id)}">归档</button>`);
@@ -515,6 +524,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             <span>${esc(thr.title)}</span>
             <span class="badge ${badgeCls}">${esc(badgeText)}</span>
           </div>
+          ${ledgerHtml}
           ${metaHtml}
           ${previewHtml}
           ${renderTaskProgress(latest)}
@@ -717,6 +727,22 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     });
     bodyEl.querySelectorAll('[data-filter-thread]').forEach((b) => {
       b.onclick = () => onFilterThread?.(b.dataset.filterThread, b.dataset.threadTitle);
+    });
+    bodyEl.querySelectorAll('[data-rename-thread]').forEach((b) => {
+      b.onclick = async () => {
+        const nextTitle = window.prompt('输入新的话题标题：', b.dataset.threadTitle || '');
+        if (!nextTitle?.trim() || nextTitle.trim() === b.dataset.threadTitle) return;
+        try {
+          await api(`/api/threads/${b.dataset.renameThread}`, {
+            method: 'PUT',
+            body: { title: nextTitle.trim() },
+          });
+          showToast('话题名称已更新');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
     });
     bodyEl.querySelectorAll('[data-archive-thread]').forEach((b) => {
       b.onclick = async () => {

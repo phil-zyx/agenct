@@ -8,7 +8,7 @@ mod tools;
 
 pub use compact::compact_user_context;
 pub use roles::{delete_role, list_roles, list_roles_sync, AgentRole};
-pub use threads::{list_active_threads_sync, list_threads_sync, ThreadView};
+pub use threads::{archive_stale_threads, list_active_threads_sync, list_threads_sync, ThreadView};
 
 use crate::{
     auth::AuthUser,
@@ -661,7 +661,12 @@ pub async fn delete_ledger(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateThreadInput {
-    pub status: String,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub ledger_id: Option<String>,
 }
 
 pub async fn update_thread(
@@ -670,31 +675,95 @@ pub async fn update_thread(
     Path(id): Path<String>,
     Json(input): Json<UpdateThreadInput>,
 ) -> Result<Json<Value>> {
-    let status = input.status.trim().to_owned();
-    if !matches!(status.as_str(), "active" | "archived") {
-        return Err(invalid("thread status must be active or archived"));
+    if input.status.is_none() && input.title.is_none() && input.ledger_id.is_none() {
+        return Err(invalid(
+            "at least one of status, title, or ledger_id is required",
+        ));
     }
+    let next_status = match input.status.as_deref() {
+        Some(raw) => {
+            let s = raw.trim().to_owned();
+            if !matches!(s.as_str(), "active" | "archived") {
+                return Err(invalid("thread status must be active or archived"));
+            }
+            Some(s)
+        }
+        None => None,
+    };
+    let next_title = match input.title.as_deref() {
+        Some(raw) => {
+            let clean = truncate_bytes(raw.lines().next().unwrap_or("").trim(), 80);
+            if clean.is_empty() {
+                return Err(invalid("thread title cannot be empty"));
+            }
+            Some(clean)
+        }
+        None => None,
+    };
+    let next_ledger = input.ledger_id.map(|s| s.trim().to_owned());
+
     let uid = user.id.clone();
     let tid = id.clone();
-    let st_db = status.clone();
+    let st_ret = next_status.clone();
+    let title_ret = next_title.clone();
+    let ledger_ret = next_ledger.clone();
     hub.db
         .write(move |conn| {
-            if conn.execute(
-                "UPDATE threads SET status = ?3, updated_at = ?4 WHERE id = ?1 AND user_id = ?2",
-                params![tid, uid, st_db, now_unix()],
-            )? == 0
-            {
+            let cur: Option<(String, String, String)> = conn
+                .query_row(
+                    "SELECT status, title, ledger_id FROM threads WHERE id = ?1 AND user_id = ?2",
+                    params![tid, uid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((cur_status, cur_title, cur_ledger)) = cur else {
                 return Err(denied());
-            }
+            };
+            let validated_ledger = match next_ledger.as_deref() {
+                Some("") => String::new(),
+                Some(lid) => {
+                    let exists: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM ledgers WHERE id = ?1 AND user_id = ?2",
+                            params![lid, uid],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if !exists {
+                        return Err(invalid("invalid ledger_id"));
+                    }
+                    lid.to_owned()
+                }
+                None => cur_ledger,
+            };
+            conn.execute(
+                "UPDATE threads
+                 SET status = ?3, title = ?4, ledger_id = ?5, updated_at = ?6
+                 WHERE id = ?1 AND user_id = ?2",
+                params![
+                    tid,
+                    uid,
+                    next_status.unwrap_or(cur_status),
+                    next_title.unwrap_or(cur_title),
+                    validated_ledger,
+                    now_unix()
+                ],
+            )?;
             Ok(())
         })
         .await?;
     hub.events.emit(
         user.id,
         "brain",
-        json!({"updated_thread": id, "status": status}),
+        json!({
+            "updated_thread": id,
+            "status": st_ret,
+            "title": title_ret,
+            "ledger_id": ledger_ret,
+        }),
     );
-    Ok(Json(json!({"ok": true, "id": id, "status": status})))
+    Ok(Json(json!({"ok": true, "id": id})))
 }
 
 pub async fn delete_thread(
@@ -737,6 +806,8 @@ pub struct ChatInput {
     pub message: String,
     #[serde(default)]
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
 }
 
 pub async fn chat(
@@ -758,7 +829,40 @@ pub async fn chat(
             return Err(invalid("invalid request_id"));
         }
     }
-    let out = run_turn(&hub, &user.id, msg, input.request_id.as_deref()).await?;
+    let pinned_tid = input
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    if let Some(ref tid) = pinned_tid {
+        let uid = user.id.clone();
+        let tid_db = tid.clone();
+        let owned: bool = hub
+            .db
+            .read(move |conn| {
+                Ok(conn
+                    .query_row(
+                        "SELECT 1 FROM threads WHERE id = ?1 AND user_id = ?2",
+                        params![tid_db, uid],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false))
+            })
+            .await?;
+        if !owned {
+            return Err(invalid("invalid thread_id"));
+        }
+    }
+    let out = run_turn(
+        &hub,
+        &user.id,
+        msg,
+        input.request_id.as_deref(),
+        pinned_tid.as_deref(),
+    )
+    .await?;
     Ok(Json(out))
 }
 
@@ -823,6 +927,7 @@ struct TurnSnapshot {
     gitlab_configured: bool,
     history: Vec<ChatMessage>,
     contacts: Vec<String>,
+    pinned_thread_title: Option<String>,
     user_msg_id: i64,
 }
 
@@ -836,6 +941,7 @@ pub async fn run_turn(
     user_id: &str,
     message: &str,
     request_id: Option<&str>,
+    pinned_thread_id: Option<&str>,
 ) -> Result<Value> {
     if let Some(rid) = request_id {
         match lookup_request(hub, user_id, rid).await? {
@@ -856,12 +962,13 @@ pub async fn run_turn(
         .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, "another chat turn is already running"))?;
 
-    let snapshot = load_snapshot_and_claim(hub, user_id, message, request_id).await?;
+    let snapshot =
+        load_snapshot_and_claim(hub, user_id, message, request_id, pinned_thread_id).await?;
     let user_msg_id = snapshot.user_msg_id;
     hub.events
         .emit(user_id.to_owned(), "message", json!({"pending": true}));
 
-    match drive_turn(hub, user_id, message, snapshot).await {
+    match drive_turn(hub, user_id, message, snapshot, pinned_thread_id).await {
         Ok(out) => Ok(out),
         Err(err) => {
             mark_turn_failed(hub, user_id, user_msg_id).await;
@@ -877,6 +984,7 @@ fn build_snapshot_sync(
     uid: &str,
     message: &str,
     with_history: bool,
+    pinned_thread_id: Option<&str>,
 ) -> Result<TurnSnapshot> {
     let profile = read_profile_sync(conn, uid)?;
     let (rolling_summary, _) = read_compaction_state_sync(conn, uid)?;
@@ -899,19 +1007,47 @@ fn build_snapshot_sync(
         .and_then(|v| v["token"].as_str().map(|t| !t.trim().is_empty()))
         .unwrap_or(false);
 
+    let pinned_thread_title = match pinned_thread_id {
+        Some(tid) => conn
+            .query_row(
+                "SELECT title FROM threads WHERE id = ?1 AND user_id = ?2",
+                params![tid, uid],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+        None => None,
+    };
+
     let history = if !with_history {
         Vec::new()
     } else {
-        let mut hist_stmt = conn.prepare(
-            "SELECT role, content, thread_id, context FROM (
-                SELECT id, role, content, thread_id, context FROM messages
-                WHERE user_id = ?1 AND status = 'complete' AND role IN ('user','assistant')
-                ORDER BY id DESC LIMIT 10
-             ) ORDER BY id ASC",
-        )?;
-        let raw_hist: Vec<(String, String, Option<String>, String)> = hist_stmt
-            .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut raw_hist: Vec<(String, String, Option<String>, String)> = Vec::new();
+        if let Some(tid) = pinned_thread_id {
+            let mut thr_stmt = conn.prepare(
+                "SELECT role, content, thread_id, context FROM (
+                    SELECT id, role, content, thread_id, context FROM messages
+                    WHERE user_id = ?1 AND thread_id = ?2 AND status = 'complete' AND role IN ('user','assistant')
+                    ORDER BY id DESC LIMIT 10
+                 ) ORDER BY id ASC",
+            )?;
+            raw_hist = thr_stmt
+                .query_map(params![uid, tid], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
+        if raw_hist.len() < 2 {
+            let mut hist_stmt = conn.prepare(
+                "SELECT role, content, thread_id, context FROM (
+                    SELECT id, role, content, thread_id, context FROM messages
+                    WHERE user_id = ?1 AND status = 'complete' AND role IN ('user','assistant')
+                    ORDER BY id DESC LIMIT 10
+                 ) ORDER BY id ASC",
+            )?;
+            raw_hist = hist_stmt
+                .query_map([uid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+        }
         let total_hist = raw_hist.len();
         raw_hist
             .into_iter()
@@ -977,6 +1113,7 @@ fn build_snapshot_sync(
         gitlab_configured,
         history,
         contacts,
+        pinned_thread_title,
         user_msg_id: 0,
     })
 }
@@ -988,15 +1125,24 @@ async fn load_snapshot_and_claim(
     user_id: &str,
     message: &str,
     request_id: Option<&str>,
+    pinned_thread_id: Option<&str>,
 ) -> Result<TurnSnapshot> {
     let uid = user_id.to_owned();
     let msg_owned = message.to_owned();
     let rid_owned = request_id.map(str::to_owned);
+    let pinned_owned = pinned_thread_id.map(str::to_owned);
     let secrets = hub.secrets.clone();
     hub.db
         .write(move |conn| {
             let tx = conn.transaction()?;
-            let mut snap = build_snapshot_sync(&tx, &secrets, &uid, &msg_owned, true)?;
+            let mut snap = build_snapshot_sync(
+                &tx,
+                &secrets,
+                &uid,
+                &msg_owned,
+                true,
+                pinned_owned.as_deref(),
+            )?;
             let now = now_unix();
             let existing: Option<(i64, String)> = match rid_owned.as_deref() {
                 Some(rid) => tx
@@ -1107,13 +1253,29 @@ struct AgentMode<'a> {
 }
 
 /// Runs an interactive chat turn: agent loop, then atomically persists the final reply.
-async fn drive_turn(hub: &Hub, user_id: &str, message: &str, snap: TurnSnapshot) -> Result<Value> {
+async fn drive_turn(
+    hub: &Hub,
+    user_id: &str,
+    message: &str,
+    snap: TurnSnapshot,
+    pinned_thread_id: Option<&str>,
+) -> Result<Value> {
+    let focus_suffix = match pinned_thread_id {
+        Some(tid) => {
+            let title = snap.pinned_thread_title.as_deref().unwrap_or(tid);
+            format!(
+                "\n\n=== 当前聚焦 Topic ===\n\
+                 用户正在工作线程 `{tid}`（「{title}」）界面下聚焦讨论，请优先围绕该 Topic 回答，并在调用 `dispatch_node` 时默认沿用 `{tid}`（除非用户明确要求另开全新无关话题）。"
+            )
+        }
+        None => String::new(),
+    };
     let mode = AgentMode {
-        prompt_suffix: "",
+        prompt_suffix: &focus_suffix,
         interactive: true,
         allowed_tools: None,
         callback_depth: 0,
-        initial_thread_id: None,
+        initial_thread_id: pinned_thread_id.map(str::to_owned),
     };
     let out = agent_loop(hub, user_id, message, &snap, &mode).await?;
     let reply = persist_turn(
@@ -1149,7 +1311,7 @@ pub async fn run_headless(
     let secrets = hub.secrets.clone();
     let snap = hub
         .db
-        .read(move |conn| build_snapshot_sync(conn, &secrets, &uid, &instr, false))
+        .read(move |conn| build_snapshot_sync(conn, &secrets, &uid, &instr, false, None))
         .await?;
     let mode = AgentMode {
         prompt_suffix,
@@ -1320,7 +1482,7 @@ pub async fn run_task_callback(
     let secrets = hub.secrets.clone();
     let Ok(snap) = hub
         .db
-        .read(move |conn| build_snapshot_sync(conn, &secrets, &uid_snap, &instr_snap, false))
+        .read(move |conn| build_snapshot_sync(conn, &secrets, &uid_snap, &instr_snap, false, None))
         .await
     else {
         return;
@@ -1748,10 +1910,13 @@ async fn agent_loop_json_fallback(
             parsed.thread_id.as_deref(),
             parsed.thread_title.as_deref(),
             message,
+            None,
         )
         .await?;
-        if step == 0 || resolved.is_some() {
+        if resolved.is_some() {
             ctx.active_thread_id = resolved;
+        } else if step == 0 && mode.initial_thread_id.is_none() {
+            ctx.active_thread_id = None;
         }
 
         let mut outcomes = Vec::with_capacity(parsed.tools.len());

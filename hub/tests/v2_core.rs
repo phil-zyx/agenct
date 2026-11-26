@@ -4249,3 +4249,282 @@ async fn node_submit_accepts_backend_field_and_records_audit() {
         "expected backend in audit title, got: {audit_title}"
     );
 }
+
+#[tokio::test]
+async fn chat_pinned_thread_id_persists_discussion_and_rejects_foreign_thread() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (alice_c, alice_csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let (bob_c, bob_csrf) = seed_user(&hub, "u-bob", "bob", "Bob", false).await;
+    let router = app(hub.clone());
+
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"name": "pc-1", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 1. Alice starts a topic thread via /node dispatch.
+    let (st, chat1) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": "/node 排查移动端输入框布局"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let thr_id = chat1["thread_id"].as_str().unwrap().to_owned();
+
+    // 2. Pure follow-up discussion in the pinned thread stays attached to thr_id.
+    let (st, chat2) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": "为什么窄屏要用双行布局？", "thread_id": thr_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{chat2}");
+    assert_eq!(chat2["thread_id"].as_str(), Some(thr_id.as_str()));
+
+    let (msg_count, turns): (i64, i64) = hub
+        .db
+        .read({
+            let tid = thr_id.clone();
+            move |conn| {
+                let cnt: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM messages WHERE user_id='u-alice' AND thread_id=?1",
+                    [&tid],
+                    |r| r.get(0),
+                )?;
+                let tc: i64 = conn.query_row(
+                    "SELECT turn_count FROM threads WHERE id=?1 AND user_id='u-alice'",
+                    [&tid],
+                    |r| r.get(0),
+                )?;
+                Ok((cnt, tc))
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(msg_count, 4);
+    assert_eq!(turns, 2);
+
+    // 3. Cross-user pinned thread_id is rejected (400 BAD_REQUEST).
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&bob_c),
+        Some(&bob_csrf),
+        Some(json!({"message": "偷窥别人的话题", "thread_id": thr_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn thread_update_rename_ledger_binding_and_stale_archive_hygiene() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"name": "pc-1", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, ledger) = req_json(
+        &router,
+        "POST",
+        "/api/ledgers",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"title": "Agenct v2", "status": "active", "notes": "主线"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let ledger_id = ledger["id"].as_str().unwrap().to_owned();
+
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node 检查 composer 高度"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let thr_id = chat["thread_id"].as_str().unwrap().to_owned();
+
+    // 1. Rename + bind ledger via PUT /api/threads/{id}.
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        &format!("/api/threads/{thr_id}"),
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"title": "移动端输入框修复", "ledger_id": ledger_id})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 2. Empty update or invalid ledger_id is rejected.
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        &format!("/api/threads/{thr_id}"),
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        &format!("/api/threads/{thr_id}"),
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"ledger_id": "ldg_nonexistent"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 3. Bootstrap reflects updated title, ledger_id, and turn_count.
+    let (st, boot) = req_json(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let thr_view = boot["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == thr_id)
+        .unwrap();
+    assert_eq!(thr_view["title"], "移动端输入框修复");
+    assert_eq!(thr_view["ledger_id"], ledger_id);
+    assert_eq!(thr_view["turn_count"], 1);
+
+    // 4. Stale (>48h) active threads are archived and >10m empty shells are deleted by archive_stale_threads().
+    let now = agenct_hub::config::now_unix();
+    hub.db
+        .write(move |conn| {
+            conn.execute(
+                "INSERT INTO threads(id, user_id, title, status, summary, turn_count, updated_at)
+                 VALUES ('thr_stale', 'u-alice', '陈年旧话题', 'active', 'old', 2, ?1),
+                        ('thr_empty', 'u-alice', '空壳线程', 'active', '', 0, ?2)",
+                rusqlite::params![now - 49 * 3600, now - 1200],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    agenct_hub::brain::archive_stale_threads(&hub).await;
+
+    let (stale_status, empty_exists, fresh_status): (String, i64, String) = hub
+        .db
+        .read(move |conn| {
+            let st: String =
+                conn.query_row("SELECT status FROM threads WHERE id='thr_stale'", [], |r| {
+                    r.get(0)
+                })?;
+            let emp: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM threads WHERE id='thr_empty'",
+                [],
+                |r| r.get(0),
+            )?;
+            let fr: String =
+                conn.query_row("SELECT status FROM threads WHERE id=?1", [&thr_id], |r| {
+                    r.get(0)
+                })?;
+            Ok((st, emp, fr))
+        })
+        .await
+        .unwrap();
+    assert_eq!(stale_status, "archived");
+    assert_eq!(empty_exists, 0);
+    assert_eq!(fresh_status, "active");
+}
+
+#[tokio::test]
+async fn cron_and_ephemeral_dispatch_do_not_create_noise_threads() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"name": "pc-1", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 1. One-off dispatch with thread_id="none" creates a task without creating any thread.
+    let (st, chat1) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node --thread none 检查节点进程快照"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(chat1["thread_id"].is_null());
+    assert_eq!(chat1["tasks"].as_array().unwrap().len(), 1);
+    assert!(chat1["tasks"][0]["thread_id"].is_null());
+
+    // 2. Headless cron dispatch does not create threads or attach cron report messages to threads.
+    let _cron_id = create_due_cron(
+        &router,
+        &hub,
+        &cookie,
+        &csrf,
+        "/node 每日巡检 homelab 状态",
+        "cloud",
+    )
+    .await;
+    assert_eq!(
+        agenct_hub::automation::run_due_crons(&hub).await.unwrap(),
+        1
+    );
+
+    let (thr_cnt, cron_thr_msgs, total_tasks): (i64, i64, i64) = hub
+        .db
+        .read(|conn| {
+            let tc: i64 = conn.query_row("SELECT COUNT(*) FROM threads", [], |r| r.get(0))?;
+            let cm: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE content LIKE '%[定时汇报]%' AND thread_id IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?;
+            let tk: i64 = conn.query_row("SELECT COUNT(*) FROM tasks WHERE thread_id IS NULL", [], |r| r.get(0))?;
+            Ok((tc, cm, tk))
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        thr_cnt, 0,
+        "ephemeral dispatch and cron must not create threads"
+    );
+    assert_eq!(cron_thr_msgs, 0);
+    assert_eq!(total_tasks, 2);
+}

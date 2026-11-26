@@ -413,6 +413,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     optimisticMsg = {
       role: 'user',
       content: text,
+      thread_id: activeThread ? activeThread.id : null,
       request_id: requestId,
       created_at: Math.floor(Date.now() / 1000),
     };
@@ -428,9 +429,11 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     scrollerEl.scrollTop = scrollerEl.scrollHeight;
 
     try {
+      const chatBody = { message: text, request_id: requestId };
+      if (activeThread) chatBody.thread_id = activeThread.id;
       await api('/api/chat', {
         method: 'POST',
-        body: { message: text, request_id: requestId },
+        body: chatBody,
       });
       lastFailed = null;
       optimisticMsg = null;
@@ -518,9 +521,13 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     if (!activeThread && !olderMessages.length) {
       hasMoreGlobal = Boolean(state.has_more_messages);
     }
+    if (activeThread) {
+      const matched = (state.threads || []).find((t) => t.id === activeThread.id);
+      if (matched) activeThread.title = matched.title;
+    }
     if (threadFilterBar && threadFilterTitle) {
       threadFilterBar.classList.toggle('hide', !activeThread);
-      threadFilterTitle.textContent = activeThread ? `正在查看线程：${activeThread.title}` : '';
+      threadFilterTitle.textContent = activeThread ? `当前话题：${activeThread.title}` : '';
     }
     listEl.dataset.filtered = activeThread ? 'true' : 'false';
 
@@ -531,7 +538,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
 
     const baseMsgs = currentMessages();
     let msgs = baseMsgs;
-    if (optimisticMsg && !activeThread) {
+    if (optimisticMsg && (!activeThread || optimisticMsg.thread_id === activeThread.id)) {
       const synced = baseMsgs.some(
         (m) =>
           m.role === 'user' &&

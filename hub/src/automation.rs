@@ -617,7 +617,7 @@ async fn execute_cron_job(
         let report = out.reply;
         let msg = format!("**[定时汇报]** {}\n\n{}", job.instruction, report);
         let uid = user_id.to_owned();
-        let thread_id = out.thread_id;
+        let thread_id: Option<String> = None;
         hub.db
             .write(move |conn| {
                 conn.execute(
@@ -779,11 +779,16 @@ impl Hub {
     /// Nothing here awaits a slow run, so one stuck job never delays the others.
     pub async fn run_scheduler(&self) {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut tick: u64 = 0;
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
                 _ = self.scheduler_notify.notified() => {}
             }
+            if tick.is_multiple_of(10) {
+                crate::brain::archive_stale_threads(self).await;
+            }
+            tick = tick.wrapping_add(1);
             crate::nodes::reap_expired_leases(self).await;
             if let Ok(due) = claim_due_crons(self).await {
                 for (uid, job) in due {

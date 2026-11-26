@@ -318,7 +318,7 @@ pub async fn inbound_webhook(
         return Err(invalid("IM text must be 1..4000 bytes"));
     }
 
-    let reply = crate::brain::run_turn(&hub, &user_id, &text, None).await?;
+    let reply = crate::brain::run_turn(&hub, &user_id, &text, None, None).await?;
     Ok(Json(json!({
         "ok": true,
         "reply": reply["reply"],
