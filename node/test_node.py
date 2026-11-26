@@ -78,6 +78,81 @@ class TestUnifiedNode(unittest.TestCase):
         self.assertIn("stderr:\npartial stderr", content)
         self.assertIn("Tmux session: job-123", content)
 
+    def test_node_idle_timeout_default_and_overrides(self) -> None:
+        argv = ["--self-check"]
+        with mock.patch.dict(os.environ, clear=True):
+            self.assertEqual(node.parse_args(argv).idle_timeout, 300)
+        with mock.patch.dict(os.environ, {"AGENCT_NODE_IDLE_TIMEOUT": "180"}):
+            self.assertEqual(node.parse_args(argv).idle_timeout, 180)
+            self.assertEqual(node.parse_args([*argv, "--idle-timeout", "0"]).idle_timeout, 0)
+            self.assertEqual(node.parse_args([*argv, "--idle-timeout", "45"]).idle_timeout, 45)
+        for value in ("", "invalid", "1.5", "-1"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"AGENCT_NODE_IDLE_TIMEOUT": value}),
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                self.assertEqual(node.parse_args(argv).idle_timeout, 300)
+                self.assertIn("invalid AGENCT_NODE_IDLE_TIMEOUT", stderr.getvalue())
+                with self.assertRaises(SystemExit) as exc:
+                    node.parse_args([*argv, "--idle-timeout", value])
+                self.assertEqual(exc.exception.code, 2)
+                self.assertIn("expected a non-negative integer", stderr.getvalue())
+
+    def test_job_idle_timeout_kills_silent_process_group(self) -> None:
+        script = (
+            "import time; "
+            "print('initial line', flush=True); "
+            "time.sleep(5)"
+        )
+        command = shlex.join([sys.executable, "-c", script]) + " & wait"
+        with (
+            tempfile.TemporaryDirectory() as workdir,
+            mock.patch.object(node.os, "killpg", wraps=os.killpg) as killpg,
+        ):
+            t0 = node.time.monotonic()
+            status, content, _ = node.execute_job(
+                f"custom:{command}", {"tmux_session": "job-idle"}, workdir, "workspace-write",
+                10, threading.Event(), lambda _s, _t: None, idle_timeout=1,
+            )
+            elapsed = node.time.monotonic() - t0
+        self.assertLess(elapsed, 4.0)
+        killpg.assert_called_once()
+        pgid, sig = killpg.call_args.args
+        self.assertNotEqual(pgid, os.getpgrp())
+        self.assertEqual(sig, node.signal.SIGKILL)
+        self.assertEqual(status, "timeout")
+        self.assertIn("[idle-timeout] No output for 1s", content)
+        self.assertIn("stdout:\ninitial line", content)
+
+    def test_job_active_output_resets_idle_timeout(self) -> None:
+        script = (
+            "import time\n"
+            "for i in range(4):\n"
+            "    print(f'tick-{i}', flush=True)\n"
+            "    if i < 3:\n"
+            "        time.sleep(0.4)\n"
+        )
+        command = shlex.join([sys.executable, "-c", script])
+        with tempfile.TemporaryDirectory() as workdir:
+            status, content, _ = node.execute_job(
+                f"custom:{command}", {}, workdir, "workspace-write",
+                10, threading.Event(), lambda _s, _t: None, idle_timeout=1,
+            )
+        self.assertEqual(status, "completed")
+        self.assertIn("tick-3", content)
+
+    def test_job_idle_timeout_zero_disables_watchdog(self) -> None:
+        script = "import time; time.sleep(1.2); print('ok', flush=True)"
+        command = shlex.join([sys.executable, "-c", script])
+        with tempfile.TemporaryDirectory() as workdir:
+            status, content, _ = node.execute_job(
+                f"custom:{command}", {}, workdir, "workspace-write",
+                10, threading.Event(), lambda _s, _t: None, idle_timeout=0,
+            )
+        self.assertEqual(status, "completed")
+        self.assertIn("ok", content)
+
     def test_node_submits_timeout_with_partial_output_and_agent_session(self) -> None:
         job = {"task_id": "tsk_timeout", "task_revision": 1, "lease_token": "lease", "agent": "codex"}
         partial = b'{"type":"thread.started","thread_id":"thread-1234"}\n'
@@ -607,7 +682,7 @@ class TestUnifiedNode(unittest.TestCase):
 
     def test_run_self_check_mocked_pass_and_fail(self) -> None:
         with tempfile.TemporaryDirectory() as workdir:
-            def fake_exec(agent, job, wd, _sb, _to, _ev, _cb):
+            def fake_exec(agent, job, wd, _sb, _to, _ev, _cb, **_kw):
                 inst = job["instruction"]
                 if job.get("sandbox") == "readonly":
                     path = inst.split("Read ", 1)[1].split(" and reply", 1)[0]

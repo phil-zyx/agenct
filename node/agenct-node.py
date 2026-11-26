@@ -41,6 +41,9 @@ VALID_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 MAX_RESULT_BYTES = 16_000
 DEFAULT_NODE_TIMEOUT = 3600
 NODE_TIMEOUT_ENV = "AGENCT_NODE_TIMEOUT"
+DEFAULT_IDLE_TIMEOUT = 300
+NODE_IDLE_TIMEOUT_ENV = "AGENCT_NODE_IDLE_TIMEOUT"
+IDLE_WARN_SECS = 60
 MAX_EVIDENCE_BYTES = 5 * 1024 * 1024
 MAX_EVIDENCE_COUNT = 4
 _SAFE_MODEL_RE = re.compile(r"^[A-Za-z0-9._:/@][A-Za-z0-9._:/@-]{0,127}$")
@@ -867,6 +870,17 @@ def build_prompt(
     return "\n\n".join(parts)
 
 
+class IdleTimeoutExpired(subprocess.TimeoutExpired):
+    """Raised when a child process produces no stdout/stderr output for `idle_timeout` seconds."""
+
+
+def _kill_process_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def run_monitored(
     argv: list[str] | str,
     *,
@@ -879,6 +893,7 @@ def run_monitored(
     stage_label: str,
     agent_hint: str = "",
     started_at: float | None = None,
+    idle_timeout: int = 0,
 ) -> tuple[int, bytes, bytes, bool]:
     if started_at is None:
         started_at = time.monotonic()
@@ -896,6 +911,9 @@ def run_monitored(
     err_chunks: list[bytes] = []
     tail_lock = threading.Lock()
     recent: list[str] = []
+    last_activity = [started_at]
+    last_idle_notice = [0.0]
+    last_tail = [""]
 
     def reader(stream, sink: list[bytes]) -> None:
         if stream is None:
@@ -904,13 +922,19 @@ def run_monitored(
             with stream:
                 for line in stream:
                     sink.append(line)
+                    now = time.monotonic()
                     text = summarize_progress_line(agent_hint, decode_bytes(line))
-                    if text:
-                        with tail_lock:
+                    tail = ""
+                    with tail_lock:
+                        last_activity[0] = now
+                        last_idle_notice[0] = 0.0
+                        if text:
                             recent.append(text[-160:])
                             if len(recent) > 4:
                                 recent.pop(0)
-                            tail = " | ".join(recent)[-360:]
+                            last_tail[0] = " | ".join(recent)[-360:]
+                            tail = last_tail[0]
+                    if text:
                         progress_cb(stage_label, tail)
         except Exception:
             pass
@@ -924,22 +948,34 @@ def run_monitored(
     while proc.poll() is None:
         if cancel_event.is_set():
             cancelled = True
-            proc.terminate()
+            _kill_process_group(proc.pid, signal.SIGTERM)
             try:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                _kill_process_group(proc.pid, signal.SIGKILL)
+                proc.wait()
             break
-        if time.monotonic() - started_at >= timeout:
+        now = time.monotonic()
+        if now - started_at >= timeout:
             # start_new_session makes the child PID the process group ID.
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            _kill_process_group(proc.pid, signal.SIGKILL)
             proc.wait()
             t_out.join(timeout=1)
             t_err.join(timeout=1)
             raise subprocess.TimeoutExpired(argv, timeout, b"".join(out_chunks), b"".join(err_chunks))
+        if idle_timeout > 0:
+            with tail_lock:
+                idle_for = now - last_activity[0]
+                tail_snap = last_tail[0]
+            if idle_for >= idle_timeout:
+                _kill_process_group(proc.pid, signal.SIGKILL)
+                proc.wait()
+                t_out.join(timeout=1)
+                t_err.join(timeout=1)
+                raise IdleTimeoutExpired(argv, idle_timeout, b"".join(out_chunks), b"".join(err_chunks))
+            if idle_for >= IDLE_WARN_SECS and (now - last_idle_notice[0]) >= 15.0:
+                last_idle_notice[0] = now
+                progress_cb(f"{stage_label}（已静默 {int(idle_for)}s）", tail_snap)
         time.sleep(0.2)
 
     t_out.join(timeout=2)
@@ -1230,6 +1266,7 @@ def execute_job(
     cancel_event: threading.Event,
     progress_cb,
     meta_out: dict | None = None,
+    idle_timeout: int = DEFAULT_IDLE_TIMEOUT,
 ) -> tuple[str, str, list[dict]]:
     eff_sandbox = tighten_sandbox(sandbox, job.get("sandbox"))
     job_model = sanitize_job_model(job.get("model"))
@@ -1265,6 +1302,7 @@ def execute_job(
                 progress_cb=progress_cb,
                 stage_label="Running custom command",
                 agent_hint="custom",
+                idle_timeout=idle_timeout,
             )
             if cancelled:
                 return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1308,6 +1346,7 @@ def execute_job(
                     stage_label=stage_label,
                     agent_hint=agent,
                     started_at=started_at,
+                    idle_timeout=idle_timeout,
                 )
                 if cancelled:
                     return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1343,6 +1382,7 @@ def execute_job(
                             stage_label=stage_label,
                             agent_hint=agent,
                             started_at=started_at,
+                            idle_timeout=idle_timeout,
                         )
                         if cancelled:
                             return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1404,7 +1444,13 @@ def execute_job(
         raw_out = decode_bytes(exc.stdout)
         _, captured_sid = parse_cli_output(agent, raw_out)
         session_id = captured_sid or resume_sid
-        content = f"[timeout] Execution timed out after {timeout}s. Adjust {NODE_TIMEOUT_ENV} or --timeout."
+        if isinstance(exc, IdleTimeoutExpired):
+            content = (
+                f"[idle-timeout] No output for {idle_timeout}s; terminated hung process to unblock queue. "
+                f"Adjust {NODE_IDLE_TIMEOUT_ENV} or --idle-timeout (0 disables)."
+            )
+        else:
+            content = f"[timeout] Execution timed out after {timeout}s. Adjust {NODE_TIMEOUT_ENV} or --timeout."
         if session_id:
             if meta_out is not None:
                 meta_out["agent_session_id"] = session_id
@@ -1448,7 +1494,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
     env_header = build_env_header(args.kind, agent, workdir, allowed_agents)
     agents_disp = ",".join("custom" if a.startswith("custom:") else a for a in allowed_agents)
     print(
-        f"[agenct-node] hub={hub} kind={args.kind} agent={agent} agents={agents_disp} sandbox={sandbox} workdir={workdir}",
+        f"[agenct-node] hub={hub} kind={args.kind} agent={agent} agents={agents_disp} "
+        f"sandbox={sandbox} idle_timeout={args.idle_timeout}s workdir={workdir}",
         flush=True,
     )
 
@@ -1565,7 +1612,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
         else:
             try:
                 status, content, attachments = execute_job(
-                    chosen_agent, job, workdir, sandbox, args.timeout, cancel_event, on_progress, meta_out=meta_out
+                    chosen_agent, job, workdir, sandbox, args.timeout, cancel_event, on_progress,
+                    meta_out=meta_out, idle_timeout=args.idle_timeout,
                 )
             finally:
                 stop_heartbeat.set()
@@ -1603,9 +1651,10 @@ def run_node_loop(args: argparse.Namespace) -> int:
 def run_self_check(args: argparse.Namespace) -> int:
     """Run minimal real headless pre-flight checks for every enabled CLI engine."""
     probe_timeout = max(15, min(args.timeout, 180))
+    probe_idle_timeout = min(args.idle_timeout, probe_timeout) if args.idle_timeout > 0 else 0
     print(
         f"[self-check] job timeout={args.timeout}s (--timeout overrides {NODE_TIMEOUT_ENV}, "
-        f"default {DEFAULT_NODE_TIMEOUT}s); probe timeout={probe_timeout}s",
+        f"default {DEFAULT_NODE_TIMEOUT}s); idle_timeout={args.idle_timeout}s; probe timeout={probe_timeout}s",
         flush=True,
     )
     workdir = os.path.abspath(args.workdir or os.environ.get("AGENCT_WORKDIR") or os.getcwd())
@@ -1646,6 +1695,7 @@ def run_self_check(args: argparse.Namespace) -> int:
                 probe_timeout,
                 threading.Event(),
                 lambda _s, _t: None,
+                idle_timeout=probe_idle_timeout,
             )
             ro_dt = time.monotonic() - t0
             dir_clean = sorted(os.listdir(probe_dir)) == ["probe.txt"]
@@ -1678,6 +1728,7 @@ def run_self_check(args: argparse.Namespace) -> int:
                     probe_timeout,
                     threading.Event(),
                     lambda _s, _t: None,
+                    idle_timeout=probe_idle_timeout,
                 )
                 wr_dt = time.monotonic() - t1
                 wr_ok = wr_status == "completed" and wr_token in wr_out
@@ -1705,6 +1756,18 @@ def positive_timeout(value: str) -> int:
     raise argparse.ArgumentTypeError("expected a positive integer number of seconds")
 
 
+def non_negative_timeout(value: str) -> int:
+    if re.fullmatch(r"\+?[0-9]+", value.strip()):
+        try:
+            seconds = int(value)
+        except ValueError:
+            pass
+        else:
+            if seconds >= 0:
+                return seconds
+    raise argparse.ArgumentTypeError("expected a non-negative integer number of seconds")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Unified Agenct Node (PC or Cloud Runner)")
     p.add_argument("--hub", default="", help="Agenct Hub origin URL (e.g. https://agenct.example.com)")
@@ -1728,6 +1791,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Per-job timeout in seconds (positive integer). Overrides {NODE_TIMEOUT_ENV}. "
         f"Default: {DEFAULT_NODE_TIMEOUT}; invalid environment values use the default.",
     )
+    p.add_argument(
+        "--idle-timeout", type=non_negative_timeout,
+        help=f"Silent-hang watchdog timeout in seconds (non-negative integer; 0 disables). "
+        f"Overrides {NODE_IDLE_TIMEOUT_ENV}. Default: {DEFAULT_IDLE_TIMEOUT}.",
+    )
     p.add_argument("--once", action="store_true", help="Run a single poll cycle and exit")
     p.add_argument(
         "--self-check",
@@ -1742,6 +1810,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 parsed.timeout = positive_timeout(os.environ[NODE_TIMEOUT_ENV])
             except argparse.ArgumentTypeError as exc:
                 print(f"Warning: invalid {NODE_TIMEOUT_ENV}: {exc}; using {DEFAULT_NODE_TIMEOUT}s.", file=sys.stderr)
+    if parsed.idle_timeout is None:
+        parsed.idle_timeout = DEFAULT_IDLE_TIMEOUT
+        if NODE_IDLE_TIMEOUT_ENV in os.environ:
+            try:
+                parsed.idle_timeout = non_negative_timeout(os.environ[NODE_IDLE_TIMEOUT_ENV])
+            except argparse.ArgumentTypeError as exc:
+                print(
+                    f"Warning: invalid {NODE_IDLE_TIMEOUT_ENV}: {exc}; using {DEFAULT_IDLE_TIMEOUT}s.",
+                    file=sys.stderr,
+                )
     if not parsed.self_check and not parsed.hub:
         p.error("the following arguments are required: --hub")
     return parsed
