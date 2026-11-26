@@ -76,13 +76,17 @@ let refreshQueued = false;
 let syncTimer = null;
 let taskEventVersion = 0;
 
+const isMobile = () => window.innerWidth <= 900;
+
 function setTasksOpen(open) {
+  if (open && isMobile()) setContactsOpen(false);
   roomEl.classList.toggle('tasks-open', open);
   navTasks.setAttribute('aria-pressed', String(open));
   museToggle.setAttribute('aria-expanded', String(open));
 }
 
 function setContactsOpen(open) {
+  if (open && isMobile()) setTasksOpen(false);
   contactSidebar.classList.toggle('hide', !open);
   roomEl.classList.toggle('contacts-open', open);
   navContacts.setAttribute('aria-expanded', String(open));
@@ -232,6 +236,10 @@ async function boot() {
   let searchTimer = null;
   function setSearchOpen(open) {
     if (!searchPanel) return;
+    if (open && isMobile()) {
+      setTasksOpen(false);
+      setContactsOpen(false);
+    }
     searchPanel.classList.toggle('hide', !open);
     navSearch?.classList.toggle('active', open);
     navSearch?.setAttribute('aria-expanded', String(open));
@@ -315,6 +323,10 @@ async function boot() {
   // Left rail & floating avatar navigation
   navChat.onclick = () => {
     setSettingsOpen(false);
+    if (isMobile()) {
+      setTasksOpen(false);
+      setContactsOpen(false);
+    }
     railMenu.classList.add('hide');
   };
   navTasks.onclick = () => {
@@ -380,4 +392,33 @@ async function boot() {
   });
 }
 
+// Track the visual viewport (mobile soft keyboard & rotation) so the fixed top bar and workspace fit cleanly.
+function initVisualViewport() {
+  const vv = window.visualViewport;
+  if (!vv) return;
+  const root = document.documentElement;
+  let frame = 0;
+  const apply = () => {
+    if (frame) {
+      cancelAnimationFrame(frame);
+      frame = 0;
+    }
+    if (vv.height < window.innerHeight - 1 || vv.offsetTop > 0) {
+      root.style.setProperty('--vvh', vv.height + 'px');
+      root.style.setProperty('--vvt', vv.offsetTop + 'px');
+    } else {
+      root.style.removeProperty('--vvh');
+      root.style.removeProperty('--vvt');
+    }
+  };
+  const schedule = () => {
+    if (!frame) frame = requestAnimationFrame(apply);
+  };
+  vv.addEventListener('resize', apply);
+  window.addEventListener('resize', apply);
+  vv.addEventListener('scroll', schedule);
+  apply();
+}
+
+initVisualViewport();
 boot();

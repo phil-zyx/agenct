@@ -378,21 +378,117 @@ try {
   await page.reload({ waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#room:not(.hide)');
   await page.waitForSelector('#head-avatar-buddy:not(.hide) .buddy-svg');
+
+  // 7b. Verify mobile viewport adaptation (chat overflow containment, composer visibility, drawer + avatar grid, overlay nav, settings).
+  for (const vp of [
+    { width: 375, height: 667 },
+    { width: 390, height: 844 },
+  ]) {
+    await page.setViewportSize(vp);
+    await page.evaluate(() => {
+      const list = document.getElementById('messages');
+      if (document.getElementById('e2e-mobile-overflow-probe')) return;
+      const div = document.createElement('div');
+      div.id = 'e2e-mobile-overflow-probe';
+      div.className = 'msg msg-assistant';
+      div.innerHTML = `<div class="md-body">
+        <p class="md-p">检查超长链接：https://gitlab.internal.example.com/example-org/agenct/merge_requests/12345/diffs?view=parallel&token=abcdefghijklmnopqrstuvwxyz0123456789</p>
+        <pre class="md-pre"><code>cargo clippy --manifest-path hub/Cargo.toml --all-targets -- -D warnings && python3 node/agenct-node.py --self-check --agents codex,agy,opencode</code></pre>
+        <div class="md-table-wrap"><table class="md-table"><thead><tr><th>模块</th><th>引擎版本</th><th>状态说明</th><th>超宽测试列信息</th></tr></thead><tbody><tr><td>hub/src/brain/mod.rs</td><td>claude-opus-4-6-extended</td><td>已通过</td><td>用于验证手机端不会横向撑破消息气泡或页面容器</td></tr></tbody></table></div>
+      </div>`;
+      list.appendChild(div);
+    });
+    const chatMetrics = await page.evaluate(() => {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const scroller = document.getElementById('scroller');
+      const composer = document.getElementById('chat-form').getBoundingClientRect();
+      const sendBtn = document.getElementById('send-btn').getBoundingClientRect();
+      return {
+        vw,
+        vh,
+        docSW: document.documentElement.scrollWidth,
+        scrollerSW: scroller.scrollWidth,
+        scrollerCW: scroller.clientWidth,
+        composerBottom: Math.round(composer.bottom),
+        sendBtnRight: Math.round(sendBtn.right),
+        inputFontSize: getComputedStyle(document.getElementById('chat-input')).fontSize,
+      };
+    });
+    assert.ok(chatMetrics.docSW <= chatMetrics.vw, `mobile chat horizontal overflow (${vp.width}px): docSW=${chatMetrics.docSW} > vw=${chatMetrics.vw}`);
+    assert.ok(chatMetrics.scrollerSW <= chatMetrics.scrollerCW, `mobile scroller overflow (${vp.width}px): ${chatMetrics.scrollerSW} > ${chatMetrics.scrollerCW}`);
+    assert.ok(chatMetrics.composerBottom <= chatMetrics.vh + 1, `mobile composer clipped at bottom (${vp.width}px): ${chatMetrics.composerBottom} > ${chatMetrics.vh}`);
+    assert.ok(chatMetrics.sendBtnRight <= chatMetrics.vw, `mobile send button clipped at right (${vp.width}px): ${chatMetrics.sendBtnRight} > ${chatMetrics.vw}`);
+    assert.equal(chatMetrics.inputFontSize, '16px', 'mobile chat input must be 16px to prevent iOS focus auto-zoom');
+
+    await page.click('#nav-tasks');
+    await page.waitForSelector('#task-pane .muse-seg button[data-tab="soul"]');
+    await page.click('.muse-seg button[data-tab="soul"]');
+    await page.waitForSelector('#task-pane .avatar-grid');
+    const drawerMetrics = await page.evaluate(() => {
+      const vw = window.innerWidth;
+      const body = document.getElementById('drawer-body');
+      const grid = document.querySelector('#task-pane .avatar-grid');
+      const maxChoiceRight = Math.max(
+        ...Array.from(document.querySelectorAll('#task-pane .avatar-choice')).map((el) => Math.round(el.getBoundingClientRect().right)),
+      );
+      return {
+        vw,
+        docSW: document.documentElement.scrollWidth,
+        bodySW: body.scrollWidth,
+        bodyCW: body.clientWidth,
+        gridSW: grid.scrollWidth,
+        gridCW: grid.clientWidth,
+        maxChoiceRight,
+      };
+    });
+    assert.ok(drawerMetrics.docSW <= drawerMetrics.vw, `mobile drawer overflow (${vp.width}px): docSW=${drawerMetrics.docSW} > vw=${drawerMetrics.vw}`);
+    assert.ok(drawerMetrics.bodySW <= drawerMetrics.bodyCW, `mobile drawerBody overflow (${vp.width}px): ${drawerMetrics.bodySW} > ${drawerMetrics.bodyCW}`);
+    assert.ok(drawerMetrics.gridSW <= drawerMetrics.gridCW, `mobile avatarGrid overflow (${vp.width}px): ${drawerMetrics.gridSW} > ${drawerMetrics.gridCW}`);
+    assert.ok(drawerMetrics.maxChoiceRight <= drawerMetrics.vw, `mobile avatarChoice clipped (${vp.width}px): ${drawerMetrics.maxChoiceRight} > ${drawerMetrics.vw}`);
+
+    await page.click('#nav-chat');
+    await page.waitForSelector('#room:not(.tasks-open)');
+
+    await page.click('#rail-more');
+    await page.click('#open-settings');
+    await page.waitForSelector('#settings-view:not(.hide) #models-form');
+    const settingsMetrics = await page.evaluate(() => {
+      const el = document.getElementById('settings-view');
+      const rc = el.getBoundingClientRect();
+      return {
+        vw: window.innerWidth,
+        vh: window.innerHeight,
+        bottom: Math.round(rc.bottom),
+        sw: el.scrollWidth,
+        cw: el.clientWidth,
+      };
+    });
+    assert.ok(settingsMetrics.bottom <= settingsMetrics.vh + 1, `mobile settings pane clipped at bottom (${vp.width}px): ${settingsMetrics.bottom} > ${settingsMetrics.vh}`);
+    assert.ok(settingsMetrics.sw <= settingsMetrics.cw, `mobile settings pane overflow (${vp.width}px): ${settingsMetrics.sw} > ${settingsMetrics.cw}`);
+    await page.click('#close-settings');
+  }
+  await page.setViewportSize({ width: 1280, height: 800 });
+
+  assert.deepEqual(errors, [], `unexpected browser errors: ${errors.join('; ')}`);
+
+  // 7c. Per-user brain model settings: private URLs are rejected by the Hub (SSRF guard).
   await page.click('#rail-more');
   await page.click('#open-settings');
   await page.waitForSelector('#perms-form');
-
-  // 7b. Per-user brain model settings: private URLs are rejected by the Hub (SSRF guard).
   await page.waitForSelector('#models-form');
   assert.ok((await page.textContent('#settings-body')).includes('服务器默认：stub'));
-  await page.fill('#models-form input[name="brain_url"]', 'https://10.0.0.11/v1/chat/completions');
+  await page.fill('#models-form input[name="brain_url"]', 'https://10.20.30.40/v1/chat/completions');
   await page.fill('#models-form input[name="brain_model"]', 'evil');
   await page.fill('#models-form input[name="brain_key"]', 'sk-test-123456789');
   const rejected = page.waitForResponse((r) => r.url().endsWith('/api/settings/models') && r.request().method() === 'PUT');
   await page.click('#models-form button[type="submit"]');
   assert.equal((await rejected).status(), 400);
-
-  assert.deepEqual(errors, [], `unexpected browser errors: ${errors.join('; ')}`);
+  assert.deepEqual(
+    errors.filter((e) => !e.includes('status of 400')),
+    [],
+    `unexpected browser errors during SSRF check: ${errors.join('; ')}`,
+  );
 
   // 8. Verify backup.py backup + restore works cleanly against live SQLite DB.
   const archive = path.join(tmpDir, 'backup.zip');
