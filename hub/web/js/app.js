@@ -1,9 +1,12 @@
 // Agenct v2 entrypoint with classic left-rail + centered-chat + floating-avatar Muse drawer layout.
-import { api, esc, fmtTime, setCsrfToken, showToast } from './api.js';
+import { api, setCsrfToken, showToast } from './api.js';
 import { createAvatarController } from './avatar.js';
 import { initChat } from './chat.js';
 import { initDrawer } from './drawer.js';
+import { initCommandPalette } from './palette.js';
+import { cycleSoundMode, getSoundMode, isSoundEnabled, playDone, playTap, playToggle, playWarn, soundModeLabel } from './sound.js';
 import { connectEvents } from './sse.js';
+import { initRailGlideTip } from './ui.js';
 
 const state = {
   user: null,
@@ -40,9 +43,11 @@ const searchResults = document.getElementById('search-results');
 const railBadge = document.getElementById('rail-badge');
 const railMore = document.getElementById('rail-more');
 const railMenu = document.getElementById('rail-menu');
+const railIndicator = document.getElementById('rail-indicator');
 const museToggle = document.getElementById('muse-head-toggle');
 
 const agentNameEl = document.getElementById('agent-name');
+const headStateTextEl = document.getElementById('head-state-text');
 const drawerAgentNameEl = document.getElementById('drawer-agent-name');
 const headAvatarEl = document.getElementById('head-avatar');
 const headBuddyEl = document.getElementById('head-avatar-buddy');
@@ -62,7 +67,9 @@ const avatarUI = createAvatarController({
   headAvatarEl,
   headBuddyEl,
   headBadgeEl,
+  headStateTextEl,
   heroWrapEl: heroAvatarWrapEl,
+  chatPaneEl: chatPane,
   drawerAvatarEl,
   drawerBuddyEl,
   drawerBadgeEl,
@@ -78,30 +85,71 @@ let taskEventVersion = 0;
 
 const isMobile = () => window.innerWidth <= 900;
 
-function setTasksOpen(open) {
-  if (open && isMobile()) setContactsOpen(false);
+function syncRailState() {
+  const inSettings = !settingsView.classList.contains('hide');
+  const tasksOpen = roomEl.classList.contains('tasks-open');
+  const contactsOpen = !contactSidebar.classList.contains('hide');
+  const searchOpen = Boolean(searchPanel && !searchPanel.classList.contains('hide'));
+  const menuOpen = !railMenu.classList.contains('hide');
+
+  navChat.classList.toggle('active', !inSettings);
+  navChat.setAttribute('aria-current', inSettings ? 'false' : 'page');
+  railMore.classList.toggle('active', inSettings);
+  navTasks.classList.toggle('is-open-panel', tasksOpen);
+  navContacts.classList.toggle('is-open-panel', contactsOpen);
+  navSearch?.classList.toggle('is-open-panel', searchOpen);
+  railMore.classList.toggle('is-open-panel', !inSettings && menuOpen);
+
+  if (railIndicator) {
+    if (inSettings) {
+      railIndicator.style.opacity = '0';
+    } else {
+      railIndicator.style.opacity = '1';
+      railIndicator.style.transform = `translateY(${navChat.offsetTop}px)`;
+    }
+  }
+}
+
+function setTasksOpen(open, silent = false) {
+  const wasOpen = roomEl.classList.contains('tasks-open');
+  if (open && isMobile()) setContactsOpen(false, true);
   roomEl.classList.toggle('tasks-open', open);
   navTasks.setAttribute('aria-pressed', String(open));
   museToggle.setAttribute('aria-expanded', String(open));
+  if (!open) {
+    document.getElementById('status-tray-wrap')?.classList.remove('is-open');
+    document.getElementById('status-tray-wrap')?.setAttribute('aria-hidden', 'true');
+    document.getElementById('status-tray')?.setAttribute('aria-hidden', 'true');
+    document.getElementById('status-picker-btn')?.setAttribute('aria-expanded', 'false');
+    document.getElementById('status-tray-tip')?.classList.remove('is-visible');
+  }
+  syncRailState();
+  if (!silent && wasOpen !== open) playToggle(open);
 }
 
-function setContactsOpen(open) {
-  if (open && isMobile()) setTasksOpen(false);
+function setContactsOpen(open, silent = false) {
+  const wasOpen = !contactSidebar.classList.contains('hide');
+  if (open && isMobile()) setTasksOpen(false, true);
   contactSidebar.classList.toggle('hide', !open);
   roomEl.classList.toggle('contacts-open', open);
   navContacts.setAttribute('aria-expanded', String(open));
   navContacts.classList.toggle('active', open);
+  syncRailState();
+  if (!silent && wasOpen !== open) playToggle(open);
 }
 
 function setSettingsOpen(open) {
+  const wasOpen = !settingsView.classList.contains('hide');
   settingsView.classList.toggle('hide', !open);
   chatPane.classList.toggle('hide', open);
-  navChat.classList.toggle('active', !open);
+  if (!wasOpen && open) playToggle(true);
+  else if (wasOpen && !open) playToggle(false);
   if (open) {
-    setTasksOpen(false);
-    setContactsOpen(false);
+    setTasksOpen(false, true);
+    setContactsOpen(false, true);
     drawerUI.loadIntegrations().then(() => drawerUI.renderSettingsPane());
   }
+  syncRailState();
 }
 
 async function refresh() {
@@ -132,6 +180,7 @@ async function refresh() {
     avatarUI.setAvatar(state.profile?.avatar_id);
     chatUI.syncTasks(state.tasks || [], taskVersion);
     chatUI.render();
+    chatUI.renderEnginePill?.();
     drawerUI.render();
   })().finally(() => {
     refreshInFlight = null;
@@ -233,99 +282,154 @@ async function boot() {
     },
   });
 
-  let searchTimer = null;
-  function setSearchOpen(open) {
-    if (!searchPanel) return;
-    if (open && isMobile()) {
-      setTasksOpen(false);
-      setContactsOpen(false);
-    }
-    searchPanel.classList.toggle('hide', !open);
-    navSearch?.classList.toggle('active', open);
-    navSearch?.setAttribute('aria-expanded', String(open));
-    if (open) {
-      setSettingsOpen(false);
-      searchInput?.focus();
+  let commandPalette = null;
+  function openAvatarPicker() {
+    setSettingsOpen(false);
+    drawerUI.openTab('soul');
+    const grid = document.querySelector('#drawer-body .avatar-grid');
+    if (grid) {
+      grid.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      grid.classList.remove('is-highlighted');
+      void grid.offsetWidth;
+      grid.classList.add('is-highlighted');
+      setTimeout(() => grid.classList.remove('is-highlighted'), 950);
     }
   }
 
-  async function runSearch(q) {
-    if (!searchResults) return;
-    const trimmed = q.trim();
-    if (!trimmed) {
-      searchResults.innerHTML = '';
+  commandPalette = initCommandPalette({
+    state,
+    panelEl: searchPanel,
+    inputEl: searchInput,
+    resultsEl: searchResults,
+    closeBtn: closeSearch,
+    triggerBtn: navSearch,
+    actions: {
+      onBeforeOpen: () => {
+        if (isMobile()) {
+          setTasksOpen(false, true);
+          setContactsOpen(false, true);
+        }
+      },
+      onSyncRail: syncRailState,
+      onSwitchEngine: async (node, ag) => {
+        commandPalette.close(true);
+        await chatUI.switchEngine(node, ag);
+      },
+      getSoundLabel: () => soundModeLabel(getSoundMode()),
+      onCycleSound: () => {
+        const nextMode = cycleSoundMode();
+        syncSoundUI();
+        showToast(`交互音效：${soundModeLabel(nextMode)}`);
+        commandPalette.open();
+      },
+      onOpenAvatarPicker: () => {
+        commandPalette.close(true);
+        openAvatarPicker();
+      },
+      onRenameAgent: () => {
+        commandPalette.close(true);
+        setSettingsOpen(false);
+        setTasksOpen(true);
+        setTimeout(startEditAgentName, 60);
+      },
+      onToggleTasks: (force) => {
+        commandPalette.close(true);
+        setSettingsOpen(false);
+        setTasksOpen(typeof force === 'boolean' ? force : !roomEl.classList.contains('tasks-open'));
+      },
+      isTasksOpen: () => roomEl.classList.contains('tasks-open'),
+      onToggleContacts: () => {
+        commandPalette.close(true);
+        setSettingsOpen(false);
+        setContactsOpen(contactSidebar.classList.contains('hide'));
+      },
+      isContactsOpen: () => !contactSidebar.classList.contains('hide'),
+      onOpenSettings: () => {
+        commandPalette.close(true);
+        setSettingsOpen(true);
+      },
+      onOpenThread: (threadId, title) => {
+        setSettingsOpen(false);
+        if (window.innerWidth <= 900) setTasksOpen(false);
+        chatUI.setThreadFilter(threadId, title);
+      },
+    },
+  });
+
+  const editAgentNameBtn = document.getElementById('edit-agent-name-btn');
+  const agentNameInput = document.getElementById('drawer-agent-name-input');
+  let editingAgentName = false;
+
+  function startEditAgentName() {
+    if (!editAgentNameBtn || !agentNameInput || editingAgentName) return;
+    editingAgentName = true;
+    playTap();
+    agentNameInput.value = state.profile?.name || drawerAgentNameEl.textContent || 'Agenct';
+    editAgentNameBtn.classList.add('hide');
+    agentNameInput.classList.remove('hide');
+    agentNameInput.focus();
+    agentNameInput.select();
+  }
+
+  async function finishEditAgentName(commit) {
+    if (!editAgentNameBtn || !agentNameInput || !editingAgentName) return;
+    editingAgentName = false;
+    const prevName = state.profile?.name || drawerAgentNameEl.textContent || 'Agenct';
+    const nextName = agentNameInput.value.trim();
+    agentNameInput.classList.add('hide');
+    editAgentNameBtn.classList.remove('hide');
+    if (!commit) return;
+    if (!nextName) {
+      showToast('名字不能为空');
       return;
     }
+    if (nextName === prevName) return;
+    agentNameEl.textContent = nextName;
+    drawerAgentNameEl.textContent = nextName;
     try {
-      const res = await api(`/api/search?q=${encodeURIComponent(trimmed)}`);
-      const parts = [];
-      if ((res.messages || []).length) {
-        parts.push('<div class="search-group-title">对话记录</div>');
-        for (const m of res.messages) {
-          const thrTitle =
-            (state.threads || []).find((t) => t.id === m.thread_id)?.title || m.thread_id || '';
-          parts.push(`
-            <button type="button" class="search-hit" data-hit-thread="${esc(m.thread_id || '')}" data-hit-title="${esc(thrTitle)}">
-              <div class="search-hit-meta">
-                <span>${esc(m.role === 'user' ? '我' : 'Agenct')}</span>
-                <span>${esc(fmtTime(m.created_at))}</span>
-                ${thrTitle ? `<span class="badge">${esc(thrTitle)}</span>` : ''}
-              </div>
-              <div>${esc(m.snippet)}</div>
-            </button>`);
-        }
-      }
-      if ((res.ledgers || []).length) {
-        parts.push('<div class="search-group-title">持续事项</div>');
-        for (const l of res.ledgers) {
-          parts.push(`
-            <div class="search-hit">
-              <div class="search-hit-meta"><strong>${esc(l.title)}</strong><span class="badge">${esc(l.status)}</span></div>
-              <div>${esc((l.notes || '').slice(0, 160))}</div>
-            </div>`);
-        }
-      }
-      if ((res.memory_matches || []).length) {
-        parts.push('<div class="search-group-title">长期记忆</div>');
-        for (const line of res.memory_matches) {
-          parts.push(`<div class="search-hit"><div>${esc(line)}</div></div>`);
-        }
-      }
-      searchResults.innerHTML = parts.length ? parts.join('') : '<p class="note">未找到匹配内容</p>';
-      searchResults.querySelectorAll('[data-hit-thread]').forEach((btn) => {
-        if (!btn.dataset.hitThread) return;
-        btn.onclick = () => {
-          setSearchOpen(false);
-          chatUI.setThreadFilter(btn.dataset.hitThread, btn.dataset.hitTitle);
-        };
-      });
+      await api('/api/brain', { method: 'PUT', body: { name: nextName } });
+      playDone();
+      showToast(`已更名为：${nextName}`);
+      await refresh();
     } catch (err) {
-      searchResults.innerHTML = `<p class="note">搜索失败：${esc(err.message)}</p>`;
+      playWarn();
+      agentNameEl.textContent = prevName;
+      drawerAgentNameEl.textContent = prevName;
+      showToast(`更名失败：${err.message}`);
     }
   }
 
-  navSearch && (navSearch.onclick = () => setSearchOpen(searchPanel.classList.contains('hide')));
-  closeSearch && (closeSearch.onclick = () => setSearchOpen(false));
-  searchInput?.addEventListener('input', () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => runSearch(searchInput.value), 220);
+  editAgentNameBtn?.addEventListener('click', startEditAgentName);
+  agentNameInput?.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter' && !ev.isComposing) {
+      ev.preventDefault();
+      finishEditAgentName(true);
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      finishEditAgentName(false);
+    }
   });
+  agentNameInput?.addEventListener('blur', () => finishEditAgentName(true));
+
   document.addEventListener('keydown', (ev) => {
     if (roomEl.classList.contains('hide')) return;
     if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'k') {
       ev.preventDefault();
-      setSearchOpen(searchPanel.classList.contains('hide'));
-    } else if (ev.key === 'Escape' && searchPanel && !searchPanel.classList.contains('hide')) {
-      setSearchOpen(false);
+      commandPalette.toggle();
+    } else if (ev.key === 'Escape') {
+      if (commandPalette.isOpen()) commandPalette.close();
+      setStatusTrayOpen(false, true);
     }
   });
 
   // Left rail & floating avatar navigation
   navChat.onclick = () => {
+    playTap();
     setSettingsOpen(false);
     if (isMobile()) {
-      setTasksOpen(false);
-      setContactsOpen(false);
+      setTasksOpen(false, true);
+      setContactsOpen(false, true);
     }
     railMenu.classList.add('hide');
   };
@@ -347,10 +451,103 @@ async function boot() {
     const open = railMenu.classList.contains('hide');
     railMenu.classList.toggle('hide', !open);
     railMore.setAttribute('aria-expanded', String(open));
+    syncRailState();
+    playTap();
   };
   document.addEventListener('click', () => {
     railMenu.classList.add('hide');
     railMore.setAttribute('aria-expanded', 'false');
+    setStatusTrayOpen(false, true);
+    syncRailState();
+  });
+
+  const soundBtn = document.getElementById('toggle-sound');
+  const soundLabel = document.getElementById('sound-label');
+  const statusPickerBtn = document.getElementById('status-picker-btn');
+  const statusTrayWrap = document.getElementById('status-tray-wrap');
+  const statusTray = document.getElementById('status-tray');
+  const statusTrayTip = document.getElementById('status-tray-tip');
+  const statusSoundOrb = document.getElementById('status-sound-orb');
+
+  function syncSoundUI() {
+    const mode = getSoundMode();
+    const label = soundModeLabel(mode);
+    const on = isSoundEnabled();
+    if (soundLabel) soundLabel.textContent = `交互音效：${label}`;
+    soundBtn?.setAttribute('aria-pressed', String(on));
+    if (statusSoundOrb) {
+      statusSoundOrb.dataset.tip = `交互音效：${label}（点击切换）`;
+      statusSoundOrb.setAttribute('aria-pressed', String(on));
+      statusSoundOrb.classList.toggle('is-muted', !on);
+    }
+  }
+  syncSoundUI();
+  syncRailState();
+  initRailGlideTip(document.querySelector('.rail'));
+
+  function setStatusTrayOpen(open, silent = false) {
+    if (!statusPickerBtn || !statusTrayWrap || !statusTray) return;
+    const wasOpen = statusTrayWrap.classList.contains('is-open');
+    statusTrayWrap.classList.toggle('is-open', open);
+    statusTrayWrap.setAttribute('aria-hidden', String(!open));
+    statusTray.setAttribute('aria-hidden', String(!open));
+    statusPickerBtn.setAttribute('aria-expanded', String(open));
+    if (!open) statusTrayTip?.classList.remove('is-visible');
+    if (!silent && wasOpen !== open) playToggle(open);
+  }
+
+  statusPickerBtn?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    setStatusTrayOpen(!statusTrayWrap?.classList.contains('is-open'));
+  });
+  avatarStatePill?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    setStatusTrayOpen(!statusTrayWrap?.classList.contains('is-open'));
+  });
+  statusTray?.addEventListener('click', (ev) => ev.stopPropagation());
+  statusTray?.addEventListener('pointerleave', () => statusTrayTip?.classList.remove('is-visible'));
+  statusTray?.querySelectorAll('.status-orb').forEach((orb) => {
+    const showTip = () => {
+      if (!statusTrayTip || !statusTray) return;
+      statusTrayTip.textContent = orb.dataset.tip || '';
+      const centerX = orb.offsetLeft + orb.offsetWidth / 2;
+      const trayLeft = statusTray.offsetLeft;
+      statusTrayWrap.style.setProperty('--tip-x', `${trayLeft + centerX}px`);
+      statusTrayTip.classList.add('is-visible');
+    };
+    orb.addEventListener('pointerenter', showTip);
+    orb.addEventListener('focus', showTip);
+    orb.addEventListener('blur', () => statusTrayTip?.classList.remove('is-visible'));
+    orb.addEventListener('click', () => {
+      const act = orb.dataset.statusAct;
+      if (act === 'poke') {
+        avatarUI.poke({ force: true });
+        showToast('已打招呼，随时待命');
+      } else if (act === 'avatar') {
+        playTap();
+        openAvatarPicker();
+      } else if (act === 'search') {
+        commandPalette.open();
+      } else if (act === 'sound') {
+        const nextMode = cycleSoundMode();
+        syncSoundUI();
+        showToast(`交互音效已切为：${soundModeLabel(nextMode)}`);
+        if (statusTrayTip?.classList.contains('is-visible')) {
+          statusTrayTip.textContent = orb.dataset.tip || '';
+        }
+        return;
+      } else if (act === 'settings') {
+        setSettingsOpen(true);
+      }
+      setStatusTrayOpen(false, true);
+    });
+  });
+
+  soundBtn?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    const nextMode = cycleSoundMode();
+    syncSoundUI();
+    showToast(`交互音效：${soundModeLabel(nextMode)}`);
   });
 
   document.getElementById('open-settings').onclick = () => {
@@ -384,6 +581,10 @@ async function boot() {
     },
     onTask(task) {
       chatUI.onTask(task, ++taskEventVersion);
+      if (task?.status === 'done') {
+        chatUI.flashIslandDone?.();
+        playDone();
+      } else if (task?.status === 'failed') playWarn();
     },
     onSync(kind) {
       if (kind === 'resync') chatUI.setStage('');

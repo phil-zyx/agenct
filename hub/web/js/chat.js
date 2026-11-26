@@ -1,5 +1,7 @@
 // Chat stream, typing indicator, attachment uploads, and floating pill composer.
 import { api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
+import { playDone, playSend, playTap, playToggle, playWarn } from './sound.js';
+import { initDelegatedCopy, writeClipboard } from './ui.js';
 
 function randomId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -11,6 +13,11 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   const scrollerEl = document.getElementById('scroller');
   const listEl = document.getElementById('messages');
   const formEl = document.getElementById('chat-form');
+  const pillEl = formEl.querySelector('.composer-pill');
+  const engineWrap = document.getElementById('composer-engine-wrap');
+  const engineBtn = document.getElementById('composer-engine-btn');
+  const engineLabel = document.getElementById('composer-engine-label');
+  const engineMenu = document.getElementById('composer-engine-menu');
   const inputEl = document.getElementById('chat-input');
   const sendBtn = document.getElementById('send-btn');
   const fileEl = document.getElementById('file-input');
@@ -20,6 +27,8 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   const elapsedEl = document.getElementById('work-elapsed');
   const workLogEl = document.getElementById('work-log');
   const logTailEl = document.getElementById('work-log-tail');
+  const islandShellEl = document.getElementById('island-shell');
+  const scrollBottomBtn = document.getElementById('scroll-bottom-btn');
   const headEl = document.getElementById('muse-head-toggle');
   const heroEl = document.getElementById('hero-avatar-wrap');
   const typingEl = document.getElementById('typing');
@@ -45,6 +54,10 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   let threadHasMore = false;
   let loadingOlder = false;
   let scrollAfterRender = true;
+  let hasBootRendered = false;
+  let lastSeenMsgId = 0;
+  let switchingThread = false;
+  let launchTimer = null;
   let brainWork = null;
   let taskWork = new Map();
   let visibleTaskId = null;
@@ -52,6 +65,30 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   let elapsedTimer = null;
   let lastActivityKey = '';
   let lastTaskSnapshot = null;
+  let currentStatusLabel = '';
+  let donePulseTimer = null;
+  const renderedContents = new Map();
+
+  function distFromBottom() {
+    return Math.max(0, scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight);
+  }
+
+  function syncScrollBottom() {
+    if (!scrollBottomBtn) return;
+    const dist = distFromBottom();
+    if (dist <= 60) {
+      scrollBottomBtn.classList.remove('is-visible', 'has-unread');
+    } else if (dist > 160) {
+      scrollBottomBtn.classList.add('is-visible');
+    }
+  }
+
+  scrollerEl?.addEventListener('scroll', syncScrollBottom, { passive: true });
+  scrollBottomBtn?.addEventListener('click', () => {
+    playTap();
+    scrollBottomBtn.classList.remove('has-unread');
+    scrollerEl.scrollTo({ top: scrollerEl.scrollHeight, behavior: 'smooth' });
+  });
 
   const stageLabels = new Map([
     ['connecting', '正在连接'],
@@ -62,6 +99,31 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     ['starting execution', '正在启动执行'],
   ]);
 
+  function fmtDuration(secs) {
+    const s = Math.max(0, Math.floor(secs));
+    if (s < 60) return `${s} 秒`;
+    if (s < 3600) return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
+    return `${Math.floor(s / 3600)} 小时 ${Math.floor((s % 3600) / 60)} 分`;
+  }
+
+  function fmtCompactDuration(secs) {
+    const s = Math.max(0, Math.floor(secs));
+    if (s < 60) return `${s}s`;
+    if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+    return `${Math.floor(s / 3600)}h${Math.floor((s % 3600) / 60)}m`;
+  }
+
+  function humanizeStage(rawStage, status) {
+    const st = String(rawStage || '').trim();
+    const mapped = stageLabels.get(st.toLowerCase());
+    if (mapped) return mapped;
+    if (/^running\s+/i.test(st)) {
+      const quiet = st.match(/（(已静默\s*[^）]+)）/);
+      return quiet ? `正在执行 · ${quiet[1]}` : '正在执行';
+    }
+    return st || (status === 'queued' ? '等待节点接单' : '正在执行');
+  }
+
   function emitActivity() {
     if (!onActivityChange) return;
     const payload = {
@@ -69,17 +131,29 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       streaming: Boolean(streamingText),
       taskStatus: typeof lastTaskSnapshot?.status === 'string' ? lastTaskSnapshot.status : '',
       taskStage: typeof lastTaskSnapshot?.stage === 'string' ? lastTaskSnapshot.stage : '',
+      statusLabel: currentStatusLabel,
     };
-    const key = `${payload.brainStage}|${payload.streaming ? 1 : 0}|${payload.taskStatus}|${payload.taskStage}`;
+    const key = `${payload.brainStage}|${payload.streaming ? 1 : 0}|${payload.taskStatus}|${payload.taskStage}|${payload.statusLabel}`;
     if (key === lastActivityKey) return;
     lastActivityKey = key;
     onActivityChange(payload);
   }
 
   function renderElapsed() {
-    elapsedEl.textContent = visibleWork
-      ? `${Math.floor((performance.now() - visibleWork.startedAt) / 1000)} 秒`
-      : '';
+    const secs = visibleWork ? Math.floor((performance.now() - visibleWork.startedAt) / 1000) : 0;
+    elapsedEl.textContent = visibleWork ? fmtDuration(secs) : '';
+    if (visibleWork) {
+      const stage = typeof visibleWork.stage === 'string' ? visibleWork.stage.trim() : '';
+      const shortStage = humanizeStage(stage, lastTaskSnapshot?.status);
+      const nextLabel = `${shortStage} · ${fmtCompactDuration(secs)}`;
+      if (nextLabel !== currentStatusLabel) {
+        currentStatusLabel = nextLabel;
+        emitActivity();
+      }
+    } else if (currentStatusLabel) {
+      currentStatusLabel = '';
+      emitActivity();
+    }
   }
 
   function renderWork() {
@@ -89,8 +163,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     visibleWork = brainWork || task;
     const busy = Boolean(visibleWork);
     const stage = typeof visibleWork?.stage === 'string' ? visibleWork.stage.trim() : '';
-    const label = stageLabels.get(stage?.toLowerCase()) || stage
-      || (task?.status === 'queued' ? '等待节点接单' : '正在执行');
+    const label = humanizeStage(stage, task?.status);
     const text = busy ? `正在工作 · ${label}` : '';
     if (workStageEl.textContent !== text) workStageEl.textContent = text;
     stageEl.classList.toggle('hide', !busy);
@@ -98,7 +171,8 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     heroEl?.classList.toggle('is-thinking', busy);
 
     const taskId = visibleWork?.taskId;
-    const tail = visibleWork?.logTail || '';
+    const rawTail = visibleWork?.logTail || '';
+    const tail = rawTail ? rawTail.split(/\s+\|\s+/).join('\n') : '';
     if (taskId !== visibleTaskId || !tail) workLogEl.open = false;
     visibleTaskId = taskId;
     if (logTailEl.textContent !== tail) logTailEl.textContent = tail;
@@ -111,6 +185,15 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       elapsedTimer = null;
     }
     emitActivity();
+  }
+
+  function flashIslandDone() {
+    if (!islandShellEl) return;
+    islandShellEl.classList.remove('just-done');
+    void islandShellEl.offsetWidth;
+    islandShellEl.classList.add('just-done');
+    clearTimeout(donePulseTimer);
+    donePulseTimer = setTimeout(() => islandShellEl.classList.remove('just-done'), 1050);
   }
 
   function onTask(event, version) {
@@ -177,19 +260,32 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       return;
     }
     typingEl.classList.add('hide');
-    const nearBottom =
-      scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight < 120;
+    const nearBottom = distFromBottom() < 140;
     streamMsgEl.innerHTML = renderMarkdown(streamingText);
     streamWrapEl.classList.remove('hide');
     if (nearBottom) {
       scrollerEl.scrollTop = scrollerEl.scrollHeight;
+    } else if (scrollBottomBtn) {
+      scrollBottomBtn.classList.add('is-visible', 'has-unread');
     }
+  }
+
+  function syncComposerState() {
+    if (!inputEl.value) {
+      inputEl.style.height = '';
+    } else {
+      inputEl.style.height = 'auto';
+      inputEl.style.height = `${Math.min(Math.max(inputEl.scrollHeight, 36), 180)}px`;
+    }
+    const active = inputEl.value.trim().length > 0 || pendingAtts.length > 0;
+    pillEl?.classList.toggle('has-content', active);
   }
 
   function renderPendingAtts() {
     if (!pendingAtts.length) {
       attsEl.classList.add('hide');
       attsEl.innerHTML = '';
+      syncComposerState();
       return;
     }
     attsEl.classList.remove('hide');
@@ -205,6 +301,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
         renderPendingAtts();
       };
     });
+    syncComposerState();
   }
 
   async function uploadFile(file, name = file.name) {
@@ -257,6 +354,27 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
   });
 
+  inputEl.addEventListener('input', syncComposerState);
+
+  if (pillEl) {
+    pillEl.addEventListener('dragover', (ev) => {
+      if (ev.dataTransfer?.types?.includes('Files')) {
+        ev.preventDefault();
+        pillEl.classList.add('is-dragover');
+      }
+    });
+    pillEl.addEventListener('dragleave', (ev) => {
+      if (!pillEl.contains(ev.relatedTarget)) pillEl.classList.remove('is-dragover');
+    });
+    pillEl.addEventListener('drop', async (ev) => {
+      pillEl.classList.remove('is-dragover');
+      const files = Array.from(ev.dataTransfer?.files || []);
+      if (!files.length) return;
+      ev.preventDefault();
+      for (const file of files.slice(0, 4)) await uploadFile(file);
+    });
+  }
+
   inputEl.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
@@ -281,6 +399,12 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
     sending = true;
     sendBtn.disabled = true;
+    playSend();
+    clearTimeout(launchTimer);
+    sendBtn.classList.remove('is-launching');
+    void sendBtn.offsetWidth;
+    sendBtn.classList.add('is-launching');
+    launchTimer = setTimeout(() => sendBtn.classList.remove('is-launching'), 300);
     // Retrying the exact same text after a failure reuses its request_id, so the server
     // revives the failed message instead of storing a duplicate.
     const requestId =
@@ -313,11 +437,13 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       clearStreaming();
       await onRefresh();
     } catch (err) {
+      playWarn();
       lastFailed = { text, requestId };
       optimisticMsg = null;
       clearStreaming();
       await onRefresh().catch(() => render());
       inputEl.value = text;
+      syncComposerState();
       showToast(`发送失败：${err.message}`);
     } finally {
       sending = false;
@@ -348,6 +474,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       activeThread = null;
       threadMessages = [];
       threadHasMore = false;
+      switchingThread = true;
       scrollAfterRender = true;
       render();
     };
@@ -416,24 +543,61 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       }
     }
     if (!msgs.length) {
+      renderedContents.clear();
       listEl.innerHTML = '';
       scrollAfterRender = true;
+      switchingThread = false;
+      syncScrollBottom();
       return;
     }
+    const stickBottom = !hasBootRendered || switchingThread || Boolean(optimisticMsg) || distFromBottom() <= 160;
+    const maxRenderedId = msgs.reduce((mx, m) => Math.max(mx, m.id || 0), 0);
+    const animateNew = hasBootRendered && !switchingThread;
+    let newAssistantArrived = false;
+    renderedContents.clear();
     listEl.innerHTML = msgs
-      .map(
-        (m) => `
-      <div class="msg msg-${esc(m.role)}${m.status === 'failed' ? ' msg-failed' : ''}">
+      .map((m, idx) => {
+        const key = String(idx);
+        renderedContents.set(key, String(m.content || ''));
+        const isNew = animateNew && (!m.id || m.id > lastSeenMsgId);
+        if (isNew && !activeThread && m.role === 'assistant' && m.status !== 'failed') {
+          newAssistantArrived = true;
+        }
+        const actionsHtml =
+          m.role === 'assistant' && m.status !== 'failed'
+            ? `<div class="msg-actions" aria-label="消息操作">
+          <button type="button" class="msg-act-btn msg-act-copy" data-msg-idx="${key}" aria-label="复制全文" title="复制全文">
+            <svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-copy"/></svg>
+            <svg class="ic ic-check" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-check"/></svg>
+          </button>
+          <button type="button" class="msg-act-btn msg-act-quote" data-msg-idx="${key}" aria-label="引用追问" title="引用追问">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-reply"/></svg>
+          </button>
+        </div>`
+            : '';
+        return `
+      <div class="msg msg-${esc(m.role)}${m.status === 'failed' ? ' msg-failed' : ''}${isNew ? ' msg-enter' : ''}">
+        ${actionsHtml}
         <div>${renderMarkdown(m.content)}</div>
         <div class="msg-meta">${esc(fmtTime(m.created_at))}${
           m.status === 'failed' ? ' · 未送达，可重新发送' : ''
         }</div>
-      </div>`,
-      )
+      </div>`;
+      })
       .join('');
-    if (scrollAfterRender) {
-      scrollerEl.scrollTop = scrollerEl.scrollHeight;
+    if (!activeThread) {
+      lastSeenMsgId = Math.max(lastSeenMsgId, maxRenderedId);
+      hasBootRendered = true;
     }
+    if (newAssistantArrived) playDone();
+    switchingThread = false;
+    if (scrollAfterRender && stickBottom) {
+      scrollerEl.scrollTop = scrollerEl.scrollHeight;
+      scrollBottomBtn?.classList.remove('has-unread');
+    } else if (newAssistantArrived && !stickBottom && scrollBottomBtn) {
+      scrollBottomBtn.classList.add('is-visible', 'has-unread');
+    }
+    syncScrollBottom();
     scrollAfterRender = true;
   }
 
@@ -442,6 +606,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     activeThread = { id: threadId, title: title || threadId };
     threadMessages = [];
     threadHasMore = false;
+    switchingThread = true;
     try {
       const params = new URLSearchParams({ thread_id: threadId, limit: '40' });
       const res = await api(`/api/messages?${params.toString()}`);
@@ -450,6 +615,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       scrollAfterRender = true;
       render();
     } catch (err) {
+      switchingThread = false;
       showToast(`加载线程记录失败：${err.message}`);
     }
   }
@@ -485,8 +651,146 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     if (!inputEl.value.startsWith(prefix)) {
       inputEl.value = prefix + inputEl.value;
     }
+    syncComposerState();
     inputEl.focus();
   }
 
-  return { render, setStage, onDelta, onTask, syncTasks, insertMention, setThreadFilter };
+  function closeEngineMenu() {
+    if (!engineMenu || !engineBtn) return;
+    engineMenu.classList.add('hide');
+    engineBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function primaryNode() {
+    const nodes = state.nodes || [];
+    return (
+      nodes.find((n) => n.online && n.kind === 'pc') ||
+      nodes.find((n) => n.online) ||
+      nodes[0] ||
+      null
+    );
+  }
+
+  async function switchEngine(node, ag) {
+    if (!node || !ag || ag === node.default_agent) return;
+    try {
+      await api(`/api/nodes/${encodeURIComponent(node.id)}`, {
+        method: 'PUT',
+        body: { default_agent: ag },
+      });
+      playToggle(true);
+      showToast(`已将 ${node.name} 默认引擎切换为 ${ag}`);
+      await onRefresh();
+    } catch (err) {
+      playWarn();
+      showToast(err.message);
+    }
+  }
+
+  function renderEnginePill() {
+    if (!engineWrap || !engineBtn || !engineLabel || !engineMenu) return;
+    const node = primaryNode();
+    if (!node) {
+      engineWrap.classList.add('hide');
+      closeEngineMenu();
+      return;
+    }
+    engineWrap.classList.remove('hide');
+    engineWrap.classList.toggle('is-online', Boolean(node.online));
+    const curDefault = node.effective_default_agent || node.default_agent || 'auto';
+    engineLabel.innerHTML = `<span class="engine-node-name">${esc(node.name)} · </span><span>${esc(curDefault)}</span>`;
+
+    const candidates = Array.from(
+      new Set([
+        ...(node.effective_agents || []),
+        ...(node.detected_agents || []),
+        'agy',
+        'opencode',
+        'codex',
+        'claude',
+      ]),
+    ).filter(Boolean);
+
+    engineMenu.innerHTML = `
+      <div class="engine-menu-head">
+        <span>${esc(node.name)}</span>
+        <span class="badge ${node.online ? 'ok' : ''}">${node.online ? '在线' : '离线'}</span>
+      </div>
+      ${candidates
+        .map((ag) => {
+          const active = ag === (node.default_agent || curDefault);
+          return `<button type="button" class="engine-menu-opt${active ? ' on' : ''}" role="menuitemradio" aria-checked="${active ? 'true' : 'false'}" data-pick-engine="${esc(ag)}"><span>${esc(ag)}</span><span class="engine-menu-check">${active ? '✓' : ''}</span></button>`;
+        })
+        .join('')}`;
+
+    engineMenu.querySelectorAll('[data-pick-engine]').forEach((btn) => {
+      btn.onclick = async (ev) => {
+        ev.stopPropagation();
+        const ag = btn.dataset.pickEngine;
+        closeEngineMenu();
+        await switchEngine(node, ag);
+      };
+    });
+  }
+
+  engineBtn?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (!engineMenu) return;
+    const open = engineMenu.classList.contains('hide');
+    engineMenu.classList.toggle('hide', !open);
+    engineBtn.setAttribute('aria-expanded', String(open));
+    playToggle(open);
+  });
+  document.addEventListener('click', (ev) => {
+    if (engineWrap && !engineWrap.contains(ev.target)) closeEngineMenu();
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape') closeEngineMenu();
+  });
+
+  listEl?.addEventListener('click', async (ev) => {
+    const copyBtn = ev.target?.closest?.('.msg-act-copy');
+    if (copyBtn) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const raw = renderedContents.get(copyBtn.dataset.msgIdx || '') || '';
+      if (!raw) return;
+      const ok = await writeClipboard(raw);
+      if (!ok) {
+        playWarn();
+        showToast('复制失败，请手动选择复制');
+        return;
+      }
+      playTap();
+      copyBtn.classList.add('is-copied');
+      clearTimeout(copyBtn._copyTimer);
+      copyBtn._copyTimer = setTimeout(() => copyBtn.classList.remove('is-copied'), 1600);
+      return;
+    }
+    const quoteBtn = ev.target?.closest?.('.msg-act-quote');
+    if (quoteBtn) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const raw = renderedContents.get(quoteBtn.dataset.msgIdx || '') || '';
+      const snippet = raw
+        .split(/\r?\n/)
+        .map((l) => l.replace(/^#+\s*/, '').trim())
+        .filter(Boolean)
+        .slice(0, 2)
+        .join(' ')
+        .slice(0, 110);
+      if (!snippet) return;
+      playTap();
+      const prefix = `> ${snippet}\n\n`;
+      inputEl.value = inputEl.value.trim() ? `${prefix}${inputEl.value}` : prefix;
+      syncComposerState();
+      inputEl.focus();
+      inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+    }
+  });
+
+  initDelegatedCopy(listEl);
+  syncComposerState();
+  renderEnginePill();
+  return { render, setStage, onDelta, onTask, syncTasks, insertMention, setThreadFilter, renderEnginePill, flashIslandDone, switchEngine };
 }

@@ -10,41 +10,75 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <svg class="ic-sprite" aria-hidden="true">
+    <defs>
+      <symbol id="ic-chat" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linejoin="round"><path stroke-linecap="square" d="M22 11.183c0 4.934-4.477 9.076-10 9.076c-.697 0-1.343-.176-2-.297c-.785.965-1.944 1.782-3.96 1.788c-.615.002-.922.003-1.072-.209s-.022-.574.235-1.299c.339-.957.37-1.998-.453-2.753C3.046 15.857 2 13.568 2 11.183C2 6.25 6.477 2.25 12 2.25s10 4 10 8.933Z"/><path stroke-linecap="round" d="M12.2 11.25H12m-4.3 0h-.2m9.2 0h-.2m-4.1 0a.4.4 0 1 1-.8 0a.4.4 0 0 1 .8 0m-4.5 0a.4.4 0 1 1-.8 0a.4.4 0 0 1 .8 0m9 0a.4.4 0 1 1-.8 0a.4.4 0 0 1 .8 0"/></g></symbol>
+      <symbol id="ic-tasks" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="m8.643 3.146l-1.705.788C4.313 5.147 3 5.754 3 6.75s1.313 1.603 3.938 2.816l1.705.788c1.652.764 2.478 1.146 3.357 1.146s1.705-.382 3.357-1.146l1.705-.788C19.687 8.353 21 7.746 21 6.75s-1.313-1.603-3.938-2.816l-1.705-.788C13.705 2.382 12.879 2 12 2s-1.705.382-3.357 1.146"/><path d="M20.788 11.097c.141.199.212.406.212.634c0 .982-1.313 1.58-3.938 2.776l-1.705.777c-1.652.753-2.478 1.13-3.357 1.13s-1.705-.377-3.357-1.13l-1.705-.777C4.313 13.311 3 12.713 3 11.731c0-.228.07-.435.212-.634"/><path d="M20.377 16.266c.415.331.623.661.623 1.052c0 .981-1.313 1.58-3.938 2.776l-1.705.777C13.705 21.624 12.879 22 12 22s-1.705-.376-3.357-1.13l-1.705-.776C4.313 18.898 3 18.299 3 17.318c0-.391.208-.72.623-1.052"/></g></symbol>
+      <symbol id="ic-contacts" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M18.5 20.5c-.234-2.931-2.658-5.252-5.692-5.448L11.999 15q-.431.012-.811.03C8.18 15.172 5.73 17.597 5.5 20.5m9.75-11.25a3.25 3.25 0 1 1-6.5 0a3.25 3.25 0 0 1 6.5 0M5.502 8.5A3.25 3.25 0 0 1 9.5 3.752M18.496 8.5A3.25 3.25 0 0 0 14.5 3.752M22 18c-.18-2.263-2-4.5-4-5M2 18c.18-2.263 2-4.5 4-5"/></symbol>
+      <symbol id="ic-search" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="m17 17l4 4m-2-10a8 8 0 1 0-16 0a8 8 0 0 0 16 0"/></symbol>
+      <symbol id="ic-settings" viewBox="0 0 24 24"><g fill="none" stroke="currentColor"><path d="M15.5 12a3.5 3.5 0 1 1-7 0a3.5 3.5 0 0 1 7 0Z"/><path stroke-linecap="round" d="M21.011 14.097c.522-.141.783-.212.886-.346c.103-.135.103-.351.103-.784v-1.934c0-.433 0-.65-.103-.784s-.364-.205-.886-.345c-1.95-.526-3.171-2.565-2.668-4.503c.139-.533.208-.8.142-.956s-.256-.264-.635-.479l-1.725-.98c-.372-.21-.558-.316-.725-.294s-.356.21-.733.587c-1.459 1.455-3.873 1.455-5.333 0c-.377-.376-.565-.564-.732-.587c-.167-.022-.353.083-.725.295l-1.725.979c-.38.215-.57.323-.635.48c-.066.155.003.422.141.955c.503 1.938-.718 3.977-2.669 4.503c-.522.14-.783.21-.886.345S2 10.6 2 11.033v1.934c0 .433 0 .65.103.784s.364.205.886.346c1.95.526 3.171 2.565 2.668 4.502c-.139.533-.208.8-.142.956s.256.264.635.48l1.725.978c.372.212.558.317.725.295s.356-.21.733-.587c1.46-1.457 3.876-1.457 5.336 0c.377.376.565.564.732.587c.167.022.353-.083.726-.295l1.724-.979c.38-.215.57-.323.635-.48s-.003-.422-.141-.955c-.504-1.937.716-3.976 2.666-4.502Z"/></g></symbol>
+      <symbol id="ic-sound" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M14 14.814V9.186c0-3.145 0-4.717-.925-5.109c-.926-.391-2.015.72-4.193 2.945c-1.128 1.152-1.771 1.407-3.376 1.407c-1.403 0-2.105 0-2.61.344C1.85 9.487 2.01 10.882 2.01 12s-.159 2.513.888 3.227c.504.344 1.206.344 2.609.344c1.605 0 2.248.255 3.376 1.407c2.178 2.224 3.267 3.336 4.193 2.945c.925-.392.925-1.964.925-5.11M17 9c.625.82 1 1.863 1 3s-.375 2.18-1 3m3-8c1.25 1.366 2 3.106 2 5s-.75 3.634-2 5"/></symbol>
+      <symbol id="ic-user" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M18.498 19.151c-1.16-1.75-3.203-2.95-5.567-3.094L11.998 16q-.498.013-.936.032c-2.345.106-4.396 1.348-5.562 3.12M14.996 10a3 3 0 1 1-6 0a3 3 0 0 1 6 0"/><path d="M22 12c0 5.523-4.477 10-10 10S2 17.523 2 12S6.477 2 12 2s10 4.477 10 10"/></g></symbol>
+      <symbol id="ic-logout" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M15.5 18.5c0 .464 0 .697-.026.892a3 3 0 0 1-2.582 2.582C12.697 22 12.464 22 12 22H8.5c-2.828 0-4.243 0-5.121-.879C2.5 20.243 2.5 18.828 2.5 16V8c0-2.828 0-4.243.879-5.121C4.257 2 5.672 2 8.5 2H12c.464 0 .697 0 .892.026a3 3 0 0 1 2.582 2.582c.026.195.026.428.026.892"/><path d="m3.5 3l3.789 1.894c.832.538 1.249.807 1.48 1.29C9 6.669 9 7.27 9 8.473v6.387c0 1.048 0 1.572-.183 2.014s-.52.733-1.195 1.314L3.5 21m17.713-9H13.5m5.133-3c.972.76 2.868 2.329 2.868 3c0 .673-1.896 2.242-2.868 3.002"/></g></symbol>
+      <symbol id="ic-attach" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M9.5 8v6.5a2.5 2.5 0 0 0 5 0v-8a4.5 4.5 0 1 0-9 0v9a6.5 6.5 0 1 0 13 0V6"/></symbol>
+      <symbol id="ic-caret" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M18 9s-4.419 6-6 6s-6-6-6-6"/></symbol>
+      <symbol id="ic-send" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M12 5.5V19m6-8s-4.419-6-6-6s-6 6-6 6"/></symbol>
+      <symbol id="ic-poke" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linejoin="round" d="m15 2l.539 2.392a5.39 5.39 0 0 0 4.07 4.07L22 9l-2.392.539a5.39 5.39 0 0 0-4.07 4.07L15 16l-.539-2.392a5.39 5.39 0 0 0-4.07-4.07L8 9l2.392-.539a5.39 5.39 0 0 0 4.07-4.07zM7 12l.385 1.708a3.85 3.85 0 0 0 2.907 2.907L12 17l-1.708.385a3.85 3.85 0 0 0-2.907 2.907L7 22l-.385-1.708a3.85 3.85 0 0 0-2.907-2.907L2 17l1.708-.385a3.85 3.85 0 0 0 2.907-2.907z"/></symbol>
+      <symbol id="ic-avatar" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 15a5 5 0 0 0 4 2a5 5 0 0 0 4-2m-.375-6.613v.53m-7.25-.53v.53m.375-.167c0-.414-.168-.75-.375-.75S8 8.336 8 8.75s.168.75.375.75s.375-.336.375-.75m7.25 0c0-.414-.168-.75-.375-.75s-.375.336-.375.75s.168.75.375.75s.375-.336.375-.75"/></g></symbol>
+      <symbol id="ic-tuning" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M13 4H3m8 15H3m18 0h-4m4-7.5H11M21 4h-2M5 11.5H3M14.5 2c.466 0 .699 0 .883.076a1 1 0 0 1 .54.541c.077.184.077.417.077.883v1c0 .466 0 .699-.076.883a1 1 0 0 1-.541.54C15.199 6 14.966 6 14.5 6s-.699 0-.883-.076a1 1 0 0 1-.54-.541C13 5.199 13 4.966 13 4.5v-1c0-.466 0-.699.076-.883a1 1 0 0 1 .541-.54C13.801 2 14.034 2 14.5 2m-2 15c.466 0 .699 0 .883.076a1 1 0 0 1 .54.541c.077.184.077.417.077.883v1c0 .466 0 .699-.076.883a1 1 0 0 1-.541.54c-.184.077-.417.077-.883.077s-.699 0-.883-.076a1 1 0 0 1-.54-.541C11 20.199 11 19.966 11 19.5v-1c0-.466 0-.699.076-.883a1 1 0 0 1 .541-.54c.184-.077.417-.077.883-.077m-3-7.5c.466 0 .699 0 .883.076a1 1 0 0 1 .54.541c.077.184.077.417.077.883v1c0 .466 0 .699-.076.883a1 1 0 0 1-.541.54c-.184.077-.417.077-.883.077s-.699 0-.883-.076a1 1 0 0 1-.54-.541C8 12.699 8 12.466 8 12v-1c0-.466 0-.699.076-.883a1 1 0 0 1 .541-.54c.184-.077.417-.077.883-.077"/></symbol>
+      <symbol id="ic-copy" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M7.5 14.5c0-3.3 0-4.95 1.025-5.975S11.2 7.5 14.5 7.5s4.95 0 5.975 1.025S21.5 11.2 21.5 14.5s0 4.95-1.025 5.975S17.8 21.5 14.5 21.5s-4.95 0-5.975-1.025S7.5 17.8 7.5 14.5"/><path d="M7.5 16.5c-1.396 0-2.095 0-2.656-.196a3.5 3.5 0 0 1-2.148-2.148C2.5 13.595 2.5 12.896 2.5 11.5v-2c0-3.3 0-4.95 1.025-5.975S6.2 2.5 9.5 2.5h2c1.396 0 2.095 0 2.656.196a3.5 3.5 0 0 1 2.148 2.148c.196.561.196 1.26.196 2.656"/></g></symbol>
+      <symbol id="ic-check" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="m5 14l3.5 3.5L19 6.5"/></symbol>
+      <symbol id="ic-close" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M19 19L5 5.001M19 5L5 18.999"/></symbol>
+      <symbol id="ic-down" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M12 18.502v-13.5m6 8s-4.419 6-6 6s-6-6-6-6"/></symbol>
+      <symbol id="ic-reply" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M11 6h4.5a4.5 4.5 0 1 1 0 9H4"/><path d="M7 12s-3 2.21-3 3s3 3 3 3"/></g></symbol>
+      <symbol id="ic-bolt" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linejoin="round" d="M8.628 12.674H8.17c-1.484 0-2.225 0-2.542-.49c-.316-.489-.015-1.17.588-2.533l1.812-4.098c.548-1.239.822-1.859 1.353-2.206S10.586 3 11.935 3h2.09c1.638 0 2.458 0 2.767.535c.309.536-.098 1.25-.91 2.681l-1.073 1.886c-.404.711-.606 1.066-.603 1.358c.003.378.205.726.53.917c.25.147.657.147 1.471.147c1.03 0 1.545 0 1.813.178c.349.232.531.646.467 1.061c-.049.32-.395.703-1.088 1.469l-5.535 6.12c-1.087 1.203-1.63 1.804-1.996 1.613c-.365-.19-.19-.983.16-2.569l.688-3.106c.267-1.208.4-1.812.08-2.214c-.322-.402-.937-.402-2.168-.402Z"/></symbol>
+      <symbol id="ic-edit" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linejoin="round"><path d="m16.425 4.605l.99-.99a2.1 2.1 0 0 1 2.97 2.97l-.99.99m-2.97-2.97l-6.66 6.66a3.96 3.96 0 0 0-1.041 1.84L8 16l2.896-.724a3.96 3.96 0 0 0 1.84-1.042l6.659-6.659m-2.97-2.97l2.97 2.97"/><path stroke-linecap="round" d="M19 13.5c0 3.288 0 4.931-.908 6.038a4 4 0 0 1-.554.554C16.43 21 14.788 21 11.5 21H11c-3.771 0-5.657 0-6.828-1.172S3 16.771 3 13v-.5c0-3.287 0-4.931.908-6.038q.25-.304.554-.554C5.57 5 7.212 5 10.5 5"/></g></symbol>
+    </defs>
+  </svg>
   <nav class="rail" aria-label="主导航">
-    <img class="rail-logo" src="brand/agenct-icon.svg" alt="Agenct" width="34" height="34">
-    <button type="button" id="nav-chat" class="rail-btn active" title="聊天" aria-label="聊天" aria-current="page">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1 1 3.4 6.5L4 20l1.3-3.6A7.9 7.9 0 0 1 4 12Z"/></svg>
-    </button>
-    <button type="button" id="nav-tasks" class="rail-btn" title="工作线程与节点" aria-label="工作线程与节点" aria-pressed="false">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="m8.5 12 2.5 2.5 4.5-5"/></svg>
-      <span id="rail-badge" class="rail-badge"></span>
-    </button>
-    <button type="button" id="nav-contacts" class="rail-btn" title="联系人" aria-label="联系人" aria-expanded="false">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="3" width="15" height="18" rx="3"/><path d="M3 7h4M3 12h4M3 17h4"/><circle cx="12.5" cy="9" r="2.2"/><path d="M9 17a3.5 3.5 0 0 1 7 0"/></svg>
-    </button>
-    <button type="button" id="nav-search" class="rail-btn" title="搜索历史与记忆 (Ctrl+K)" aria-label="搜索历史与记忆" aria-expanded="false">
-      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></svg>
-    </button>
-    <div class="rail-spacer"></div>
-    <div class="rail-more-wrap">
-      <button type="button" id="rail-more" class="rail-btn" title="设置与账号" aria-label="设置与账号" aria-haspopup="menu" aria-expanded="false">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>
-      </button>
-      <div id="rail-menu" class="rail-menu hide" role="menu" aria-label="设置与账号">
-        <button type="button" id="open-settings" class="rail-menu-item" role="menuitem">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/></svg>
-          <span>账号与设置</span>
+    <div class="rail-dock">
+      <div class="rail-group">
+        <span id="rail-indicator" class="rail-indicator" aria-hidden="true"></span>
+        <button type="button" id="nav-chat" class="rail-btn active" title="聊天" aria-label="聊天" aria-current="page">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-chat"/></svg>
         </button>
-        <hr class="rail-menu-sep">
-        <button type="button" id="logout-btn" class="rail-menu-item danger" role="menuitem">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4M10 16l-4-4 4-4M6 12h10"/></svg>
-          <span>退出登录</span>
+        <button type="button" id="nav-tasks" class="rail-btn" title="工作线程与节点" aria-label="工作线程与节点" aria-pressed="false">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-tasks"/></svg>
+          <span id="rail-badge" class="rail-badge"></span>
         </button>
+        <button type="button" id="nav-contacts" class="rail-btn" title="联系人" aria-label="联系人" aria-expanded="false">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-contacts"/></svg>
+        </button>
+        <button type="button" id="nav-search" class="rail-btn" title="搜索历史与记忆 (Ctrl+K)" aria-label="搜索历史与记忆" aria-expanded="false">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-search"/></svg>
+        </button>
+      </div>
+      <span class="rail-sep" aria-hidden="true"></span>
+      <div class="rail-spacer"></div>
+      <div class="rail-more-wrap">
+        <button type="button" id="rail-more" class="rail-btn" title="设置与账号" aria-label="设置与账号" aria-haspopup="menu" aria-expanded="false">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-settings"/></svg>
+        </button>
+        <div id="rail-menu" class="rail-menu hide" role="menu" aria-label="设置与账号">
+          <button type="button" id="toggle-sound" class="rail-menu-item" role="menuitem">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-sound"/></svg>
+            <span id="sound-label">交互音效：柔和</span>
+          </button>
+          <button type="button" id="open-settings" class="rail-menu-item" role="menuitem">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-user"/></svg>
+            <span>账号与设置</span>
+          </button>
+          <hr class="rail-menu-sep">
+          <button type="button" id="logout-btn" class="rail-menu-item danger" role="menuitem">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-logout"/></svg>
+            <span>退出登录</span>
+          </button>
+        </div>
       </div>
     </div>
   </nav>
 
-  <p id="toast" class="toast hide" role="status" aria-live="polite"></p>
+  <div id="toast" class="toast-stack" role="status" aria-live="polite"></div>
 
   <!-- Login View (GitLab OAuth and/or local owner token) -->
   <section id="login-view" class="login hide">
@@ -78,47 +112,73 @@
     <aside id="contact-sidebar" class="contact-sidebar hide" aria-label="联系人">
       <div class="sidebar-head">
         <strong>联系人</strong>
-        <button type="button" id="close-contacts" class="icon-btn" aria-label="关闭联系人">✕</button>
+        <button type="button" id="close-contacts" class="icon-btn" aria-label="关闭联系人"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-close"/></svg></button>
       </div>
       <div id="contacts-list" class="sidebar-list"></div>
     </aside>
 
     <!-- Primary Centered Chat Column -->
-    <section id="chat-pane" class="chat-pane" aria-label="与管家的对话">
-      <div id="search-panel" class="search-panel hide" aria-label="搜索对话、事项与记忆">
-        <div class="search-panel-head">
-          <input id="search-input" type="search" placeholder="搜索对话记录、持续事项或长期记忆… (Ctrl+K)" autocomplete="off">
-          <button type="button" id="close-search" class="icon-btn" aria-label="关闭搜索">✕</button>
+    <section id="chat-pane" class="chat-pane" data-agent-state="idle" aria-label="与管家的对话">
+      <div class="ambient-aura" aria-hidden="true"></div>
+      <div id="search-panel" class="cmd-backdrop hide" role="dialog" aria-modal="true" aria-label="指令舱与搜索">
+        <div class="cmd-modal">
+          <div class="cmd-head">
+            <svg class="ic cmd-head-ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-search"/></svg>
+            <input id="search-input" type="search" placeholder="搜索对话、事项、记忆，或输入指令（切引擎 / 音效 / 形象 / 设置）…" autocomplete="off">
+            <kbd class="cmd-kbd">ESC</kbd>
+            <button type="button" id="close-search" class="icon-btn" aria-label="关闭搜索"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-close"/></svg></button>
+          </div>
+          <div id="search-results" class="cmd-results"></div>
+          <div class="cmd-foot">
+            <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
+            <span><kbd>↵</kbd> 执行</span>
+            <span><kbd>⌘K</kbd> 唤起</span>
+          </div>
         </div>
-        <div id="search-results" class="search-results"></div>
       </div>
       <div id="thread-filter-bar" class="thread-filter-bar hide" role="status">
         <span id="thread-filter-title"></span>
         <button type="button" id="clear-thread-filter" class="text-btn sm">返回全部对话</button>
       </div>
-      <div id="scroller" class="scroller">
-        <button type="button" id="muse-head-toggle" class="stream-head" data-agent-state="idle" aria-label="打开管家工作台" aria-expanded="false">
-          <span class="avatar-stage">
-            <img id="head-avatar" class="avatar" src="brand/agenct-icon.svg" alt="" width="40" height="40">
-            <span id="head-avatar-buddy" class="avatar-buddy hide" aria-hidden="true"></span>
-            <span id="head-avatar-badge" class="avatar-status-badge" aria-hidden="true"></span>
-          </span>
-          <span id="agent-name" class="avatar-name">Agenct</span>
+      <div class="scroller-wrap">
+        <div class="chat-fade-top" aria-hidden="true"></div>
+        <div id="scroller" class="scroller">
+          <div id="island-shell" class="island-shell">
+            <button type="button" id="muse-head-toggle" class="stream-head" data-agent-state="idle" aria-label="打开管家工作台" aria-expanded="false">
+              <span class="avatar-stage">
+                <img id="head-avatar" class="avatar" src="brand/agenct-icon.svg" alt="" width="40" height="40">
+                <span id="head-avatar-buddy" class="avatar-buddy hide" aria-hidden="true"></span>
+                <span id="head-avatar-badge" class="avatar-status-badge" aria-hidden="true"></span>
+              </span>
+              <span class="island-meta">
+                <span id="agent-name" class="avatar-name">Agenct</span>
+                <span id="head-state-text" class="island-sub">在线待命</span>
+              </span>
+              <span class="island-wave" aria-hidden="true"><span></span><span></span><span></span></span>
+            </button>
+          </div>
+          <div id="load-older-wrap" class="load-older-wrap hide">
+            <button type="button" id="load-older-btn" class="sm">加载更早消息</button>
+          </div>
+          <div id="messages" class="stream" aria-label="对话记录"></div>
+          <div id="stream-live" class="stream-live hide" aria-live="polite">
+            <div id="streaming-msg" class="msg msg-assistant msg-streaming"></div>
+          </div>
+          <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
+        </div>
+        <button type="button" id="scroll-bottom-btn" class="scroll-bottom-btn" aria-label="回到底部">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-down"/></svg>
+          <span id="scroll-bottom-label" class="scroll-bottom-label">有新回复</span>
         </button>
-        <div id="load-older-wrap" class="load-older-wrap hide">
-          <button type="button" id="load-older-btn" class="sm">加载更早消息</button>
-        </div>
-        <div id="messages" class="stream" aria-label="对话记录"></div>
-        <div id="stream-live" class="stream-live hide" aria-live="polite">
-          <div id="streaming-msg" class="msg msg-assistant msg-streaming"></div>
-        </div>
-        <div id="typing" class="typing hide" aria-hidden="true"><span></span><span></span><span></span></div>
       </div>
 
       <form id="chat-form" class="composer">
         <div id="stage-bar" class="stage-pill hide">
           <div class="stage-row">
-            <span id="work-stage" role="status"></span>
+            <span class="stage-lead">
+              <span class="pixel-grid" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span>
+              <span id="work-stage" class="shimmer-label" role="status"></span>
+            </span>
             <span id="work-elapsed" class="work-elapsed"></span>
           </div>
           <details id="work-log" class="work-log hide">
@@ -130,12 +190,20 @@
         <div class="composer-pill">
           <label class="attach-btn" title="添加附件 (图片/PDF/ZIP/文本)" aria-label="添加附件">
             <input id="file-input" type="file" hidden>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-attach"/></svg>
             <span>附件</span>
           </label>
+          <div id="composer-engine-wrap" class="engine-pill-wrap hide">
+            <button type="button" id="composer-engine-btn" class="engine-pill-btn" aria-haspopup="menu" aria-expanded="false" title="切换当前主节点默认引擎">
+              <span class="engine-pill-dot" aria-hidden="true"></span>
+              <span id="composer-engine-label" class="engine-pill-label"></span>
+              <svg class="ic engine-pill-caret" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-caret"/></svg>
+            </button>
+            <div id="composer-engine-menu" class="engine-menu hide" role="menu" aria-label="切换节点默认引擎"></div>
+          </div>
           <textarea id="chat-input" rows="1" placeholder="直接告诉我你想解决的问题，或 @同事 协作…"></textarea>
           <button type="submit" id="send-btn" class="send-btn" aria-label="发送">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-send"/></svg>
           </button>
         </div>
       </form>
@@ -158,15 +226,44 @@
     <!-- Optional Right Muse Drawer (opened by clicking floating avatar or rail "任务") -->
     <aside id="task-pane" class="task-pane" aria-label="管家工作台">
       <div class="muse-hero">
-        <button type="button" id="close-drawer" class="icon-btn muse-close-btn" aria-label="关闭工作台">✕</button>
+        <button type="button" id="close-drawer" class="icon-btn muse-close-btn" aria-label="关闭工作台"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-close"/></svg></button>
         <div id="hero-avatar-wrap" class="muse-hero-avatar-wrap" data-agent-state="idle">
           <span class="avatar-stage big">
             <img id="drawer-avatar" class="avatar big" src="brand/agenct-icon.svg" alt="" width="88" height="88">
             <span id="drawer-avatar-buddy" class="avatar-buddy big hide" aria-hidden="true"></span>
             <span id="drawer-avatar-badge" class="avatar-status-badge big" aria-hidden="true"></span>
+            <button type="button" id="status-picker-btn" class="status-picker-btn" aria-label="展开快捷操作与状态" aria-expanded="false" aria-controls="status-tray">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
           </span>
         </div>
-        <h2 id="drawer-agent-name" class="muse-drawer-name">Agenct</h2>
+        <div id="status-tray-wrap" class="status-tray-wrap" aria-hidden="true">
+          <span id="status-tray-tip" class="status-tray-tip" aria-hidden="true"></span>
+          <div id="status-tray" class="status-tray" role="toolbar" aria-label="管家快捷操作">
+            <button type="button" class="status-orb" data-status-act="poke" data-tip="戳一下" aria-label="戳一下">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-poke"/></svg>
+            </button>
+            <button type="button" class="status-orb" data-status-act="avatar" data-tip="切换形象" aria-label="切换形象">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-avatar"/></svg>
+            </button>
+            <button type="button" class="status-orb" data-status-act="search" data-tip="全局搜索" aria-label="全局搜索">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-search"/></svg>
+            </button>
+            <button type="button" class="status-orb" id="status-sound-orb" data-status-act="sound" data-tip="交互音效：开" aria-label="切换交互音效" aria-pressed="true">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-sound"/></svg>
+            </button>
+            <button type="button" class="status-orb" data-status-act="settings" data-tip="节点与设置" aria-label="节点与设置">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-tuning"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="muse-name-wrap">
+          <button type="button" id="edit-agent-name-btn" class="muse-name-btn" title="点击修改管家名字" aria-label="修改管家名字">
+            <h2 id="drawer-agent-name" class="muse-drawer-name">Agenct</h2>
+            <svg class="ic muse-name-edit-ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-edit"/></svg>
+          </button>
+          <input id="drawer-agent-name-input" class="muse-name-input hide" type="text" maxlength="48" autocomplete="off" aria-label="输入新的管家名字">
+        </div>
         <p class="muse-conn-status">
           <span id="avatar-state-pill" class="avatar-state-pill" data-agent-state="idle">在线待命</span>
           <span>·</span>
@@ -178,7 +275,7 @@
       </div>
 
       <div class="muse-seg-wrap">
-        <div class="seg muse-seg" role="tablist">
+        <div class="seg muse-seg" role="tablist" data-active-idx="0">
           <button type="button" class="tab on" data-tab="tasks" role="tab" aria-selected="true">工作线程</button>
           <button type="button" class="tab" data-tab="soul" role="tab" aria-selected="false">人设记忆</button>
         </div>

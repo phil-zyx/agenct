@@ -1,13 +1,17 @@
 // Right Muse Drawer (Tasks/Nodes, Ledgers/Crons/Audit, SOUL/MEMORY) + Settings Pane + Contacts.
 import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 import { renderBuddySvg } from './avatar.js';
+import { playTap, playToggle } from './sound.js';
 import { stripNoise, triageTasks } from './triage.js';
+import { COPY_BTN_HTML, bindHoldAction, initDelegatedCopy } from './ui.js';
 
 export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread }) {
   const bodyEl = document.getElementById('drawer-body');
   const settingsBody = document.getElementById('settings-body');
   const contactsList = document.getElementById('contacts-list');
   const tabBtns = Array.from(document.querySelectorAll('.muse-seg .tab'));
+  initDelegatedCopy(bodyEl);
+  initDelegatedCopy(settingsBody);
 
   let activeTab = 'tasks';
   let lastInstallCmd = '';
@@ -15,14 +19,17 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
   const taskTimers = new Map();
   let elapsedTimer = null;
 
-  tabBtns.forEach((btn) => {
+  tabBtns.forEach((btn, idx) => {
     btn.onclick = () => {
+      if (activeTab === btn.dataset.tab) return;
       activeTab = btn.dataset.tab;
+      if (btn.parentElement) btn.parentElement.dataset.activeIdx = String(idx);
       tabBtns.forEach((b) => {
         const on = b === btn;
         b.classList.toggle('on', on);
         b.setAttribute('aria-selected', String(on));
       });
+      playToggle(true);
       renderDrawer();
     };
   });
@@ -51,6 +58,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
   const TARGET_LABEL = { cloud: '云端', 'cloud-node': '云端节点', auto: '自动节点' };
   const AUDIT_ACTION_LABEL = {
     node_create: '接入节点',
+    node_update: '更新节点',
     node_submit: '节点完成',
     dispatch_node: '派发节点',
     task_callback: '自动跟进',
@@ -256,33 +264,41 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             </div>
           </form>
         </details>
-        ${lastInstallCmd ? `<div class="install-box"><strong>一次性接入命令：</strong><br><code>${esc(lastInstallCmd)}</code></div>` : ''}
+        ${lastInstallCmd ? `<div class="install-box">${COPY_BTN_HTML}<strong>一次性接入命令：</strong><br><code>${esc(lastInstallCmd)}</code></div>` : ''}
       </section>`;
   }
 
   function bindNodeHandlers(root) {
     root.querySelectorAll('[data-rotate]').forEach((b) => {
-      b.onclick = async () => {
-        try {
-          const r = await api(`/api/nodes/${b.dataset.rotate}/token`, { method: 'POST' });
-          lastInstallCmd = `AGENCT_NODE_TOKEN=${r.token}`;
-          showToast('节点令牌已重置');
-          renderAll();
-        } catch (err) {
-          showToast(err.message);
-        }
-      };
+      bindHoldAction(
+        b,
+        async () => {
+          try {
+            const r = await api(`/api/nodes/${b.dataset.rotate}/token`, { method: 'POST' });
+            lastInstallCmd = `AGENCT_NODE_TOKEN=${r.token}`;
+            showToast('节点令牌已重置');
+            renderAll();
+          } catch (err) {
+            showToast(err.message);
+          }
+        },
+        { shortHint: '请长按「重置令牌」确认操作' },
+      );
     });
     root.querySelectorAll('[data-rm-node]').forEach((b) => {
-      b.onclick = async () => {
-        try {
-          await api(`/api/nodes/${b.dataset.rmNode}`, { method: 'DELETE' });
-          showToast('已移除节点');
-          await onRefresh();
-        } catch (err) {
-          showToast(err.message);
-        }
-      };
+      bindHoldAction(
+        b,
+        async () => {
+          try {
+            await api(`/api/nodes/${b.dataset.rmNode}`, { method: 'DELETE' });
+            showToast('已移除节点');
+            await onRefresh();
+          } catch (err) {
+            showToast(err.message);
+          }
+        },
+        { shortHint: '请长按「移除」确认删除节点' },
+      );
     });
     root.querySelectorAll('.edit-node-form').forEach((form) => {
       form.onsubmit = async (ev) => {
@@ -685,15 +701,19 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       };
     });
     bodyEl.querySelectorAll('[data-cancel]').forEach((b) => {
-      b.onclick = async () => {
-        try {
-          await api(`/api/tasks/${b.dataset.cancel}/action`, { method: 'POST', body: { action: 'cancel' } });
-          showToast('任务已取消');
-          await onRefresh();
-        } catch (err) {
-          showToast(err.message);
-        }
-      };
+      bindHoldAction(
+        b,
+        async () => {
+          try {
+            await api(`/api/tasks/${b.dataset.cancel}/action`, { method: 'POST', body: { action: 'cancel' } });
+            showToast('任务已取消');
+            await onRefresh();
+          } catch (err) {
+            showToast(err.message);
+          }
+        },
+        { shortHint: '请长按「取消」确认中止任务' },
+      );
     });
     bodyEl.querySelectorAll('[data-filter-thread]').forEach((b) => {
       b.onclick = () => onFilterThread?.(b.dataset.filterThread, b.dataset.threadTitle);
@@ -863,6 +883,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       btn.onclick = async () => {
         const id = btn.dataset.pickAvatar;
         if (!id || id === currentAvatar) return;
+        playTap();
         try {
           await api('/api/brain', { method: 'PUT', body: { avatar_id: id } });
           const picked = AVATAR_CATALOG.find((a) => a.id === id);
@@ -967,6 +988,9 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       </section>`;
 
     bindNodeHandlers(settingsBody);
+    settingsBody.querySelectorAll('label.toggle input[type="checkbox"]').forEach((cb) => {
+      cb.addEventListener('change', () => playToggle(cb.checked));
+    });
     const saveModels = async (body, okMsg) => {
       try {
         integrations.models = await api('/api/settings/models', { method: 'PUT', body });
@@ -996,12 +1020,14 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       }
       await saveModels(body, '模型配置已保存');
     };
-    document.getElementById('models-clear-brain')?.addEventListener('click', () =>
-      saveModels({ clear_brain: true }, '已恢复默认大脑模型'),
-    );
-    document.getElementById('models-clear-vision')?.addEventListener('click', () =>
-      saveModels({ clear_vision: true }, '已移除识图模型'),
-    );
+    const clearBrainBtn = document.getElementById('models-clear-brain');
+    bindHoldAction(clearBrainBtn, () => saveModels({ clear_brain: true }, '已恢复默认大脑模型'), {
+      shortHint: '请长按「恢复默认大脑」确认清除',
+    });
+    const clearVisionBtn = document.getElementById('models-clear-vision');
+    bindHoldAction(clearVisionBtn, () => saveModels({ clear_vision: true }, '已移除识图模型'), {
+      shortHint: '请长按「移除识图模型」确认删除',
+    });
     document.getElementById('models-test-btn').onclick = async () => {
       try {
         const r = await api('/api/settings/models/test', { method: 'POST' });
@@ -1113,5 +1139,19 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     renderContacts();
   }
 
-  return { render: renderAll, loadIntegrations, renderSettingsPane };
+  function openTab(tabName) {
+    const idx = tabBtns.findIndex((b) => b.dataset.tab === tabName);
+    if (idx < 0) return;
+    activeTab = tabName;
+    const seg = tabBtns[idx].parentElement;
+    if (seg) seg.dataset.activeIdx = String(idx);
+    tabBtns.forEach((b, i) => {
+      const on = i === idx;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-selected', String(on));
+    });
+    renderDrawer();
+  }
+
+  return { render: renderAll, loadIntegrations, renderSettingsPane, openTab };
 }

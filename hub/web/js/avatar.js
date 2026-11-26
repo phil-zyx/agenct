@@ -1,5 +1,6 @@
 // Real-time state-driven animated avatar ("buddy") + universal corner status badge.
 import { avatarById } from './api.js';
+import { playTap } from './sound.js';
 
 export const BUDDY_AVATAR_ID = 'buddy';
 export const IDLE_TO_REST_MS = 35_000;
@@ -222,7 +223,9 @@ export function createAvatarController({
   headAvatarEl,
   headBuddyEl,
   headBadgeEl,
+  headStateTextEl,
   heroWrapEl,
+  chatPaneEl,
   drawerAvatarEl,
   drawerBuddyEl,
   drawerBadgeEl,
@@ -275,9 +278,16 @@ export function createAvatarController({
   function applyState() {
     const next = deriveAgentState({ ...activity, resting });
     const meta = STATUS_META[next] || STATUS_META.idle;
-    for (const el of [headToggleEl, heroWrapEl]) {
+    for (const el of [headToggleEl, heroWrapEl, chatPaneEl]) {
       if (!el) continue;
       if (el.dataset.agentState !== next) el.dataset.agentState = next;
+    }
+    if (headStateTextEl) {
+      const custom = typeof activity.statusLabel === 'string' ? activity.statusLabel.trim() : '';
+      const subText = next === 'idle' || next === 'resting' || next === 'offline'
+        ? meta.label
+        : (custom || meta.label);
+      if (headStateTextEl.textContent !== subText) headStateTextEl.textContent = subText;
     }
     if (statusPillEl) {
       if (statusPillEl.textContent !== meta.label) statusPillEl.textContent = meta.label;
@@ -319,25 +329,34 @@ export function createAvatarController({
     applyState();
   }
 
+  function poke({ force = false } = {}) {
+    if (!heroWrapEl) return false;
+    const cur = heroWrapEl.dataset.agentState;
+    if (!force && (avatarId !== BUDDY_AVATAR_ID || (cur !== 'idle' && cur !== 'resting'))) {
+      return false;
+    }
+    playTap();
+    resting = false;
+    clearTimeout(idleTimer);
+    idleTimer = null;
+    scheduleRestTimer();
+    applyState();
+    delete heroWrapEl.dataset.agentPoke;
+    void heroWrapEl.offsetWidth;
+    heroWrapEl.dataset.agentPoke = '1';
+    clearTimeout(pokeTimer);
+    pokeTimer = setTimeout(() => {
+      if (heroWrapEl.dataset.agentPoke) delete heroWrapEl.dataset.agentPoke;
+    }, 900);
+    return true;
+  }
+
   if (heroWrapEl) {
-    heroWrapEl.addEventListener('click', () => {
-      const cur = heroWrapEl.dataset.agentState;
-      if (avatarId !== BUDDY_AVATAR_ID || (cur !== 'idle' && cur !== 'resting')) return;
-      resting = false;
-      clearTimeout(idleTimer);
-      idleTimer = null;
-      scheduleRestTimer();
-      applyState();
-      heroWrapEl.dataset.agentPoke = '1';
-      clearTimeout(pokeTimer);
-      pokeTimer = setTimeout(() => {
-        if (heroWrapEl.dataset.agentPoke) delete heroWrapEl.dataset.agentPoke;
-      }, 900);
-    });
+    heroWrapEl.addEventListener('click', () => poke());
   }
 
   scheduleRestTimer();
   applyState();
 
-  return { setAvatar, setActivity };
+  return { setAvatar, setActivity, poke };
 }

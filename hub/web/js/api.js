@@ -104,7 +104,9 @@ export function renderMarkdown(raw) {
         i++;
       }
       if (i < lines.length) i++;
-      out.push(`<pre class="md-pre"><code>${esc(codeLines.join('\n'))}</code></pre>`);
+      out.push(
+        `<div class="md-code-wrap"><button type="button" class="copy-btn" aria-label="复制代码" title="复制"><svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-copy"/></svg><svg class="ic ic-check" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-check"/></svg></button><pre class="md-pre"><code>${esc(codeLines.join('\n'))}</code></pre></div>`,
+      );
       continue;
     }
 
@@ -209,12 +211,35 @@ export function fmtTime(unix) {
 }
 
 export function showToast(msg) {
-  const el = document.getElementById('toast');
-  if (!el) return;
-  el.textContent = msg;
-  el.classList.remove('hide');
-  clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => el.classList.add('hide'), 3200);
+  const stack = document.getElementById('toast');
+  const text = String(msg ?? '').trim();
+  if (!stack || !text) return;
+  const now = performance.now();
+  if (showToast._lastMsg === text && now - (showToast._lastAt || 0) < 900) return;
+  showToast._lastMsg = text;
+  showToast._lastAt = now;
+
+  const item = document.createElement('div');
+  item.className = 'toast-item';
+  item.textContent = text;
+
+  const dismiss = () => {
+    if (item._gone) return;
+    item._gone = true;
+    clearTimeout(item._t);
+    item.classList.add('is-leaving');
+    setTimeout(() => item.remove(), 220);
+  };
+
+  item.addEventListener('click', dismiss);
+  stack.appendChild(item);
+
+  const live = Array.from(stack.children).filter((el) => !el._gone);
+  while (live.length > 3) {
+    const oldest = live.shift();
+    if (oldest) oldest.remove();
+  }
+  item._t = setTimeout(dismiss, 3400);
 }
 
 export const AVATAR_CATALOG = [
