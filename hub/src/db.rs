@@ -453,11 +453,26 @@ impl Db {
              PRAGMA foreign_keys = ON;",
         )?;
         migrate(&mut writer)?;
-        // On startup, mark any orphaned running node jobs without a valid future lease as failed.
+        // On startup, mark any orphaned running node jobs without a valid future lease as failed
+        // and transition their parent running tasks so stale red badges cannot survive restarts.
         let now = crate::config::now_unix();
         writer.execute(
-            "UPDATE node_jobs SET status='failed', updated_at=?1
+            "UPDATE node_jobs
+             SET status='failed', lease_hash=NULL, lease_until=NULL, stage='lease_expired', updated_at=?1
              WHERE status='running' AND (lease_until IS NULL OR lease_until <= ?1)",
+            [now],
+        )?;
+        writer.execute(
+            "UPDATE tasks
+             SET status = 'failed',
+                 result = COALESCE(NULLIF(result, ''), '节点执行中断或租约已过期'),
+                 revision = revision + 1,
+                 updated_at = ?1
+             WHERE status = 'running'
+               AND NOT EXISTS (
+                   SELECT 1 FROM node_jobs j
+                   WHERE j.task_id = tasks.id AND j.status IN ('queued', 'running')
+               )",
             [now],
         )?;
         // A chat turn still `pending` at startup was interrupted by a crash/restart: mark it failed

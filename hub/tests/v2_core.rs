@@ -587,18 +587,24 @@ async fn attachment_acl_and_ssrf_and_automation_permissions_are_enforced() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
-    let job_status: String = hub
+    let (job_status, task_status): (String, String) = hub
         .db
         .read(move |conn| {
-            Ok(conn.query_row(
-                "SELECT status FROM node_jobs WHERE task_id = ?1",
-                [auto_tid],
-                |r| r.get(0),
-            )?)
+            Ok((
+                conn.query_row(
+                    "SELECT status FROM node_jobs WHERE task_id = ?1",
+                    [&auto_tid],
+                    |r| r.get(0),
+                )?,
+                conn.query_row("SELECT status FROM tasks WHERE id = ?1", [&auto_tid], |r| {
+                    r.get(0)
+                })?,
+            ))
         })
         .await
         .unwrap();
     assert_eq!(job_status, "failed");
+    assert_eq!(task_status, "failed");
 
     // 5. Append-only audit_logs trigger rejects UPDATE/DELETE.
     let update_err = hub
@@ -3812,4 +3818,434 @@ async fn verbose_node_submit_auto_digests_without_on_complete_while_short_posts_
         .unwrap();
     assert!(latest_msg.contains("uptime: 14 days, load 0.12"));
     assert_eq!(audits_after, 1);
+}
+
+#[tokio::test]
+async fn orphaned_running_tasks_fail_on_lease_expiry_rotation_and_node_removal() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, node) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"name": "pc-reddot", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_id = node["node"]["id"].as_str().unwrap().to_owned();
+    let mut node_token = node["token"].as_str().unwrap().to_owned();
+
+    // Online handshake so node is eligible for /node dispatch.
+    let handshake = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header("x-agenct-node-kind", "pc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(handshake.status(), StatusCode::OK);
+
+    // Helper to enqueue + claim a task on pc-reddot.
+    let dispatch_and_claim = |title: &str, token: &str| {
+        let router = router.clone();
+        let cookie = cookie.clone();
+        let csrf = csrf.clone();
+        let title = title.to_owned();
+        let token = token.to_owned();
+        async move {
+            let (st, chat) = req_json(
+                &router,
+                "POST",
+                "/api/chat",
+                Some(&cookie),
+                Some(&csrf),
+                Some(json!({"message": format!("/node {title}")})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            let tid = chat["tasks"][0]["task_id"].as_str().unwrap().to_owned();
+
+            let poll = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/node/v1/work")
+                        .header(header::HOST, "127.0.0.1:8080")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header("x-agenct-node-protocol", "2")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(poll.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&poll.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(body["job"]["task_id"].as_str(), Some(tid.as_str()));
+            tid
+        }
+    };
+
+    // 1. Lease expiry + global background reap fails both node_job and parent task.
+    let tid_exp = dispatch_and_claim("lease expiry task", &node_token).await;
+    let tid_exp_q = tid_exp.clone();
+    hub.db
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE node_jobs SET lease_until = 1 WHERE task_id = ?1",
+                [&tid_exp_q],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    agenct_hub::nodes::reap_expired_leases(&hub).await;
+
+    let (j1, t1, r1): (String, String, String) = hub
+        .db
+        .read(move |conn| {
+            Ok((
+                conn.query_row(
+                    "SELECT status FROM node_jobs WHERE task_id = ?1",
+                    [&tid_exp],
+                    |r| r.get(0),
+                )?,
+                conn.query_row("SELECT status FROM tasks WHERE id = ?1", [&tid_exp], |r| {
+                    r.get(0)
+                })?,
+                conn.query_row(
+                    "SELECT COALESCE(result, '') FROM tasks WHERE id = ?1",
+                    [&tid_exp],
+                    |r| r.get(0),
+                )?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert_eq!(j1, "failed");
+    assert_eq!(t1, "failed");
+    assert!(!r1.is_empty());
+
+    // 2. Token rotation while a task is running also fails the parent task.
+    let tid_rot = dispatch_and_claim("token rotate task", &node_token).await;
+    let (st, rot_resp) = req_json(
+        &router,
+        "POST",
+        &format!("/api/nodes/{node_id}/token"),
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    node_token = rot_resp["token"].as_str().unwrap().to_owned();
+
+    let t2: String = hub
+        .db
+        .read(move |conn| {
+            Ok(
+                conn.query_row("SELECT status FROM tasks WHERE id = ?1", [&tid_rot], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(t2, "failed");
+
+    // 3. Removing a node while a task is running cascades node_jobs and fails the parent task.
+    let tid_rm = dispatch_and_claim("node remove task", &node_token).await;
+    let (st, _) = req_json(
+        &router,
+        "DELETE",
+        &format!("/api/nodes/{node_id}"),
+        Some(&cookie),
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let t3: String = hub
+        .db
+        .read(move |conn| {
+            Ok(
+                conn.query_row("SELECT status FROM tasks WHERE id = ?1", [&tid_rm], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(t3, "failed");
+
+    // 4. Bootstrap active task list has zero pending/running tasks left (red badge cleared).
+    let (st, boot) = req_json(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let active_count = boot["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| matches!(t["status"].as_str(), Some("pending" | "running")))
+        .count();
+    assert_eq!(active_count, 0);
+}
+
+#[tokio::test]
+async fn chat_manage_node_switches_default_agent_and_persists_for_dispatch() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, created) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({
+            "id": "homelab",
+            "name": "HomeLab",
+            "kind": "pc",
+            "default_agent": "codex",
+            "allowed_agents": ["codex", "agy", "opencode"]
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_token = created["token"].as_str().unwrap().to_owned();
+
+    // Online handshake so node is eligible for /node dispatch.
+    let handshake = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header("x-agenct-node-kind", "pc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(handshake.status(), StatusCode::OK);
+
+    // 1. Chat triggers manage_node to switch homelab default_agent -> agy.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/nodecfg homelab default=agy"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, nodes_after_agy) =
+        req_json(&router, "GET", "/api/nodes", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(nodes_after_agy[0]["default_agent"], "agy");
+    assert_eq!(nodes_after_agy[0]["effective_default_agent"], "agy");
+
+    // 2. Subsequent /node dispatch without explicit agent inherits the persisted default ("agy").
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node inspect status"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let poll = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(poll.status(), StatusCode::OK);
+    let claimed: Value =
+        serde_json::from_slice(&poll.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(claimed["job"]["agent"], "agy");
+
+    // 3. Omitting node_id auto-resolves single/sole-online node -> switches to opencode.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/nodecfg default=opencode"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, nodes_after_oc) =
+        req_json(&router, "GET", "/api/nodes", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(nodes_after_oc[0]["default_agent"], "opencode");
+
+    // 4. Invalid engine name fails gracefully without corrupting persisted default_agent.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/nodecfg homelab default=invalid_engine"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, nodes_after_err) =
+        req_json(&router, "GET", "/api/nodes", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(nodes_after_err[0]["default_agent"], "opencode");
+}
+
+#[tokio::test]
+async fn node_submit_accepts_backend_field_and_records_audit() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, created) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"name": "pc-backend", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_token = created["token"].as_str().unwrap().to_owned();
+
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node check backend receipt"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let task_id = chat["tasks"][0]["task_id"].as_str().unwrap().to_owned();
+
+    let work_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(work_resp.status(), StatusCode::OK);
+    let work_json: Value =
+        serde_json::from_slice(&work_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let lease = work_json["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev = work_json["job"]["task_revision"].as_i64().unwrap();
+
+    // Unknown fields must still return 422 due to deny_unknown_fields.
+    let unknown_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{task_id}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease,
+                        "request_id": "sub-unknown",
+                        "expected_revision": rev,
+                        "status": "completed",
+                        "content": "ok",
+                        "unexpected_field": true
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Valid submit with backend field succeeds (200 OK) and records backend in audit_logs.
+    let ok_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{task_id}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease,
+                        "request_id": "sub-backend-1",
+                        "expected_revision": rev,
+                        "status": "completed",
+                        "content": "Done via tmux.",
+                        "agent": "codex",
+                        "backend": "tmux"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok_resp.status(), StatusCode::OK);
+
+    let audit_title: String = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT title FROM audit_logs WHERE action = 'node_submit' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert!(
+        audit_title.contains("pc-backend [tmux]:"),
+        "expected backend in audit title, got: {audit_title}"
+    );
 }

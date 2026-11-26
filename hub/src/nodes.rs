@@ -813,13 +813,15 @@ pub async fn create(
     })))
 }
 
-pub async fn update(
-    State(hub): State<Hub>,
-    AuthUser(user): AuthUser,
-    Path(node_id): Path<String>,
-    Json(input): Json<UpdateNodeInput>,
-) -> Result<Json<NodeView>> {
-    let next_name = match input.name.as_deref() {
+pub(crate) async fn update_node_config(
+    hub: &Hub,
+    user_id: &str,
+    node_id: &str,
+    name: Option<&str>,
+    default_agent: Option<&str>,
+    allowed_agents: Option<&[String]>,
+) -> Result<NodeView> {
+    let next_name = match name {
         Some(raw) => {
             let trimmed = raw.trim();
             if trimmed.is_empty() || trimmed.len() > 80 {
@@ -829,7 +831,7 @@ pub async fn update(
         }
         None => None,
     };
-    let next_default = match input.default_agent.as_deref() {
+    let next_default = match default_agent {
         Some(raw) if raw.trim().is_empty() => Some(String::new()),
         Some(raw) => Some(
             normalize_agent_name(raw)
@@ -838,13 +840,13 @@ pub async fn update(
         ),
         None => None,
     };
-    let next_allowed = match input.allowed_agents.as_deref() {
+    let next_allowed = match allowed_agents {
         Some(list) => Some(normalize_agents_list(list)?),
         None => None,
     };
 
-    let uid = user.id.clone();
-    let nid = node_id.clone();
+    let uid = user_id.to_owned();
+    let nid = node_id.to_owned();
     let updated = hub
         .db
         .write(move |conn| {
@@ -914,11 +916,134 @@ pub async fn update(
         .await?;
 
     hub.events.emit(
-        user.id,
+        user_id.to_owned(),
         "node",
         json!({"action": "updated", "node": updated}),
     );
-    Ok(Json(updated))
+    Ok(updated)
+}
+
+pub async fn update(
+    State(hub): State<Hub>,
+    AuthUser(user): AuthUser,
+    Path(node_id): Path<String>,
+    Json(input): Json<UpdateNodeInput>,
+) -> Result<Json<NodeView>> {
+    update_node_config(
+        &hub,
+        &user.id,
+        &node_id,
+        input.name.as_deref(),
+        input.default_agent.as_deref(),
+        input.allowed_agents.as_deref(),
+    )
+    .await
+    .map(Json)
+}
+
+pub(crate) fn fail_orphaned_running_tasks_sync(
+    conn: &Connection,
+    user_id: Option<&str>,
+    reason: &str,
+    now: i64,
+) -> Result<Vec<(String, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT owner_id, requester_id, id
+         FROM tasks
+         WHERE status = 'running'
+           AND (?1 IS NULL OR owner_id = ?1)
+           AND NOT EXISTS (
+               SELECT 1 FROM node_jobs j
+               WHERE j.task_id = tasks.id AND j.status IN ('queued', 'running')
+           )",
+    )?;
+    let rows = stmt
+        .query_map(params![user_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    if !rows.is_empty() {
+        conn.execute(
+            "UPDATE tasks
+             SET status = 'failed',
+                 result = COALESCE(NULLIF(result, ''), ?2),
+                 revision = revision + 1,
+                 updated_at = ?3
+             WHERE status = 'running'
+               AND (?1 IS NULL OR owner_id = ?1)
+               AND NOT EXISTS (
+                   SELECT 1 FROM node_jobs j
+                   WHERE j.task_id = tasks.id AND j.status IN ('queued', 'running')
+               )",
+            params![user_id, reason, now],
+        )?;
+    }
+    Ok(rows)
+}
+
+pub(crate) fn emit_failed_tasks(hub: &Hub, failed: Vec<(String, String, String)>) {
+    for (owner_id, requester_id, task_id) in failed {
+        let payload = json!({"task_id": task_id, "status": "failed"});
+        if requester_id != owner_id {
+            hub.events.emit(requester_id, "task", payload.clone());
+        }
+        hub.events.emit(owner_id, "task", payload);
+    }
+}
+
+pub(crate) fn reap_expired_leases_sync(
+    conn: &Connection,
+    scope: Option<(&str, Option<&str>)>,
+    now: i64,
+) -> Result<Vec<(String, String, String)>> {
+    match scope {
+        Some((uid, Some(nid))) => {
+            conn.execute(
+                "UPDATE node_jobs
+                 SET status='failed', lease_hash=NULL, lease_until=NULL, stage='lease_expired', updated_at=?3
+                 WHERE user_id=?1 AND node_id=?2 AND status='running'
+                   AND (lease_until IS NULL OR lease_until <= ?3)",
+                params![uid, nid, now],
+            )?;
+        }
+        Some((uid, None)) => {
+            conn.execute(
+                "UPDATE node_jobs
+                 SET status='failed', lease_hash=NULL, lease_until=NULL, stage='lease_expired', updated_at=?2
+                 WHERE user_id=?1 AND status='running'
+                   AND (lease_until IS NULL OR lease_until <= ?2)",
+                params![uid, now],
+            )?;
+        }
+        None => {
+            conn.execute(
+                "UPDATE node_jobs
+                 SET status='failed', lease_hash=NULL, lease_until=NULL, stage='lease_expired', updated_at=?1
+                 WHERE status='running'
+                   AND (lease_until IS NULL OR lease_until <= ?1)",
+                params![now],
+            )?;
+        }
+    }
+    fail_orphaned_running_tasks_sync(
+        conn,
+        scope.map(|(uid, _)| uid),
+        "节点执行中断或租约已过期",
+        now,
+    )
+}
+
+pub async fn reap_expired_leases(hub: &Hub) {
+    if let Ok(failed) = hub
+        .db
+        .write(|conn| {
+            let tx = conn.transaction()?;
+            let failed = reap_expired_leases_sync(&tx, None, now_unix())?;
+            tx.commit()?;
+            Ok(failed)
+        })
+        .await
+    {
+        emit_failed_tasks(hub, failed);
+    }
 }
 
 pub async fn rotate_token(
@@ -931,25 +1056,36 @@ pub async fn rotate_token(
     let uid = user.id.clone();
     let nid = node_id.clone();
 
-    hub.db
+    let failed = hub
+        .db
         .write(move |conn| {
-            let changed = conn.execute(
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
                 "UPDATE nodes SET token_hash = ?3 WHERE user_id = ?1 AND id = ?2",
                 params![uid, nid, token_hash],
             )?;
             if changed == 0 {
                 return Err(denied());
             }
+            let now = now_unix();
             // Invalidate any running leases held by the rotated token.
-            conn.execute(
+            tx.execute(
                 "UPDATE node_jobs SET status='failed', lease_hash=NULL, lease_until=NULL, updated_at=?3
                  WHERE user_id = ?1 AND node_id = ?2 AND status = 'running'",
-                params![uid, nid, now_unix()],
+                params![uid, nid, now],
             )?;
-            Ok(())
+            let failed = fail_orphaned_running_tasks_sync(
+                &tx,
+                Some(&uid),
+                "节点令牌已重置，原任务已中止",
+                now,
+            )?;
+            tx.commit()?;
+            Ok(failed)
         })
         .await?;
 
+    emit_failed_tasks(&hub, failed);
     hub.node_waiters.notify(&user.id, &node_id);
     Ok(Json(json!({"id": node_id, "token": token})))
 }
@@ -961,18 +1097,28 @@ pub async fn remove(
 ) -> Result<Json<Value>> {
     let uid = user.id.clone();
     let nid = node_id.clone();
-    hub.db
+    let failed = hub
+        .db
         .write(move |conn| {
-            let changed = conn.execute(
+            let tx = conn.transaction()?;
+            let changed = tx.execute(
                 "DELETE FROM nodes WHERE user_id = ?1 AND id = ?2",
                 params![uid, nid],
             )?;
             if changed == 0 {
                 return Err(denied());
             }
-            Ok(())
+            let failed = fail_orphaned_running_tasks_sync(
+                &tx,
+                Some(&uid),
+                "执行节点已移除，任务已中止",
+                now_unix(),
+            )?;
+            tx.commit()?;
+            Ok(failed)
         })
         .await?;
+    emit_failed_tasks(&hub, failed);
     hub.node_waiters.notify(&user.id, &node_id);
     hub.events
         .emit(user.id, "node", json!({"action": "removed", "id": node_id}));
@@ -1066,7 +1212,8 @@ struct ClaimedWork {
 async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Option<ClaimedWork>> {
     let uid = user_id.to_owned();
     let nid = node_id.to_owned();
-    hub.db
+    let (claimed, failed_tasks) = hub
+        .db
         .write(move |conn| {
             let tx = conn.transaction()?;
             let node_cfg: Option<(String, String)> = tx
@@ -1080,14 +1227,9 @@ async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Optio
                 return Err(Error(StatusCode::UNAUTHORIZED, "invalid node token"));
             };
             let perms = automation::read_permissions_sync(&tx, &uid)?;
-            automation::revoke_disallowed_jobs_sync(&tx, &uid, &perms)?;
+            let mut failed_tasks = automation::revoke_disallowed_jobs_sync(&tx, &uid, &perms)?;
             let now = now_unix();
-            tx.execute(
-                "UPDATE node_jobs SET status='failed', updated_at=?3
-                 WHERE user_id=?1 AND node_id=?2 AND status='running'
-                   AND (lease_until IS NULL OR lease_until <= ?3)",
-                params![uid, nid, now],
-            )?;
+            failed_tasks.extend(reap_expired_leases_sync(&tx, Some((&uid, Some(&nid))), now)?);
             struct PendingJob {
                 task_id: String,
                 task_revision: i64,
@@ -1140,7 +1282,7 @@ async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Optio
             }) = pending
             else {
                 tx.commit()?;
-                return Ok(None);
+                return Ok((None, failed_tasks));
             };
             let (detected_default, _) = extract_node_detected_agents(&node_caps);
             let requested_or_default = if !job_agent.trim().is_empty() {
@@ -1195,23 +1337,28 @@ async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Optio
                 let t = s.trim();
                 (!t.is_empty()).then(|| t.to_owned())
             };
-            Ok(Some(ClaimedWork {
-                task_id,
-                task_revision,
-                lease_token,
-                lease_until,
-                title,
-                instruction,
-                agent: (!requested_or_default.is_empty()).then_some(requested_or_default),
-                role: opt_non_empty(job_role),
-                model: opt_non_empty(job_model),
-                effort: opt_non_empty(job_effort),
-                sandbox: opt_non_empty(job_sandbox),
-                thread_id,
-                agent_session_id,
-            }))
+            Ok((
+                Some(ClaimedWork {
+                    task_id,
+                    task_revision,
+                    lease_token,
+                    lease_until,
+                    title,
+                    instruction,
+                    agent: (!requested_or_default.is_empty()).then_some(requested_or_default),
+                    role: opt_non_empty(job_role),
+                    model: opt_non_empty(job_model),
+                    effort: opt_non_empty(job_effort),
+                    sandbox: opt_non_empty(job_sandbox),
+                    thread_id,
+                    agent_session_id,
+                }),
+                failed_tasks,
+            ))
         })
-        .await
+        .await?;
+    emit_failed_tasks(hub, failed_tasks);
+    Ok(claimed)
 }
 
 pub async fn work(
@@ -1333,14 +1480,15 @@ pub async fn renew_lease(
     let tl_clone = clean_tail.clone();
     let rev = input.expected_revision;
 
-    let lease_until = hub
+    let (lease_until, revoked) = hub
         .db
         .write(move |conn| {
-            let perms = automation::read_permissions_sync(conn, &uid)?;
-            automation::revoke_disallowed_jobs_sync(conn, &uid, &perms)?;
+            let tx = conn.transaction()?;
+            let perms = automation::read_permissions_sync(&tx, &uid)?;
+            let revoked = automation::revoke_disallowed_jobs_sync(&tx, &uid, &perms)?;
             let now = now_unix();
             let until = now + LEASE_TTL_SECS;
-            let changed = conn.execute(
+            let changed = tx.execute(
                 "UPDATE node_jobs
                  SET lease_until = ?6, stage = ?7, log_tail = ?8, updated_at = ?9
                  WHERE task_id = ?1 AND user_id = ?2 AND node_id = ?3
@@ -1348,12 +1496,15 @@ pub async fn renew_lease(
                    AND status = 'running' AND lease_until > ?9",
                 params![tid, uid, node_id, lease_hash, rev, until, st_clone, tl_clone, now],
             )?;
-            if changed != 1 {
-                return Err(Error(StatusCode::CONFLICT, "node lease is no longer valid"));
-            }
-            Ok(until)
+            tx.commit()?;
+            Ok(((changed == 1).then_some(until), revoked))
         })
         .await?;
+
+    emit_failed_tasks(&hub, revoked);
+    let Some(lease_until) = lease_until else {
+        return Err(Error(StatusCode::CONFLICT, "node lease is no longer valid"));
+    };
 
     hub.events.emit(
         user_id,
@@ -1393,6 +1544,8 @@ pub struct SubmitResultInput {
     agent: Option<String>,
     #[serde(default)]
     agent_session_id: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
 }
 
 fn valid_session_id(raw: &str) -> Option<String> {
@@ -1404,6 +1557,20 @@ fn valid_session_id(raw: &str) -> Option<String> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
     {
         Some(trimmed.to_owned())
+    } else {
+        None
+    }
+}
+
+fn sanitize_backend_name(raw: &str) -> Option<String> {
+    let norm = raw.trim().to_ascii_lowercase();
+    if !norm.is_empty()
+        && norm.len() <= 32
+        && norm
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        Some(norm)
     } else {
         None
     }
@@ -1554,6 +1721,8 @@ pub async fn submit_result(
     let rev = input.expected_revision;
     let node_name_db = node_name.clone();
     let agent_sid_db = input.agent_session_id.as_deref().and_then(valid_session_id);
+    let submit_backend = input.backend.as_deref().and_then(sanitize_backend_name);
+    let submit_backend_db = submit_backend.clone();
     let submit_agent_db = input
         .agent
         .as_deref()
@@ -1750,12 +1919,16 @@ pub async fn submit_result(
                     params![req_id, uid, peer_msg, now],
                 )?;
             }
+            let audit_summary = match submit_backend_db.as_deref() {
+                Some(b) => format!("{node_name_db} [{b}]: {title}"),
+                None => format!("{node_name_db}: {title}"),
+            };
             record_audit(
                 &tx,
                 &uid,
                 "node_submit",
                 final_status,
-                &format!("{node_name_db}: {title}"),
+                &audit_summary,
                 &truncate_bytes(&content_db, 240),
             )?;
             tx.commit()?;
@@ -1774,11 +1947,11 @@ pub async fn submit_result(
         .await?;
 
     if !already_submitted {
-        hub.events.emit(
-            user_id.clone(),
-            "task",
-            json!({"task_id": task_id, "status": final_status, "result": content}),
-        );
+        let mut task_event = json!({"task_id": task_id, "status": final_status, "result": content});
+        if let Some(ref backend) = submit_backend {
+            task_event["backend"] = json!(backend);
+        }
+        hub.events.emit(user_id.clone(), "task", task_event);
         if will_callback {
             hub.events.emit(
                 user_id.clone(),

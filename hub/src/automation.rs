@@ -107,7 +107,8 @@ pub fn revoke_disallowed_jobs_sync(
     conn: &Connection,
     user_id: &str,
     perms: &Permissions,
-) -> Result<()> {
+) -> Result<Vec<(String, String, String)>> {
+    let now = now_unix();
     conn.execute(
         "UPDATE node_jobs SET status='failed', lease_hash=NULL, lease_until=NULL, updated_at=?4
          WHERE user_id = ?1 AND status IN ('queued','running')
@@ -116,10 +117,15 @@ pub fn revoke_disallowed_jobs_sync(
             user_id,
             i64::from(perms.auto_accept),
             i64::from(perms.gitlab_execute),
-            now_unix()
+            now
         ],
     )?;
-    Ok(())
+    crate::nodes::fail_orphaned_running_tasks_sync(
+        conn,
+        Some(user_id),
+        "自动化执行权限已关闭，任务已中止",
+        now,
+    )
 }
 
 pub fn list_rules_sync(conn: &Connection, user_id: &str) -> Result<Vec<DispatchRule>> {
@@ -187,7 +193,8 @@ pub async fn update_permissions(
 ) -> Result<Json<Permissions>> {
     let uid = user.id.clone();
     let next = input.clone();
-    hub.db
+    let revoked = hub
+        .db
         .write(move |conn| {
             let tx = conn.transaction()?;
             tx.execute(
@@ -208,7 +215,7 @@ pub async fn update_permissions(
                     now_unix()
                 ],
             )?;
-            revoke_disallowed_jobs_sync(&tx, &uid, &next)?;
+            let revoked = revoke_disallowed_jobs_sync(&tx, &uid, &next)?;
             record_audit(
                 &tx,
                 &uid,
@@ -221,9 +228,10 @@ pub async fn update_permissions(
                 ),
             )?;
             tx.commit()?;
-            Ok(())
+            Ok(revoked)
         })
         .await?;
+    crate::nodes::emit_failed_tasks(&hub, revoked);
     hub.events
         .emit(user.id, "automation", json!({"permissions": input}));
     Ok(Json(input))
@@ -776,6 +784,7 @@ impl Hub {
                 _ = interval.tick() => {}
                 _ = self.scheduler_notify.notified() => {}
             }
+            crate::nodes::reap_expired_leases(self).await;
             if let Ok(due) = claim_due_crons(self).await {
                 for (uid, job) in due {
                     drop(spawn_cron(self, uid, job));

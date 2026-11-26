@@ -633,7 +633,8 @@ pub async fn set_member_status(
     let next_status = input.status;
     let caller_id = caller.id;
     let target_clone = target_id.clone();
-    hub.db
+    let failed = hub
+        .db
         .write(move |conn| {
             let changed = conn.execute(
                 "UPDATE users SET status = ?2 WHERE id = ?1",
@@ -642,14 +643,23 @@ pub async fn set_member_status(
             if changed == 0 {
                 return Err(denied());
             }
-            if next_status == "disabled" {
+            let failed = if next_status == "disabled" {
+                let now = now_unix();
                 conn.execute("DELETE FROM sessions WHERE user_id = ?1", [&target_clone])?;
                 conn.execute(
-                    "UPDATE node_jobs SET status='failed', updated_at=?2
+                    "UPDATE node_jobs SET status='failed', lease_hash=NULL, lease_until=NULL, updated_at=?2
                      WHERE user_id = ?1 AND status IN ('queued','running')",
-                    params![target_clone, now_unix()],
+                    params![target_clone, now],
                 )?;
-            }
+                crate::nodes::fail_orphaned_running_tasks_sync(
+                    conn,
+                    Some(&target_clone),
+                    "账号已停用，任务已中止",
+                    now,
+                )?
+            } else {
+                Vec::new()
+            };
             record_audit(
                 conn,
                 &caller_id,
@@ -658,9 +668,10 @@ pub async fn set_member_status(
                 &format!("Member {target_clone} -> {next_status}"),
                 "Updated by admin",
             )?;
-            Ok(())
+            Ok(failed)
         })
         .await?;
+    crate::nodes::emit_failed_tasks(&hub, failed);
     Ok(Json(json!({"ok": true, "id": target_id})))
 }
 

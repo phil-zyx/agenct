@@ -61,6 +61,10 @@ pub(super) struct ToolCall {
     #[serde(default)]
     pub(super) agent: Option<String>,
     #[serde(default)]
+    pub(super) default_agent: Option<String>,
+    #[serde(default)]
+    pub(super) allowed_agents: Option<Vec<String>>,
+    #[serde(default)]
     pub(super) role: Option<String>,
     #[serde(default)]
     pub(super) description: Option<String>,
@@ -104,6 +108,8 @@ fn minimal_tool_call(name: &str) -> ToolCall {
         keyword: None,
         node_id: None,
         agent: None,
+        default_agent: None,
+        allowed_agents: None,
         role: None,
         description: None,
         model: None,
@@ -173,6 +179,9 @@ pub(super) fn default_reply_for_tools(tools: &[ToolCall]) -> String {
     }
     if tools.iter().any(|t| t.tool == "manage_role") {
         return "已更新军团角色配置。".into();
+    }
+    if tools.iter().any(|t| t.tool == "manage_node") {
+        return "好的，已更新执行节点配置。".into();
     }
     if tools
         .iter()

@@ -116,6 +116,19 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
             ),
         ),
         (
+            "manage_node",
+            fn_schema(
+                "manage_node",
+                "修改执行节点（如 homelab）的默认执行引擎或启用引擎白名单并立即持久化",
+                json!({
+                    "node_id": {"type": "string", "description": "目标节点 ID 或名称（仅有一个节点或唯一在线节点时可省略）"},
+                    "default_agent": {"type": "string", "enum": ["", "claude", "codex", "agy", "opencode", "ollama", "openai", "template"], "description": "节点默认执行引擎（空字符串表示跟随节点自动检测）"},
+                    "allowed_agents": {"type": "array", "items": {"type": "string"}, "description": "可选：允许使用的执行引擎白名单；传空数组清空自定义限制"}
+                }),
+                &[],
+            ),
+        ),
+        (
             "fetch_gitlab_commits",
             fn_schema(
                 "fetch_gitlab_commits",
@@ -392,7 +405,8 @@ pub(super) fn build_system_prompt(
    - 若任务完成后需要自动验收结果、更新账本或编排下一步，可填写简短 `on_complete` 跟进目标。
 7. close_thread: {"tool":"close_thread","thread_id":"已完结的 thr_xxx"}
 8. delegate_colleague: {"tool":"delegate_colleague","peer":"同事username或姓名","instruction":"需要同事协助的清晰事项"}
-9. manage_role: {"tool":"manage_role","action":"upsert|delete","name":"角色名","description":null,"agent":null,"model":null,"effort":null,"sandbox":null,"node_id":null,"prompt":null}"#
+9. manage_role: {"tool":"manage_role","action":"upsert|delete","name":"角色名","description":null,"agent":null,"model":null,"effort":null,"sandbox":null,"node_id":null,"prompt":null}
+10. manage_node: {"tool":"manage_node","node_id":null,"default_agent":null,"allowed_agents":null}"#
     };
 
     format!(
@@ -418,6 +432,7 @@ pub(super) fn build_system_prompt(
 
 === 军团角色管理与 Plan → Execute 分工纪律 ===
 - 军团角色通过对话直接配置：当用户配置角色、切换某角色的引擎/模型/推理强度（`effort`）/沙箱或删除角色时，当轮调用 `manage_role` 落盘，并用一句简短中文确认最终生效的配置。
+- 节点默认引擎或启用白名单通过对话直接修改：当用户要求把某个节点的默认引擎切成指定引擎（如「把 homelab 默认切成 agy / opencode」）或调整启用引擎时，当轮必须调用 `manage_node` 落库生效，不要只写进 `MEMORY.md`。
 - 派发任务时优先用 `dispatch_node(role=...)`；如果用户临时说「这次换某个模型/只读看看」，通过 `model`/`effort`/`sandbox` 单次覆盖即可，不必改动原角色。
 - **Plan → Execute 默认先审再做**：用户让 `planner` 做规划/排查时，先让其只读出方案并回传给用户；**不要未经用户确认就自动触发 `executor` 改代码**。仅当用户明确要求「规划完直接自动执行 / 一条龙」时，才在 `dispatch_node` 中挂载 `on_complete` 自动衔接后续角色。
 

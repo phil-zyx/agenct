@@ -588,6 +588,45 @@ fn parse_stub_role_cmd(rest: &str) -> Option<(String, Value)> {
     Some((format!("已配置军团角色 {name}"), args))
 }
 
+fn parse_stub_node_cfg_cmd(rest: &str) -> Option<(String, Value)> {
+    let tokens = split_stub_tokens(rest.trim());
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut args = json!({});
+    let mut has_change = false;
+    for tok in &tokens {
+        if let Some((k, v)) = tok.split_once('=') {
+            match k.trim() {
+                "node" | "node_id" => {
+                    let nid = v.trim();
+                    if !nid.is_empty() {
+                        args["node_id"] = json!(nid);
+                    }
+                }
+                "default" | "default_agent" | "agent" => {
+                    args["default_agent"] = json!(v.trim());
+                    has_change = true;
+                }
+                "allowed" | "allowed_agents" => {
+                    let list: Vec<String> = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    args["allowed_agents"] = json!(list);
+                    has_change = true;
+                }
+                _ => {}
+            }
+        } else if args.get("node_id").is_none() && !tok.trim().is_empty() {
+            args["node_id"] = json!(tok.trim());
+        }
+    }
+    has_change.then(|| ("已更新节点配置".into(), args))
+}
+
 fn stub_turn<F: FnMut(&str)>(
     messages: &[Value],
     stream: bool,
@@ -706,6 +745,22 @@ fn stub_turn<F: FnMut(&str)>(
                 tool_calls: vec![LlmToolCall {
                     id: "call_stub_role_1".into(),
                     name: "manage_role".into(),
+                    arguments: args.to_string(),
+                }],
+            }
+        } else {
+            LlmTurnResponse {
+                content: format!("收到你的消息：{trimmed}"),
+                tool_calls: Vec::new(),
+            }
+        }
+    } else if let Some(rest) = trimmed.strip_prefix("/nodecfg ") {
+        if let Some((reply, args)) = parse_stub_node_cfg_cmd(rest) {
+            LlmTurnResponse {
+                content: reply,
+                tool_calls: vec![LlmToolCall {
+                    id: "call_stub_nodecfg_1".into(),
+                    name: "manage_node".into(),
                     arguments: args.to_string(),
                 }],
             }
@@ -932,6 +987,16 @@ fn stub_reply(system: &str, user_message: &str, images: usize, json_mode: bool) 
     if let Some(rest) = trimmed.strip_prefix("/role ") {
         if let Some((reply, mut args)) = parse_stub_role_cmd(rest) {
             args["tool"] = json!("manage_role");
+            return json!({
+                "reply": reply,
+                "tools": [args]
+            })
+            .to_string();
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("/nodecfg ") {
+        if let Some((reply, mut args)) = parse_stub_node_cfg_cmd(rest) {
+            args["tool"] = json!("manage_node");
             return json!({
                 "reply": reply,
                 "tools": [args]

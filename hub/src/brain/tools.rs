@@ -161,6 +161,10 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
             ctx.stage("正在更新军团角色…");
             apply_manage_role(hub, user_id, ctx.node_list, call).await
         }
+        "manage_node" => {
+            ctx.stage("正在更新节点配置…");
+            apply_manage_node(hub, user_id, ctx.node_list, call).await
+        }
         "fetch_gitlab_commits" => {
             ctx.stage("正在拉取 GitLab 提交记录…");
             if let Some(summary) =
@@ -953,6 +957,105 @@ async fn apply_manage_role(
             summary.join(" / ")
         ),
     ))
+}
+
+async fn apply_manage_node(
+    hub: &Hub,
+    user_id: &str,
+    node_list: &[nodes::NodeView],
+    call: &ToolCall,
+) -> Result<ToolOutcome> {
+    let tool = "manage_node";
+    let target = if let Some(raw) = call
+        .node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match node_list
+            .iter()
+            .find(|n| n.id.eq_ignore_ascii_case(raw) || n.name.eq_ignore_ascii_case(raw))
+        {
+            Some(n) => n,
+            None => {
+                let known = if node_list.is_empty() {
+                    "暂无已注册节点".to_owned()
+                } else {
+                    node_list
+                        .iter()
+                        .map(|n| format!("{}（{}）", n.id, n.name))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                };
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    format!("未找到节点 `{raw}`（当前节点：{known}）。"),
+                    format!("（未找到节点 `{raw}`。）"),
+                ));
+            }
+        }
+    } else if node_list.len() == 1 {
+        &node_list[0]
+    } else {
+        let online: Vec<&nodes::NodeView> = node_list.iter().filter(|n| n.online).collect();
+        if online.len() == 1 {
+            online[0]
+        } else {
+            let known = if node_list.is_empty() {
+                "暂无已注册节点".to_owned()
+            } else {
+                node_list
+                    .iter()
+                    .map(|n| format!("{}（{}）", n.id, n.name))
+                    .collect::<Vec<_>>()
+                    .join("、")
+            };
+            return Ok(ToolOutcome::failed(
+                tool,
+                format!("无法唯一确定目标节点，请指定 node_id（当前节点：{known}）。"),
+                "（请指定需要修改的节点。）",
+            ));
+        }
+    };
+
+    let next_default = call.default_agent.as_deref().or(call.agent.as_deref());
+    let next_allowed = call.allowed_agents.as_deref();
+    if next_default.is_none() && next_allowed.is_none() {
+        return Ok(ToolOutcome::failed(
+            tool,
+            "请至少提供 `default_agent` 或 `allowed_agents` 之一。",
+            "（缺少要更新的节点引擎配置。）",
+        ));
+    }
+
+    match nodes::update_node_config(hub, user_id, &target.id, None, next_default, next_allowed)
+        .await
+    {
+        Ok(updated) => {
+            let def_label = if updated.effective_default_agent.is_empty() {
+                "auto"
+            } else {
+                updated.effective_default_agent.as_str()
+            };
+            let allowed_label = if updated.effective_agents.is_empty() {
+                "默认".to_owned()
+            } else {
+                updated.effective_agents.join(",")
+            };
+            Ok(ToolOutcome::done(
+                tool,
+                format!(
+                    "已更新节点 `{}`（{}）：默认引擎={}，可用引擎={}。",
+                    updated.id, updated.name, def_label, allowed_label
+                ),
+            ))
+        }
+        Err(err) => Ok(ToolOutcome::failed(
+            tool,
+            format!("更新节点配置失败：{}。", err.1),
+            format!("（更新节点配置失败：{}。）", err.1),
+        )),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
