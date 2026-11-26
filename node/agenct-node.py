@@ -16,8 +16,10 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib
 import json
 import locale
+import ntpath
 import os
 import platform
 import re
@@ -38,6 +40,10 @@ PROTOCOL_VERSION = "2"
 VALID_AGENTS = ("auto", "claude", "codex", "agy", "opencode", "ollama", "openai", "template")
 CLI_AGENTS = ("claude", "codex", "agy", "opencode")
 VALID_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+VALID_EXEC_BACKENDS = ("auto", "tmux", "conpty", "wt-tail", "pipe")
+VALID_TMUX_MODES = ("auto", "on", "off")
+EXEC_BACKEND_ENV = "AGENCT_EXEC_BACKEND"
+_TMUX_ALIAS_MAP = {"auto": "auto", "on": "tmux", "off": "pipe"}
 MAX_RESULT_BYTES = 16_000
 DEFAULT_NODE_TIMEOUT = 3600
 NODE_TIMEOUT_ENV = "AGENCT_NODE_TIMEOUT"
@@ -87,7 +93,11 @@ _AGY_WORKSPACE_SETTINGS = json.dumps(
     },
     separators=(",", ":"),
 )
-_OPENCODE_READONLY_PERMISSION = json.dumps({"edit": "deny", "bash": "deny"}, separators=(",", ":"))
+_OPENCODE_READONLY_PERMISSION = json.dumps(
+    {"edit": "deny", "bash": "deny", "external_directory": "deny"},
+    separators=(",", ":"),
+)
+_OPENCODE_WORKSPACE_PERMISSION = json.dumps({"external_directory": "deny"}, separators=(",", ":"))
 _OPENCODE_DENIAL_LINE_RE = re.compile(
     r"^\s*!\s*permission requested:.*auto-rejecting",
     re.IGNORECASE | re.MULTILINE,
@@ -875,10 +885,1151 @@ class IdleTimeoutExpired(subprocess.TimeoutExpired):
 
 
 def _kill_process_group(pid: int, sig: int) -> None:
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    else:
+        try:
+            os.kill(pid, sig)
+        except OSError:
+            pass
+
+
+def is_windows(system: str | None = None) -> bool:
+    """Return True only on native Windows (never on Linux, macOS, or WSL2)."""
+    sys_name = (platform.system() if system is None else system).strip().lower()
+    return sys_name.startswith("win")
+
+
+def is_wsl2(
+    system: str | None = None,
+    release: str | None = None,
+    env: dict[str, str] | None = None,
+) -> bool:
+    """Return True when running inside WSL2 on Linux."""
+    if is_windows(system):
+        return False
+    sys_name = (platform.system() if system is None else system).strip().lower()
+    if sys_name != "linux":
+        return False
+    rel = (platform.release() if release is None else release).lower()
+    eff_env = os.environ if env is None else env
+    return "microsoft" in rel or bool(eff_env.get("WSL_DISTRO_NAME")) or bool(eff_env.get("WSL_INTEROP"))
+
+
+def get_runs_dir(system: str | None = None, env: dict[str, str] | None = None) -> str:
+    """Return execution log directory: %USERPROFILE%\\.agenct\\runs on Windows, /tmp/agenct-runs on POSIX."""
+    eff_env = os.environ if env is None else env
+    if is_windows(system):
+        profile = (eff_env.get("USERPROFILE") or "").strip() or os.path.expanduser("~")
+        if "\\" in profile or (len(profile) >= 2 and profile[1] == ":"):
+            return ntpath.join(profile, ".agenct", "runs")
+        return os.path.join(profile, ".agenct", "runs")
+    return os.path.join(tempfile.gettempdir(), "agenct-runs")
+
+
+def _sanitize_task_label(task_id: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", str(task_id or "").strip()).strip("._-")
+    return (cleaned or "task")[:40]
+
+
+def build_wt_tail_argv(wt_bin: str, task_id: str, log_path: str) -> list[str]:
+    """Build strictly whitelisted Windows Terminal tail command argv."""
+    if not wt_bin or "\n" in log_path or "\r" in log_path or "\x00" in log_path:
+        raise ValueError("Invalid wt-tail arguments")
+    safe_task = _sanitize_task_label(task_id)
+    if any(ch in log_path for ch in (" ", "\t", "'", '"', ";", "|", "&", "$", "`", "(", ")")):
+        escaped = log_path.replace("'", "''")
+        ps_cmd = f"Get-Content -Wait '{escaped}'"
+    else:
+        ps_cmd = f"Get-Content -Wait {log_path}"
+    return [
+        wt_bin,
+        "-w",
+        "0",
+        "new-tab",
+        "--title",
+        f"agenct:{safe_task}",
+        "pwsh",
+        "-NoExit",
+        "-Command",
+        ps_cmd,
+    ]
+
+
+def probe_tmux(
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    socket_path: str | None = None,
+) -> bool:
+    """Probe whether tmux is installed and its server socket is usable on POSIX/WSL2."""
+    if is_windows(system):
+        return False
+    which_fn = which or shutil.which
+    tmux_bin = which_fn("tmux")
+    if not tmux_bin:
+        return False
+    run_fn = runner or subprocess.run
     try:
-        os.killpg(pid, sig)
-    except ProcessLookupError:
+        ver = run_fn([tmux_bin, "-V"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+        if ver.returncode != 0:
+            return False
+        ls_cmd = [tmux_bin, "-S", socket_path, "list-sessions"] if socket_path else [tmux_bin, "list-sessions"]
+        ls_res = run_fn(ls_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+        if ls_res.returncode == 0:
+            return True
+        combined = (decode_bytes(ls_res.stdout) + "\n" + decode_bytes(ls_res.stderr)).lower()
+        for err_marker in (
+            "unsafe permissions",
+            "operation not permitted",
+            "permission denied",
+            "can't create socket",
+            "cannot create socket",
+        ):
+            if err_marker in combined:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def probe_conpty(
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    import_module: Callable[[str], object] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> str | None:
+    """Probe Windows ConPTY provider ('pywinpty' or 'node-pty'); returns None on non-Windows or failure."""
+    if not is_windows(system):
+        return None
+    imp = import_module or importlib.import_module
+    try:
+        mod = imp("winpty")
+        if hasattr(mod, "PtyProcess") or hasattr(mod, "PTY"):
+            return "pywinpty"
+    except Exception:
         pass
+    which_fn = which or shutil.which
+    node_bin = which_fn("node")
+    if node_bin:
+        run_fn = runner or subprocess.run
+        try:
+            res = run_fn(
+                [node_bin, "-e", "require.resolve('node-pty')"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            if res.returncode == 0:
+                return "node-pty"
+        except Exception:
+            pass
+    return None
+
+
+def probe_wt_exe(
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> str | None:
+    """Probe native Windows wt.exe availability (rejects non-Windows/WSL2 /mnt/ paths and broken Store aliases)."""
+    if not is_windows(system):
+        return None
+    which_fn = which or shutil.which
+    wt_bin = which_fn("wt.exe") or which_fn("wt")
+    if not wt_bin:
+        return None
+    if wt_bin.replace("\\", "/").lower().startswith("/mnt/"):
+        return None
+    run_fn = runner or subprocess.run
+    try:
+        res = run_fn([wt_bin, "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=3)
+        if res.returncode != 0:
+            return None
+        return wt_bin
+    except Exception:
+        return None
+
+
+_WRAPPER_SCRIPT = r"""
+import json, os, subprocess, sys, threading
+
+run_dir = sys.argv[1]
+spec_path = os.path.join(run_dir, "spec.json")
+with open(spec_path, "r", encoding="utf-8") as fh:
+    spec = json.load(fh)
+try:
+    os.unlink(spec_path)
+except OSError:
+    pass
+
+stdout_path = os.path.join(run_dir, "stdout.log")
+stderr_path = os.path.join(run_dir, "stderr.log")
+pid_path = os.path.join(run_dir, "child.pid")
+exit_path = os.path.join(run_dir, "exit.code")
+
+popen_kwargs = dict(
+    shell=bool(spec.get("shell")),
+    cwd=spec["cwd"],
+    env=spec["env"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if os.name != "nt":
+    popen_kwargs["start_new_session"] = True
+else:
+    popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+proc = subprocess.Popen(spec["argv"], **popen_kwargs)
+pid_tmp = pid_path + ".tmp"
+with open(pid_tmp, "w", encoding="utf-8") as fh:
+    fh.write(str(proc.pid))
+os.replace(pid_tmp, pid_path)
+
+def pump(stream, log_path, mirror):
+    if stream is None:
+        return
+    fd = stream.fileno()
+    with open(log_path, "ab", buffering=0) as log_fh:
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            log_fh.write(chunk)
+            if mirror is not None:
+                try:
+                    mirror.write(chunk)
+                    mirror.flush()
+                except Exception:
+                    pass
+
+t_out = threading.Thread(
+    target=pump, args=(proc.stdout, stdout_path, getattr(sys.stdout, "buffer", None)), daemon=True
+)
+t_err = threading.Thread(
+    target=pump, args=(proc.stderr, stderr_path, getattr(sys.stderr, "buffer", None)), daemon=True
+)
+t_out.start()
+t_err.start()
+rc = proc.wait()
+t_out.join(timeout=2)
+t_err.join(timeout=2)
+
+exit_tmp = exit_path + ".tmp"
+with open(exit_tmp, "w", encoding="utf-8") as fh:
+    fh.write(str(rc))
+os.replace(exit_tmp, exit_path)
+sys.exit(rc)
+"""
+
+_NODE_PTY_HOST_SCRIPT = r"""
+const pty = require("node-pty");
+const pyExe = process.argv[2];
+const wrapperPath = process.argv[3];
+const runDir = process.argv[4];
+const cwd = process.argv[5] || process.cwd();
+const term = pty.spawn(pyExe, [wrapperPath, runDir], {
+  name: "xterm-color",
+  cols: 120,
+  rows: 30,
+  cwd,
+  env: process.env,
+});
+term.onData(() => {});
+term.onExit(({ exitCode }) => {
+  process.exit(typeof exitCode === "number" ? exitCode : 0);
+});
+"""
+
+
+def _prepare_wrapper_run_dir(
+    runs_dir: str,
+    prefix: str,
+    argv: list[str] | str,
+    *,
+    shell: bool,
+    cwd: str,
+    env: dict[str, str],
+) -> tuple[str, str, str, str]:
+    os.makedirs(runs_dir, exist_ok=True)
+    run_dir = tempfile.mkdtemp(prefix=f"{prefix}-", dir=runs_dir)
+    try:
+        os.chmod(run_dir, 0o700)
+    except OSError:
+        pass
+    spec_path = os.path.join(run_dir, "spec.json")
+    wrapper_path = os.path.join(run_dir, "wrapper.py")
+    stdout_path = os.path.join(run_dir, "stdout.log")
+    stderr_path = os.path.join(run_dir, "stderr.log")
+    with open(spec_path, "w", encoding="utf-8") as fh:
+        json.dump({"argv": argv, "shell": shell, "cwd": cwd, "env": env}, fh)
+    with open(wrapper_path, "w", encoding="utf-8") as fh:
+        fh.write(_WRAPPER_SCRIPT)
+    for path in (spec_path, wrapper_path, stdout_path, stderr_path):
+        if not os.path.exists(path):
+            open(path, "wb").close()
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    return run_dir, wrapper_path, stdout_path, stderr_path
+
+
+def _read_int_file(path: str) -> int | None:
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = fh.read().strip()
+        return int(raw) if raw else None
+    except (OSError, ValueError):
+        return None
+
+
+def _terminate_proc_or_pg(proc: subprocess.Popen | None, pid: int | None, *, force: bool) -> None:
+    if not is_windows() and hasattr(os, "killpg"):
+        target_pid = pid if pid is not None else (proc.pid if proc is not None else None)
+        if target_pid is None:
+            return
+        if force:
+            _kill_process_group(target_pid, signal.SIGKILL)
+            if proc is not None:
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+            return
+        _kill_process_group(target_pid, signal.SIGTERM)
+        if proc is not None:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(target_pid, signal.SIGKILL)
+                proc.wait()
+        else:
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                try:
+                    os.kill(target_pid, 0)
+                except OSError:
+                    return
+                time.sleep(0.05)
+            _kill_process_group(target_pid, signal.SIGKILL)
+        return
+
+    if proc is not None:
+        if force:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                proc.wait()
+    elif pid is not None:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+
+class ExecHandle:
+    """Opaque handle returned by ExecBackend.spawn()."""
+
+    def __init__(
+        self,
+        *,
+        backend: str,
+        session_id: str,
+        argv: list[str] | str,
+        log_path: str = "",
+        stdout_path: str = "",
+        stderr_path: str = "",
+        pid: int | None = None,
+        proc: subprocess.Popen | None = None,
+        run_dir: str = "",
+        meta: dict | None = None,
+    ) -> None:
+        self.backend = backend
+        self.session_id = session_id
+        self.argv = argv
+        self.log_path = log_path
+        self.stdout_path = stdout_path
+        self.stderr_path = stderr_path
+        self.pid = pid
+        self.proc = proc
+        self.run_dir = run_dir
+        self.meta: dict = dict(meta or {})
+        self.returncode: int | None = None
+
+
+class BackendLogStream:
+    """Minimal streaming log interface returned by ExecBackend.log(handle)."""
+
+    path: str = ""
+
+    def read_chunks(self) -> tuple[bytes, bytes]:
+        raise NotImplementedError
+
+    def is_done(self) -> bool:
+        raise NotImplementedError
+
+    def returncode(self) -> int | None:
+        raise NotImplementedError
+
+    def wait_event(self, timeout: float = 0.05) -> None:
+        time.sleep(timeout)
+
+    def wait_drain(self, timeout: float = 2.0) -> tuple[bytes, bytes]:
+        return self.read_chunks()
+
+
+class PipeLogStream(BackendLogStream):
+    """Thread-backed non-blocking chunk stream over subprocess stdout/stderr pipes."""
+
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        *,
+        tee_path: str = "",
+    ) -> None:
+        self.proc = proc
+        self.path = tee_path
+        self._lock = threading.Lock()
+        self._event = threading.Event()
+        self._out_buf: list[bytes] = []
+        self._err_buf: list[bytes] = []
+        self._tee_lock = threading.Lock()
+        self._tee_fh = open(tee_path, "ab", buffering=0) if tee_path else None
+        self._t_out = threading.Thread(target=self._pump, args=(proc.stdout, self._out_buf), daemon=True)
+        self._t_err = threading.Thread(target=self._pump, args=(proc.stderr, self._err_buf), daemon=True)
+        self._t_out.start()
+        self._t_err.start()
+
+    def _pump(self, stream, sink: list[bytes]) -> None:
+        if stream is None:
+            return
+        try:
+            fd = stream.fileno()
+            while True:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    break
+                with self._lock:
+                    sink.append(chunk)
+                if self._tee_fh is not None:
+                    with self._tee_lock:
+                        try:
+                            self._tee_fh.write(chunk)
+                        except OSError:
+                            pass
+                self._event.set()
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+            self._event.set()
+
+    def read_chunks(self) -> tuple[bytes, bytes]:
+        with self._lock:
+            out = b"".join(self._out_buf)
+            err = b"".join(self._err_buf)
+            self._out_buf.clear()
+            self._err_buf.clear()
+            self._event.clear()
+        return out, err
+
+    def is_done(self) -> bool:
+        return self.proc.poll() is not None and not self._t_out.is_alive() and not self._t_err.is_alive()
+
+    def returncode(self) -> int | None:
+        return self.proc.poll()
+
+    def wait_event(self, timeout: float = 0.05) -> None:
+        self._event.wait(timeout)
+
+    def wait_drain(self, timeout: float = 2.0) -> tuple[bytes, bytes]:
+        self._t_out.join(timeout=timeout)
+        self._t_err.join(timeout=timeout)
+        out, err = self.read_chunks()
+        self.close()
+        return out, err
+
+    def close(self) -> None:
+        with self._tee_lock:
+            if self._tee_fh is not None:
+                try:
+                    self._tee_fh.close()
+                except OSError:
+                    pass
+                self._tee_fh = None
+
+
+class FileLogStream(BackendLogStream):
+    """Offset-based incremental reader over wrapper stdout.log / stderr.log + exit.code."""
+
+    def __init__(
+        self,
+        stdout_path: str,
+        stderr_path: str,
+        exit_path: str,
+        *,
+        is_alive_cb: Callable[[], bool] | None = None,
+    ) -> None:
+        self.path = stdout_path
+        self._stdout_path = stdout_path
+        self._stderr_path = stderr_path
+        self._exit_path = exit_path
+        self._is_alive_cb = is_alive_cb
+        self._out_pos = 0
+        self._err_pos = 0
+        self._rc: int | None = None
+        self._last_alive_check = time.monotonic()
+
+    def _read_new(self, path: str, pos: int) -> tuple[bytes, int]:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(pos)
+                data = fh.read()
+                return data, pos + len(data)
+        except OSError:
+            return b"", pos
+
+    def read_chunks(self) -> tuple[bytes, bytes]:
+        out, self._out_pos = self._read_new(self._stdout_path, self._out_pos)
+        err, self._err_pos = self._read_new(self._stderr_path, self._err_pos)
+        return out, err
+
+    def is_done(self) -> bool:
+        if self._rc is not None:
+            return True
+        rc = _read_int_file(self._exit_path)
+        if rc is not None:
+            self._rc = rc
+            return True
+        if self._is_alive_cb is not None:
+            now = time.monotonic()
+            if now - self._last_alive_check >= 0.3:
+                self._last_alive_check = now
+                if not self._is_alive_cb():
+                    rc_retry = _read_int_file(self._exit_path)
+                    self._rc = rc_retry if rc_retry is not None else -1
+                    return True
+        return False
+
+    def returncode(self) -> int | None:
+        if self._rc is None:
+            rc = _read_int_file(self._exit_path)
+            if rc is not None:
+                self._rc = rc
+        return self._rc
+
+    def wait_drain(self, timeout: float = 2.0) -> tuple[bytes, bytes]:
+        deadline = time.monotonic() + min(timeout, 0.5)
+        while self._rc is None and time.monotonic() < deadline:
+            if self.is_done():
+                break
+            time.sleep(0.02)
+        return self.read_chunks()
+
+
+class ExecBackend:
+    """Minimal cross-platform execution backend contract: spawn / log / attach / cleanup / list."""
+
+    name: str = "pipe"
+
+    def spawn(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        task_id: str = "",
+    ) -> ExecHandle:
+        raise NotImplementedError
+
+    def log(self, handle: ExecHandle) -> BackendLogStream:
+        raise NotImplementedError
+
+    def attach(self, handle: ExecHandle) -> list[str] | None:
+        raise NotImplementedError
+
+    def cleanup(self, handle: ExecHandle, *, terminate: bool = False, force: bool = False) -> None:
+        raise NotImplementedError
+
+    def list(self) -> list[dict[str, str]]:
+        raise NotImplementedError
+
+
+class PipeBackend(ExecBackend):
+    """Fallback direct-pipe backend matching original subprocess behavior."""
+
+    name = "pipe"
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active: dict[str, ExecHandle] = {}
+
+    def spawn(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        task_id: str = "",
+    ) -> ExecHandle:
+        popen_kwargs: dict = {
+            "shell": shell,
+            "cwd": cwd,
+            "env": env,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if not is_windows():
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen(argv, **popen_kwargs)
+        sid = f"pipe-{_sanitize_task_label(task_id)}-{uuid.uuid4().hex[:6]}"
+        stream = PipeLogStream(proc)
+        handle = ExecHandle(
+            backend=self.name,
+            session_id=sid,
+            argv=argv,
+            pid=proc.pid,
+            proc=proc,
+            meta={"stream": stream},
+        )
+        with self._lock:
+            self._active[sid] = handle
+        return handle
+
+    def log(self, handle: ExecHandle) -> BackendLogStream:
+        return handle.meta["stream"]
+
+    def attach(self, handle: ExecHandle) -> list[str] | None:
+        return None
+
+    def cleanup(self, handle: ExecHandle, *, terminate: bool = False, force: bool = False) -> None:
+        proc = handle.proc
+        if terminate and proc is not None and proc.poll() is None:
+            _terminate_proc_or_pg(proc, proc.pid, force=force)
+        if proc is not None:
+            handle.returncode = proc.poll()
+        stream = handle.meta.get("stream")
+        if isinstance(stream, PipeLogStream) and not terminate:
+            stream.close()
+        with self._lock:
+            self._active.pop(handle.session_id, None)
+
+    def list(self) -> list[dict[str, str]]:
+        with self._lock:
+            items = list(self._active.values())
+        return [
+            {
+                "backend": self.name,
+                "session_id": h.session_id,
+                "pid": str(h.pid or ""),
+                "status": "running" if h.proc and h.proc.poll() is None else "exited",
+            }
+            for h in items
+        ]
+
+
+class TmuxBackend(ExecBackend):
+    """POSIX/WSL2 named tmux session backend with raw wrapper capture and attach support."""
+
+    name = "tmux"
+
+    def __init__(
+        self,
+        *,
+        tmux_bin: str | None = None,
+        runs_dir: str | None = None,
+        socket_path: str | None = None,
+    ) -> None:
+        self.tmux_bin = tmux_bin or shutil.which("tmux") or "tmux"
+        self.runs_dir = runs_dir
+        self.socket_path = socket_path
+
+    def _tmux_cmd(self, *args: str) -> list[str]:
+        if self.socket_path:
+            return [self.tmux_bin, "-S", self.socket_path, *args]
+        return [self.tmux_bin, *args]
+
+    def _has_session(self, session_name: str) -> bool:
+        try:
+            res = subprocess.run(
+                self._tmux_cmd("has-session", "-t", session_name),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            return res.returncode == 0
+        except Exception:
+            return False
+
+    def spawn(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        task_id: str = "",
+    ) -> ExecHandle:
+        runs_dir = self.runs_dir or get_runs_dir()
+        safe_task = _sanitize_task_label(task_id)
+        session_name = f"agenct-{safe_task}-{uuid.uuid4().hex[:6]}"
+        run_dir, wrapper_path, stdout_path, stderr_path = _prepare_wrapper_run_dir(
+            runs_dir, f"tmux-{safe_task}", argv, shell=shell, cwd=cwd, env=env
+        )
+        cmd = self._tmux_cmd("new-session", "-d", "-s", session_name, "-c", cwd, sys.executable, wrapper_path, run_dir)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        if res.returncode != 0:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            err_msg = decode_bytes(res.stderr).strip() or decode_bytes(res.stdout).strip()
+            raise RuntimeError(f"tmux new-session failed ({res.returncode}): {err_msg}")
+        exit_path = os.path.join(run_dir, "exit.code")
+        pid_path = os.path.join(run_dir, "child.pid")
+        stream = FileLogStream(
+            stdout_path,
+            stderr_path,
+            exit_path,
+            is_alive_cb=lambda: self._has_session(session_name),
+        )
+        return ExecHandle(
+            backend=self.name,
+            session_id=session_name,
+            argv=argv,
+            log_path=stdout_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            run_dir=run_dir,
+            meta={"stream": stream, "pid_path": pid_path, "exit_path": exit_path},
+        )
+
+    def log(self, handle: ExecHandle) -> BackendLogStream:
+        return handle.meta["stream"]
+
+    def attach(self, handle: ExecHandle) -> list[str] | None:
+        return self._tmux_cmd("attach-session", "-t", handle.session_id)
+
+    def cleanup(self, handle: ExecHandle, *, terminate: bool = False, force: bool = False) -> None:
+        pid_path = handle.meta.get("pid_path", "")
+        if terminate and pid_path:
+            child_pid = _read_int_file(pid_path)
+            if child_pid is None:
+                deadline = time.monotonic() + 0.3
+                while child_pid is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                    child_pid = _read_int_file(pid_path)
+            if child_pid is not None:
+                _terminate_proc_or_pg(None, child_pid, force=force)
+        try:
+            subprocess.run(
+                self._tmux_cmd("kill-session", "-t", handle.session_id),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception:
+            pass
+        if not terminate and handle.run_dir:
+            shutil.rmtree(handle.run_dir, ignore_errors=True)
+
+    def list(self) -> list[dict[str, str]]:
+        try:
+            res = subprocess.run(
+                self._tmux_cmd("list-sessions", "-F", "#{session_name}\t#{session_attached}\t#{session_windows}"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=3,
+            )
+            if res.returncode != 0:
+                return []
+            out: list[dict[str, str]] = []
+            for line in decode_bytes(res.stdout).splitlines():
+                parts = line.split("\t")
+                if not parts or not parts[0].startswith("agenct-"):
+                    continue
+                out.append(
+                    {
+                        "backend": self.name,
+                        "session_id": parts[0],
+                        "attached": parts[1] if len(parts) > 1 else "0",
+                        "windows": parts[2] if len(parts) > 2 else "1",
+                    }
+                )
+            return out
+        except Exception:
+            return []
+
+
+class ConPtyBackend(ExecBackend):
+    """Windows native ConPTY backend (pywinpty / node-pty) using wrapper capture to preserve JSONL."""
+
+    name = "conpty"
+
+    def __init__(
+        self,
+        *,
+        provider: str = "pywinpty",
+        runs_dir: str | None = None,
+        node_bin: str | None = None,
+        import_module: Callable[[str], object] | None = None,
+    ) -> None:
+        self.provider = provider
+        self.runs_dir = runs_dir
+        self.node_bin = node_bin or shutil.which("node") or "node"
+        self._import_module = import_module or importlib.import_module
+        self._lock = threading.Lock()
+        self._active: dict[str, ExecHandle] = {}
+
+    def spawn(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        task_id: str = "",
+    ) -> ExecHandle:
+        runs_dir = self.runs_dir or get_runs_dir(system="Windows")
+        safe_task = _sanitize_task_label(task_id)
+        session_id = f"conpty-{safe_task}-{uuid.uuid4().hex[:6]}"
+        run_dir, wrapper_path, stdout_path, stderr_path = _prepare_wrapper_run_dir(
+            runs_dir, f"conpty-{safe_task}", argv, shell=shell, cwd=cwd, env=env
+        )
+        exit_path = os.path.join(run_dir, "exit.code")
+        pid_path = os.path.join(run_dir, "child.pid")
+        pty_proc = None
+        host_proc = None
+
+        try:
+            if self.provider == "pywinpty":
+                winpty = self._import_module("winpty")
+                pty_cls = getattr(winpty, "PtyProcess", None)
+                if pty_cls is not None:
+                    pty_proc = pty_cls.spawn([sys.executable, wrapper_path, run_dir], cwd=cwd)
+                    threading.Thread(target=self._drain_pywinpty, args=(pty_proc,), daemon=True).start()
+                    is_alive_cb = lambda: bool(getattr(pty_proc, "isalive", lambda: False)())
+                elif hasattr(winpty, "PTY"):
+                    pty_proc = winpty.PTY(120, 30)
+                    pty_proc.spawn(sys.executable, cmdline=subprocess.list2cmdline([wrapper_path, run_dir]), cwd=cwd)
+                    threading.Thread(target=self._drain_pywinpty, args=(pty_proc,), daemon=True).start()
+                    is_alive_cb = lambda: bool(getattr(pty_proc, "isalive", lambda: False)())
+                else:
+                    raise RuntimeError("winpty module exposes neither PtyProcess nor PTY")
+            elif self.provider == "node-pty":
+                host_js = os.path.join(run_dir, "pty_host.js")
+                with open(host_js, "w", encoding="utf-8") as fh:
+                    fh.write(_NODE_PTY_HOST_SCRIPT)
+                host_proc = subprocess.Popen(
+                    [self.node_bin, host_js, sys.executable, wrapper_path, run_dir, cwd],
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                is_alive_cb = lambda: host_proc.poll() is None
+            else:
+                raise RuntimeError(f"Unsupported ConPTY provider: {self.provider}")
+        except Exception:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+
+        stream = FileLogStream(stdout_path, stderr_path, exit_path, is_alive_cb=is_alive_cb)
+        handle = ExecHandle(
+            backend=self.name,
+            session_id=session_id,
+            argv=argv,
+            log_path=stdout_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            proc=host_proc,
+            run_dir=run_dir,
+            meta={
+                "stream": stream,
+                "pid_path": pid_path,
+                "exit_path": exit_path,
+                "pty_proc": pty_proc,
+                "provider": self.provider,
+            },
+        )
+        with self._lock:
+            self._active[session_id] = handle
+        return handle
+
+    @staticmethod
+    def _drain_pywinpty(pty_proc: object) -> None:
+        read_fn = getattr(pty_proc, "read", None)
+        if not callable(read_fn):
+            return
+        while True:
+            try:
+                data = read_fn()
+                if not data:
+                    break
+            except Exception:
+                break
+
+    def log(self, handle: ExecHandle) -> BackendLogStream:
+        return handle.meta["stream"]
+
+    def attach(self, handle: ExecHandle) -> list[str] | None:
+        return None
+
+    def cleanup(self, handle: ExecHandle, *, terminate: bool = False, force: bool = False) -> None:
+        if terminate:
+            child_pid = _read_int_file(handle.meta.get("pid_path", ""))
+            if child_pid is not None:
+                _terminate_proc_or_pg(None, child_pid, force=force)
+            pty_proc = handle.meta.get("pty_proc")
+            if pty_proc is not None:
+                for meth in ("terminate", "kill", "close"):
+                    fn = getattr(pty_proc, meth, None)
+                    if callable(fn):
+                        try:
+                            fn(force=True) if meth == "terminate" else fn()
+                            break
+                        except TypeError:
+                            try:
+                                fn()
+                                break
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
+            if handle.proc is not None and handle.proc.poll() is None:
+                _terminate_proc_or_pg(handle.proc, handle.proc.pid, force=force)
+        if not terminate:
+            pty_proc = handle.meta.get("pty_proc")
+            if pty_proc is not None:
+                close_fn = getattr(pty_proc, "close", None)
+                if callable(close_fn):
+                    try:
+                        close_fn()
+                    except Exception:
+                        pass
+            if handle.proc is not None:
+                try:
+                    handle.proc.wait(timeout=2)
+                except Exception:
+                    pass
+            with self._lock:
+                self._active.pop(handle.session_id, None)
+            if handle.run_dir:
+                shutil.rmtree(handle.run_dir, ignore_errors=True)
+
+    def list(self) -> list[dict[str, str]]:
+        with self._lock:
+            items = list(self._active.values())
+        return [
+            {
+                "backend": self.name,
+                "session_id": h.session_id,
+                "provider": str(h.meta.get("provider") or self.provider),
+            }
+            for h in items
+        ]
+
+
+class WtTailBackend(ExecBackend):
+    """Windows lightweight tier: raw pipe execution + whitelisted Windows Terminal log-tail tab."""
+
+    name = "wt-tail"
+
+    def __init__(self, *, wt_bin: str = "wt.exe", runs_dir: str | None = None) -> None:
+        self.wt_bin = wt_bin
+        self.runs_dir = runs_dir
+        self._lock = threading.Lock()
+        self._active: dict[str, ExecHandle] = {}
+
+    def spawn(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        task_id: str = "",
+    ) -> ExecHandle:
+        runs_dir = self.runs_dir or get_runs_dir(system="Windows")
+        os.makedirs(runs_dir, exist_ok=True)
+        safe_task = _sanitize_task_label(task_id)
+        session_id = f"agenct:{safe_task}"
+        log_path = os.path.join(runs_dir, f"agenct-{safe_task}-{uuid.uuid4().hex[:6]}.log")
+        open(log_path, "ab").close()
+
+        wt_argv = build_wt_tail_argv(self.wt_bin, safe_task, log_path)
+        try:
+            subprocess.Popen(
+                wt_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
+            raise RuntimeError(f"wt.exe launch failed: {exc}") from exc
+
+        popen_kwargs: dict = {
+            "shell": shell,
+            "cwd": cwd,
+            "env": env,
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+        }
+        if not is_windows():
+            popen_kwargs["start_new_session"] = True
+        else:
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen(argv, **popen_kwargs)
+        stream = PipeLogStream(proc, tee_path=log_path)
+        handle = ExecHandle(
+            backend=self.name,
+            session_id=session_id,
+            argv=argv,
+            log_path=log_path,
+            stdout_path=log_path,
+            stderr_path=log_path,
+            pid=proc.pid,
+            proc=proc,
+            meta={"stream": stream, "wt_argv": wt_argv},
+        )
+        with self._lock:
+            self._active[session_id] = handle
+        return handle
+
+    def log(self, handle: ExecHandle) -> BackendLogStream:
+        return handle.meta["stream"]
+
+    def attach(self, handle: ExecHandle) -> list[str] | None:
+        return list(handle.meta.get("wt_argv") or []) or None
+
+    def cleanup(self, handle: ExecHandle, *, terminate: bool = False, force: bool = False) -> None:
+        proc = handle.proc
+        if terminate and proc is not None and proc.poll() is None:
+            _terminate_proc_or_pg(proc, proc.pid, force=force)
+        if proc is not None:
+            handle.returncode = proc.poll()
+        stream = handle.meta.get("stream")
+        if isinstance(stream, PipeLogStream) and not terminate:
+            stream.close()
+        with self._lock:
+            self._active.pop(handle.session_id, None)
+
+    def list(self) -> list[dict[str, str]]:
+        with self._lock:
+            items = list(self._active.values())
+        return [
+            {
+                "backend": self.name,
+                "session_id": h.session_id,
+                "log_path": h.log_path,
+                "status": "running" if h.proc and h.proc.poll() is None else "exited",
+            }
+            for h in items
+        ]
+
+
+def resolve_exec_backend(
+    requested: str = "auto",
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    import_module: Callable[[str], object] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+    runs_dir: str | None = None,
+    socket_path: str | None = None,
+) -> ExecBackend:
+    """Resolve the requested execution backend, silently degrading on probe failure without raising."""
+    req = (requested or "auto").strip().lower()
+    if req == "pipe":
+        return PipeBackend()
+
+    win = is_windows(system)
+    if req == "auto":
+        if not win:
+            if probe_tmux(system=system, which=which, runner=runner, socket_path=socket_path):
+                which_fn = which or shutil.which
+                return TmuxBackend(tmux_bin=which_fn("tmux"), runs_dir=runs_dir, socket_path=socket_path)
+            return PipeBackend()
+        provider = probe_conpty(system=system, which=which, import_module=import_module, runner=runner)
+        if provider:
+            which_fn = which or shutil.which
+            return ConPtyBackend(
+                provider=provider,
+                runs_dir=runs_dir,
+                node_bin=which_fn("node") if provider == "node-pty" else None,
+                import_module=import_module,
+            )
+        wt_bin = probe_wt_exe(system=system, which=which, runner=runner)
+        if wt_bin:
+            return WtTailBackend(wt_bin=wt_bin, runs_dir=runs_dir)
+        return PipeBackend()
+
+    if req == "tmux":
+        if not win and probe_tmux(system=system, which=which, runner=runner, socket_path=socket_path):
+            which_fn = which or shutil.which
+            return TmuxBackend(tmux_bin=which_fn("tmux"), runs_dir=runs_dir, socket_path=socket_path)
+        return PipeBackend()
+
+    if req == "conpty":
+        provider = probe_conpty(system=system, which=which, import_module=import_module, runner=runner)
+        if provider:
+            which_fn = which or shutil.which
+            return ConPtyBackend(
+                provider=provider,
+                runs_dir=runs_dir,
+                node_bin=which_fn("node") if provider == "node-pty" else None,
+                import_module=import_module,
+            )
+        return PipeBackend()
+
+    if req == "wt-tail":
+        wt_bin = probe_wt_exe(system=system, which=which, runner=runner)
+        if wt_bin:
+            return WtTailBackend(wt_bin=wt_bin, runs_dir=runs_dir)
+        return PipeBackend()
+
+    return PipeBackend()
 
 
 def run_monitored(
@@ -894,93 +2045,103 @@ def run_monitored(
     agent_hint: str = "",
     started_at: float | None = None,
     idle_timeout: int = 0,
+    backend: ExecBackend | None = None,
+    task_id: str = "",
+    meta_out: dict | None = None,
 ) -> tuple[int, bytes, bytes, bool]:
     if started_at is None:
         started_at = time.monotonic()
-    proc = subprocess.Popen(
-        argv,
-        shell=shell,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    active_backend: ExecBackend = backend if backend is not None else PipeBackend()
+    try:
+        handle = active_backend.spawn(argv, shell=shell, cwd=cwd, env=env, task_id=task_id)
+    except Exception:
+        if active_backend.name == "pipe":
+            raise
+        active_backend = PipeBackend()
+        handle = active_backend.spawn(argv, shell=shell, cwd=cwd, env=env, task_id=task_id)
+
+    if meta_out is not None:
+        meta_out["backend"] = active_backend.name
+        attach_cmd = active_backend.attach(handle)
+        if attach_cmd:
+            meta_out["attach_cmd"] = attach_cmd
+        if active_backend.name == "tmux" and handle.session_id:
+            meta_out["tmux_session"] = handle.session_id
+
+    log_stream = active_backend.log(handle)
     out_chunks: list[bytes] = []
     err_chunks: list[bytes] = []
-    tail_lock = threading.Lock()
+    line_bufs = [b"", b""]
     recent: list[str] = []
-    last_activity = [started_at]
-    last_idle_notice = [0.0]
-    last_tail = [""]
+    last_activity = started_at
+    last_idle_notice = 0.0
+    last_tail = ""
 
-    def reader(stream, sink: list[bytes]) -> None:
-        if stream is None:
-            return
-        try:
-            with stream:
-                for line in stream:
-                    sink.append(line)
-                    now = time.monotonic()
-                    text = summarize_progress_line(agent_hint, decode_bytes(line))
-                    tail = ""
-                    with tail_lock:
-                        last_activity[0] = now
-                        last_idle_notice[0] = 0.0
-                        if text:
-                            recent.append(text[-160:])
-                            if len(recent) > 4:
-                                recent.pop(0)
-                            last_tail[0] = " | ".join(recent)[-360:]
-                            tail = last_tail[0]
+    def ingest(out_delta: bytes, err_delta: bytes, *, flush_partial: bool = False) -> None:
+        nonlocal last_activity, last_idle_notice, last_tail
+        now = time.monotonic()
+        for idx, (delta, sink) in enumerate(((out_delta, out_chunks), (err_delta, err_chunks))):
+            if delta:
+                sink.append(delta)
+                last_activity = now
+                last_idle_notice = 0.0
+                line_bufs[idx] += delta
+            if b"\n" in line_bufs[idx] or (flush_partial and line_bufs[idx]):
+                if flush_partial:
+                    lines = line_bufs[idx].splitlines(keepends=True)
+                    line_bufs[idx] = b""
+                else:
+                    parts = line_bufs[idx].split(b"\n")
+                    lines = [p + b"\n" for p in parts[:-1]]
+                    line_bufs[idx] = parts[-1]
+                for raw_line in lines:
+                    text = summarize_progress_line(agent_hint, decode_bytes(raw_line))
                     if text:
-                        progress_cb(stage_label, tail)
-        except Exception:
-            pass
-
-    t_out = threading.Thread(target=reader, args=(proc.stdout, out_chunks), daemon=True)
-    t_err = threading.Thread(target=reader, args=(proc.stderr, err_chunks), daemon=True)
-    t_out.start()
-    t_err.start()
+                        recent.append(text[-160:])
+                        if len(recent) > 4:
+                            recent.pop(0)
+                        last_tail = " | ".join(recent)[-360:]
+                        progress_cb(stage_label, last_tail)
 
     cancelled = False
-    while proc.poll() is None:
-        if cancel_event.is_set():
-            cancelled = True
-            _kill_process_group(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                _kill_process_group(proc.pid, signal.SIGKILL)
-                proc.wait()
-            break
-        now = time.monotonic()
-        if now - started_at >= timeout:
-            # start_new_session makes the child PID the process group ID.
-            _kill_process_group(proc.pid, signal.SIGKILL)
-            proc.wait()
-            t_out.join(timeout=1)
-            t_err.join(timeout=1)
-            raise subprocess.TimeoutExpired(argv, timeout, b"".join(out_chunks), b"".join(err_chunks))
-        if idle_timeout > 0:
-            with tail_lock:
-                idle_for = now - last_activity[0]
-                tail_snap = last_tail[0]
-            if idle_for >= idle_timeout:
-                _kill_process_group(proc.pid, signal.SIGKILL)
-                proc.wait()
-                t_out.join(timeout=1)
-                t_err.join(timeout=1)
-                raise IdleTimeoutExpired(argv, idle_timeout, b"".join(out_chunks), b"".join(err_chunks))
-            if idle_for >= IDLE_WARN_SECS and (now - last_idle_notice[0]) >= 15.0:
-                last_idle_notice[0] = now
-                progress_cb(f"{stage_label}（已静默 {int(idle_for)}s）", tail_snap)
-        time.sleep(0.2)
+    timed_out = False
+    try:
+        while True:
+            out_delta, err_delta = log_stream.read_chunks()
+            if out_delta or err_delta:
+                ingest(out_delta, err_delta)
+            if log_stream.is_done():
+                break
+            if cancel_event.is_set():
+                cancelled = True
+                active_backend.cleanup(handle, terminate=True, force=False)
+                break
+            now = time.monotonic()
+            if now - started_at >= timeout:
+                timed_out = True
+                active_backend.cleanup(handle, terminate=True, force=True)
+                rem_out, rem_err = log_stream.wait_drain(timeout=1.0)
+                ingest(rem_out, rem_err, flush_partial=True)
+                raise subprocess.TimeoutExpired(argv, timeout, b"".join(out_chunks), b"".join(err_chunks))
+            if idle_timeout > 0:
+                idle_for = now - last_activity
+                if idle_for >= idle_timeout:
+                    timed_out = True
+                    active_backend.cleanup(handle, terminate=True, force=True)
+                    rem_out, rem_err = log_stream.wait_drain(timeout=1.0)
+                    ingest(rem_out, rem_err, flush_partial=True)
+                    raise IdleTimeoutExpired(argv, idle_timeout, b"".join(out_chunks), b"".join(err_chunks))
+                if idle_for >= IDLE_WARN_SECS and (now - last_idle_notice) >= 15.0:
+                    last_idle_notice = now
+                    progress_cb(f"{stage_label}（已静默 {int(idle_for)}s）", last_tail)
+            log_stream.wait_event(0.05)
 
-    t_out.join(timeout=2)
-    t_err.join(timeout=2)
-    return proc.returncode or 0, b"".join(out_chunks), b"".join(err_chunks), cancelled
+        rem_out, rem_err = log_stream.wait_drain(timeout=2.0)
+        ingest(rem_out, rem_err, flush_partial=True)
+        rc = log_stream.returncode()
+        return (rc or 0), b"".join(out_chunks), b"".join(err_chunks), cancelled
+    finally:
+        active_backend.cleanup(handle, terminate=False, force=False)
 
 
 def sanitize_job_model(val: object) -> str:
@@ -1048,6 +2209,10 @@ def _opencode_cli_env(base_env: dict[str, str], sandbox: str) -> dict[str, str]:
     env = dict(base_env)
     if sandbox == "readonly":
         env["OPENCODE_PERMISSION"] = _OPENCODE_READONLY_PERMISSION
+    elif sandbox == "workspace-write":
+        env["OPENCODE_PERMISSION"] = _OPENCODE_WORKSPACE_PERMISSION
+    else:
+        env.pop("OPENCODE_PERMISSION", None)
     return env
 
 
@@ -1097,15 +2262,21 @@ def _build_codex_argv(
     resume_sid: str = "",
     model: str = "",
     effort: str = "",
+    codex_tmux: bool = False,
 ) -> list[str]:
     sb_mode = {
         "readonly": "read-only",
         "workspace-write": "workspace-write",
         "unsafe-full": "danger-full-access",
     }.get(sandbox, "workspace-write")
-    # Codex Linux workspace-write disables network_access by default, which seccomp-blocks
-    # AF_UNIX connect() (e.g. `tmux ls` on /tmp/tmux-*/default) while FS outside workdir stays ro.
-    extra_cfg = ["-c", "sandbox_workspace_write.network_access=true"] if sandbox == "workspace-write" else []
+    # Explicitly disable network_access under workspace-write by default instead of relying on
+    # Codex/CLI implicit defaults. Only opt in when --codex-tmux is set under workspace-write
+    # (Linux seccomp otherwise blocks AF_UNIX connect() to /tmp/tmux-*/default); never in readonly.
+    if sb_mode == "workspace-write":
+        allow_network = sandbox == "workspace-write" and bool(codex_tmux)
+        extra_cfg = ["-c", f"sandbox_workspace_write.network_access={'true' if allow_network else 'false'}"]
+    else:
+        extra_cfg = []
     model_args = ["-m", model] if model else []
     eff_args = (
         ["-c", f'model_reasoning_effort="{"xhigh" if effort == "max" else effort}"']
@@ -1248,10 +2419,16 @@ def build_cli_argv(
     resume_sid: str = "",
     model: str = "",
     effort: str = "",
+    codex_tmux: bool = False,
 ) -> list[str]:
     adapter = CLI_ADAPTERS.get(agent)
     if not adapter:
         raise ValueError(f"Unsupported CLI agent: {agent}")
+    if agent == "codex":
+        return adapter.build_argv(
+            exe, prompt, workdir, sandbox, evidence_dir, in_dir, out_file, resume_sid, model, effort,
+            codex_tmux=codex_tmux,
+        )
     return adapter.build_argv(
         exe, prompt, workdir, sandbox, evidence_dir, in_dir, out_file, resume_sid, model, effort,
     )
@@ -1267,8 +2444,17 @@ def execute_job(
     progress_cb,
     meta_out: dict | None = None,
     idle_timeout: int = DEFAULT_IDLE_TIMEOUT,
+    codex_tmux: bool = False,
+    exec_backend: str | ExecBackend = "auto",
 ) -> tuple[str, str, list[dict]]:
     eff_sandbox = tighten_sandbox(sandbox, job.get("sandbox"))
+    eff_codex_tmux = bool(codex_tmux) and eff_sandbox == "workspace-write"
+    resolved_backend = (
+        exec_backend if isinstance(exec_backend, ExecBackend) else resolve_exec_backend(exec_backend)
+    )
+    if meta_out is not None:
+        meta_out["backend"] = resolved_backend.name
+    task_id_str = str(job.get("task_id") or "")
     job_model = sanitize_job_model(job.get("model"))
     job_effort = sanitize_job_effort(job.get("effort"))
     job_role = str(job.get("role") or "").strip()[:32]
@@ -1303,6 +2489,9 @@ def execute_job(
                 stage_label="Running custom command",
                 agent_hint="custom",
                 idle_timeout=idle_timeout,
+                backend=resolved_backend,
+                task_id=task_id_str,
+                meta_out=meta_out,
             )
             if cancelled:
                 return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1330,7 +2519,7 @@ def execute_job(
                 stage_label = f"Running {role_prefix}{agent}{model_suffix}"
                 argv = build_cli_argv(
                     agent, exe, prompt, workdir, eff_sandbox, evidence_dir, in_dir, out_file, resume_sid,
-                    model=job_model, effort=job_effort,
+                    model=job_model, effort=job_effort, codex_tmux=eff_codex_tmux,
                 )
                 cli_env = build_cli_env(agent, env, eff_sandbox)
 
@@ -1347,6 +2536,9 @@ def execute_job(
                     agent_hint=agent,
                     started_at=started_at,
                     idle_timeout=idle_timeout,
+                    backend=resolved_backend,
+                    task_id=task_id_str,
+                    meta_out=meta_out,
                 )
                 if cancelled:
                     return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1369,7 +2561,7 @@ def execute_job(
                             open(out_file, "wb").close()
                         fresh_argv = build_cli_argv(
                             agent, exe, prompt, workdir, eff_sandbox, evidence_dir, in_dir, out_file, "",
-                            model=job_model, effort=job_effort,
+                            model=job_model, effort=job_effort, codex_tmux=eff_codex_tmux,
                         )
                         rc, out, err, cancelled = run_monitored(
                             fresh_argv,
@@ -1383,6 +2575,9 @@ def execute_job(
                             agent_hint=agent,
                             started_at=started_at,
                             idle_timeout=idle_timeout,
+                            backend=resolved_backend,
+                            task_id=task_id_str,
+                            meta_out=meta_out,
                         )
                         if cancelled:
                             return "failed", "Job cancelled because Hub lease expired or was revoked.", []
@@ -1455,7 +2650,11 @@ def execute_job(
             if meta_out is not None:
                 meta_out["agent_session_id"] = session_id
             content += f"\nAgent session: {session_id}"
-        tmux_session = job.get("tmux_session") or job.get("tmux_session_name")
+        tmux_session = (
+            job.get("tmux_session")
+            or job.get("tmux_session_name")
+            or ((meta_out or {}).get("tmux_session") if isinstance(meta_out, dict) else None)
+        )
         if isinstance(tmux_session, str) and tmux_session.strip():
             content += f"\nTmux session: {strip_ansi(tmux_session).strip()[:128]}"
         streams = [
@@ -1487,6 +2686,16 @@ def run_node_loop(args: argparse.Namespace) -> int:
         print(f"Error: workdir does not exist: {workdir}", file=sys.stderr)
         return 2
     sandbox = "unsafe-full" if args.unsafe_full_access else args.sandbox
+    codex_tmux = bool(args.codex_tmux and sandbox == "workspace-write")
+    if args.codex_tmux and not codex_tmux:
+        print(
+            f"[agenct-node] Warning: --codex-tmux only takes effect under sandbox=workspace-write "
+            f"(current: {sandbox}); ignoring.",
+            file=sys.stderr,
+            flush=True,
+        )
+    exec_backend_spec = getattr(args, "exec_backend", "auto")
+    initial_backend = resolve_exec_backend(exec_backend_spec)
     agent, allowed_agents = resolve_node_agents(args.agent, args.agents, args.cmd)
     state_dir = os.path.abspath(args.state_dir or os.path.join(os.path.expanduser("~"), ".agenct"))
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
@@ -1495,7 +2704,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
     agents_disp = ",".join("custom" if a.startswith("custom:") else a for a in allowed_agents)
     print(
         f"[agenct-node] hub={hub} kind={args.kind} agent={agent} agents={agents_disp} "
-        f"sandbox={sandbox} idle_timeout={args.idle_timeout}s workdir={workdir}",
+        f"sandbox={sandbox} exec_backend={exec_backend_spec}({initial_backend.name}) "
+        f"idle_timeout={args.idle_timeout}s workdir={workdir}",
         flush=True,
     )
 
@@ -1613,7 +2823,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
             try:
                 status, content, attachments = execute_job(
                     chosen_agent, job, workdir, sandbox, args.timeout, cancel_event, on_progress,
-                    meta_out=meta_out, idle_timeout=args.idle_timeout,
+                    meta_out=meta_out, idle_timeout=args.idle_timeout, codex_tmux=codex_tmux,
+                    exec_backend=exec_backend_spec,
                 )
             finally:
                 stop_heartbeat.set()
@@ -1632,6 +2843,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
         }
         if meta_out.get("agent_session_id"):
             payload["agent_session_id"] = meta_out["agent_session_id"]
+        if meta_out.get("backend"):
+            payload["backend"] = meta_out["backend"]
         journal.write(
             task_id,
             rev,
@@ -1652,9 +2865,12 @@ def run_self_check(args: argparse.Namespace) -> int:
     """Run minimal real headless pre-flight checks for every enabled CLI engine."""
     probe_timeout = max(15, min(args.timeout, 180))
     probe_idle_timeout = min(args.idle_timeout, probe_timeout) if args.idle_timeout > 0 else 0
+    exec_backend_spec = getattr(args, "exec_backend", "auto")
+    resolved_backend = resolve_exec_backend(exec_backend_spec)
     print(
         f"[self-check] job timeout={args.timeout}s (--timeout overrides {NODE_TIMEOUT_ENV}, "
-        f"default {DEFAULT_NODE_TIMEOUT}s); idle_timeout={args.idle_timeout}s; probe timeout={probe_timeout}s",
+        f"default {DEFAULT_NODE_TIMEOUT}s); idle_timeout={args.idle_timeout}s; "
+        f"probe timeout={probe_timeout}s; exec_backend={exec_backend_spec}({resolved_backend.name})",
         flush=True,
     )
     workdir = os.path.abspath(args.workdir or os.environ.get("AGENCT_WORKDIR") or os.getcwd())
@@ -1662,6 +2878,14 @@ def run_self_check(args: argparse.Namespace) -> int:
         print(f"Error: workdir does not exist: {workdir}", file=sys.stderr)
         return 2
     node_sandbox = "unsafe-full" if args.unsafe_full_access else args.sandbox
+    codex_tmux = bool(args.codex_tmux and node_sandbox == "workspace-write")
+    if args.codex_tmux and not codex_tmux:
+        print(
+            f"[self-check] Warning: --codex-tmux only takes effect under sandbox=workspace-write "
+            f"(current: {node_sandbox}); ignoring.",
+            file=sys.stderr,
+            flush=True,
+        )
     _, allowed_agents = resolve_node_agents(args.agent, args.agents, args.cmd)
     cli_engines = [a for a in allowed_agents if a in CLI_AGENTS]
     if not cli_engines:
@@ -1696,6 +2920,8 @@ def run_self_check(args: argparse.Namespace) -> int:
                 threading.Event(),
                 lambda _s, _t: None,
                 idle_timeout=probe_idle_timeout,
+                codex_tmux=codex_tmux,
+                exec_backend=exec_backend_spec,
             )
             ro_dt = time.monotonic() - t0
             dir_clean = sorted(os.listdir(probe_dir)) == ["probe.txt"]
@@ -1729,6 +2955,8 @@ def run_self_check(args: argparse.Namespace) -> int:
                     threading.Event(),
                     lambda _s, _t: None,
                     idle_timeout=probe_idle_timeout,
+                    codex_tmux=codex_tmux,
+                    exec_backend=exec_backend_spec,
                 )
                 wr_dt = time.monotonic() - t1
                 wr_ok = wr_status == "completed" and wr_token in wr_out
@@ -1783,6 +3011,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--workdir", default="", help="Working directory for agent execution")
     p.add_argument("--sandbox", choices=("readonly", "workspace-write"), default="workspace-write")
     p.add_argument("--unsafe-full-access", action="store_true", help="Explicitly opt into full host access")
+    p.add_argument(
+        "--codex-tmux",
+        action="store_true",
+        help="Allow Codex workspace-write network access (needed for Linux tmux AF_UNIX sockets; ignored outside workspace-write)",
+    )
+    p.add_argument(
+        "--exec-backend",
+        choices=VALID_EXEC_BACKENDS,
+        default=None,
+        help="Execution backend: auto, tmux, conpty, wt-tail, or pipe (default: auto)",
+    )
+    p.add_argument(
+        "--tmux",
+        choices=VALID_TMUX_MODES,
+        default=None,
+        help="Compatibility alias for --exec-backend (auto->auto, on->tmux, off->pipe)",
+    )
     p.add_argument("--state-dir", default="", help="Local state/journal directory")
     p.add_argument("--poll", type=float, default=3.0, help="Fallback idle poll interval in seconds")
     p.add_argument("--wait", type=int, default=25, help="Long-poll wait seconds (0 disables long-polling)")
@@ -1803,6 +3048,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run real headless pre-flight checks for enabled CLI engines and exit",
     )
     parsed = p.parse_args(argv)
+    if parsed.exec_backend is not None:
+        if parsed.tmux is not None and _TMUX_ALIAS_MAP[parsed.tmux] != parsed.exec_backend:
+            print(
+                f"Warning: both --exec-backend={parsed.exec_backend} and --tmux={parsed.tmux} were passed; "
+                f"using --exec-backend={parsed.exec_backend}.",
+                file=sys.stderr,
+            )
+    elif parsed.tmux is not None:
+        parsed.exec_backend = _TMUX_ALIAS_MAP[parsed.tmux]
+    else:
+        raw_env_backend = (os.environ.get(EXEC_BACKEND_ENV) or "").strip().lower()
+        if raw_env_backend in VALID_EXEC_BACKENDS:
+            parsed.exec_backend = raw_env_backend
+        else:
+            if raw_env_backend:
+                print(f"Warning: invalid {EXEC_BACKEND_ENV}: {raw_env_backend!r}; using 'auto'.", file=sys.stderr)
+            parsed.exec_backend = "auto"
+    if parsed.tmux is None:
+        parsed.tmux = "auto"
     if parsed.timeout is None:
         parsed.timeout = DEFAULT_NODE_TIMEOUT
         if NODE_TIMEOUT_ENV in os.environ:

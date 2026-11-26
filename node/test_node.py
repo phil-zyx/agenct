@@ -28,6 +28,7 @@ class TestUnifiedNode(unittest.TestCase):
         args = node.parse_args(["--hub", "https://agenct.example.com"])
         self.assertEqual(args.sandbox, "workspace-write")
         self.assertFalse(args.unsafe_full_access)
+        self.assertFalse(args.codex_tmux)
         self.assertEqual(args.kind, "pc")
         self.assertEqual(args.wait, 25)
 
@@ -375,20 +376,46 @@ class TestUnifiedNode(unittest.TestCase):
         self.assertEqual(cx_new[:4], ["/bin/codex", "exec", "--skip-git-repo-check", "--json"])
         self.assertIn("-s", cx_new)
         self.assertIn("-C", cx_new)
-        self.assertIn("sandbox_workspace_write.network_access=true", cx_new)
+        self.assertIn("sandbox_workspace_write.network_access=false", cx_new)
+        self.assertNotIn("sandbox_workspace_write.network_access=true", cx_new)
+
+        cx_new_tmux = node.build_cli_argv(
+            "codex", "/bin/codex", "hi", "/w", "workspace-write", "/ev", None, "/tmp/o.txt", "", codex_tmux=True,
+        )
+        self.assertIn("sandbox_workspace_write.network_access=true", cx_new_tmux)
+        self.assertNotIn("sandbox_workspace_write.network_access=false", cx_new_tmux)
 
         cx_ro = node.build_cli_argv("codex", "/bin/codex", "hi", "/w", "readonly", "/ev", None, "/tmp/o.txt", "")
         self.assertNotIn("sandbox_workspace_write.network_access=true", cx_ro)
+        cx_ro_tmux = node.build_cli_argv(
+            "codex", "/bin/codex", "hi", "/w", "readonly", "/ev", None, "/tmp/o.txt", "", codex_tmux=True,
+        )
+        self.assertNotIn("sandbox_workspace_write.network_access=true", cx_ro_tmux)
         cx_full = node.build_cli_argv("codex", "/bin/codex", "hi", "/w", "unsafe-full", "/ev", None, "/tmp/o.txt", "")
         self.assertNotIn("sandbox_workspace_write.network_access=true", cx_full)
+        cx_full_tmux = node.build_cli_argv(
+            "codex", "/bin/codex", "hi", "/w", "unsafe-full", "/ev", None, "/tmp/o.txt", "", codex_tmux=True,
+        )
+        self.assertNotIn("sandbox_workspace_write.network_access=true", cx_full_tmux)
 
         cx_res = node.build_cli_argv("codex", "/bin/codex", "hi", "/w", "workspace-write", "/ev", None, "/tmp/o.txt", "th_1")
         self.assertEqual(cx_res[:3], ["/bin/codex", "exec", "resume"])
         self.assertIn('sandbox_mode="workspace-write"', cx_res)
-        self.assertIn("sandbox_workspace_write.network_access=true", cx_res)
+        self.assertIn("sandbox_workspace_write.network_access=false", cx_res)
+        self.assertNotIn("sandbox_workspace_write.network_access=true", cx_res)
         self.assertNotIn("-s", cx_res)
         self.assertNotIn("-C", cx_res)
         self.assertEqual(cx_res[-2:], ["th_1", "hi"])
+
+        cx_res_tmux = node.build_cli_argv(
+            "codex", "/bin/codex", "hi", "/w", "workspace-write", "/ev", None, "/tmp/o.txt", "th_1", codex_tmux=True,
+        )
+        self.assertIn("sandbox_workspace_write.network_access=true", cx_res_tmux)
+        self.assertNotIn("sandbox_workspace_write.network_access=false", cx_res_tmux)
+        cx_ro_res_tmux = node.build_cli_argv(
+            "codex", "/bin/codex", "hi", "/w", "readonly", "/ev", None, "/tmp/o.txt", "th_1", codex_tmux=True,
+        )
+        self.assertNotIn("sandbox_workspace_write.network_access=true", cx_ro_res_tmux)
 
         ag_ro = node.build_cli_argv("agy", "/bin/agy", "hi", "/w", "readonly", "/ev", "/in", None, "ag_1")
         self.assertIn("--sandbox", ag_ro)
@@ -423,11 +450,19 @@ class TestUnifiedNode(unittest.TestCase):
         oc = node.build_cli_argv("opencode", "/bin/opencode", "hi", "/w", "workspace-write", "/ev", None, None, "oc_1")
         self.assertEqual(oc, ["/bin/opencode", "run", "--format", "json", "--session", "oc_1", "hi"])
         self.assertNotIn("--auto", oc)
-        self.assertNotIn("OPENCODE_PERMISSION", node.build_cli_env("opencode", {}, "workspace-write"))
+        oc_wr_env = node.build_cli_env("opencode", {}, "workspace-write")
+        self.assertEqual(json.loads(oc_wr_env["OPENCODE_PERMISSION"]), {"external_directory": "deny"})
         oc_ro_env = node.build_cli_env("opencode", {}, "readonly")
-        self.assertEqual(json.loads(oc_ro_env["OPENCODE_PERMISSION"]), {"edit": "deny", "bash": "deny"})
+        self.assertEqual(
+            json.loads(oc_ro_env["OPENCODE_PERMISSION"]),
+            {"edit": "deny", "bash": "deny", "external_directory": "deny"},
+        )
         oc_full = node.build_cli_argv("opencode", "/bin/opencode", "hi", "/w", "unsafe-full", "/ev", None)
         self.assertIn("--auto", oc_full)
+        self.assertNotIn(
+            "OPENCODE_PERMISSION",
+            node.build_cli_env("opencode", {"OPENCODE_PERMISSION": '{"edit":"deny"}'}, "unsafe-full"),
+        )
 
     def test_tighten_sandbox_only_tightens_never_escalates(self) -> None:
         self.assertEqual(node.tighten_sandbox("workspace-write", ""), "workspace-write")
@@ -706,6 +741,582 @@ class TestUnifiedNode(unittest.TestCase):
                 mock.patch.object(node, "resolve_node_agents", return_value=("agy", ["agy"])),
             ):
                 self.assertEqual(node.run_self_check(args), 1)
+
+    def test_codex_tmux_propagates_across_all_paths_and_only_in_workspace_write(self) -> None:
+        ok_stream = b'{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}\n'
+        with tempfile.TemporaryDirectory() as workdir:
+            # 1) Initial + 2) Resume + 3) Resume fallback (fresh reopen) with codex_tmux=True vs False
+            for allow_tmux, expected_cfg in (
+                (False, "sandbox_workspace_write.network_access=false"),
+                (True, "sandbox_workspace_write.network_access=true"),
+            ):
+                with self.subTest(codex_tmux=allow_tmux):
+                    seen_argvs: list[list[str]] = []
+
+                    def fake_run(argv, **_kw):
+                        seen_argvs.append(list(argv))
+                        if len(seen_argvs) == 2:
+                            return (1, b"", b"session expired", False)
+                        return (0, ok_stream, b"", False)
+
+                    with (
+                        mock.patch.object(node.shutil, "which", return_value="/bin/codex"),
+                        mock.patch.object(node, "run_monitored", side_effect=fake_run),
+                    ):
+                        # Initial execution
+                        st1, _, _ = node.execute_job(
+                            "codex", {"task_id": "t1", "title": "Init", "instruction": "Hi"},
+                            workdir, "workspace-write", 30, threading.Event(), lambda _s, _t: None,
+                            codex_tmux=allow_tmux,
+                        )
+                        # Resume fails -> falls back to fresh reopen
+                        st2, _, _ = node.execute_job(
+                            "codex",
+                            {"task_id": "t2", "title": "Res", "instruction": "Hi", "agent_session_id": "th_prev"},
+                            workdir, "workspace-write", 30, threading.Event(), lambda _s, _t: None,
+                            codex_tmux=allow_tmux,
+                        )
+                    self.assertEqual((st1, st2), ("completed", "completed"))
+                    self.assertEqual(len(seen_argvs), 3)
+                    self.assertEqual(seen_argvs[0][:2], ["/bin/codex", "exec"])
+                    self.assertNotEqual(seen_argvs[0][2], "resume")
+                    self.assertEqual(seen_argvs[1][:3], ["/bin/codex", "exec", "resume"])
+                    self.assertEqual(seen_argvs[2][:2], ["/bin/codex", "exec"])
+                    self.assertNotEqual(seen_argvs[2][2], "resume")
+                    for argv in seen_argvs:
+                        self.assertIn(expected_cfg, argv)
+
+            # Per-job readonly tightening ignores codex_tmux=True
+            ro_argvs: list[list[str]] = []
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/codex"),
+                mock.patch.object(
+                    node, "run_monitored",
+                    side_effect=lambda argv, **_kw: (ro_argvs.append(list(argv)) or (0, ok_stream, b"", False)),
+                ),
+            ):
+                node.execute_job(
+                    "codex", {"task_id": "t3", "title": "RO", "instruction": "Hi", "sandbox": "readonly"},
+                    workdir, "workspace-write", 30, threading.Event(), lambda _s, _t: None,
+                    codex_tmux=True,
+                )
+            self.assertEqual(len(ro_argvs), 1)
+            self.assertNotIn("sandbox_workspace_write.network_access=true", ro_argvs[0])
+
+            # 4) self-check path: propagates --codex-tmux to workspace-write probe, never to readonly probe
+            sc_argvs: list[list[str]] = []
+
+            def fake_sc_run(argv, **_kw):
+                sc_argvs.append(list(argv))
+                prompt = argv[-1]
+                if "Read " in prompt:
+                    path = prompt.split("Read ", 1)[1].split(" and reply", 1)[0]
+                    tok = Path(path).read_text(encoding="utf-8").strip()
+                else:
+                    tok = prompt.split("print ", 1)[1].split(" (e.g.", 1)[0]
+                return (0, json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": tok}}).encode() + b"\n", b"", False)
+
+            sc_args = node.parse_args(["--self-check", "--workdir", workdir, "--agents", "codex", "--codex-tmux"])
+            self.assertTrue(sc_args.codex_tmux)
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/codex"),
+                mock.patch.object(node, "resolve_node_agents", return_value=("codex", ["codex"])),
+                mock.patch.object(node, "run_monitored", side_effect=fake_sc_run),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(node.run_self_check(sc_args), 0)
+            self.assertEqual(len(sc_argvs), 2)
+            self.assertNotIn("sandbox_workspace_write.network_access=true", sc_argvs[0])
+            self.assertIn("sandbox_workspace_write.network_access=true", sc_argvs[1])
+
+            # readonly node with --codex-tmux: ignored with warning (never enables network)
+            sc_ro_argvs: list[list[str]] = []
+            sc_ro_args = node.parse_args(
+                ["--self-check", "--workdir", workdir, "--agents", "codex", "--sandbox", "readonly", "--codex-tmux"]
+            )
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/codex"),
+                mock.patch.object(node, "resolve_node_agents", return_value=("codex", ["codex"])),
+                mock.patch.object(
+                    node, "run_monitored",
+                    side_effect=lambda argv, **kw: (sc_ro_argvs.append(list(argv)) or fake_sc_run(argv, **kw)),
+                ),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()) as sc_ro_err,
+            ):
+                self.assertEqual(node.run_self_check(sc_ro_args), 0)
+            self.assertIn("--codex-tmux only takes effect under sandbox=workspace-write", sc_ro_err.getvalue())
+            self.assertEqual(len(sc_ro_argvs), 1)
+            self.assertNotIn("sandbox_workspace_write.network_access=true", sc_ro_argvs[0])
+
+            # run_node_loop forwards --codex-tmux only under workspace-write
+            for sb_flag, expected_flag in (("workspace-write", True), ("readonly", False)):
+                with self.subTest(loop_sandbox=sb_flag):
+                    captured_kw: dict = {}
+
+                    def fake_loop_exec(_agent, _job, _wd, _sb, _to, _ev, _cb, **kw):
+                        captured_kw.update(kw)
+                        return ("completed", "done", [])
+
+                    loop_args = node.parse_args([
+                        "--hub", "https://agenct.example.com", "--token", "tok", "--once",
+                        "--agent", "codex", "--agents", "codex", "--workdir", workdir,
+                        "--state-dir", workdir, "--sandbox", sb_flag, "--codex-tmux",
+                    ])
+                    with (
+                        mock.patch.object(node, "execute_job", side_effect=fake_loop_exec),
+                        mock.patch.object(
+                            node, "http_json",
+                            side_effect=lambda url, *_a, **_k: (
+                                {"job": {"task_id": "t_loop", "task_revision": 1, "lease_token": "l", "agent": "codex"}}
+                                if url.endswith("/work") else {}
+                            ),
+                        ),
+                        redirect_stdout(io.StringIO()),
+                        redirect_stderr(io.StringIO()) as loop_err,
+                    ):
+                        self.assertEqual(node.run_node_loop(loop_args), 0)
+                    self.assertEqual(captured_kw.get("codex_tmux"), expected_flag)
+                    if not expected_flag:
+                        self.assertIn("--codex-tmux only takes effect under sandbox=workspace-write", loop_err.getvalue())
+
+    def test_exec_backend_cli_args_tmux_alias_and_codex_tmux_orthogonality(self) -> None:
+        base = ["--hub", "https://agenct.example.com"]
+        with mock.patch.dict(os.environ, {}, clear=True):
+            args_default = node.parse_args(base)
+            self.assertEqual(args_default.exec_backend, "auto")
+            self.assertEqual(args_default.tmux, "auto")
+            self.assertFalse(args_default.codex_tmux)
+
+            for choice in ("auto", "tmux", "conpty", "wt-tail", "pipe"):
+                parsed = node.parse_args([*base, "--exec-backend", choice])
+                self.assertEqual(parsed.exec_backend, choice)
+                self.assertFalse(parsed.codex_tmux)
+
+            # Compatibility alias --tmux {auto,on,off} -> exec_backend {auto,tmux,pipe}
+            self.assertEqual(node.parse_args([*base, "--tmux", "auto"]).exec_backend, "auto")
+            self.assertEqual(node.parse_args([*base, "--tmux", "on"]).exec_backend, "tmux")
+            self.assertEqual(node.parse_args([*base, "--tmux", "off"]).exec_backend, "pipe")
+
+            # Orthogonal to --codex-tmux: neither flag alters the other's semantics
+            ortho1 = node.parse_args([*base, "--tmux", "on"])
+            self.assertEqual(ortho1.exec_backend, "tmux")
+            self.assertFalse(ortho1.codex_tmux)
+
+            ortho2 = node.parse_args([*base, "--codex-tmux", "--exec-backend", "pipe"])
+            self.assertEqual(ortho2.exec_backend, "pipe")
+            self.assertTrue(ortho2.codex_tmux)
+
+            # Explicit --exec-backend takes precedence over conflicting --tmux with warning
+            with redirect_stderr(io.StringIO()) as err:
+                both = node.parse_args([*base, "--exec-backend", "pipe", "--tmux", "on"])
+            self.assertEqual(both.exec_backend, "pipe")
+            self.assertIn("using --exec-backend=pipe", err.getvalue())
+
+        with mock.patch.dict(os.environ, {"AGENCT_EXEC_BACKEND": "wt-tail"}, clear=True):
+            self.assertEqual(node.parse_args(base).exec_backend, "wt-tail")
+        with mock.patch.dict(os.environ, {"AGENCT_EXEC_BACKEND": "bogus"}, clear=True), redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(node.parse_args(base).exec_backend, "auto")
+            self.assertIn("invalid AGENCT_EXEC_BACKEND", err.getvalue())
+
+    def test_exec_backend_probe_and_auto_selection_all_tiers(self) -> None:
+        def ok_run(cmd, **_kw):
+            return subprocess.CompletedProcess(cmd, 0, b"tmux 3.4\n", b"")
+
+        # 1) Linux / macOS: tmux available -> tmux; missing -> pipe; unsafe socket -> pipe
+        for plat in ("Linux", "Darwin"):
+            b_tmux = node.resolve_exec_backend(
+                "auto", system=plat, which=lambda c: "/usr/bin/tmux" if c == "tmux" else None, runner=ok_run,
+            )
+            self.assertIsInstance(b_tmux, node.TmuxBackend)
+            self.assertEqual(b_tmux.name, "tmux")
+
+            with redirect_stderr(io.StringIO()) as err:
+                b_pipe = node.resolve_exec_backend("auto", system=plat, which=lambda _c: None, runner=ok_run)
+            self.assertIsInstance(b_pipe, node.PipeBackend)
+            self.assertEqual(b_pipe.name, "pipe")
+            self.assertEqual(err.getvalue(), "")
+
+        def unsafe_tmux_run(cmd, **_kw):
+            if "-V" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, b"tmux 3.2a\n", b"")
+            return subprocess.CompletedProcess(cmd, 1, b"", b"directory /tmp/tmux-1000 has unsafe permissions\n")
+
+        b_unsafe = node.resolve_exec_backend(
+            "auto", system="Linux", which=lambda c: "/usr/bin/tmux" if c == "tmux" else None, runner=unsafe_tmux_run,
+        )
+        self.assertEqual(b_unsafe.name, "pipe")
+
+        # 2) WSL2: must be treated strictly as Linux, NEVER invoke /mnt/c/.../wt.exe
+        self.assertFalse(node.is_windows("Linux"))
+        self.assertTrue(node.is_wsl2("Linux", "6.18.58.1-microsoft-standard-WSL2", {"WSL_DISTRO_NAME": "Ubuntu"}))
+        wt_calls: list[list[str]] = []
+
+        def wsl_which(cmd: str) -> str | None:
+            if cmd in ("wt.exe", "wt"):
+                return "/mnt/c/Users/dev/AppData/Local/Microsoft/WindowsApps/wt.exe"
+            return None
+
+        def wsl_runner(cmd, **_kw):
+            wt_calls.append(list(cmd))
+            return subprocess.CompletedProcess(cmd, 0, b"1.20\n", b"")
+
+        b_wsl_notmux = node.resolve_exec_backend("auto", system="Linux", which=wsl_which, runner=wsl_runner)
+        self.assertEqual(b_wsl_notmux.name, "pipe")
+        self.assertEqual(wt_calls, [])
+
+        b_wsl_explicit_wt = node.resolve_exec_backend("wt-tail", system="Linux", which=wsl_which, runner=wsl_runner)
+        self.assertEqual(b_wsl_explicit_wt.name, "pipe")
+        self.assertEqual(wt_calls, [])
+
+        # Even if tmux IS present alongside /mnt/c/wt.exe on WSL2, choose tmux and never touch wt.exe
+        def wsl_which_with_tmux(cmd: str) -> str | None:
+            if cmd == "tmux":
+                return "/usr/bin/tmux"
+            return wsl_which(cmd)
+
+        b_wsl_tmux = node.resolve_exec_backend("auto", system="Linux", which=wsl_which_with_tmux, runner=ok_run)
+        self.assertEqual(b_wsl_tmux.name, "tmux")
+
+        # 3) Windows: conpty (pywinpty) -> conpty (node-pty) -> wt-tail -> pipe
+        fake_winpty = type("FakeWinpty", (), {"PtyProcess": object})()
+        b_win_pywinpty = node.resolve_exec_backend(
+            "auto",
+            system="Windows",
+            which=lambda _c: None,
+            import_module=lambda name: fake_winpty if name == "winpty" else (_ for _ in ()).throw(ImportError(name)),
+            runner=ok_run,
+        )
+        self.assertIsInstance(b_win_pywinpty, node.ConPtyBackend)
+        self.assertEqual(b_win_pywinpty.name, "conpty")
+        self.assertEqual(b_win_pywinpty.provider, "pywinpty")
+
+        def fail_winpty(_name: str):
+            raise ImportError("No module named 'winpty'")
+
+        # pywinpty missing, node-pty available -> conpty (node-pty)
+        b_win_nodepty = node.resolve_exec_backend(
+            "auto",
+            system="Windows",
+            which=lambda c: r"C:\Program Files\nodejs\node.exe" if c == "node" else None,
+            import_module=fail_winpty,
+            runner=lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, b"", b""),
+        )
+        self.assertIsInstance(b_win_nodepty, node.ConPtyBackend)
+        self.assertEqual(b_win_nodepty.provider, "node-pty")
+
+        # pywinpty & node-pty missing, wt.exe working -> wt-tail
+        b_win_wt = node.resolve_exec_backend(
+            "auto",
+            system="Windows",
+            which=lambda c: r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps\wt.exe" if c == "wt.exe" else None,
+            import_module=fail_winpty,
+            runner=lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, b"1.20.0\n", b""),
+        )
+        self.assertIsInstance(b_win_wt, node.WtTailBackend)
+        self.assertEqual(b_win_wt.name, "wt-tail")
+
+        # pywinpty missing & wt.exe missing -> silent degradation to pipe
+        with redirect_stderr(io.StringIO()) as err:
+            b_win_missing_wt = node.resolve_exec_backend(
+                "auto", system="Windows", which=lambda _c: None, import_module=fail_winpty, runner=ok_run,
+            )
+        self.assertIsInstance(b_win_missing_wt, node.PipeBackend)
+        self.assertEqual(err.getvalue(), "")
+
+        # wt.exe Store App Execution Alias broken (WinError 1920 / OSError) -> silent degradation to pipe
+        def broken_store_alias(_cmd, **_kw):
+            raise OSError(1920, "The file cannot be accessed by the system")
+
+        with redirect_stderr(io.StringIO()) as err:
+            b_win_broken_alias = node.resolve_exec_backend(
+                "auto",
+                system="Windows",
+                which=lambda c: r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps\wt.exe" if c == "wt.exe" else None,
+                import_module=fail_winpty,
+                runner=broken_store_alias,
+            )
+        self.assertIsInstance(b_win_broken_alias, node.PipeBackend)
+        self.assertEqual(err.getvalue(), "")
+
+        # Explicit conpty when pywinpty raises ImportError -> safe fallback to pipe without crashing
+        b_explicit_conpty = node.resolve_exec_backend(
+            "conpty", system="Windows", which=lambda _c: None, import_module=fail_winpty,
+        )
+        self.assertIsInstance(b_explicit_conpty, node.PipeBackend)
+
+    def test_runs_dir_windows_uses_userprofile_and_linux_keeps_tmp(self) -> None:
+        win_dir = node.get_runs_dir(system="Windows", env={"USERPROFILE": r"C:\Users\alice"})
+        self.assertEqual(win_dir, r"C:\Users\alice\.agenct\runs")
+        self.assertNotIn("/tmp", win_dir)
+
+        linux_dir = node.get_runs_dir(system="Linux", env={})
+        self.assertEqual(linux_dir, os.path.join(tempfile.gettempdir(), "agenct-runs"))
+
+    def test_wt_tail_whitelisted_argv_and_runtime_degradation(self) -> None:
+        wt_argv = node.build_wt_tail_argv("wt.exe", "tsk_42", r"C:\Users\alice\.agenct\runs\tsk_42.log")
+        self.assertEqual(
+            wt_argv,
+            [
+                "wt.exe", "-w", "0", "new-tab",
+                "--title", "agenct:tsk_42",
+                "pwsh", "-NoExit", "-Command",
+                r"Get-Content -Wait C:\Users\alice\.agenct\runs\tsk_42.log",
+            ],
+        )
+
+        # Simulated wt-tail execution with mocked wt.exe launch
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = os.path.join(tmp, "runs")
+            real_popen = subprocess.Popen
+            wt_launched: list[list[str]] = []
+
+            def selective_popen(cmd, *a, **kw):
+                if isinstance(cmd, list) and cmd and cmd[0] == "wt.exe":
+                    wt_launched.append(list(cmd))
+                    return mock.MagicMock()
+                return real_popen(cmd, *a, **kw)
+
+            backend = node.WtTailBackend(wt_bin="wt.exe", runs_dir=runs_dir)
+            meta: dict = {}
+            with mock.patch.object(node.subprocess, "Popen", side_effect=selective_popen):
+                rc, out, err, cancelled = node.run_monitored(
+                    [sys.executable, "-c", "import sys; print('wt-ok'); print('wt-err', file=sys.stderr)"],
+                    shell=False, cwd=tmp, env=dict(os.environ), timeout=10,
+                    cancel_event=threading.Event(), progress_cb=lambda _s, _t: None,
+                    stage_label="test", backend=backend, task_id="tsk_wt", meta_out=meta,
+                )
+            self.assertEqual(rc, 0)
+            self.assertFalse(cancelled)
+            self.assertEqual(out.decode().strip(), "wt-ok")
+            self.assertEqual(err.decode().strip(), "wt-err")
+            self.assertEqual(meta.get("backend"), "wt-tail")
+            self.assertEqual(len(wt_launched), 1)
+            self.assertEqual(wt_launched[0][:6], ["wt.exe", "-w", "0", "new-tab", "--title", "agenct:tsk_wt"])
+            self.assertIn("Get-Content -Wait", wt_launched[0][-1])
+            self.assertEqual(backend.list(), [])
+
+            # If wt.exe fails at spawn time (e.g. broken Store alias), run_monitored silently degrades to pipe
+            def failing_wt_popen(cmd, *a, **kw):
+                if isinstance(cmd, list) and cmd and cmd[0] == "wt.exe":
+                    raise OSError(1920, "Store alias unavailable")
+                return real_popen(cmd, *a, **kw)
+
+            meta_deg: dict = {}
+            with mock.patch.object(node.subprocess, "Popen", side_effect=failing_wt_popen):
+                rc2, out2, _err2, _c2 = node.run_monitored(
+                    [sys.executable, "-c", "print('fallback-pipe')"],
+                    shell=False, cwd=tmp, env=dict(os.environ), timeout=10,
+                    cancel_event=threading.Event(), progress_cb=lambda _s, _t: None,
+                    stage_label="test", backend=backend, task_id="tsk_deg", meta_out=meta_deg,
+                )
+            self.assertEqual(rc2, 0)
+            self.assertEqual(out2.decode().strip(), "fallback-pipe")
+            self.assertEqual(meta_deg.get("backend"), "pipe")
+
+    def test_conpty_wrapper_preserves_long_jsonl_and_import_failure_falls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = os.path.join(tmp, "runs")
+
+            class FakePtyProcess:
+                def __init__(self, proc: subprocess.Popen) -> None:
+                    self._proc = proc
+
+                @classmethod
+                def spawn(cls, cmd, cwd=None):
+                    p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    return cls(p)
+
+                def read(self):
+                    return self._proc.stdout.read(1024) if self._proc.stdout else b""
+
+                def isalive(self):
+                    return self._proc.poll() is None
+
+                def terminate(self, force=False):
+                    if self._proc.poll() is None:
+                        self._proc.kill() if force else self._proc.terminate()
+
+                def close(self):
+                    try:
+                        self._proc.wait(timeout=2)
+                    finally:
+                        for st in (self._proc.stdout, self._proc.stderr):
+                            if st is not None:
+                                st.close()
+
+            fake_winpty = type("FakeWinpty", (), {"PtyProcess": FakePtyProcess})()
+            long_text = "X" * 2400
+            emit_script = (
+                "import json; "
+                f"print(json.dumps({{'type':'result','result':'{long_text}'}}), flush=True)"
+            )
+            backend = node.ConPtyBackend(
+                provider="pywinpty",
+                runs_dir=runs_dir,
+                import_module=lambda name: fake_winpty if name == "winpty" else (_ for _ in ()).throw(ImportError(name)),
+            )
+            meta: dict = {}
+            rc, out, _err, cancelled = node.run_monitored(
+                [sys.executable, "-c", emit_script],
+                shell=False, cwd=tmp, env=dict(os.environ), timeout=10,
+                cancel_event=threading.Event(), progress_cb=lambda _s, _t: None,
+                stage_label="test", backend=backend, task_id="tsk_conpty", meta_out=meta,
+            )
+            self.assertEqual(rc, 0)
+            self.assertFalse(cancelled)
+            self.assertEqual(meta.get("backend"), "conpty")
+            lines = out.decode("utf-8").splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(json.loads(lines[0])["result"], long_text)
+            self.assertEqual(backend.list(), [])
+
+            # Import failure during spawn degrades safely to pipe without crashing
+            broken_backend = node.ConPtyBackend(
+                provider="pywinpty",
+                runs_dir=runs_dir,
+                import_module=lambda _n: (_ for _ in ()).throw(ImportError("winpty missing")),
+            )
+            meta_fb: dict = {}
+            rc_fb, out_fb, _, _ = node.run_monitored(
+                [sys.executable, "-c", "print('safe-fallback')"],
+                shell=False, cwd=tmp, env=dict(os.environ), timeout=10,
+                cancel_event=threading.Event(), progress_cb=lambda _s, _t: None,
+                stage_label="test", backend=broken_backend, task_id="tsk_fb", meta_out=meta_fb,
+            )
+            self.assertEqual(rc_fb, 0)
+            self.assertEqual(out_fb.decode().strip(), "safe-fallback")
+            self.assertEqual(meta_fb.get("backend"), "pipe")
+
+    def test_tmux_backend_real_isolated_socket_and_interface(self) -> None:
+        if node.is_windows() or not node.shutil.which("tmux"):
+            self.skipTest("tmux not available on this host")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o700)
+            sock = os.path.join(tmp, "tmux.sock")
+            runs_dir = os.path.join(tmp, "runs")
+            if not node.probe_tmux(socket_path=sock):
+                self.skipTest("tmux socket unavailable in this environment")
+            backend = node.TmuxBackend(runs_dir=runs_dir, socket_path=sock)
+            try:
+                long_payload = "Y" * 2200
+                script = (
+                    "import json, sys, time; "
+                    f"print(json.dumps({{'type':'result','result':'{long_payload}'}}), flush=True); "
+                    "print('stderr-line', file=sys.stderr, flush=True); "
+                    "time.sleep(0.2)"
+                )
+                meta: dict = {}
+                seen_sessions: list[list[dict[str, str]]] = []
+
+                def on_prog(_stage, _tail):
+                    if not seen_sessions:
+                        seen_sessions.append(backend.list())
+
+                rc, out, err, cancelled = node.run_monitored(
+                    [sys.executable, "-c", script],
+                    shell=False, cwd=tmp, env=dict(os.environ), timeout=10,
+                    cancel_event=threading.Event(), progress_cb=on_prog,
+                    stage_label="tmux-test", backend=backend, task_id="tsk_tmux", meta_out=meta,
+                )
+                self.assertEqual(rc, 0)
+                self.assertFalse(cancelled)
+                self.assertEqual(meta.get("backend"), "tmux")
+                self.assertTrue(str(meta.get("tmux_session", "")).startswith("agenct-tsk_tmux-"))
+                self.assertEqual(meta.get("attach_cmd")[-2:], ["-t", meta["tmux_session"]])
+                self.assertEqual(json.loads(out.decode("utf-8").strip())["result"], long_payload)
+                self.assertEqual(err.decode("utf-8").strip(), "stderr-line")
+                self.assertEqual(backend.list(), [])
+            finally:
+                subprocess.run(["tmux", "-S", sock, "kill-server"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def test_run_monitored_depends_only_on_backend_interface(self) -> None:
+        events: list[str] = []
+
+        class StubLog(node.BackendLogStream):
+            def __init__(self) -> None:
+                self._step = 0
+
+            def read_chunks(self) -> tuple[bytes, bytes]:
+                if self._step == 0:
+                    self._step = 1
+                    return b"step-1\n", b""
+                return b"", b""
+
+            def is_done(self) -> bool:
+                return self._step >= 1
+
+            def returncode(self) -> int | None:
+                return 0 if self._step >= 1 else None
+
+        class StubBackend(node.ExecBackend):
+            name = "stub"
+
+            def spawn(self, argv, *, shell, cwd, env, task_id=""):
+                events.append("spawn")
+                return node.ExecHandle(backend=self.name, session_id="stub-1", argv=argv)
+
+            def log(self, handle):
+                events.append("log")
+                return StubLog()
+
+            def attach(self, handle):
+                events.append("attach")
+                return ["stub-attach", handle.session_id]
+
+            def cleanup(self, handle, *, terminate=False, force=False):
+                events.append(f"cleanup:{terminate}:{force}")
+
+            def list(self):
+                return [{"backend": self.name, "session_id": "stub-1"}]
+
+        meta: dict = {}
+        progress: list[tuple[str, str]] = []
+        rc, out, err, cancelled = node.run_monitored(
+            ["noop"], shell=False, cwd=".", env={}, timeout=5,
+            cancel_event=threading.Event(),
+            progress_cb=lambda st, tl: progress.append((st, tl)),
+            stage_label="Stub", backend=StubBackend(), task_id="t1", meta_out=meta,
+        )
+        self.assertEqual((rc, out, err, cancelled), (0, b"step-1\n", b"", False))
+        self.assertEqual(meta["backend"], "stub")
+        self.assertEqual(meta["attach_cmd"], ["stub-attach", "stub-1"])
+        self.assertEqual(events, ["spawn", "attach", "log", "cleanup:False:False"])
+        self.assertEqual(progress, [("Stub", "step-1")])
+
+    def test_default_auto_behavior_and_backend_reported_in_task_receipt(self) -> None:
+        for resolved_obj, expected_backend in (
+            (node.TmuxBackend(tmux_bin="/usr/bin/tmux"), "tmux"),
+            (node.PipeBackend(), "pipe"),
+        ):
+            with self.subTest(expected_backend=expected_backend), tempfile.TemporaryDirectory() as workdir:
+                submitted_payloads: list[dict] = []
+
+                def fake_http(url, _token, *, method, **kwargs):
+                    if url.endswith("/work"):
+                        return {"job": {"task_id": "tsk_be", "task_revision": 1, "lease_token": "l", "agent": "template"}}
+                    if url.endswith("/submit"):
+                        self.assertEqual(method, "POST")
+                        submitted_payloads.append(kwargs["body"])
+                        return {}
+                    return {}
+
+                # Default CLI args (no --exec-backend passed -> auto)
+                args = node.parse_args([
+                    "--hub", "https://agenct.example.com", "--token", "tok", "--once",
+                    "--agent", "template", "--agents", "template",
+                    "--workdir", workdir, "--state-dir", workdir,
+                ])
+                self.assertEqual(args.exec_backend, "auto")
+                with (
+                    mock.patch.object(node, "resolve_exec_backend", return_value=resolved_obj),
+                    mock.patch.object(node, "http_json", side_effect=fake_http),
+                    redirect_stdout(io.StringIO()),
+                ):
+                    self.assertEqual(node.run_node_loop(args), 0)
+                self.assertEqual(len(submitted_payloads), 1)
+                self.assertEqual(submitted_payloads[0].get("backend"), expected_backend)
+                self.assertEqual(submitted_payloads[0].get("status"), "completed")
 
 
 if __name__ == "__main__":

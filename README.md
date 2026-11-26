@@ -77,6 +77,52 @@ curl -fsSL https://agenct.example.com/node/install.sh | sh -s -- agn_...
 
 节点默认运行在 `workspace-write` 沙箱模式；仅当显式传入 `--unsafe-full-access` 时才开放全主目录访问。
 
+对于 `codex` 节点，默认显式传入 `sandbox_workspace_write.network_access=false` 关闭外网（不依赖 Codex 隐式默认值）。Linux 下 Codex 关闭网络时 seccomp 会一并拦截 `AF_UNIX connect()`（导致无法连接 `/tmp/tmux-*/default` 执行 `tmux ls` 等）；如确需让 Codex 访问本地 tmux，可在启动节点时显式传入 `--codex-tmux`（仅在 `--sandbox workspace-write` 下生效，`readonly` 与 `unsafe-full` 下会自动忽略，且会同时开放 `workspace-write` 内的外网访问）。验收探测步骤：
+
+```sh
+# 1. 默认关闭外网：tmux socket 与外网探测均应被拦截
+codex exec --skip-git-repo-check -s workspace-write -c sandbox_workspace_write.network_access=false \
+  'Run `tmux ls 2>&1 || true` and `curl -sfI --max-time 5 https://example.com 2>&1 || echo NET_BLOCKED`'
+
+# 2. 启用 --codex-tmux（仅 workspace-write 生效）：自检并探测 tmux socket 与外网
+python3 node/agenct-node.py --self-check --agents codex --sandbox workspace-write --codex-tmux
+codex exec --skip-git-repo-check -s workspace-write -c sandbox_workspace_write.network_access=true \
+  'Run `tmux ls 2>&1 || true` and `curl -sfI --max-time 5 https://example.com | head -n 1`'
+```
+
+#### 跨平台执行后端探测（`--exec-backend`）
+
+`node/agenct-node.py` 支持通过 `--exec-backend {auto,tmux,conpty,wt-tail,pipe}`（默认 `auto`，兼容别名 `--tmux {auto,on,off}` 分别映射到 `auto`/`tmux`/`pipe`，与 `--codex-tmux` 正交）自动选择并静默降级执行后端，并在任务回执中附带实际命中的 `backend` 字段：
+
+- **Linux / macOS / WSL2**：`auto` 优先探测 `tmux`（命名会话 `agenct-<task>-<id>`，支持 `tmux attach -t <session>`，输出经 Wrapper 原始管道采集不折行 JSONL）；不可用时静默降级为 `pipe`。WSL2 严格按 Linux 路径处理，**不会**调用 `/mnt/c` 下的 `wt.exe`。
+- **Windows**：`auto` 按 `conpty`（需探测到 `pywinpty` 或 `node-pty`，经 Wrapper 采集原始输出避免 ConPTY 折行切碎 JSONL）→ `wt-tail`（白名单调用 `wt.exe -w 0 new-tab --title "agenct:<task>" pwsh -NoExit -Command "Get-Content -Wait <log>"`，缺失或 Store 别名不可用时降级）→ `pipe` 顺序降级；运行日志写入 `%USERPROFILE%\.agenct\runs\` 而非 `/tmp`。
+
+各平台验收步骤：
+
+```sh
+# 1. Linux / macOS / WSL2：验证默认 auto 探测（有可用 tmux 走 tmux，无则静默降级 pipe）
+python3 -m unittest discover -s node -p 'test_*.py' -v
+python3 node/agenct-node.py --self-check --agents codex --exec-backend auto
+# 兼容别名验证（与 --codex-tmux 互不影响）
+python3 node/agenct-node.py --self-check --agents codex --tmux off
+# 若命中 tmux，另开终端可查看/附着会话：
+tmux list-sessions | grep '^agenct-'
+```
+
+```powershell
+# 2. Windows（原生 PowerShell）：
+# 2a) 默认 auto 探测（已装 pywinpty/node-pty 走 conpty；否则若 wt.exe 可用走 wt-tail；否则降级 pipe）
+py -3 -m unittest discover -s node -p "test_*.py" -v
+py -3 node\agenct-node.py --self-check --agents codex --exec-backend auto
+
+# 2b) 指定 wt-tail：确认日志落盘在 %USERPROFILE%\.agenct\runs\ 且 Windows Terminal 新标签页打开 tail
+py -3 node\agenct-node.py --self-check --agents codex --exec-backend wt-tail
+dir "$env:USERPROFILE\.agenct\runs"
+
+# 2c) 卸载 pywinpty / 禁用 wt.exe Store 别名时，确认 --exec-backend auto 静默降级为 pipe 不抛错
+py -3 node\agenct-node.py --self-check --agents codex --exec-backend pipe
+```
+
 ## 备份与恢复
 
 ```sh
