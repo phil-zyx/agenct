@@ -1186,7 +1186,39 @@ fn append_missing_attachments(reply: &str, source: &str) -> String {
     out
 }
 
-/// Invokes the brain asynchronously when a node completes a task with `on_complete` set.
+/// Returns `true` when raw node output is long or structured enough to benefit from
+/// automatic Brain distillation rather than dumping raw prose directly into chat.
+pub fn should_auto_digest(content: &str) -> bool {
+    let mut non_empty_lines = 0usize;
+    let mut char_count = 0usize;
+
+    for raw_line in content.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Evidence attachment links are preserved separately in the distilled message.
+        if (trimmed.starts_with("![") || trimmed.starts_with('['))
+            && trimmed.contains("/api/attachments/att_")
+        {
+            continue;
+        }
+        non_empty_lines += 1;
+        char_count += trimmed.chars().count();
+        if non_empty_lines > 4
+            || char_count > 260
+            || trimmed.starts_with("```")
+            || trimmed.starts_with("##")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Invokes the brain asynchronously when a node completes a task:
+/// either running an explicit `on_complete` follow-up workflow or automatically
+/// distilling verbose node output into a concise chat reply.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_task_callback(
     hub: Hub,
@@ -1208,8 +1240,11 @@ pub async fn run_task_callback(
     let gate = hub.user_gate(&user_id);
     let _guard = gate.lock_owned().await;
 
-    let allow_followup_dispatch = next_depth < MAX_CALLBACK_DEPTH;
-    let allowed_tools: &[&str] = if allow_followup_dispatch {
+    let has_followup = !on_complete.trim().is_empty();
+    let allow_followup_dispatch = has_followup && next_depth < MAX_CALLBACK_DEPTH;
+    let allowed_tools: &[&str] = if !has_followup {
+        &[]
+    } else if allow_followup_dispatch {
         &[
             "update_ledger",
             "update_memory",
@@ -1220,24 +1255,65 @@ pub async fn run_task_callback(
         &["update_ledger", "update_memory", "close_thread"]
     };
 
-    let instruction = format!(
-        "{}\n任务「{}」（id=`{}`，执行节点：{}，状态：{}）已返回结果。\n\
-         既定后续验收/跟进要求：{}\n\n\
-         【节点执行结果】\n{}\n\n\
-         请用自然简洁的中文总结给用户（整体 ≤10 行）：直接说清结果与关键事实，最后如有具体文件/commit/任务ID/附件或链接顺手带一句（没有就别凑）；禁止套用「待审批：」「结论：」「来源：」这种机械前缀；节点原始报告已保存在右侧抽屉「查看结果」，切勿重复粘贴；如需要可调用允许的工具更新账本、更新记忆、归档线程{}。",
-        crate::llm::TASK_CALLBACK_MARKER,
-        task_title,
-        task_id,
-        node_name,
-        task_status,
-        on_complete.trim(),
-        truncate_bytes(result_content.trim(), 6000),
-        if allow_followup_dispatch {
-            "或继续派发下一步节点任务"
-        } else {
-            "（已达自动回调深度上限，不可再派发后续节点任务）"
-        }
-    );
+    let truncated_result = truncate_bytes(result_content.trim(), 6000);
+    let (instruction, prompt_suffix, audit_action, msg_header, im_title) = if has_followup {
+        let instr = format!(
+            "{}\n任务「{}」（id=`{}`，执行节点：{}，状态：{}）已返回结果。\n\
+             既定后续验收/跟进要求：{}\n\n\
+             【节点执行结果】\n{}\n\n\
+             请用自然简洁的中文总结给用户（3～5 句、≤6 行以内）：直接说清结果与关键事实，最后如有具体文件/commit/任务ID/附件或链接顺手带一句（没有就别凑）；禁止套用「待审批：」「结论：」「来源：」这种机械前缀；节点原始报告已保存在右侧抽屉「查看结果」，切勿重复粘贴；如需要可调用允许的工具更新账本、更新记忆、归档线程{}。",
+            crate::llm::TASK_CALLBACK_MARKER,
+            task_title,
+            task_id,
+            node_name,
+            task_status,
+            on_complete.trim(),
+            truncated_result,
+            if allow_followup_dispatch {
+                "或继续派发下一步节点任务"
+            } else {
+                "（已达自动回调深度上限，不可再派发后续节点任务）"
+            }
+        );
+        let suffix = "\n\n=== 当前运行模式：异步任务回流自动验收 ===\n\
+            - 这是节点完成任务后的唯一面向用户的汇总回执，用户可能不在屏幕前；**像靠谱的人类助理一样自然汇报（3～5 句、≤6 行以内）**。\n\
+            - 默认在已有授权范围内直接执行并给结论，不反问。仅当同时存在至少两个可续接的活跃线程或节点回执，且无法唯一判断用户指的是哪一个时，第一句用一句话反问确认（例如「你是指刚才的 A 还是 B？」），当轮禁止调用 `dispatch_node` 或其他变更类工具。普通派发或信息不足但可合理默认时，按默认规则执行。\n\
+            - 直接说清核心结果与关键事实；如有具体依据（`file:line`、commit、任务 ID、附件或链接）文末顺手带一句，无则省略。\n\
+            - **禁止套用「待审批：」「结论：」「来源：」这类表单前缀**，严禁堆砌多级标题或大表格，严禁复述节点原始全文，不要寒暄。";
+        (
+            instr,
+            suffix,
+            "task_callback",
+            format!("**[自动跟进 · {task_title}]**"),
+            format!("任务自动跟进：{task_title}"),
+        )
+    } else {
+        let instr = format!(
+            "{}\n任务「{}」（id=`{}`，执行节点：{}，状态：{}）已完成。\n\n\
+             【节点执行结果】\n{}\n\n\
+             请将上述节点执行结果提炼成给用户看的简短聊天回复（**3～5 句、≤6 行以内，尽量 ≤200 字**）：\n\
+             1. 若需要用户拍板/审批/二选一，第一句直接点明决策项；否则直接给核心结论与 1～3 个关键事实。\n\
+             2. 文末如有具体 `file:line`、commit、URL 或附件顺手带一句，没有就别凑。\n\
+             3. 节点完整原始报告已存入右侧抽屉「查看结果」，切勿照搬排障过程、逐文件清单、命令输出、大表格、多级标题，也不要套用「待审批：」「结论：」「来源：」等表单标签。",
+            crate::llm::TASK_DIGEST_MARKER,
+            task_title,
+            task_id,
+            node_name,
+            task_status,
+            truncated_result,
+        );
+        let suffix = "\n\n=== 当前运行模式：节点结果精简提炼 ===\n\
+            - 你的唯一任务是把执行节点返回的原始技术报告提炼为自然、干练的中文对话汇报（**3～5 句、≤6 行、尽量 ≤200 字**）。\n\
+            - 禁止调用任何工具，也不要输出 JSON 或多级 `#` 标题 / Markdown 大表格 / 大段代码块 / 「结论：」「来源：」前缀。\n\
+            - 保留结论、必要决策点与最关键依据；冗长细节已在抽屉「查看结果」留存，无需复述。";
+        (
+            instr,
+            suffix,
+            "task_digest",
+            format!("**[节点 {node_name} · {task_title}]**"),
+            format!("任务完成：{task_title}"),
+        )
+    };
 
     let uid_snap = user_id.clone();
     let instr_snap = instruction.clone();
@@ -1251,7 +1327,7 @@ pub async fn run_task_callback(
     };
 
     let mode = AgentMode {
-        prompt_suffix: "\n\n=== 当前运行模式：异步任务回流自动验收 ===\n- 这是节点完成任务后的唯一面向用户的汇总回执，用户可能不在屏幕前；**像靠谱的人类助理一样自然汇报（整体 ≤10 行）**。\n- 默认在已有授权范围内直接执行并给结论，不反问。仅当同时存在至少两个可续接的活跃线程或节点回执，且无法唯一判断用户指的是哪一个时，第一句用一句话反问确认（例如「你是指刚才的 A 还是 B？」），当轮禁止调用 `dispatch_node` 或其他变更类工具。普通派发或信息不足但可合理默认时，按默认规则执行。\n- 直接说清核心结果与关键事实；如有具体依据（`file:line`、commit、任务 ID、附件或链接）文末顺手带一句，无则省略。\n- **禁止套用「待审批：」「结论：」「来源：」这类表单前缀**，严禁堆砌多级标题或大表格，严禁复述节点原始全文，不要寒暄。",
+        prompt_suffix,
         interactive: false,
         allowed_tools: Some(allowed_tools),
         callback_depth: next_depth,
@@ -1262,7 +1338,7 @@ pub async fn run_task_callback(
         Ok(out) => {
             let merged_reply = append_missing_attachments(out.reply.trim(), &result_content);
             let reply = truncate_bytes(&merged_reply, 16_000);
-            let msg = format!("**[自动跟进 · {task_title}]**\n\n{reply}");
+            let msg = format!("{msg_header}\n\n{reply}");
             let thread_db = out.thread_id.or(task_thread_id);
             let uid_db = user_id.clone();
             let title_db = task_title.clone();
@@ -1276,14 +1352,7 @@ pub async fn run_task_callback(
                          VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
                         params![uid_db, thread_db, truncate_bytes(&msg, 16_000), now_unix()],
                     )?;
-                    record_audit(
-                        &tx,
-                        &uid_db,
-                        "task_callback",
-                        "ok",
-                        &title_db,
-                        &audit_detail,
-                    )?;
+                    record_audit(&tx, &uid_db, audit_action, "ok", &title_db, &audit_detail)?;
                     tx.commit()?;
                     Ok(())
                 })
@@ -1294,14 +1363,8 @@ pub async fn run_task_callback(
                 "message",
                 json!({"task_id": task_id, "callback": true}),
             );
-            crate::integrations::im::maybe_notify(
-                &hub,
-                &user_id,
-                "delivery",
-                &format!("任务自动跟进：{task_title}"),
-                &reply,
-            )
-            .await;
+            crate::integrations::im::maybe_notify(&hub, &user_id, "delivery", &im_title, &reply)
+                .await;
         }
         Err(err) => {
             let uid_db = user_id.clone();
@@ -1326,7 +1389,7 @@ pub async fn run_task_callback(
                             now_unix()
                         ],
                     )?;
-                    record_audit(&tx, &uid_db, "task_callback", "failed", &title_db, &detail)?;
+                    record_audit(&tx, &uid_db, audit_action, "failed", &title_db, &detail)?;
                     tx.commit()?;
                     Ok(())
                 })
@@ -1894,4 +1957,21 @@ async fn prepare_images(
     out.context = captions.join("\n\n");
     out.persist_context = out.context.clone();
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_auto_digest;
+
+    #[test]
+    fn should_auto_digest_only_triggers_on_verbose_or_structured_output() {
+        assert!(!should_auto_digest("已重启服务，健康检查通过。"));
+        assert!(!should_auto_digest(
+            "第一行结论\n第二行关键事实\n\n![ev](/api/attachments/att_0123456789abcdef0123456789abcdef)"
+        ));
+        assert!(should_auto_digest("1\n2\n3\n4\n5"));
+        assert!(should_auto_digest(&"a".repeat(261)));
+        assert!(should_auto_digest("总结如下：\n```sh\necho hi\n```"));
+        assert!(should_auto_digest("## 详细排查报告\n一切正常"));
+    }
 }

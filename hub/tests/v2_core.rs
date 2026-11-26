@@ -3597,3 +3597,219 @@ async fn chat_managed_roles_model_dispatch_and_session_isolation() {
     assert_eq!(st, StatusCode::OK);
     assert!(final_roles.as_array().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn verbose_node_submit_auto_digests_without_on_complete_while_short_posts_directly() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, created) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"name": "pc-digest", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_token = created["token"].as_str().unwrap().to_owned();
+
+    // Online handshake so node is eligible for /node dispatch.
+    let poll_empty = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header("x-agenct-node-kind", "pc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(poll_empty.status(), StatusCode::OK);
+
+    // 1. Verbose report without `on_complete` must trigger automatic Brain digest while keeping full raw result in drawer.
+    let (st, chat1) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node inspect service logs"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tid1 = chat1["tasks"][0]["task_id"].as_str().unwrap().to_owned();
+
+    let poll1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let job1: Value =
+        serde_json::from_slice(&poll1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let lease1 = job1["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev1 = job1["job"]["task_revision"].as_i64().unwrap();
+
+    let raw_verbose = "## 完整日志排查结论\n服务已恢复健康。\n- 检查项 1：端口监听正常\n- 检查项 2：数据库连接正常\n- 检查项 3：队列积压已清空\nRAW_VERBOSE_MARKER_DO_NOT_DUMP";
+    let png_b64 = STANDARD.encode([0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+    let mut rx = hub.events.subscribe("u-alice");
+    let sub1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{tid1}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease1,
+                        "request_id": "sub-digest-verbose",
+                        "expected_revision": rev1,
+                        "status": "completed",
+                        "content": raw_verbose,
+                        "attachments": [{"name": "screen.png", "mime_type": "image/png", "data_base64": png_b64}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub1.status(), StatusCode::OK);
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let ev = rx.recv().await.unwrap();
+            if ev.kind == "message" && ev.data.contains("\"callback\":true") {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("auto-digest should emit completion message event");
+
+    let (msgs, saved_result, digest_audits): (Vec<String>, Option<String>, i64) = hub
+        .db
+        .read({
+            let tid = tid1.clone();
+            move |conn| {
+                let mut ms = conn
+                    .prepare("SELECT content FROM messages WHERE user_id='u-alice' ORDER BY id")?;
+                let msgs = ms
+                    .query_map([], |r| r.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                let saved_result: Option<String> =
+                    conn.query_row("SELECT result FROM tasks WHERE id=?1", [&tid], |r| r.get(0))?;
+                let digest_audits: i64 = conn.query_row(
+                    "SELECT count(*) FROM audit_logs WHERE user_id='u-alice' AND action='task_digest' AND status='ok'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((msgs, saved_result, digest_audits))
+            }
+        })
+        .await
+        .unwrap();
+
+    assert!(saved_result
+        .as_deref()
+        .is_some_and(|r| r.contains("RAW_VERBOSE_MARKER_DO_NOT_DUMP")));
+    assert_eq!(digest_audits, 1);
+    let last_msg = msgs.last().unwrap();
+    assert!(last_msg.contains("**[节点 pc-digest"));
+    assert!(last_msg.contains("已提炼节点结论：## 完整日志排查结论"));
+    assert!(last_msg.contains("/api/attachments/att_"));
+    assert!(!last_msg.contains("RAW_VERBOSE_MARKER_DO_NOT_DUMP"));
+
+    // 2. Concise 1-line node output skips auto-digest and posts immediately.
+    let (st, chat2) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node check uptime"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let tid2 = chat2["tasks"][0]["task_id"].as_str().unwrap().to_owned();
+    let poll2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let job2: Value =
+        serde_json::from_slice(&poll2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let lease2 = job2["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev2 = job2["job"]["task_revision"].as_i64().unwrap();
+    let sub2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{tid2}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease2,
+                        "request_id": "sub-short-direct",
+                        "expected_revision": rev2,
+                        "status": "completed",
+                        "content": "uptime: 14 days, load 0.12"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub2.status(), StatusCode::OK);
+
+    let (latest_msg, audits_after): (String, i64) = hub
+        .db
+        .read(|conn| {
+            let msg: String = conn.query_row(
+                "SELECT content FROM messages WHERE user_id='u-alice' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?;
+            let cnt: i64 = conn.query_row(
+                "SELECT count(*) FROM audit_logs WHERE user_id='u-alice' AND action='task_digest'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((msg, cnt))
+        })
+        .await
+        .unwrap();
+    assert!(latest_msg.contains("uptime: 14 days, load 0.12"));
+    assert_eq!(audits_after, 1);
+}

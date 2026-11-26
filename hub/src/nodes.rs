@@ -1571,6 +1571,7 @@ pub async fn submit_result(
         task_thread_id,
         on_complete,
         cb_depth,
+        will_callback,
     ) = hub
         .db
         .write(move |conn| {
@@ -1634,6 +1635,7 @@ pub async fn submit_result(
                     None,
                     String::new(),
                     0,
+                    false,
                 ));
             }
             if cur_status != "running"
@@ -1669,8 +1671,8 @@ pub async fn submit_result(
                 [&tid],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )?;
-            let will_callback =
-                !on_complete.trim().is_empty() && cb_depth < crate::brain::MAX_CALLBACK_DEPTH;
+            let will_callback = cb_depth < crate::brain::MAX_CALLBACK_DEPTH
+                && (!on_complete.trim().is_empty() || crate::brain::should_auto_digest(&content_db));
             tx.execute(
                 "UPDATE tasks SET status = ?2, result = ?3, revision = revision + 1, updated_at = ?4
                  WHERE id = ?1",
@@ -1766,13 +1768,12 @@ pub async fn submit_result(
                 task_thread_id,
                 on_complete,
                 cb_depth,
+                will_callback,
             ))
         })
         .await?;
 
     if !already_submitted {
-        let will_callback =
-            !on_complete.trim().is_empty() && cb_depth < crate::brain::MAX_CALLBACK_DEPTH;
         hub.events.emit(
             user_id.clone(),
             "task",

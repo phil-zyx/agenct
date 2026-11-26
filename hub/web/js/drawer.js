@@ -54,6 +54,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     node_submit: '节点完成',
     dispatch_node: '派发节点',
     task_callback: '自动跟进',
+    task_digest: '提炼结论',
     cron_run: '定时执行',
     update_memory: '更新记忆',
     update_ledger: '更新事项',

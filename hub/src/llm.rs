@@ -55,6 +55,8 @@ pub const VISION_CAPTION_MARKER: &str = "VISION_CAPTION_TASK";
 pub const TOOL_RESULTS_MARKER: &str = "TOOL_RESULTS";
 /// Marker in headless async task callback prompts (also used by the offline stub).
 pub const TASK_CALLBACK_MARKER: &str = "TASK_CALLBACK_EVENT";
+/// Marker in headless automatic node-result distillation prompts (also used by the offline stub).
+pub const TASK_DIGEST_MARKER: &str = "TASK_DIGEST_EVENT";
 /// Stub-only command that simulates an upstream LLM failure (for offline tests).
 const STUB_FAIL_COMMAND: &str = "/stub_fail";
 
@@ -632,6 +634,11 @@ fn stub_turn<F: FnMut(&str)>(
             content: format!("（看到 {images} 张图片）收到你的消息：{trimmed}"),
             tool_calls: Vec::new(),
         }
+    } else if trimmed.starts_with(TASK_DIGEST_MARKER) {
+        LlmTurnResponse {
+            content: stub_digest_reply(trimmed),
+            tool_calls: Vec::new(),
+        }
     } else if trimmed.starts_with(TASK_CALLBACK_MARKER) {
         let mut tool_calls = Vec::new();
         if trimmed.contains("账本") {
@@ -839,6 +846,21 @@ fn extract_user_text_and_images(msg: &Value) -> (String, usize) {
     }
 }
 
+fn stub_digest_reply(trimmed: &str) -> String {
+    let body = trimmed
+        .split_once("【节点执行结果】")
+        .map(|(_, rest)| rest)
+        .or_else(|| trimmed.strip_prefix(TASK_DIGEST_MARKER))
+        .unwrap_or(trimmed);
+    let first_line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let snippet: String = first_line.chars().take(160).collect();
+    format!("已提炼节点结论：{snippet}")
+}
+
 /// Deterministic stub for offline unit/integration tests without hitting external APIs.
 fn stub_reply(system: &str, user_message: &str, images: usize, json_mode: bool) -> String {
     if system.contains(VISION_CAPTION_MARKER) {
@@ -860,6 +882,14 @@ fn stub_reply(system: &str, user_message: &str, images: usize, json_mode: bool) 
     if images > 0 {
         return json!({
             "reply": format!("（看到 {images} 张图片）收到你的消息：{trimmed}"),
+            "tools": []
+        })
+        .to_string();
+    }
+    if trimmed.starts_with(TASK_DIGEST_MARKER) {
+        return json!({
+            "reply": stub_digest_reply(trimmed),
+            "thread_id": Value::Null,
             "tools": []
         })
         .to_string();
