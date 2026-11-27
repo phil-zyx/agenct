@@ -143,7 +143,7 @@ pub async fn delegate_to_peer(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskActionInput {
-    pub action: String, // "assign_node" | "deliver" | "cancel"
+    pub action: String, // "assign_node" | "retry_elevated" | "deliver" | "cancel"
     #[serde(default)]
     pub node_id: Option<String>,
     #[serde(default)]
@@ -192,14 +192,14 @@ pub async fn task_action(
                     let now = now_unix();
                     let next_rev = rev + 1;
                     tx.execute(
-                        "UPDATE tasks SET status='running', revision=?2, updated_at=?3 WHERE id=?1",
+                        "UPDATE tasks SET status='running', blocked_reason='', revision=?2, updated_at=?3 WHERE id=?1",
                         params![tid, next_rev, now],
                     )?;
                     tx.execute(
                         "INSERT INTO node_jobs(task_id, user_id, node_id, agent, task_revision, authorization, status, updated_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, 'manual', 'queued', ?6)
                          ON CONFLICT(task_id) DO UPDATE SET
-                           node_id=excluded.node_id, agent=excluded.agent, task_revision=excluded.task_revision,
+                           node_id=excluded.node_id, agent=excluded.agent, sandbox='', task_revision=excluded.task_revision,
                            authorization='manual', status='queued',
                            lease_hash=NULL, lease_until=NULL, submission_hash=NULL,
                            stage='Queued', updated_at=excluded.updated_at",
@@ -218,6 +218,153 @@ pub async fn task_action(
             Ok(Json(
                 json!({"ok": true, "task_id": task_id, "node_id": node_id}),
             ))
+        }
+        "retry_elevated" => {
+            let wanted_node = input.node_id.clone();
+            let (node_id, node_name, title) = hub
+                .db
+                .write(move |conn| {
+                    let tx = conn.transaction()?;
+                    struct RetryTaskRow {
+                        requester_id: String,
+                        status: String,
+                        revision: i64,
+                        title: String,
+                        instruction: String,
+                        existing_node_id: Option<String>,
+                        existing_agent: String,
+                        existing_role: String,
+                        existing_model: String,
+                        existing_effort: String,
+                    }
+                    let task: Option<RetryTaskRow> = tx
+                        .query_row(
+                            "SELECT t.requester_id, t.status, t.revision, t.title, t.instruction,
+                                    j.node_id, COALESCE(j.agent, ''), COALESCE(j.role, ''),
+                                    COALESCE(j.model, ''), COALESCE(j.effort, '')
+                             FROM tasks t
+                             LEFT JOIN node_jobs j ON j.task_id = t.id
+                             WHERE t.id = ?1 AND t.owner_id = ?2",
+                            params![tid, uid],
+                            |r| {
+                                Ok(RetryTaskRow {
+                                    requester_id: r.get(0)?,
+                                    status: r.get(1)?,
+                                    revision: r.get(2)?,
+                                    title: r.get(3)?,
+                                    instruction: r.get(4)?,
+                                    existing_node_id: r.get(5)?,
+                                    existing_agent: r.get(6)?,
+                                    existing_role: r.get(7)?,
+                                    existing_model: r.get(8)?,
+                                    existing_effort: r.get(9)?,
+                                })
+                            },
+                        )
+                        .optional()?;
+                    let Some(row) = task else {
+                        return Err(denied());
+                    };
+                    if row.requester_id != uid {
+                        return Err(invalid("cross-user delegated tasks cannot be elevated"));
+                    }
+                    if row.status != "failed" {
+                        return Err(invalid("only failed tasks can use elevated retry"));
+                    }
+                    let target_node = wanted_node.as_deref().or(row.existing_node_id.as_deref());
+                    let node = nodes::pick_node_for_task_sync(
+                        &tx,
+                        &uid,
+                        target_node,
+                        false,
+                        Some(&row.instruction),
+                    )?
+                    .ok_or_else(|| invalid("no registered node available"))?;
+                    let supports_elevated = node
+                        .capabilities
+                        .split('|')
+                        .any(|seg| seg.trim().eq_ignore_ascii_case("elevated:1"));
+                    if !supports_elevated {
+                        return Err(invalid(
+                            "目标节点未开启单次放行支持（请在节点启动参数中加入 --allow-elevated）",
+                        ));
+                    }
+                    let agent = if row.existing_agent.trim().is_empty() {
+                        node.default_agent.clone()
+                    } else {
+                        row.existing_agent
+                    };
+                    let now = now_unix();
+                    let next_rev = row.revision + 1;
+                    tx.execute(
+                        "UPDATE tasks
+                         SET status = 'running', blocked_reason = '', revision = ?2, updated_at = ?3
+                         WHERE id = ?1",
+                        params![tid, next_rev, now],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO node_jobs(
+                            task_id, user_id, node_id, agent, role, model, effort, sandbox,
+                            task_revision, authorization, status, updated_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'elevated', ?8, 'manual', 'queued', ?9)
+                         ON CONFLICT(task_id) DO UPDATE SET
+                           node_id = excluded.node_id,
+                           agent = excluded.agent,
+                           role = excluded.role,
+                           model = excluded.model,
+                           effort = excluded.effort,
+                           sandbox = 'elevated',
+                           task_revision = excluded.task_revision,
+                           authorization = 'manual',
+                           status = 'queued',
+                           lease_hash = NULL,
+                           lease_until = NULL,
+                           submission_hash = NULL,
+                           stage = 'Queued (elevated)',
+                           updated_at = excluded.updated_at",
+                        params![
+                            tid,
+                            uid,
+                            node.id,
+                            agent,
+                            row.existing_role,
+                            row.existing_model,
+                            row.existing_effort,
+                            next_rev,
+                            now
+                        ],
+                    )?;
+                    record_audit(
+                        &tx,
+                        &uid,
+                        "task_elevate",
+                        "queued",
+                        &row.title,
+                        &format!("node={} 单次放行重试", node.name),
+                    )?;
+                    tx.commit()?;
+                    Ok((node.id, node.name, row.title))
+                })
+                .await?;
+            hub.node_waiters.notify(&user.id, &node_id);
+            hub.events.emit(
+                user.id,
+                "task",
+                json!({
+                    "task_id": task_id,
+                    "status": "running",
+                    "node_id": node_id,
+                    "elevated": true,
+                    "title": title,
+                    "node_name": node_name,
+                }),
+            );
+            Ok(Json(json!({
+                "ok": true,
+                "task_id": task_id,
+                "node_id": node_id,
+                "sandbox": "elevated",
+            })))
         }
         "deliver" => {
             let body = input
@@ -283,6 +430,8 @@ pub async fn task_action(
                 json!({"ok": true, "task_id": task_id, "status": "done"}),
             ))
         }
-        _ => Err(invalid("action must be assign_node, deliver, or cancel")),
+        _ => Err(invalid(
+            "action must be assign_node, retry_elevated, deliver, or cancel",
+        )),
     }
 }

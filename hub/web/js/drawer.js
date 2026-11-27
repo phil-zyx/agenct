@@ -61,6 +61,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     node_update: '更新节点',
     node_submit: '节点完成',
     dispatch_node: '派发节点',
+    task_elevate: '单次放行',
     task_callback: '自动跟进',
     task_digest: '提炼结论',
     cron_run: '定时执行',
@@ -146,9 +147,13 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     if (info.os) summary.push(osMap[info.os] || info.os);
     const repos = info.repos ? info.repos.split(',').map((s) => s.trim()).filter(Boolean) : [];
     if (repos.length) summary.push(`${repos.length} 个仓库`);
+    const sb = (info.sandbox || '').toLowerCase();
     return {
       summary: summary.join(' · ') || (raw && !raw.includes(':') ? raw : ''),
       repos,
+      sandbox: sb,
+      elevated: info.elevated === '1',
+      codexNet: info.codex_net === '1',
     };
   }
 
@@ -211,6 +216,16 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
                   )
                   .join('')}</div>`
               : '';
+            const sbTag =
+              parsed.sandbox === 'readonly'
+                ? '<span class="engine-tag">仅只读</span>'
+                : parsed.sandbox === 'unsafe-full'
+                  ? '<span class="engine-tag is-warn">全宿主机权限</span>'
+                  : parsed.sandbox
+                    ? '<span class="engine-tag">工作区沙箱</span>'
+                    : '';
+            const elevTag = parsed.elevated ? '<span class="engine-tag">支持单次放行</span>' : '';
+            const sandboxTagsHtml = sbTag || elevTag ? `<div class="engine-tags">${sbTag}${elevTag}</div>` : '';
             const reposHtml = parsed.repos.length
               ? `<details class="node-repos"><summary>已发现仓库 (${parsed.repos.length})</summary><div class="repo-tags">${parsed.repos.map((r) => `<span class="repo-tag">${esc(r)}</span>`).join('')}</div></details>`
               : '';
@@ -222,6 +237,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             </div>
             ${parsed.summary ? `<div class="item-sub">${esc(parsed.summary)}</div>` : ''}
             ${enginesHtml}
+            ${sandboxTagsHtml}
             ${reposHtml}
             <details class="node-repos">
               <summary>配置引擎</summary>
@@ -444,6 +460,11 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       return `<details class="node-repos"><summary>执行记录 (${runs.length})</summary>${rows}</details>`;
     }
 
+    function renderBlockedHtml(t) {
+      if (!t || t.status !== 'failed' || !t.blocked_reason) return '';
+      return `<div class="sandbox-block-note">沙箱受阻：${esc(t.blocked_reason)}</div>`;
+    }
+
     function taskActionsHtml(latest) {
       if (!latest) return [];
       const isOwner = latest.owner_id === uid;
@@ -453,6 +474,9 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         actions.push(
           `<button type="button" class="sm primary" data-assign="${esc(latest.id)}">${latest.status === 'failed' ? '重试' : '派给节点'}</button>`,
         );
+      }
+      if (isOwner && !isCrossUser && latest.status === 'failed' && latest.blocked_reason) {
+        actions.push(`<button type="button" class="sm warn" data-elevate="${esc(latest.id)}">单次放行重试</button>`);
       }
       if (isOwner && isCrossUser && latest.status !== 'done' && latest.status !== 'canceled') {
         actions.push(`<button type="button" class="sm" data-deliver="${esc(latest.id)}">交付结果</button>`);
@@ -526,6 +550,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           </div>
           ${ledgerHtml}
           ${metaHtml}
+          ${renderBlockedHtml(latest)}
           ${previewHtml}
           ${renderTaskProgress(latest)}
           ${detailsHtml}
@@ -595,6 +620,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             <span class="badge ${latest.status === 'done' ? 'ok' : isRunning ? 'warn' : ''}">${esc(stLabel)}</span>
           </div>
           ${metaParts.length ? `<div class="thread-meta">${esc(metaParts.join(' · '))}</div>` : ''}
+          ${renderBlockedHtml(latest)}
           ${preview ? `<div class="item-sub">${esc(preview)}</div>` : ''}
           ${renderTaskProgress(latest)}
           ${renderRunsDetails(runs)}
@@ -693,6 +719,21 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           showToast(err.message);
         }
       };
+    });
+    bodyEl.querySelectorAll('[data-elevate]').forEach((b) => {
+      bindHoldAction(
+        b,
+        async () => {
+          try {
+            await api(`/api/tasks/${b.dataset.elevate}/action`, { method: 'POST', body: { action: 'retry_elevated' } });
+            showToast('已批准单次放行重试');
+            await onRefresh();
+          } catch (err) {
+            showToast(err.message);
+          }
+        },
+        { shortHint: '请长按「单次放行重试」确认仅本次放行' },
+      );
     });
     bodyEl.querySelectorAll('[data-deliver]').forEach((b) => {
       b.onclick = async () => {

@@ -1205,6 +1205,7 @@ struct ClaimedWork {
     model: Option<String>,
     effort: Option<String>,
     sandbox: Option<String>,
+    authorization: String,
     thread_id: Option<String>,
     agent_session_id: Option<String>,
 }
@@ -1241,11 +1242,12 @@ async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Optio
                 model: String,
                 effort: String,
                 sandbox: String,
+                authorization: String,
             }
             let pending: Option<PendingJob> = tx
                 .query_row(
                     "SELECT j.task_id, j.task_revision, t.title, t.instruction, t.thread_id,
-                            j.agent, j.role, j.model, j.effort, j.sandbox
+                            j.agent, j.role, j.model, j.effort, j.sandbox, j.authorization
                      FROM node_jobs j
                      JOIN tasks t ON t.id = j.task_id
                      WHERE j.user_id = ?1 AND j.node_id = ?2
@@ -1264,6 +1266,7 @@ async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Optio
                             model: r.get(7)?,
                             effort: r.get(8)?,
                             sandbox: r.get(9)?,
+                            authorization: r.get(10)?,
                         })
                     },
                 )
@@ -1279,6 +1282,7 @@ async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Optio
                 model: job_model,
                 effort: job_effort,
                 sandbox: job_sandbox,
+                authorization: job_authorization,
             }) = pending
             else {
                 tx.commit()?;
@@ -1350,6 +1354,7 @@ async fn try_claim_work(hub: &Hub, user_id: &str, node_id: &str) -> Result<Optio
                     model: opt_non_empty(job_model),
                     effort: opt_non_empty(job_effort),
                     sandbox: opt_non_empty(job_sandbox),
+                    authorization: job_authorization,
                     thread_id,
                     agent_session_id,
                 }),
@@ -1405,6 +1410,7 @@ pub async fn work(
         model,
         effort,
         sandbox,
+        authorization,
         thread_id,
         agent_session_id,
     }) = claimed
@@ -1444,6 +1450,7 @@ pub async fn work(
             "model": model,
             "effort": effort,
             "sandbox": sandbox,
+            "authorization": authorization,
             "thread_id": thread_id,
             "agent_session_id": agent_session_id,
             "attachments": atts,
@@ -1546,6 +1553,8 @@ pub struct SubmitResultInput {
     agent_session_id: Option<String>,
     #[serde(default)]
     backend: Option<String>,
+    #[serde(default)]
+    blocked_reason: Option<String>,
 }
 
 fn valid_session_id(raw: &str) -> Option<String> {
@@ -1723,6 +1732,18 @@ pub async fn submit_result(
     let agent_sid_db = input.agent_session_id.as_deref().and_then(valid_session_id);
     let submit_backend = input.backend.as_deref().and_then(sanitize_backend_name);
     let submit_backend_db = submit_backend.clone();
+    let blocked_reason = if final_status == "failed" {
+        input
+            .blocked_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| truncate_bytes(s, 240))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let blocked_db = blocked_reason.clone();
     let submit_agent_db = input
         .agent
         .as_deref()
@@ -1843,9 +1864,10 @@ pub async fn submit_result(
             let will_callback = cb_depth < crate::brain::MAX_CALLBACK_DEPTH
                 && (!on_complete.trim().is_empty() || crate::brain::should_auto_digest(&content_db));
             tx.execute(
-                "UPDATE tasks SET status = ?2, result = ?3, revision = revision + 1, updated_at = ?4
+                "UPDATE tasks
+                 SET status = ?2, result = ?3, blocked_reason = ?5, revision = revision + 1, updated_at = ?4
                  WHERE id = ?1",
-                params![tid, final_status, content_db, now],
+                params![tid, final_status, content_db, now, blocked_db],
             )?;
             // Post raw result to chat immediately only when there is no automatic callback;
             // when `on_complete` triggers, keep the raw output in tasks.result / drawer and let
@@ -1947,7 +1969,12 @@ pub async fn submit_result(
         .await?;
 
     if !already_submitted {
-        let mut task_event = json!({"task_id": task_id, "status": final_status, "result": content});
+        let mut task_event = json!({
+            "task_id": task_id,
+            "status": final_status,
+            "result": content,
+            "blocked_reason": blocked_reason,
+        });
         if let Some(ref backend) = submit_backend {
             task_event["backend"] = json!(backend);
         }

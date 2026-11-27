@@ -43,7 +43,7 @@ export function triageTasks(tasks) {
   for (const task of tasks) {
     const confirmation = task.status === 'done' && previewLines(task.result).find((line) => CONFIRMATION.test(line));
     if (task.status === 'failed' || confirmation) {
-      groups.decision.push({ task, preview: cleanPreviewLine(confirmation || task.result) });
+      groups.decision.push({ task, preview: cleanPreviewLine(confirmation || task.blocked_reason || task.result) });
     } else if (task.status === 'done' || task.status === 'canceled') {
       groups.conclusion.push({ task, preview: cleanPreviewLine(task.result) });
     } else {

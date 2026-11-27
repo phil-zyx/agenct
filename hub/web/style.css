@@ -1103,6 +1103,13 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
 .engine-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .engine-tag { padding: 1px 8px; border-radius: 999px; background: var(--soft); color: var(--muted); font-size: 11.5px; }
 .engine-tag.is-default { background: var(--done-soft); color: var(--done); font-weight: 600; }
+.engine-tag.is-warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+.sandbox-block-note {
+  margin-top: 6px; padding: 6px 9px; border-radius: 8px;
+  background: var(--warn-soft); color: var(--warn); font-size: 12px; line-height: 1.45;
+  word-break: break-word; overflow-wrap: anywhere;
+}
+button.warn { background: var(--warn-soft); color: var(--warn); border-color: color-mix(in srgb, var(--warn) 35%, var(--line)); }
 .engine-checks { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 8px; }
 .engine-check { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text); cursor: pointer; }
 .engine-installed { color: var(--done); font-size: 10.5px; }
@@ -1141,7 +1148,7 @@ label.toggle input[type="checkbox"]:focus-visible { outline: 2px solid var(--bra
 .engine-pill-btn[aria-expanded="true"] .engine-pill-caret { transform: rotate(180deg); color: var(--brand); }
 .engine-menu {
   position: absolute; bottom: calc(100% + 10px); left: 0; z-index: 25;
-  min-width: 176px; padding: 6px; display: flex; flex-direction: column; gap: 2px;
+  min-width: 240px; padding: 6px; display: flex; flex-direction: column; gap: 2px;
   background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);
   transform-origin: bottom left;
 }
@@ -1152,13 +1159,15 @@ label.toggle input[type="checkbox"]:focus-visible { outline: 2px solid var(--bra
   font-size: 11.5px; font-weight: 600; color: var(--muted);
 }
 .engine-menu-opt {
-  display: flex; align-items: center; justify-content: space-between; width: 100%;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;
   padding: 7px 10px; border: none; border-radius: 9px; background: transparent;
   color: var(--text); font-size: 13px; font-weight: 500;
 }
 .engine-menu-opt:hover { background: var(--soft); }
 .engine-menu-opt.on { background: var(--brand-soft); color: var(--brand); font-weight: 600; }
-.engine-menu-check { font-size: 12px; }
+.engine-menu-opt-meta { display: inline-flex; align-items: center; gap: 6px; flex: none; }
+.engine-menu-scope { font-size: 11px; font-weight: 500; color: var(--muted); }
+.engine-menu-check { font-size: 12px; width: 12px; text-align: center; }
 
 /* Hold-to-confirm destructive action button */
 .hold-btn { position: relative; overflow: hidden; user-select: none; -webkit-user-select: none; touch-action: none; }

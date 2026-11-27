@@ -694,6 +694,27 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
   }
 
+  function parseNodeCaps(raw) {
+    const info = {};
+    for (const part of String(raw || '').split('|')) {
+      const idx = part.indexOf(':');
+      if (idx <= 0) continue;
+      info[part.slice(0, idx).trim().toLowerCase()] = part.slice(idx + 1).trim().toLowerCase();
+    }
+    return info;
+  }
+
+  function engineScopeLabel(ag, caps) {
+    const sb = caps.sandbox || 'workspace-write';
+    if (sb === 'readonly') return '仅只读';
+    if (sb === 'unsafe-full') return '全宿主机权限';
+    if (ag === 'codex') return caps.codex_net === '1' ? 'OS沙箱·可联网' : 'OS沙箱·断网';
+    if (ag === 'agy') return '工作区终端沙箱';
+    if (ag === 'claude') return '工作区工具白名单';
+    if (ag === 'opencode') return '仅目录拦截·bash无沙箱';
+    return '工作区沙箱';
+  }
+
   function renderEnginePill() {
     if (!engineWrap || !engineBtn || !engineLabel || !engineMenu) return;
     const node = primaryNode();
@@ -704,6 +725,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
     engineWrap.classList.remove('hide');
     engineWrap.classList.toggle('is-online', Boolean(node.online));
+    const caps = parseNodeCaps(node.capabilities);
     const curDefault = node.effective_default_agent || node.default_agent || 'auto';
     engineLabel.innerHTML = `<span class="engine-node-name">${esc(node.name)} · </span><span>${esc(curDefault)}</span>`;
 
@@ -726,7 +748,8 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       ${candidates
         .map((ag) => {
           const active = ag === (node.default_agent || curDefault);
-          return `<button type="button" class="engine-menu-opt${active ? ' on' : ''}" role="menuitemradio" aria-checked="${active ? 'true' : 'false'}" data-pick-engine="${esc(ag)}"><span>${esc(ag)}</span><span class="engine-menu-check">${active ? '✓' : ''}</span></button>`;
+          const scope = engineScopeLabel(ag, caps);
+          return `<button type="button" class="engine-menu-opt${active ? ' on' : ''}" role="menuitemradio" aria-checked="${active ? 'true' : 'false'}" data-pick-engine="${esc(ag)}"><span>${esc(ag)}</span><span class="engine-menu-opt-meta"><span class="engine-menu-scope">${esc(scope)}</span><span class="engine-menu-check">${active ? '✓' : ''}</span></span></button>`;
         })
         .join('')}`;
 

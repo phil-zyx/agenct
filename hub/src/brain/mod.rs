@@ -182,7 +182,7 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
 
             let mut task_stmt = conn.prepare(
                 "SELECT t.id, t.requester_id, t.owner_id, t.thread_id, t.title, t.instruction, t.status,
-                        t.result, t.revision, t.updated_at,
+                        t.result, t.blocked_reason, t.revision, t.updated_at,
                         j.node_id, j.status, j.stage, j.log_tail, j.role, j.agent, j.model
                  FROM tasks t
                  LEFT JOIN node_jobs j ON j.task_id = t.id
@@ -200,15 +200,16 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                         "instruction": r.get::<_, String>(5)?,
                         "status": r.get::<_, String>(6)?,
                         "result": r.get::<_, Option<String>>(7)?,
-                        "revision": r.get::<_, i64>(8)?,
-                        "updated_at": r.get::<_, i64>(9)?,
-                        "node_id": r.get::<_, Option<String>>(10)?,
-                        "job_status": r.get::<_, Option<String>>(11)?,
-                        "stage": r.get::<_, Option<String>>(12)?,
-                        "log_tail": r.get::<_, Option<String>>(13)?,
-                        "role": r.get::<_, Option<String>>(14)?,
-                        "agent": r.get::<_, Option<String>>(15)?,
-                        "model": r.get::<_, Option<String>>(16)?,
+                        "blocked_reason": r.get::<_, String>(8)?,
+                        "revision": r.get::<_, i64>(9)?,
+                        "updated_at": r.get::<_, i64>(10)?,
+                        "node_id": r.get::<_, Option<String>>(11)?,
+                        "job_status": r.get::<_, Option<String>>(12)?,
+                        "stage": r.get::<_, Option<String>>(13)?,
+                        "log_tail": r.get::<_, Option<String>>(14)?,
+                        "role": r.get::<_, Option<String>>(15)?,
+                        "agent": r.get::<_, Option<String>>(16)?,
+                        "model": r.get::<_, Option<String>>(17)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;

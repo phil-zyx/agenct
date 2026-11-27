@@ -49,6 +49,7 @@ DEFAULT_NODE_TIMEOUT = 3600
 NODE_TIMEOUT_ENV = "AGENCT_NODE_TIMEOUT"
 DEFAULT_IDLE_TIMEOUT = 300
 NODE_IDLE_TIMEOUT_ENV = "AGENCT_NODE_IDLE_TIMEOUT"
+NODE_ALLOW_ELEVATED_ENV = "AGENCT_ALLOW_ELEVATED"
 IDLE_WARN_SECS = 60
 MAX_EVIDENCE_BYTES = 5 * 1024 * 1024
 MAX_EVIDENCE_COUNT = 4
@@ -405,6 +406,36 @@ def detect_cli_stream_error(agent: str, raw: str, raw_err: str = "") -> bool:
     return False
 
 
+_SANDBOX_BLOCK_PATTERNS = (
+    re.compile(r"^\s*!\s*(permission requested:.*auto-rejecting.*)$", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"(Action denied(?:\s+in\s+headless\s+mode)?\s*:[^\r\n]+)", re.IGNORECASE),
+    re.compile(r"(Sandbox blocked[^\r\n]+)", re.IGNORECASE),
+    re.compile(r"(Read-only file system[^\r\n]*|Operation not permitted[^\r\n]*|Permission denied[^\r\n]*)", re.IGNORECASE),
+    re.compile(r"([^\r\n]*(?:network_access|outside the workspace|sandbox restriction)[^\r\n]*)", re.IGNORECASE),
+)
+
+
+def detect_sandbox_block(agent: str, raw_out: str, raw_err: str = "", text: str = "") -> str:
+    """Return a concise 1-line sandbox/permission block reason when a job failed due to isolation."""
+    haystacks = (
+        strip_ansi(raw_err),
+        text,
+        strip_ansi(raw_out),
+    )
+    for hay in haystacks:
+        if not hay:
+            continue
+        for pat in _SANDBOX_BLOCK_PATTERNS:
+            m = pat.search(hay)
+            if m:
+                msg = m.group(1).strip().lstrip("! ").strip()
+                if msg:
+                    return msg[:160]
+        if agent == "opencode" and "rule which prevents you from using this specific tool call" in hay:
+            return "OpenCode tool permission blocked directory or command access"
+    return ""
+
+
 def _summarize_opencode_event(ev: dict) -> str:
     ev_type = ev.get("type")
     if ev_type == "tool_use":
@@ -688,6 +719,10 @@ def build_env_header(
     agent: str,
     workdir: str,
     agents: list[str] | None = None,
+    *,
+    sandbox: str = "workspace-write",
+    allow_elevated: bool = False,
+    codex_tmux: bool = False,
 ) -> str:
     host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())[:48]
     os_name = platform.system().lower()
@@ -711,10 +746,17 @@ def build_env_header(
             agent_labels.append(lbl)
     if default_label and default_label not in agent_labels:
         agent_labels.insert(0, default_label)
+    sb_clean = sandbox if sandbox in _SANDBOX_RANK else "workspace-write"
+    extra_flags = []
+    if allow_elevated:
+        extra_flags.append("elevated:1")
+    if codex_tmux and sb_clean == "workspace-write":
+        extra_flags.append("codex_net:1")
+    flag_part = f" | {' | '.join(extra_flags)}" if extra_flags else ""
     repo_part = f" | repos:{','.join(repos)}" if repos else ""
     summary = (
         f"kind:{kind} | os:{os_name} | host:{host} | agent:{default_label}"
-        f" | agents:{','.join(agent_labels)}{repo_part}"
+        f" | agents:{','.join(agent_labels)} | sandbox:{sb_clean}{flag_part}{repo_part}"
     )
     return summary[:560]
 
@@ -2171,6 +2213,15 @@ def tighten_sandbox(node_sandbox: str, requested: object) -> str:
     return req if _SANDBOX_RANK[req] < _SANDBOX_RANK[base] else base
 
 
+def resolve_job_sandbox(node_sandbox: str, job: dict, *, allow_elevated: bool = False) -> str:
+    """Resolve effective sandbox: downward-only unless host opted in AND manual retry requested elevated."""
+    req = str(job.get("sandbox") or "").strip().lower()
+    auth = str(job.get("authorization") or "").strip().lower()
+    if allow_elevated and req == "elevated" and auth == "manual":
+        return "unsafe-full"
+    return tighten_sandbox(node_sandbox, job.get("sandbox"))
+
+
 class CliAdapter:
     """Explicit headless contract that every supported CLI engine must satisfy."""
 
@@ -2446,8 +2497,9 @@ def execute_job(
     idle_timeout: int = DEFAULT_IDLE_TIMEOUT,
     codex_tmux: bool = False,
     exec_backend: str | ExecBackend = "auto",
+    allow_elevated: bool = False,
 ) -> tuple[str, str, list[dict]]:
-    eff_sandbox = tighten_sandbox(sandbox, job.get("sandbox"))
+    eff_sandbox = resolve_job_sandbox(sandbox, job, allow_elevated=allow_elevated)
     eff_codex_tmux = bool(codex_tmux) and eff_sandbox == "workspace-write"
     resolved_backend = (
         exec_backend if isinstance(exec_backend, ExecBackend) else resolve_exec_backend(exec_backend)
@@ -2594,6 +2646,10 @@ def execute_job(
                 text = file_text or out_text or strip_ansi(raw_err).strip()
                 stream_err = detect_cli_stream_error(agent, raw_out, raw_err)
                 status = "completed" if rc == 0 and not stream_err and text else "failed"
+                if status == "failed" and meta_out is not None:
+                    blocked = detect_sandbox_block(agent, raw_out, raw_err, text)
+                    if blocked:
+                        meta_out["blocked_reason"] = blocked
                 return status, truncate_utf8(text or f"{agent} exited with code {rc}"), collect_evidence(evidence_dir)
             finally:
                 if ro_cwd:
@@ -2686,6 +2742,7 @@ def run_node_loop(args: argparse.Namespace) -> int:
         print(f"Error: workdir does not exist: {workdir}", file=sys.stderr)
         return 2
     sandbox = "unsafe-full" if args.unsafe_full_access else args.sandbox
+    allow_elevated = bool(getattr(args, "allow_elevated", False))
     codex_tmux = bool(args.codex_tmux and sandbox == "workspace-write")
     if args.codex_tmux and not codex_tmux:
         print(
@@ -2700,11 +2757,20 @@ def run_node_loop(args: argparse.Namespace) -> int:
     state_dir = os.path.abspath(args.state_dir or os.path.join(os.path.expanduser("~"), ".agenct"))
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     journal = ExecutionJournal(state_dir)
-    env_header = build_env_header(args.kind, agent, workdir, allowed_agents)
+    env_header = build_env_header(
+        args.kind,
+        agent,
+        workdir,
+        allowed_agents,
+        sandbox=sandbox,
+        allow_elevated=allow_elevated,
+        codex_tmux=codex_tmux,
+    )
     agents_disp = ",".join("custom" if a.startswith("custom:") else a for a in allowed_agents)
+    elev_note = " elevated=1" if allow_elevated else ""
     print(
         f"[agenct-node] hub={hub} kind={args.kind} agent={agent} agents={agents_disp} "
-        f"sandbox={sandbox} exec_backend={exec_backend_spec}({initial_backend.name}) "
+        f"sandbox={sandbox}{elev_note} exec_backend={exec_backend_spec}({initial_backend.name}) "
         f"idle_timeout={args.idle_timeout}s workdir={workdir}",
         flush=True,
     )
@@ -2824,7 +2890,7 @@ def run_node_loop(args: argparse.Namespace) -> int:
                 status, content, attachments = execute_job(
                     chosen_agent, job, workdir, sandbox, args.timeout, cancel_event, on_progress,
                     meta_out=meta_out, idle_timeout=args.idle_timeout, codex_tmux=codex_tmux,
-                    exec_backend=exec_backend_spec,
+                    exec_backend=exec_backend_spec, allow_elevated=allow_elevated,
                 )
             finally:
                 stop_heartbeat.set()
@@ -2845,6 +2911,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
             payload["agent_session_id"] = meta_out["agent_session_id"]
         if meta_out.get("backend"):
             payload["backend"] = meta_out["backend"]
+        if meta_out.get("blocked_reason"):
+            payload["blocked_reason"] = meta_out["blocked_reason"]
         journal.write(
             task_id,
             rev,
@@ -2996,6 +3064,10 @@ def non_negative_timeout(value: str) -> int:
     raise argparse.ArgumentTypeError("expected a non-negative integer number of seconds")
 
 
+def _env_flag(name: str) -> bool:
+    return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Unified Agenct Node (PC or Cloud Runner)")
     p.add_argument("--hub", default="", help="Agenct Hub origin URL (e.g. https://agenct.example.com)")
@@ -3011,6 +3083,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--workdir", default="", help="Working directory for agent execution")
     p.add_argument("--sandbox", choices=("readonly", "workspace-write"), default="workspace-write")
     p.add_argument("--unsafe-full-access", action="store_true", help="Explicitly opt into full host access")
+    p.add_argument(
+        "--allow-elevated",
+        action="store_true",
+        default=_env_flag(NODE_ALLOW_ELEVATED_ENV),
+        help="Opt in to manual one-shot elevated retries (Hub retry_elevated only)",
+    )
     p.add_argument(
         "--codex-tmux",
         action="store_true",

@@ -4528,3 +4528,260 @@ async fn cron_and_ephemeral_dispatch_do_not_create_noise_threads() {
     assert_eq!(cron_thr_msgs, 0);
     assert_eq!(total_tasks, 2);
 }
+
+#[tokio::test]
+async fn sandbox_blocked_task_and_one_shot_manual_elevation_enforce_boundaries() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (alice_c, alice_csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let (bob_c, bob_csrf) = seed_user(&hub, "u-bob", "bob", "Bob", false).await;
+    let router = app(hub.clone());
+
+    let (st, created) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"name": "pc-sb", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_token = created["token"].as_str().unwrap().to_owned();
+
+    // 1. LLM cannot self-escalate via sandbox="elevated".
+    let (st, bad_sb) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": "/node --sandbox elevated 尝试自我提权"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(bad_sb["tasks"].as_array().unwrap().is_empty());
+
+    // 2. Dispatch a normal task; node polls WITHOUT elevated:1 advertised.
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": "/node --agent opencode 查进程快照"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let task_id = chat["tasks"][0]["task_id"].as_str().unwrap().to_owned();
+
+    let work1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(
+                    "x-agenct-node-env",
+                    "kind:pc | os:linux | host:lab | agent:opencode | agents:opencode | sandbox:workspace-write",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(work1.status(), StatusCode::OK);
+    let w1: Value =
+        serde_json::from_slice(&work1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(w1["job"]["authorization"], "manual");
+    let lease1 = w1["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev1 = w1["job"]["task_revision"].as_i64().unwrap();
+
+    // Submit failure with blocked_reason -> persisted on task and exposed via /api/bootstrap.
+    let sub1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{task_id}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease1,
+                        "request_id": "sub-blk-1",
+                        "expected_revision": rev1,
+                        "status": "failed",
+                        "content": "! permission requested: external_directory (/proc/*); auto-rejecting",
+                        "agent": "opencode",
+                        "blocked_reason": "permission requested: external_directory (/proc/*); auto-rejecting"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub1.status(), StatusCode::OK);
+
+    let (st, boot) = req_json(&router, "GET", "/api/bootstrap", Some(&alice_c), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let tv = boot["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == task_id)
+        .unwrap();
+    assert_eq!(
+        tv["blocked_reason"],
+        "permission requested: external_directory (/proc/*); auto-rejecting"
+    );
+
+    // 3. retry_elevated fails while node does not advertise elevated:1.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        &format!("/api/tasks/{task_id}/action"),
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"action": "retry_elevated"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // Node heartbeats with elevated:1; retry_elevated succeeds once and clears blocked_reason.
+    let work_poll_elev = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(
+                    "x-agenct-node-env",
+                    "kind:pc | os:linux | host:lab | agent:opencode | agents:opencode | sandbox:workspace-write | elevated:1",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(work_poll_elev.status(), StatusCode::OK);
+
+    // Cross-user cannot elevate Alice's task.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        &format!("/api/tasks/{task_id}/action"),
+        Some(&bob_c),
+        Some(&bob_csrf),
+        Some(json!({"action": "retry_elevated"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+
+    let (st, elev_res) = req_json(
+        &router,
+        "POST",
+        &format!("/api/tasks/{task_id}/action"),
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"action": "retry_elevated"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{elev_res}");
+    assert_eq!(elev_res["sandbox"], "elevated");
+
+    let work2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(work2.status(), StatusCode::OK);
+    let w2: Value =
+        serde_json::from_slice(&work2.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(w2["job"]["sandbox"], "elevated");
+    assert_eq!(w2["job"]["authorization"], "manual");
+    let lease2 = w2["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev2 = w2["job"]["task_revision"].as_i64().unwrap();
+
+    // Submit failure again, then normal assign_node must reset sandbox back to normal (None).
+    let sub2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{task_id}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease2,
+                        "request_id": "sub-blk-2",
+                        "expected_revision": rev2,
+                        "status": "failed",
+                        "content": "still failed"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub2.status(), StatusCode::OK);
+
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        &format!("/api/tasks/{task_id}/action"),
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"action": "assign_node"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let work3 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let w3: Value =
+        serde_json::from_slice(&work3.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(w3["job"]["sandbox"].is_null());
+
+    let elev_audits: i64 = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM audit_logs WHERE action = 'task_elevate' AND user_id = 'u-alice'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(elev_audits, 1);
+}

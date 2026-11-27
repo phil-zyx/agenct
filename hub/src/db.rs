@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
@@ -109,6 +109,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     instruction TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('pending','running','done','failed','canceled')),
     result TEXT,
+    blocked_reason TEXT NOT NULL DEFAULT '',
     revision INTEGER NOT NULL DEFAULT 0,
     on_complete TEXT NOT NULL DEFAULT '',
     callback_depth INTEGER NOT NULL DEFAULT 0,
@@ -410,6 +411,19 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
             if !has_ledger_id {
                 tx.execute(
                     "ALTER TABLE threads ADD COLUMN ledger_id TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+        }
+        if current_version <= 13 && table_exists("tasks")? {
+            let has_blocked_reason: bool = tx
+                .prepare("PRAGMA table_info(tasks)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .any(|col| col == "blocked_reason");
+            if !has_blocked_reason {
+                tx.execute(
+                    "ALTER TABLE tasks ADD COLUMN blocked_reason TEXT NOT NULL DEFAULT ''",
                     [],
                 )?;
             }

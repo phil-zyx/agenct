@@ -1318,6 +1318,75 @@ class TestUnifiedNode(unittest.TestCase):
                 self.assertEqual(submitted_payloads[0].get("backend"), expected_backend)
                 self.assertEqual(submitted_payloads[0].get("status"), "completed")
 
+    def test_resolve_job_sandbox_only_elevates_manual_when_opted_in(self) -> None:
+        self.assertEqual(
+            node.resolve_job_sandbox("workspace-write", {"sandbox": "elevated", "authorization": "manual"}, allow_elevated=False),
+            "workspace-write",
+        )
+        self.assertEqual(
+            node.resolve_job_sandbox("workspace-write", {"sandbox": "elevated", "authorization": "cron"}, allow_elevated=True),
+            "workspace-write",
+        )
+        self.assertEqual(
+            node.resolve_job_sandbox("workspace-write", {"sandbox": "elevated", "authorization": "delegation"}, allow_elevated=True),
+            "workspace-write",
+        )
+        self.assertEqual(
+            node.resolve_job_sandbox("workspace-write", {"sandbox": "elevated", "authorization": "manual"}, allow_elevated=True),
+            "unsafe-full",
+        )
+        self.assertEqual(
+            node.resolve_job_sandbox("workspace-write", {"sandbox": "readonly", "authorization": "manual"}, allow_elevated=True),
+            "readonly",
+        )
+
+    def test_detect_sandbox_block_extracts_reasons_and_populates_meta_out(self) -> None:
+        oc_err = "! permission requested: external_directory (/proc/*); auto-rejecting\n"
+        self.assertIn(
+            "external_directory (/proc/*)",
+            node.detect_sandbox_block("opencode", '{"type":"step_start"}\n', oc_err),
+        )
+        self.assertIn(
+            "Action denied in headless mode: Bash",
+            node.detect_sandbox_block("claude", "", "", "Partial\nAction denied in headless mode: Bash"),
+        )
+        self.assertEqual(node.detect_sandbox_block("codex", "All good", "", "Done"), "")
+
+        with tempfile.TemporaryDirectory() as workdir:
+            meta: dict = {}
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/opencode"),
+                mock.patch.object(
+                    node,
+                    "run_monitored",
+                    return_value=(1, b"", oc_err.encode("utf-8"), False),
+                ),
+            ):
+                st, _, _ = node.execute_job(
+                    "opencode",
+                    {"task_id": "tsk_blk", "title": "Check", "instruction": "Inspect /proc"},
+                    workdir,
+                    "workspace-write",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                    meta_out=meta,
+                )
+            self.assertEqual(st, "failed")
+            self.assertIn("external_directory (/proc/*)", meta.get("blocked_reason", ""))
+
+    def test_build_env_header_includes_sandbox_and_elevated_flags(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "repo-a", ".git"))
+            hdr = node.build_env_header(
+                "pc", "codex", tmp, ["codex", "agy"],
+                sandbox="workspace-write", allow_elevated=True, codex_tmux=True,
+            )
+            self.assertIn("sandbox:workspace-write", hdr)
+            self.assertIn("elevated:1", hdr)
+            self.assertIn("codex_net:1", hdr)
+            self.assertLess(hdr.index("sandbox:"), hdr.index("repos:"))
+
 
 if __name__ == "__main__":
     unittest.main()
