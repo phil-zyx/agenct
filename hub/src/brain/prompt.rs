@@ -151,7 +151,7 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
                     "agent": {"type": "string", "enum": ["claude", "codex", "agy", "opencode", "ollama", "openai", "template"], "description": "可选：指定或覆盖执行引擎"},
                     "model": {"type": "string", "description": "可选：临时指定或覆盖模型名"},
                     "effort": {"type": "string", "enum": ["", "minimal", "low", "medium", "high", "xhigh", "max"], "description": "可选：临时指定或覆盖推理强度"},
-                    "sandbox": {"type": "string", "enum": ["", "readonly", "workspace-write"], "description": "可选：临时收紧沙箱（如 readonly）"},
+                    "sandbox": {"type": "string", "enum": ["", "readonly", "workspace-write"], "description": "可选：临时收紧沙箱（纯代码/git 只读核查可用 readonly；需改文件、跑构建/测试或 git commit 时留空保持 workspace-write）"},
                     "prefer_cloud": {"type": "boolean", "description": "本机代码/git/tmux 设 false；通用云端任务设 true"},
                     "title": {"type": "string", "description": "本次具体执行任务的简短标题"},
                     "instruction": {"type": "string", "description": "补全上下文指代后的自包含执行指令"},
@@ -470,6 +470,7 @@ pub(super) fn build_system_prompt(
 - 节点默认引擎或启用白名单通过对话直接修改：当用户要求把某个节点的默认引擎切成指定引擎（如「把 homelab 默认切成 agy / opencode」）或调整启用引擎时，当轮必须调用 `manage_node` 落库生效，不要只写进 `MEMORY.md`。
 - 派发任务时优先用 `dispatch_node(role=...)`；如果用户临时说「这次换某个模型/只读看看」，通过 `model`/`effort`/`sandbox` 单次覆盖即可，不必改动原角色。
 - **Plan → Execute 默认先审再做**：用户让 `planner` 做规划/排查时，先让其只读出方案并回传给用户；**不要未经用户确认就自动触发 `executor` 改代码**。仅当用户明确要求「规划完直接自动执行 / 一条龙」时，才在 `dispatch_node` 中挂载 `on_complete` 自动衔接后续角色。
+- **沙箱选用**：外层已开启 OS 隔离（`bwrap`/`seatbelt`）的节点在 `sandbox="readonly"` 下可自由执行只读巡检命令并由内核阻止写操作；需要改代码、跑测试、构建或 `git commit` 时保持默认 `workspace-write`。`~/.ssh` 等敏感密钥目录默认隔离不可见；若任务因沙箱或权限受阻失败并带 `blocked_reason`，直接告知用户受阻原因，并提示可回复 `/approve <审批码>` 或在右侧抽屉长按「单次放行重试」确认放行。
 
 === 当前人设风格 (SOUL) ===
 {soul}

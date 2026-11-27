@@ -932,6 +932,19 @@ struct TurnSnapshot {
     user_msg_id: i64,
 }
 
+fn parse_approve_command(message: &str) -> Option<String> {
+    let (prefix, rest) = message.trim().split_once(char::is_whitespace)?;
+    if !prefix.eq_ignore_ascii_case("/approve") && prefix != "放行" {
+        return None;
+    }
+    let code = rest.trim();
+    if code.len() == 6 && code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        Some(code.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
 /// Unified single-brain turn execution used by both Web UI and inbound IM webhook.
 ///
 /// Lifecycle of the user message: inserted as `pending` → `complete` together with the
@@ -968,6 +981,43 @@ pub async fn run_turn(
     let user_msg_id = snapshot.user_msg_id;
     hub.events
         .emit(user_id.to_owned(), "message", json!({"pending": true}));
+
+    if let Some(code) = parse_approve_command(message) {
+        match crate::collab::consume_approval_code(hub, user_id, &code).await {
+            Ok(outcome) => {
+                let reply = format!(
+                    "已授权单次放行重试「{}」，已重新派发到节点 {}（仅本次生效）。",
+                    outcome.title, outcome.node_name
+                );
+                let tid = outcome
+                    .thread_id
+                    .or_else(|| pinned_thread_id.map(str::to_owned));
+                match persist_turn(hub, user_id, message, user_msg_id, tid, &reply, "").await {
+                    Ok(final_reply) => {
+                        return Ok(json!({
+                            "reply": final_reply,
+                            "approved_task_id": outcome.task_id,
+                        }))
+                    }
+                    Err(err) => {
+                        mark_turn_failed(hub, user_id, user_msg_id).await;
+                        return Err(err);
+                    }
+                }
+            }
+            Err(err) => {
+                let reply = format!("单次放行未生效：{}。", err.1);
+                let tid = pinned_thread_id.map(str::to_owned);
+                match persist_turn(hub, user_id, message, user_msg_id, tid, &reply, "").await {
+                    Ok(final_reply) => return Ok(json!({"reply": final_reply})),
+                    Err(p_err) => {
+                        mark_turn_failed(hub, user_id, user_msg_id).await;
+                        return Err(p_err);
+                    }
+                }
+            }
+        }
+    }
 
     match drive_turn(hub, user_id, message, snapshot, pinned_thread_id).await {
         Ok(out) => Ok(out),
@@ -1394,6 +1444,7 @@ pub async fn run_task_callback(
     on_complete: String,
     task_thread_id: Option<String>,
     callback_depth: i64,
+    approval_footer: Option<String>,
 ) {
     let next_depth = callback_depth + 1;
     if next_depth > MAX_CALLBACK_DEPTH {
@@ -1499,7 +1550,13 @@ pub async fn run_task_callback(
 
     match agent_loop(&hub, &user_id, &instruction, &snap, &mode).await {
         Ok(out) => {
-            let merged_reply = append_missing_attachments(out.reply.trim(), &result_content);
+            let mut merged_reply = append_missing_attachments(out.reply.trim(), &result_content);
+            if let Some(ref footer) = approval_footer {
+                if !merged_reply.is_empty() {
+                    merged_reply.push_str("\n\n");
+                }
+                merged_reply.push_str(footer);
+            }
             let reply = truncate_bytes(&merged_reply, 16_000);
             let msg = format!("{msg_header}\n\n{reply}");
             let thread_db = out.thread_id.or(task_thread_id);
@@ -1526,17 +1583,32 @@ pub async fn run_task_callback(
                 "message",
                 json!({"task_id": task_id, "callback": true}),
             );
-            crate::integrations::im::maybe_notify(&hub, &user_id, "delivery", &im_title, &reply)
-                .await;
+            let im_notify_title = if task_status == "failed" {
+                format!("任务受阻：{task_title}")
+            } else {
+                im_title
+            };
+            crate::integrations::im::maybe_notify(
+                &hub,
+                &user_id,
+                "delivery",
+                &im_notify_title,
+                &reply,
+            )
+            .await;
         }
         Err(err) => {
             let uid_db = user_id.clone();
             let title_db = task_title.clone();
             let detail = err.1.to_owned();
-            let fallback_body = format!(
-                "**[节点 {node_name} · {task_title}]**\n\n{}",
-                truncate_bytes(result_content.trim(), 15_000)
-            );
+            let mut raw_body = truncate_bytes(result_content.trim(), 15_000);
+            if let Some(ref footer) = approval_footer {
+                if !raw_body.is_empty() {
+                    raw_body.push_str("\n\n");
+                }
+                raw_body.push_str(footer);
+            }
+            let fallback_body = format!("**[节点 {node_name} · {task_title}]**\n\n{raw_body}");
             let thread_db = task_thread_id.clone();
             let _ = hub
                 .db
@@ -1563,12 +1635,21 @@ pub async fn run_task_callback(
                 "message",
                 json!({"task_id": task_id, "callback_failed": true}),
             );
+            let im_notify_title = if task_status == "failed" {
+                format!("任务受阻：{task_title}")
+            } else {
+                format!("任务完成：{task_title}")
+            };
+            let im_body = match approval_footer {
+                Some(ref footer) => format!("{result_content}\n\n{footer}"),
+                None => result_content,
+            };
             crate::integrations::im::maybe_notify(
                 &hub,
                 &user_id,
                 "delivery",
-                &format!("任务完成：{task_title}"),
-                &result_content,
+                &im_notify_title,
+                &im_body,
             )
             .await;
         }

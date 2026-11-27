@@ -1762,6 +1762,7 @@ pub async fn submit_result(
         on_complete,
         cb_depth,
         will_callback,
+        approval_footer,
     ) = hub
         .db
         .write(move |conn| {
@@ -1826,6 +1827,7 @@ pub async fn submit_result(
                     String::new(),
                     0,
                     false,
+                    None,
                 ));
             }
             if cur_status != "running"
@@ -1850,17 +1852,59 @@ pub async fn submit_result(
                  WHERE task_id = ?1",
                 params![tid, job_status, submission_hash, final_status, now],
             )?;
-            let (title, req_id, task_thread_id, on_complete, cb_depth): (
-                String,
-                String,
-                Option<String>,
-                String,
-                i64,
-            ) = tx.query_row(
-                "SELECT title, requester_id, thread_id, on_complete, callback_depth FROM tasks WHERE id = ?1",
-                [&tid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )?;
+            let (
+                title,
+                req_id,
+                task_thread_id,
+                on_complete,
+                cb_depth,
+                approval_footer,
+            ): (String, String, Option<String>, String, i64, Option<String>) = {
+                let (title, req_id, task_thread_id, on_complete, cb_depth): (
+                    String,
+                    String,
+                    Option<String>,
+                    String,
+                    i64,
+                ) = tx.query_row(
+                    "SELECT title, requester_id, thread_id, on_complete, callback_depth FROM tasks WHERE id = ?1",
+                    [&tid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )?;
+                let mut approval_footer = None;
+                if final_status == "failed" && !blocked_db.is_empty() && req_id == uid {
+                    let node_caps: Option<String> = tx
+                        .query_row(
+                            "SELECT capabilities FROM nodes WHERE user_id = ?1 AND id = ?2",
+                            params![uid, nid],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    let supports_elevated = node_caps.as_deref().is_some_and(|caps| {
+                        caps.split('|')
+                            .any(|seg| seg.trim().eq_ignore_ascii_case("elevated:1"))
+                    });
+                    if supports_elevated {
+                        let code = crate::auth::random_token()[..6].to_ascii_uppercase();
+                        let code_hash = crate::collab::approval_code_hash(&uid, &code);
+                        let expires_at = now + crate::collab::ELEVATE_APPROVAL_TTL_SECS;
+                        tx.execute(
+                            "INSERT INTO elevate_approvals(task_id, user_id, code_hash, expires_at, used_at, created_at)
+                             VALUES (?1, ?2, ?3, ?4, NULL, ?5)
+                             ON CONFLICT(task_id) DO UPDATE SET
+                               code_hash = excluded.code_hash,
+                               expires_at = excluded.expires_at,
+                               used_at = NULL,
+                               created_at = excluded.created_at",
+                            params![tid, uid, code_hash, expires_at, now],
+                        )?;
+                        approval_footer = Some(format!(
+                            "> 沙箱受阻（{blocked_db}）。如需仅本次放行重试，请回复 `/approve {code}`（10 分钟内有效）或在右侧抽屉长按「单次放行重试」。"
+                        ));
+                    }
+                }
+                (title, req_id, task_thread_id, on_complete, cb_depth, approval_footer)
+            };
             let will_callback = cb_depth < crate::brain::MAX_CALLBACK_DEPTH
                 && (!on_complete.trim().is_empty() || crate::brain::should_auto_digest(&content_db));
             tx.execute(
@@ -1888,11 +1932,15 @@ pub async fn submit_result(
                 format!("{node_name_db} ({})", label_parts.join(" / "))
             };
             if !will_callback {
-                let msg_body = format!("**[节点 {node_label} · {title}]**\n\n{content_db}");
+                let mut msg_body = format!("**[节点 {node_label} · {title}]**\n\n{content_db}");
+                if let Some(ref footer) = approval_footer {
+                    msg_body.push_str("\n\n");
+                    msg_body.push_str(footer);
+                }
                 tx.execute(
                     "INSERT INTO messages(user_id, thread_id, role, content, status, created_at)
                      VALUES (?1, ?2, 'assistant', ?3, 'complete', ?4)",
-                    params![uid, task_thread_id, msg_body, now],
+                    params![uid, task_thread_id, truncate_bytes(&msg_body, 16_000), now],
                 )?;
             }
             // Update implicit thread metadata & persist (role, engine, model)-bound CLI session ID.
@@ -1964,6 +2012,7 @@ pub async fn submit_result(
                 on_complete,
                 cb_depth,
                 will_callback,
+                approval_footer,
             ))
         })
         .await?;
@@ -2000,6 +2049,7 @@ pub async fn submit_result(
         let title_bg = title.clone();
         let content_bg = content.clone();
         let status_bg = final_status.to_owned();
+        let blocked_bg = blocked_reason.clone();
         tokio::spawn(async move {
             crate::integrations::gitlab::maybe_reply_task(&h_bg, &tid_bg, &node_name, &content_bg)
                 .await;
@@ -2015,15 +2065,25 @@ pub async fn submit_result(
                     on_complete,
                     task_thread_id,
                     cb_depth,
+                    approval_footer,
                 )
                 .await;
             } else {
+                let im_title = if status_bg == "failed" {
+                    if !blocked_bg.is_empty() {
+                        format!("任务受阻：{title_bg}")
+                    } else {
+                        format!("任务失败：{title_bg}")
+                    }
+                } else {
+                    format!("任务完成：{title_bg}")
+                };
+                let im_body = match approval_footer {
+                    Some(ref footer) => format!("{content_bg}\n\n{footer}"),
+                    None => content_bg,
+                };
                 crate::integrations::im::maybe_notify(
-                    &h_bg,
-                    &uid_bg,
-                    "delivery",
-                    &format!("任务完成：{title_bg}"),
-                    &content_bg,
+                    &h_bg, &uid_bg, "delivery", &im_title, &im_body,
                 )
                 .await;
             }

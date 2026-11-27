@@ -704,14 +704,23 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     return info;
   }
 
-  function engineScopeLabel(ag, caps) {
+  function nodeIsolationSummary(caps) {
     const sb = caps.sandbox || 'workspace-write';
+    const iso = caps.isolation || '';
+    if (sb === 'unsafe-full' || iso === 'direct') return '全宿主机权限';
+    if (iso === 'bwrap' || iso === 'seatbelt') {
+      return sb === 'readonly' ? `OS只读隔离 (${iso})` : `OS工作区隔离 (${iso})`;
+    }
     if (sb === 'readonly') return '仅只读';
-    if (sb === 'unsafe-full') return '全宿主机权限';
+    return '';
+  }
+
+  function engineScopeLabel(ag, caps) {
+    if (nodeIsolationSummary(caps)) return '';
     if (ag === 'codex') return caps.codex_net === '1' ? 'OS沙箱·可联网' : 'OS沙箱·断网';
-    if (ag === 'agy') return '工作区终端沙箱';
-    if (ag === 'claude') return '工作区工具白名单';
-    if (ag === 'opencode') return '仅目录拦截·bash无沙箱';
+    if (ag === 'agy') return 'CLI终端沙箱';
+    if (ag === 'claude') return 'CLI工具白名单';
+    if (ag === 'opencode') return 'CLI目录限制';
     return '工作区沙箱';
   }
 
@@ -739,17 +748,20 @@ export function initChat({ state, onRefresh, onActivityChange }) {
         'claude',
       ]),
     ).filter(Boolean);
+    const isoSummary = nodeIsolationSummary(caps);
 
     engineMenu.innerHTML = `
       <div class="engine-menu-head">
         <span>${esc(node.name)}</span>
         <span class="badge ${node.online ? 'ok' : ''}">${node.online ? '在线' : '离线'}</span>
       </div>
+      ${isoSummary ? `<div class="engine-menu-sub">${esc(isoSummary)}</div>` : ''}
       ${candidates
         .map((ag) => {
           const active = ag === (node.default_agent || curDefault);
           const scope = engineScopeLabel(ag, caps);
-          return `<button type="button" class="engine-menu-opt${active ? ' on' : ''}" role="menuitemradio" aria-checked="${active ? 'true' : 'false'}" data-pick-engine="${esc(ag)}"><span>${esc(ag)}</span><span class="engine-menu-opt-meta"><span class="engine-menu-scope">${esc(scope)}</span><span class="engine-menu-check">${active ? '✓' : ''}</span></span></button>`;
+          const scopeHtml = scope ? `<span class="engine-menu-scope">${esc(scope)}</span>` : '';
+          return `<button type="button" class="engine-menu-opt${active ? ' on' : ''}" role="menuitemradio" aria-checked="${active ? 'true' : 'false'}" data-pick-engine="${esc(ag)}"><span>${esc(ag)}</span><span class="engine-menu-opt-meta">${scopeHtml}<span class="engine-menu-check">${active ? '✓' : ''}</span></span></button>`;
         })
         .join('')}`;
 

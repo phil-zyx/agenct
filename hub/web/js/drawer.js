@@ -152,6 +152,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       summary: summary.join(' · ') || (raw && !raw.includes(':') ? raw : ''),
       repos,
       sandbox: sb,
+      isolation: (info.isolation || '').toLowerCase(),
       elevated: info.elevated === '1',
       codexNet: info.codex_net === '1',
     };
@@ -216,14 +217,17 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
                   )
                   .join('')}</div>`
               : '';
+            const iso = parsed.isolation;
             const sbTag =
-              parsed.sandbox === 'readonly'
-                ? '<span class="engine-tag">仅只读</span>'
-                : parsed.sandbox === 'unsafe-full'
-                  ? '<span class="engine-tag is-warn">全宿主机权限</span>'
-                  : parsed.sandbox
-                    ? '<span class="engine-tag">工作区沙箱</span>'
-                    : '';
+              parsed.sandbox === 'unsafe-full' || iso === 'direct'
+                ? '<span class="engine-tag is-warn">全宿主机权限</span>'
+                : iso === 'bwrap' || iso === 'seatbelt'
+                  ? `<span class="engine-tag">${parsed.sandbox === 'readonly' ? 'OS只读隔离' : 'OS工作区隔离'} (${esc(iso)})</span>`
+                  : parsed.sandbox === 'readonly'
+                    ? '<span class="engine-tag">仅只读</span>'
+                    : parsed.sandbox
+                      ? '<span class="engine-tag">CLI内置限制</span>'
+                      : '';
             const elevTag = parsed.elevated ? '<span class="engine-tag">支持单次放行</span>' : '';
             const sandboxTagsHtml = sbTag || elevTag ? `<div class="engine-tags">${sbTag}${elevTag}</div>` : '';
             const reposHtml = parsed.repos.length

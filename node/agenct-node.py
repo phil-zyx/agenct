@@ -41,9 +41,20 @@ VALID_AGENTS = ("auto", "claude", "codex", "agy", "opencode", "ollama", "openai"
 CLI_AGENTS = ("claude", "codex", "agy", "opencode")
 VALID_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 VALID_EXEC_BACKENDS = ("auto", "tmux", "conpty", "wt-tail", "pipe")
+VALID_SANDBOX_BACKENDS = ("auto", "bwrap", "seatbelt", "cli-native")
 VALID_TMUX_MODES = ("auto", "on", "off")
 EXEC_BACKEND_ENV = "AGENCT_EXEC_BACKEND"
+SANDBOX_BACKEND_ENV = "AGENCT_SANDBOX_BACKEND"
 _TMUX_ALIAS_MAP = {"auto": "auto", "on": "tmux", "off": "pipe"}
+_DEFAULT_MASKED_SECRET_NAMES = (
+    ".ssh",
+    ".agenct",
+    ".aws",
+    ".gnupg",
+    ".kube",
+    ".netrc",
+    ".git-credentials",
+)
 MAX_RESULT_BYTES = 16_000
 DEFAULT_NODE_TIMEOUT = 3600
 NODE_TIMEOUT_ENV = "AGENCT_NODE_TIMEOUT"
@@ -410,7 +421,7 @@ _SANDBOX_BLOCK_PATTERNS = (
     re.compile(r"^\s*!\s*(permission requested:.*auto-rejecting.*)$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"(Action denied(?:\s+in\s+headless\s+mode)?\s*:[^\r\n]+)", re.IGNORECASE),
     re.compile(r"(Sandbox blocked[^\r\n]+)", re.IGNORECASE),
-    re.compile(r"(Read-only file system[^\r\n]*|Operation not permitted[^\r\n]*|Permission denied[^\r\n]*)", re.IGNORECASE),
+    re.compile(r"(Read-only file system[^\r\n]*|Operation not permitted[^\r\n]*|Permission denied[^\r\n]*|Host key verification failed[^\r\n]*)", re.IGNORECASE),
     re.compile(r"([^\r\n]*(?:network_access|outside the workspace|sandbox restriction)[^\r\n]*)", re.IGNORECASE),
 )
 
@@ -721,6 +732,7 @@ def build_env_header(
     agents: list[str] | None = None,
     *,
     sandbox: str = "workspace-write",
+    isolation: str = "",
     allow_elevated: bool = False,
     codex_tmux: bool = False,
 ) -> str:
@@ -747,10 +759,13 @@ def build_env_header(
     if default_label and default_label not in agent_labels:
         agent_labels.insert(0, default_label)
     sb_clean = sandbox if sandbox in _SANDBOX_RANK else "workspace-write"
+    iso_clean = "direct" if sb_clean == "unsafe-full" else isolation.strip().lower()
     extra_flags = []
+    if iso_clean:
+        extra_flags.append(f"isolation:{iso_clean}")
     if allow_elevated:
         extra_flags.append("elevated:1")
-    if codex_tmux and sb_clean == "workspace-write":
+    if codex_tmux and sb_clean == "workspace-write" and iso_clean not in ("bwrap", "seatbelt"):
         extra_flags.append("codex_net:1")
     flag_part = f" | {' | '.join(extra_flags)}" if extra_flags else ""
     repo_part = f" | repos:{','.join(repos)}" if repos else ""
@@ -891,6 +906,7 @@ def build_prompt(
     *,
     sandbox: str = "",
     agent: str = "",
+    os_isolated: bool = False,
 ) -> str:
     parts = [
         "You are an Agenct execution node handling an assigned task.",
@@ -905,16 +921,23 @@ def build_prompt(
     if input_files:
         parts.append("Input attachments saved locally:\n" + "\n".join(f"- {p}" for p in input_files))
     adapter = CLI_ADAPTERS.get(agent)
-    if sandbox == "readonly" and adapter and adapter.readonly_disables_shell:
-        parts.append(
-            "Read-only sandbox is active: file writes and shell commands are disabled; "
-            "use built-in read, list, and search tools directly."
-        )
-    elif sandbox == "readonly" and agent == "agy":
-        parts.append(
-            f"Read-only sandbox is active: {workdir} is mounted read-only "
-            f"(use absolute paths or 'cd {workdir}' before read-only shell commands like git log/status)."
-        )
+    if sandbox == "readonly":
+        if os_isolated:
+            parts.append(
+                "Read-only OS sandbox is active: the filesystem outside /tmp is mounted read-only; "
+                "read-only inspection commands (such as git status/log/diff/show, ls, rg, cat) work normally, "
+                "while any file write or modification is blocked by the OS."
+            )
+        elif adapter and adapter.readonly_disables_shell:
+            parts.append(
+                "Read-only sandbox is active: file writes and shell commands are disabled; "
+                "use built-in read, list, and search tools directly."
+            )
+        elif agent == "agy":
+            parts.append(
+                f"Read-only sandbox is active: {workdir} is mounted read-only "
+                f"(use absolute paths or 'cd {workdir}' before read-only shell commands like git log/status)."
+            )
     parts.append(
         f"For text queries, output the final Markdown answer directly without creating files. "
         f"Only save screenshots or downloadable artifact files to {evidence_dir} if explicitly requested."
@@ -2200,6 +2223,367 @@ def sanitize_job_effort(val: object) -> str:
     return s if s in VALID_EFFORTS else ""
 
 
+def default_masked_paths(
+    home_dir: str | None = None,
+    state_dir: str | None = None,
+) -> tuple[str, ...]:
+    """Return host credential and node state paths hidden inside OS sandboxes."""
+    home = os.path.abspath(home_dir or os.path.expanduser("~"))
+    out: list[str] = [os.path.join(home, name) for name in _DEFAULT_MASKED_SECRET_NAMES]
+    if state_dir:
+        out.append(os.path.abspath(state_dir))
+    return tuple(out)
+
+
+class SandboxPolicy:
+    """Engine-agnostic declarative isolation policy enforced outside the CLI."""
+
+    __slots__ = (
+        "mode",
+        "workdir",
+        "evidence_dir",
+        "in_dir",
+        "out_file",
+        "state_paths",
+        "masked_paths",
+    )
+
+    def __init__(
+        self,
+        *,
+        mode: str,
+        workdir: str,
+        evidence_dir: str = "",
+        in_dir: str | None = None,
+        out_file: str | None = None,
+        state_paths: tuple[str, ...] = (),
+        masked_paths: tuple[str, ...] = (),
+    ) -> None:
+        self.mode = mode if mode in _SANDBOX_RANK else "workspace-write"
+        self.workdir = workdir
+        self.evidence_dir = evidence_dir
+        self.in_dir = in_dir
+        self.out_file = out_file
+        self.state_paths = state_paths
+        self.masked_paths = masked_paths
+
+
+class SandboxBackend:
+    """Abstract OS-level sandbox wrapper parallel to ExecBackend."""
+
+    name: str = "cli-native"
+    os_isolated: bool = False
+
+    def wrap(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        policy: SandboxPolicy,
+    ) -> tuple[list[str] | str, bool, str, dict[str, str]]:
+        return argv, shell, cwd, dict(env)
+
+
+def probe_bwrap(
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> bool:
+    """Return True when bubblewrap can create unprivileged mount + PID namespaces."""
+    sys_name = (platform.system() if system is None else system).strip().lower()
+    if sys_name != "linux":
+        return False
+    which_fn = which or shutil.which
+    bwrap_bin = which_fn("bwrap")
+    if not bwrap_bin:
+        return False
+    run_fn = runner or subprocess.run
+    try:
+        res = run_fn(
+            [
+                bwrap_bin,
+                "--ro-bind", "/", "/",
+                "--dev", "/dev",
+                "--proc", "/proc",
+                "--tmpfs", "/tmp",
+                "--unshare-pid",
+                "--die-with-parent",
+                "--",
+                "/bin/true",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def probe_seatbelt(
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> bool:
+    """Return True when macOS sandbox-exec (Seatbelt) is installed and permitted."""
+    sys_name = (platform.system() if system is None else system).strip().lower()
+    if sys_name != "darwin":
+        return False
+    which_fn = which or shutil.which
+    sb_bin = which_fn("sandbox-exec")
+    if not sb_bin:
+        return False
+    run_fn = runner or subprocess.run
+    try:
+        res = run_fn(
+            [sb_bin, "-p", "(version 1)(allow default)", "/usr/bin/true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _is_same_or_parent_dir(candidate: str, target: str) -> bool:
+    return target == candidate or target.startswith(candidate + os.sep)
+
+
+class BubblewrapSandbox(SandboxBackend):
+    """Linux/WSL2 kernel mount + PID namespace sandbox via bubblewrap."""
+
+    name = "bwrap"
+    os_isolated = True
+
+    def __init__(self, bwrap_bin: str | None = None) -> None:
+        self.bwrap_bin = bwrap_bin or shutil.which("bwrap") or "bwrap"
+
+    def wrap(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        policy: SandboxPolicy,
+    ) -> tuple[list[str] | str, bool, str, dict[str, str]]:
+        out_env = dict(env)
+        if policy.mode == "unsafe-full":
+            return argv, shell, cwd, out_env
+
+        cmd: list[str] = [
+            self.bwrap_bin,
+            "--ro-bind", "/", "/",
+            "--dev", "/dev",
+            "--proc", "/proc",
+            "--tmpfs", "/tmp",
+        ]
+        workdir_real = (
+            os.path.realpath(policy.workdir)
+            if policy.workdir and os.path.exists(policy.workdir)
+            else ""
+        )
+
+        # 1. Mask sensitive credential/state paths before overlaying workspace/task mounts.
+        # Broken symlinks (e.g. ~/.aws -> /mnt/c/...) return False for os.path.exists and are skipped safely.
+        masked_real: set[str] = set()
+        for raw_p in policy.masked_paths:
+            if not raw_p or not os.path.exists(raw_p):
+                continue
+            real = os.path.realpath(raw_p)
+            if workdir_real and _is_same_or_parent_dir(real, workdir_real):
+                continue
+            if real in masked_real:
+                continue
+            if os.path.isdir(real):
+                cmd.extend(["--tmpfs", real])
+                masked_real.add(real)
+            elif os.path.isfile(real):
+                cmd.extend(["--ro-bind", "/dev/null", real])
+                masked_real.add(real)
+
+        bound_real: set[str] = set()
+        # 2. Workspace mount: writable only in workspace-write, explicit ro-bind in readonly
+        # so temp workdirs under /tmp remain readable even after --tmpfs /tmp.
+        if workdir_real and os.path.isdir(workdir_real):
+            flag = "--bind" if policy.mode == "workspace-write" else "--ro-bind"
+            cmd.extend([flag, workdir_real, workdir_real])
+            bound_real.add(workdir_real)
+
+        def _overlay_bind(raw_path: str | None, *, ro: bool = False) -> None:
+            if not raw_path or not os.path.exists(raw_path):
+                return
+            real = os.path.realpath(raw_path)
+            if any(_is_same_or_parent_dir(m, real) for m in masked_real) or real in bound_real:
+                return
+            cmd.extend(["--ro-bind" if ro else "--bind", real, real])
+            bound_real.add(real)
+
+        # 3. Task I/O mounts (must come after --tmpfs /tmp so evidence/inputs/output remain visible).
+        _overlay_bind(policy.evidence_dir, ro=False)
+        _overlay_bind(policy.in_dir, ro=True)
+        _overlay_bind(policy.out_file, ro=False)
+
+        # 4. Engine session/cache state paths required for headless execution & session resume.
+        for state_p in policy.state_paths:
+            _overlay_bind(state_p, ro=False)
+
+        cmd.extend(["--unshare-pid", "--die-with-parent", "--chdir", cwd, "--"])
+        if shell:
+            cmd.extend(["/bin/sh", "-c", str(argv)])
+        else:
+            cmd.extend(list(argv) if not isinstance(argv, str) else [argv])
+        return cmd, False, cwd, out_env
+
+
+def _sbpl_escape(path: str) -> str:
+    return path.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _sbpl_path_filter(path: str) -> str:
+    escaped = _sbpl_escape(path)
+    return f'(subpath "{escaped}")' if os.path.isdir(path) else f'(literal "{escaped}")'
+
+
+class SeatbeltSandbox(SandboxBackend):
+    """macOS sandbox-exec (Seatbelt SBPL) filesystem isolation backend."""
+
+    name = "seatbelt"
+    os_isolated = True
+
+    def __init__(self, sandbox_exec_bin: str | None = None) -> None:
+        self.sandbox_exec_bin = sandbox_exec_bin or shutil.which("sandbox-exec") or "sandbox-exec"
+
+    def build_profile(self, policy: SandboxPolicy) -> str:
+        lines = ["(version 1)", "(allow default)", "(deny file-write*)"]
+        for tmp_dir in ("/tmp", "/private/tmp", "/private/var/folders"):
+            lines.append(f'(allow file-write* (subpath "{_sbpl_escape(tmp_dir)}"))')
+        for dev_path in ("/dev/null", "/dev/tty", "/dev/dtracehelper"):
+            lines.append(f'(allow file-write* (literal "{_sbpl_escape(dev_path)}"))')
+
+        workdir_real = (
+            os.path.realpath(policy.workdir)
+            if policy.workdir and os.path.exists(policy.workdir)
+            else policy.workdir
+        )
+        masked_candidates: list[str] = []
+        masked_real: set[str] = set()
+        for raw_p in policy.masked_paths:
+            if not raw_p or not os.path.exists(raw_p):
+                continue
+            real = os.path.realpath(raw_p)
+            if workdir_real and _is_same_or_parent_dir(real, workdir_real):
+                continue
+            if real not in masked_real:
+                masked_real.add(real)
+                masked_candidates.append(real)
+                if os.path.abspath(raw_p) != real:
+                    masked_candidates.append(os.path.abspath(raw_p))
+
+        def _allow_write(raw_p: str | None) -> None:
+            if not raw_p or not os.path.exists(raw_p):
+                return
+            for candidate in dict.fromkeys((os.path.abspath(raw_p), os.path.realpath(raw_p))):
+                if any(_is_same_or_parent_dir(m, candidate) for m in masked_real):
+                    continue
+                lines.append(f"(allow file-write* {_sbpl_path_filter(candidate)})")
+
+        if policy.mode == "workspace-write" and policy.workdir:
+            _allow_write(policy.workdir)
+        _allow_write(policy.evidence_dir)
+        _allow_write(policy.out_file)
+        for sp in policy.state_paths:
+            _allow_write(sp)
+
+        for mp in masked_candidates:
+            lines.append(f"(deny file-read* file-write* {_sbpl_path_filter(mp)})")
+        return "\n".join(lines)
+
+    def wrap(
+        self,
+        argv: list[str] | str,
+        *,
+        shell: bool,
+        cwd: str,
+        env: dict[str, str],
+        policy: SandboxPolicy,
+    ) -> tuple[list[str] | str, bool, str, dict[str, str]]:
+        out_env = dict(env)
+        if policy.mode == "unsafe-full":
+            return argv, shell, cwd, out_env
+        cmd: list[str] = [self.sandbox_exec_bin, "-p", self.build_profile(policy)]
+        if shell:
+            cmd.extend(["/bin/sh", "-c", str(argv)])
+        else:
+            cmd.extend(list(argv) if not isinstance(argv, str) else [argv])
+        return cmd, False, cwd, out_env
+
+
+class CliNativeSandbox(SandboxBackend):
+    """Honest fallback when host OS provides no kernel isolation (delegates to CLI flags)."""
+
+    name = "cli-native"
+    os_isolated = False
+
+
+class DirectSandbox(SandboxBackend):
+    """No outer isolation wrapper (used exclusively for unsafe-full / manual elevated runs)."""
+
+    name = "direct"
+    os_isolated = False
+
+
+def resolve_sandbox_backend(
+    requested: str | None = "auto",
+    *,
+    system: str | None = None,
+    which: Callable[[str], str | None] | None = None,
+    runner: Callable[..., subprocess.CompletedProcess] | None = None,
+) -> SandboxBackend:
+    """Resolve host OS sandbox backend (auto -> bwrap | seatbelt | cli-native)."""
+    raw = (requested or "auto").strip().lower()
+    if raw not in VALID_SANDBOX_BACKENDS:
+        print(
+            f"[agenct-node] Warning: unknown sandbox backend '{raw}'; falling back to 'auto'.",
+            file=sys.stderr,
+            flush=True,
+        )
+        raw = "auto"
+
+    which_fn = which or shutil.which
+    if raw == "cli-native":
+        return CliNativeSandbox()
+    if raw == "bwrap":
+        if probe_bwrap(system=system, which=which_fn, runner=runner):
+            return BubblewrapSandbox(bwrap_bin=which_fn("bwrap"))
+        print(
+            "[agenct-node] Warning: --sandbox-backend=bwrap unavailable on this host; falling back to 'cli-native'.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return CliNativeSandbox()
+    if raw == "seatbelt":
+        if probe_seatbelt(system=system, which=which_fn, runner=runner):
+            return SeatbeltSandbox(sandbox_exec_bin=which_fn("sandbox-exec"))
+        print(
+            "[agenct-node] Warning: --sandbox-backend=seatbelt unavailable on this host; falling back to 'cli-native'.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return CliNativeSandbox()
+
+    if probe_bwrap(system=system, which=which_fn, runner=runner):
+        return BubblewrapSandbox(bwrap_bin=which_fn("bwrap"))
+    if probe_seatbelt(system=system, which=which_fn, runner=runner):
+        return SeatbeltSandbox(sandbox_exec_bin=which_fn("sandbox-exec"))
+    return CliNativeSandbox()
+
+
 def tighten_sandbox(node_sandbox: str, requested: object) -> str:
     """Downward-only sandbox override: can tighten (e.g. -> readonly), never escalate."""
     base = node_sandbox if node_sandbox in _SANDBOX_RANK else "workspace-write"
@@ -2228,6 +2612,7 @@ class CliAdapter:
     __slots__ = (
         "name",
         "readonly_disables_shell",
+        "state_paths",
         "build_argv",
         "build_env",
         "parse_stream",
@@ -2239,31 +2624,44 @@ class CliAdapter:
         *,
         name: str,
         readonly_disables_shell: bool,
+        state_paths: tuple[str, ...],
         build_argv: Callable[..., list[str]],
-        build_env: Callable[[dict[str, str], str], dict[str, str]],
+        build_env: Callable[..., dict[str, str]],
         parse_stream: Callable[[str], tuple[str | None, str | None, bool]],
         summarize_event: Callable[[dict], str],
     ) -> None:
         self.name = name
         self.readonly_disables_shell = readonly_disables_shell
+        self.state_paths = state_paths
         self.build_argv = build_argv
         self.build_env = build_env
         self.parse_stream = parse_stream
         self.summarize_event = summarize_event
 
 
-def _default_cli_env(base_env: dict[str, str], _sandbox: str) -> dict[str, str]:
+def _default_cli_env(
+    base_env: dict[str, str],
+    _sandbox: str,
+    *,
+    os_isolated: bool = False,
+) -> dict[str, str]:
+    _ = os_isolated
     return dict(base_env)
 
 
-def _opencode_cli_env(base_env: dict[str, str], sandbox: str) -> dict[str, str]:
+def _opencode_cli_env(
+    base_env: dict[str, str],
+    sandbox: str,
+    *,
+    os_isolated: bool = False,
+) -> dict[str, str]:
     env = dict(base_env)
-    if sandbox == "readonly":
-        env["OPENCODE_PERMISSION"] = _OPENCODE_READONLY_PERMISSION
-    elif sandbox == "workspace-write":
-        env["OPENCODE_PERMISSION"] = _OPENCODE_WORKSPACE_PERMISSION
-    else:
+    if os_isolated or sandbox == "unsafe-full":
         env.pop("OPENCODE_PERMISSION", None)
+    elif sandbox == "readonly":
+        env["OPENCODE_PERMISSION"] = _OPENCODE_READONLY_PERMISSION
+    else:
+        env["OPENCODE_PERMISSION"] = _OPENCODE_WORKSPACE_PERMISSION
     return env
 
 
@@ -2278,6 +2676,8 @@ def _build_claude_argv(
     resume_sid: str = "",
     model: str = "",
     effort: str = "",
+    *,
+    os_isolated: bool = False,
 ) -> list[str]:
     add_dirs = ["--add-dir", workdir, "--add-dir", evidence_dir]
     if in_dir:
@@ -2292,10 +2692,10 @@ def _build_claude_argv(
         argv.extend(["--effort", cl_effort])
     if resume_sid:
         argv.extend(["--resume", resume_sid])
-    if sandbox == "readonly":
-        argv.extend(["--allowedTools", "Read,Glob,Grep", "--disallowedTools", "Bash,Edit,Write,NotebookEdit"])
-    elif sandbox == "unsafe-full":
+    if os_isolated or sandbox == "unsafe-full":
         argv.append("--dangerously-skip-permissions")
+    elif sandbox == "readonly":
+        argv.extend(["--allowedTools", "Read,Glob,Grep", "--disallowedTools", "Bash,Edit,Write,NotebookEdit"])
     else:
         argv.extend(["--allowedTools", "Bash,Read,Edit,Write,Glob,Grep"])
     argv.extend([*add_dirs, "--", prompt])
@@ -2314,20 +2714,9 @@ def _build_codex_argv(
     model: str = "",
     effort: str = "",
     codex_tmux: bool = False,
+    *,
+    os_isolated: bool = False,
 ) -> list[str]:
-    sb_mode = {
-        "readonly": "read-only",
-        "workspace-write": "workspace-write",
-        "unsafe-full": "danger-full-access",
-    }.get(sandbox, "workspace-write")
-    # Explicitly disable network_access under workspace-write by default instead of relying on
-    # Codex/CLI implicit defaults. Only opt in when --codex-tmux is set under workspace-write
-    # (Linux seccomp otherwise blocks AF_UNIX connect() to /tmp/tmux-*/default); never in readonly.
-    if sb_mode == "workspace-write":
-        allow_network = sandbox == "workspace-write" and bool(codex_tmux)
-        extra_cfg = ["-c", f"sandbox_workspace_write.network_access={'true' if allow_network else 'false'}"]
-    else:
-        extra_cfg = []
     model_args = ["-m", model] if model else []
     eff_args = (
         ["-c", f'model_reasoning_effort="{"xhigh" if effort == "max" else effort}"']
@@ -2335,6 +2724,35 @@ def _build_codex_argv(
         else []
     )
     out_args = ["-o", out_file] if out_file else []
+    if os_isolated:
+        if resume_sid:
+            return [
+                exe, "exec", "resume",
+                *model_args,
+                "--dangerously-bypass-approvals-and-sandbox",
+                *eff_args,
+                "--skip-git-repo-check", "--json", *out_args, resume_sid, prompt,
+            ]
+        extra = ["--add-dir", evidence_dir]
+        if in_dir:
+            extra.extend(["--add-dir", in_dir])
+        return [
+            exe, "exec", "--skip-git-repo-check", "--json",
+            *model_args,
+            "--dangerously-bypass-approvals-and-sandbox", *eff_args, "-C", workdir, *extra, *out_args, prompt,
+        ]
+
+    sb_mode = {
+        "readonly": "read-only",
+        "workspace-write": "workspace-write",
+        "unsafe-full": "danger-full-access",
+    }.get(sandbox, "workspace-write")
+    # Fallback when OS isolation is unavailable: rely on Codex's native Landlock/Seatbelt sandbox.
+    if sb_mode == "workspace-write":
+        allow_network = sandbox == "workspace-write" and bool(codex_tmux)
+        extra_cfg = ["-c", f"sandbox_workspace_write.network_access={'true' if allow_network else 'false'}"]
+    else:
+        extra_cfg = []
     if resume_sid:
         return [
             exe, "exec", "resume",
@@ -2365,6 +2783,8 @@ def _build_agy_argv(
     resume_sid: str = "",
     model: str = "",
     effort: str = "",
+    *,
+    os_isolated: bool = False,
 ) -> list[str]:
     argv = [exe, "-p", prompt, "--output-format", "stream-json"]
     if model:
@@ -2372,13 +2792,13 @@ def _build_agy_argv(
     if effort:
         ag_effort = "low" if effort == "minimal" else effort
         argv.extend(["--effort", ag_effort])
-    if sandbox == "readonly":
-        argv.extend(["--sandbox", "--settings", _build_agy_readonly_settings(workdir, in_dir)])
-    elif sandbox == "unsafe-full":
+    if os_isolated or sandbox == "unsafe-full":
         argv.append("--dangerously-skip-permissions")
         argv.extend(["--add-dir", workdir, "--add-dir", evidence_dir])
         if in_dir:
             argv.extend(["--add-dir", in_dir])
+    elif sandbox == "readonly":
+        argv.extend(["--sandbox", "--settings", _build_agy_readonly_settings(workdir, in_dir)])
     else:
         argv.extend(["--mode", "accept-edits", "--sandbox", "--settings", _AGY_WORKSPACE_SETTINGS])
         argv.extend(["--add-dir", workdir, "--add-dir", evidence_dir])
@@ -2400,9 +2820,11 @@ def _build_opencode_argv(
     resume_sid: str = "",
     model: str = "",
     effort: str = "",
+    *,
+    os_isolated: bool = False,
 ) -> list[str]:
     argv = [exe, "run", "--format", "json"]
-    if sandbox == "unsafe-full":
+    if os_isolated or sandbox == "unsafe-full":
         argv.append("--auto")
     if model:
         argv.extend(["-m", model])
@@ -2419,6 +2841,7 @@ CLI_ADAPTERS: dict[str, CliAdapter] = {
     "claude": CliAdapter(
         name="claude",
         readonly_disables_shell=True,
+        state_paths=(".claude", ".claude.json"),
         build_argv=_build_claude_argv,
         build_env=_default_cli_env,
         parse_stream=_parse_claude_stream,
@@ -2427,6 +2850,7 @@ CLI_ADAPTERS: dict[str, CliAdapter] = {
     "codex": CliAdapter(
         name="codex",
         readonly_disables_shell=False,
+        state_paths=(".codex",),
         build_argv=_build_codex_argv,
         build_env=_default_cli_env,
         parse_stream=_parse_codex_stream,
@@ -2435,6 +2859,7 @@ CLI_ADAPTERS: dict[str, CliAdapter] = {
     "agy": CliAdapter(
         name="agy",
         readonly_disables_shell=False,
+        state_paths=(".gemini", ".config/antigravity"),
         build_argv=_build_agy_argv,
         build_env=_default_cli_env,
         parse_stream=_parse_agy_stream,
@@ -2443,6 +2868,7 @@ CLI_ADAPTERS: dict[str, CliAdapter] = {
     "opencode": CliAdapter(
         name="opencode",
         readonly_disables_shell=True,
+        state_paths=(".local/share/opencode", ".cache/opencode", ".local/state/opencode", ".config/opencode"),
         build_argv=_build_opencode_argv,
         build_env=_opencode_cli_env,
         parse_stream=_parse_opencode_stream,
@@ -2451,10 +2877,16 @@ CLI_ADAPTERS: dict[str, CliAdapter] = {
 }
 
 
-def build_cli_env(agent: str, base_env: dict[str, str], sandbox: str) -> dict[str, str]:
+def build_cli_env(
+    agent: str,
+    base_env: dict[str, str],
+    sandbox: str,
+    *,
+    os_isolated: bool = False,
+) -> dict[str, str]:
     adapter = CLI_ADAPTERS.get(agent)
     if adapter:
-        return adapter.build_env(base_env, sandbox)
+        return adapter.build_env(base_env, sandbox, os_isolated=os_isolated)
     return dict(base_env)
 
 
@@ -2471,6 +2903,8 @@ def build_cli_argv(
     model: str = "",
     effort: str = "",
     codex_tmux: bool = False,
+    *,
+    os_isolated: bool = False,
 ) -> list[str]:
     adapter = CLI_ADAPTERS.get(agent)
     if not adapter:
@@ -2478,10 +2912,11 @@ def build_cli_argv(
     if agent == "codex":
         return adapter.build_argv(
             exe, prompt, workdir, sandbox, evidence_dir, in_dir, out_file, resume_sid, model, effort,
-            codex_tmux=codex_tmux,
+            codex_tmux=codex_tmux, os_isolated=os_isolated,
         )
     return adapter.build_argv(
         exe, prompt, workdir, sandbox, evidence_dir, in_dir, out_file, resume_sid, model, effort,
+        os_isolated=os_isolated,
     )
 
 
@@ -2498,14 +2933,26 @@ def execute_job(
     codex_tmux: bool = False,
     exec_backend: str | ExecBackend = "auto",
     allow_elevated: bool = False,
+    sandbox_backend: str | SandboxBackend = "auto",
+    state_dir: str | None = None,
 ) -> tuple[str, str, list[dict]]:
     eff_sandbox = resolve_job_sandbox(sandbox, job, allow_elevated=allow_elevated)
-    eff_codex_tmux = bool(codex_tmux) and eff_sandbox == "workspace-write"
+    if eff_sandbox == "unsafe-full":
+        resolved_sb: SandboxBackend = DirectSandbox()
+    else:
+        resolved_sb = (
+            sandbox_backend
+            if isinstance(sandbox_backend, SandboxBackend)
+            else resolve_sandbox_backend(sandbox_backend)
+        )
+    os_isolated = resolved_sb.os_isolated and eff_sandbox != "unsafe-full"
+    eff_codex_tmux = bool(codex_tmux) and eff_sandbox == "workspace-write" and not os_isolated
     resolved_backend = (
         exec_backend if isinstance(exec_backend, ExecBackend) else resolve_exec_backend(exec_backend)
     )
     if meta_out is not None:
         meta_out["backend"] = resolved_backend.name
+        meta_out["isolation"] = resolved_sb.name
     task_id_str = str(job.get("task_id") or "")
     job_model = sanitize_job_model(job.get("model"))
     job_effort = sanitize_job_effort(job.get("effort"))
@@ -2513,8 +2960,24 @@ def execute_job(
     input_files, in_dir = materialize_attachments(job.get("attachments") or [], workdir, eff_sandbox)
     evidence_dir = make_scoped_tempdir("agenct-ev-", workdir, eff_sandbox)
     resume_sid = ""
+    home_dir = os.path.expanduser("~")
+    adapter = CLI_ADAPTERS.get(agent)
+    state_paths = (
+        tuple(os.path.join(home_dir, rel) for rel in adapter.state_paths)
+        if adapter
+        else ()
+    )
+    masked_paths = default_masked_paths(home_dir=home_dir, state_dir=state_dir)
     try:
-        prompt = build_prompt(job, input_files, evidence_dir, workdir, sandbox=eff_sandbox, agent=agent)
+        prompt = build_prompt(
+            job,
+            input_files,
+            evidence_dir,
+            workdir,
+            sandbox=eff_sandbox,
+            agent=agent,
+            os_isolated=os_isolated,
+        )
         env = dict(os.environ)
         env["AGENCT_WORKDIR"] = workdir
         env["AGENCT_EVIDENCE_DIR"] = evidence_dir
@@ -2523,6 +2986,7 @@ def execute_job(
         env["AGENCT_MODEL"] = job_model
         env["AGENCT_EFFORT"] = job_effort
         env["AGENCT_SANDBOX"] = eff_sandbox
+        env["AGENCT_ISOLATION"] = resolved_sb.name
         env["NO_COLOR"] = "1"
         env["CLICOLOR"] = "0"
         env["FORCE_COLOR"] = "0"
@@ -2530,11 +2994,26 @@ def execute_job(
 
         if agent.startswith("custom:"):
             custom_cmd = agent[len("custom:"):]
-            rc, out, err, cancelled = run_monitored(
+            sb_policy = SandboxPolicy(
+                mode=eff_sandbox,
+                workdir=workdir,
+                evidence_dir=evidence_dir,
+                in_dir=in_dir,
+                state_paths=(),
+                masked_paths=masked_paths,
+            )
+            wrapped_argv, wrapped_shell, wrapped_cwd, wrapped_env = resolved_sb.wrap(
                 custom_cmd,
                 shell=True,
                 cwd=workdir,
                 env=env,
+                policy=sb_policy,
+            )
+            rc, out, err, cancelled = run_monitored(
+                wrapped_argv,
+                shell=wrapped_shell,
+                cwd=wrapped_cwd,
+                env=wrapped_env,
                 timeout=timeout,
                 cancel_event=cancel_event,
                 progress_cb=progress_cb,
@@ -2547,8 +3026,14 @@ def execute_job(
             )
             if cancelled:
                 return "failed", "Job cancelled because Hub lease expired or was revoked.", []
-            text = strip_ansi(decode_bytes(out)).strip() or strip_ansi(decode_bytes(err)).strip()
+            raw_out_s = decode_bytes(out)
+            raw_err_s = decode_bytes(err)
+            text = strip_ansi(raw_out_s).strip() or strip_ansi(raw_err_s).strip()
             status = "completed" if rc == 0 and text else "failed"
+            if status == "failed" and meta_out is not None:
+                blocked = detect_sandbox_block("custom", raw_out_s, raw_err_s, text)
+                if blocked:
+                    meta_out["blocked_reason"] = blocked
             return status, truncate_utf8(text or f"Command exited with code {rc}"), collect_evidence(evidence_dir)
 
         if agent in CLI_AGENTS:
@@ -2561,7 +3046,7 @@ def execute_job(
                 if agent == "codex":
                     fd, out_file = tempfile.mkstemp(prefix="agenct-codex-", suffix=".txt")
                     os.close(fd)
-                if agent == "agy" and eff_sandbox == "readonly":
+                if not os_isolated and agent == "agy" and eff_sandbox == "readonly":
                     ro_cwd = tempfile.mkdtemp(prefix="agenct-ro-")
                     os.chmod(ro_cwd, 0o700)
                 cli_cwd = ro_cwd or workdir
@@ -2571,16 +3056,32 @@ def execute_job(
                 stage_label = f"Running {role_prefix}{agent}{model_suffix}"
                 argv = build_cli_argv(
                     agent, exe, prompt, workdir, eff_sandbox, evidence_dir, in_dir, out_file, resume_sid,
-                    model=job_model, effort=job_effort, codex_tmux=eff_codex_tmux,
+                    model=job_model, effort=job_effort, codex_tmux=eff_codex_tmux, os_isolated=os_isolated,
                 )
-                cli_env = build_cli_env(agent, env, eff_sandbox)
-
-                started_at = time.monotonic()
-                rc, out, err, cancelled = run_monitored(
+                cli_env = build_cli_env(agent, env, eff_sandbox, os_isolated=os_isolated)
+                sb_policy = SandboxPolicy(
+                    mode=eff_sandbox,
+                    workdir=workdir,
+                    evidence_dir=evidence_dir,
+                    in_dir=in_dir,
+                    out_file=out_file,
+                    state_paths=state_paths,
+                    masked_paths=masked_paths,
+                )
+                wrapped_argv, wrapped_shell, wrapped_cwd, wrapped_env = resolved_sb.wrap(
                     argv,
                     shell=False,
                     cwd=cli_cwd,
                     env=cli_env,
+                    policy=sb_policy,
+                )
+
+                started_at = time.monotonic()
+                rc, out, err, cancelled = run_monitored(
+                    wrapped_argv,
+                    shell=wrapped_shell,
+                    cwd=wrapped_cwd,
+                    env=wrapped_env,
                     timeout=timeout,
                     cancel_event=cancel_event,
                     progress_cb=progress_cb,
@@ -2607,19 +3108,26 @@ def execute_job(
                     )
                     if rc != 0 or not probe_text.strip():
                         if time.monotonic() - started_at >= timeout:
-                            raise subprocess.TimeoutExpired(argv, timeout, out, err)
+                            raise subprocess.TimeoutExpired(wrapped_argv, timeout, out, err)
                         resume_sid = ""
                         if out_file and os.path.exists(out_file):
                             open(out_file, "wb").close()
                         fresh_argv = build_cli_argv(
                             agent, exe, prompt, workdir, eff_sandbox, evidence_dir, in_dir, out_file, "",
-                            model=job_model, effort=job_effort, codex_tmux=eff_codex_tmux,
+                            model=job_model, effort=job_effort, codex_tmux=eff_codex_tmux, os_isolated=os_isolated,
                         )
-                        rc, out, err, cancelled = run_monitored(
+                        wrapped_fresh_argv, wrapped_fresh_shell, wrapped_fresh_cwd, wrapped_fresh_env = resolved_sb.wrap(
                             fresh_argv,
                             shell=False,
                             cwd=cli_cwd,
                             env=cli_env,
+                            policy=sb_policy,
+                        )
+                        rc, out, err, cancelled = run_monitored(
+                            wrapped_fresh_argv,
+                            shell=wrapped_fresh_shell,
+                            cwd=wrapped_fresh_cwd,
+                            env=wrapped_fresh_env,
                             timeout=timeout,
                             cancel_event=cancel_event,
                             progress_cb=progress_cb,
@@ -2753,6 +3261,12 @@ def run_node_loop(args: argparse.Namespace) -> int:
         )
     exec_backend_spec = getattr(args, "exec_backend", "auto")
     initial_backend = resolve_exec_backend(exec_backend_spec)
+    sandbox_backend_spec = getattr(args, "sandbox_backend", "auto")
+    os_sandbox_backend = resolve_sandbox_backend(sandbox_backend_spec)
+    node_isolation = "direct" if sandbox == "unsafe-full" else os_sandbox_backend.name
+    codex_tmux = bool(
+        args.codex_tmux and sandbox == "workspace-write" and not os_sandbox_backend.os_isolated
+    )
     agent, allowed_agents = resolve_node_agents(args.agent, args.agents, args.cmd)
     state_dir = os.path.abspath(args.state_dir or os.path.join(os.path.expanduser("~"), ".agenct"))
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
@@ -2763,6 +3277,7 @@ def run_node_loop(args: argparse.Namespace) -> int:
         workdir,
         allowed_agents,
         sandbox=sandbox,
+        isolation=node_isolation,
         allow_elevated=allow_elevated,
         codex_tmux=codex_tmux,
     )
@@ -2770,7 +3285,8 @@ def run_node_loop(args: argparse.Namespace) -> int:
     elev_note = " elevated=1" if allow_elevated else ""
     print(
         f"[agenct-node] hub={hub} kind={args.kind} agent={agent} agents={agents_disp} "
-        f"sandbox={sandbox}{elev_note} exec_backend={exec_backend_spec}({initial_backend.name}) "
+        f"sandbox={sandbox}({node_isolation}){elev_note} "
+        f"exec_backend={exec_backend_spec}({initial_backend.name}) "
         f"idle_timeout={args.idle_timeout}s workdir={workdir}",
         flush=True,
     )
@@ -2891,6 +3407,7 @@ def run_node_loop(args: argparse.Namespace) -> int:
                     chosen_agent, job, workdir, sandbox, args.timeout, cancel_event, on_progress,
                     meta_out=meta_out, idle_timeout=args.idle_timeout, codex_tmux=codex_tmux,
                     exec_backend=exec_backend_spec, allow_elevated=allow_elevated,
+                    sandbox_backend=os_sandbox_backend, state_dir=state_dir,
                 )
             finally:
                 stop_heartbeat.set()
@@ -2935,18 +3452,24 @@ def run_self_check(args: argparse.Namespace) -> int:
     probe_idle_timeout = min(args.idle_timeout, probe_timeout) if args.idle_timeout > 0 else 0
     exec_backend_spec = getattr(args, "exec_backend", "auto")
     resolved_backend = resolve_exec_backend(exec_backend_spec)
-    print(
-        f"[self-check] job timeout={args.timeout}s (--timeout overrides {NODE_TIMEOUT_ENV}, "
-        f"default {DEFAULT_NODE_TIMEOUT}s); idle_timeout={args.idle_timeout}s; "
-        f"probe timeout={probe_timeout}s; exec_backend={exec_backend_spec}({resolved_backend.name})",
-        flush=True,
-    )
     workdir = os.path.abspath(args.workdir or os.environ.get("AGENCT_WORKDIR") or os.getcwd())
     if not os.path.isdir(workdir):
         print(f"Error: workdir does not exist: {workdir}", file=sys.stderr)
         return 2
     node_sandbox = "unsafe-full" if args.unsafe_full_access else args.sandbox
-    codex_tmux = bool(args.codex_tmux and node_sandbox == "workspace-write")
+    sandbox_backend_spec = getattr(args, "sandbox_backend", "auto")
+    resolved_sb = resolve_sandbox_backend(sandbox_backend_spec)
+    sb_disp = "direct" if node_sandbox == "unsafe-full" else resolved_sb.name
+    print(
+        f"[self-check] job timeout={args.timeout}s (--timeout overrides {NODE_TIMEOUT_ENV}, "
+        f"default {DEFAULT_NODE_TIMEOUT}s); idle_timeout={args.idle_timeout}s; "
+        f"probe timeout={probe_timeout}s; exec_backend={exec_backend_spec}({resolved_backend.name}); "
+        f"sandbox_backend={sandbox_backend_spec}({sb_disp})",
+        flush=True,
+    )
+    codex_tmux = bool(
+        args.codex_tmux and node_sandbox == "workspace-write" and not resolved_sb.os_isolated
+    )
     if args.codex_tmux and not codex_tmux:
         print(
             f"[self-check] Warning: --codex-tmux only takes effect under sandbox=workspace-write "
@@ -2990,6 +3513,7 @@ def run_self_check(args: argparse.Namespace) -> int:
                 idle_timeout=probe_idle_timeout,
                 codex_tmux=codex_tmux,
                 exec_backend=exec_backend_spec,
+                sandbox_backend=resolved_sb,
             )
             ro_dt = time.monotonic() - t0
             dir_clean = sorted(os.listdir(probe_dir)) == ["probe.txt"]
@@ -3025,6 +3549,7 @@ def run_self_check(args: argparse.Namespace) -> int:
                     idle_timeout=probe_idle_timeout,
                     codex_tmux=codex_tmux,
                     exec_backend=exec_backend_spec,
+                    sandbox_backend=resolved_sb,
                 )
                 wr_dt = time.monotonic() - t1
                 wr_ok = wr_status == "completed" and wr_token in wr_out
@@ -3090,6 +3615,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Opt in to manual one-shot elevated retries (Hub retry_elevated only)",
     )
     p.add_argument(
+        "--sandbox-backend",
+        choices=VALID_SANDBOX_BACKENDS,
+        default=None,
+        help="OS sandbox backend: auto, bwrap, seatbelt, or cli-native (default: auto)",
+    )
+    p.add_argument(
         "--codex-tmux",
         action="store_true",
         help="Allow Codex workspace-write network access (needed for Linux tmux AF_UNIX sockets; ignored outside workspace-write)",
@@ -3145,6 +3676,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             parsed.exec_backend = "auto"
     if parsed.tmux is None:
         parsed.tmux = "auto"
+    if parsed.sandbox_backend is None:
+        raw_env_sb = (os.environ.get(SANDBOX_BACKEND_ENV) or "").strip().lower()
+        if raw_env_sb in VALID_SANDBOX_BACKENDS:
+            parsed.sandbox_backend = raw_env_sb
+        else:
+            if raw_env_sb:
+                print(
+                    f"Warning: invalid {SANDBOX_BACKEND_ENV}: {raw_env_sb!r}; using 'auto'.",
+                    file=sys.stderr,
+                )
+            parsed.sandbox_backend = "auto"
     if parsed.timeout is None:
         parsed.timeout = DEFAULT_NODE_TIMEOUT
         if NODE_TIMEOUT_ENV in os.environ:

@@ -2503,6 +2503,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
         "总结截图结论".into(),
         None,
         0,
+        None,
     )
     .await;
     let att_msg: String = hub
@@ -2542,6 +2543,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
         "再触发".into(),
         None,
         agenct_hub::brain::MAX_CALLBACK_DEPTH,
+        None,
     )
     .await;
     let after_msgs: i64 = hub
@@ -2593,6 +2595,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
         "总结".into(),
         None,
         0,
+        None,
     )
     .await;
     let fb_msg: String = err_hub
@@ -4784,4 +4787,225 @@ async fn sandbox_blocked_task_and_one_shot_manual_elevation_enforce_boundaries()
         .await
         .unwrap();
     assert_eq!(elev_audits, 1);
+}
+
+#[tokio::test]
+async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (alice_c, alice_csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let (_bob_c, _bob_csrf) = seed_user(&hub, "u-bob", "bob", "Bob", false).await;
+    let router = app(hub.clone());
+
+    let (st, created) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"name": "pc-im", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_token = created["token"].as_str().unwrap().to_owned();
+
+    let (st, im_cfg) = req_json(
+        &router,
+        "PUT",
+        "/api/integrations/im",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({
+            "provider": "feishu",
+            "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-im-hook",
+            "rotate_inbound_token": true
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{im_cfg}");
+    let inbound_token = im_cfg["inbound_token"].as_str().unwrap().to_owned();
+
+    // Dispatch a task to Alice's node.
+    let (st, chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": "/node --agent opencode 推送发布分支"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let task_id = chat["tasks"][0]["task_id"].as_str().unwrap().to_owned();
+
+    let w1_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(
+                    "x-agenct-node-env",
+                    "kind:pc | os:linux | host:lab | agent:opencode | agents:opencode | sandbox:workspace-write | isolation:bwrap | elevated:1",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(w1_resp.status(), StatusCode::OK);
+    let w1: Value =
+        serde_json::from_slice(&w1_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let lease1 = w1["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev1 = w1["job"]["task_revision"].as_i64().unwrap();
+
+    // Node submits failure with blocked_reason -> approval code issued and appended to assistant message.
+    let sub1 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{task_id}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease1,
+                        "request_id": "sub-im-blk-1",
+                        "expected_revision": rev1,
+                        "status": "failed",
+                        "content": "Host key verification failed.",
+                        "agent": "opencode",
+                        "blocked_reason": "Host key verification failed."
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub1.status(), StatusCode::OK);
+
+    let last_msg: String = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT content FROM messages WHERE user_id='u-alice' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    let marker = "/approve ";
+    let idx = last_msg.find(marker).expect("approval command emitted");
+    let code = last_msg[idx + marker.len()..idx + marker.len() + 6].to_owned();
+    assert_eq!(code.len(), 6);
+    assert!(code.bytes().all(|b| b.is_ascii_alphanumeric()));
+
+    // Normal Chinese sentence starting with "放行" must NOT be treated as an approval command.
+    let (st, chat_normal) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": "放行这个是交付的时候权限授权是不"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        !chat_normal["reply"].as_str().unwrap().contains("单次放行"),
+        "natural sentence unexpectedly intercepted: {chat_normal}"
+    );
+
+    // Bob cannot consume Alice's code.
+    let err_bob = agenct_hub::collab::consume_approval_code(&hub, "u-bob", &code)
+        .await
+        .err()
+        .expect("cross-user code must fail");
+    assert_eq!(err_bob.0, StatusCode::BAD_REQUEST);
+
+    // Alice approves via IM webhook (/webhooks/im) using lowercase /approve <code> -> elevated job queued!
+    let im_req = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/webhooks/im")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-agenct-im-token", &inbound_token)
+                .body(Body::from(
+                    json!({"text": format!(" /approve {} ", code.to_ascii_lowercase())})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(im_req.status(), StatusCode::OK);
+    let im_body: Value =
+        serde_json::from_slice(&im_req.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert!(
+        im_body["reply"]
+            .as_str()
+            .unwrap()
+            .contains("已授权单次放行重试"),
+        "{im_body}"
+    );
+
+    let w2_resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let w2: Value =
+        serde_json::from_slice(&w2_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(w2["job"]["task_id"], task_id);
+    assert_eq!(w2["job"]["sandbox"], "elevated");
+    assert_eq!(w2["job"]["authorization"], "manual");
+
+    // Replaying the same approval code via Web chat must be rejected as already used.
+    let (st, replay_res) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": format!("放行 {code}")})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        replay_res["reply"]
+            .as_str()
+            .unwrap()
+            .contains("单次放行未生效"),
+        "{replay_res}"
+    );
+
+    let audit_cnt: i64 = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM audit_logs WHERE action = 'task_elevate' AND detail LIKE '%chat_approve%'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(audit_cnt, 1);
 }

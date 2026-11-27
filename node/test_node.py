@@ -464,6 +464,30 @@ class TestUnifiedNode(unittest.TestCase):
             node.build_cli_env("opencode", {"OPENCODE_PERMISSION": '{"edit":"deny"}'}, "unsafe-full"),
         )
 
+        # When wrapped by an outer OS sandbox (bwrap / seatbelt), all engines run headless without internal friction.
+        cl_iso = node.build_cli_argv("claude", "/bin/claude", "hi", "/w", "readonly", "/ev", None, os_isolated=True)
+        self.assertIn("--dangerously-skip-permissions", cl_iso)
+        self.assertNotIn("--disallowedTools", cl_iso)
+        self.assertNotIn(os.path.expanduser("~"), cl_iso)
+        cx_iso = node.build_cli_argv("codex", "/bin/codex", "hi", "/w", "readonly", "/ev", None, os_isolated=True)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cx_iso)
+        self.assertNotIn("-s", cx_iso)
+        cx_iso_res = node.build_cli_argv(
+            "codex", "/bin/codex", "hi", "/w", "workspace-write", "/ev", None, None, "th_1", os_isolated=True,
+        )
+        self.assertEqual(cx_iso_res[:3], ["/bin/codex", "exec", "resume"])
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", cx_iso_res)
+        ag_iso = node.build_cli_argv("agy", "/bin/agy", "hi", "/w", "readonly", "/ev", "/in", os_isolated=True)
+        self.assertIn("--dangerously-skip-permissions", ag_iso)
+        self.assertNotIn("--sandbox", ag_iso)
+        self.assertNotIn("--settings", ag_iso)
+        oc_iso = node.build_cli_argv("opencode", "/bin/opencode", "hi", "/w", "readonly", "/ev", None, os_isolated=True)
+        self.assertIn("--auto", oc_iso)
+        self.assertNotIn(
+            "OPENCODE_PERMISSION",
+            node.build_cli_env("opencode", {"OPENCODE_PERMISSION": '{"edit":"deny"}'}, "readonly", os_isolated=True),
+        )
+
     def test_tighten_sandbox_only_tightens_never_escalates(self) -> None:
         self.assertEqual(node.tighten_sandbox("workspace-write", ""), "workspace-write")
         self.assertEqual(node.tighten_sandbox("workspace-write", "readonly"), "readonly")
@@ -603,6 +627,7 @@ class TestUnifiedNode(unittest.TestCase):
                     30,
                     threading.Event(),
                     lambda _s, _t: None,
+                    sandbox_backend="cli-native",
                 )
         self.assertEqual(status, "completed")
         self.assertEqual(content, "AGY-OK")
@@ -611,13 +636,48 @@ class TestUnifiedNode(unittest.TestCase):
         self.assertIn("agenct-ro-", os.path.basename(captured_cwds[0]))
         self.assertFalse(os.path.exists(captured_cwds[0]))
 
+        class StubOsSandbox(node.SandboxBackend):
+            name = "bwrap"
+            os_isolated = True
+
+            def wrap(self, argv, *, shell, cwd, env, policy):
+                return ["/usr/bin/bwrap", "--mode", policy.mode, *argv], False, cwd, dict(env)
+
+        iso_cwds: list[str] = []
+        iso_argvs: list[list[str]] = []
+
+        def fake_iso_run(argv, **kwargs):
+            iso_argvs.append(list(argv))
+            iso_cwds.append(kwargs["cwd"])
+            return (0, ok_stream, b"", False)
+
+        with tempfile.TemporaryDirectory() as workdir:
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/agy"),
+                mock.patch.object(node, "run_monitored", side_effect=fake_iso_run),
+            ):
+                st2, txt2, _ = node.execute_job(
+                    "agy",
+                    {"task_id": "tsk_ro_os", "title": "Survey", "instruction": "Check repo", "sandbox": "readonly"},
+                    workdir,
+                    "workspace-write",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                    sandbox_backend=StubOsSandbox(),
+                )
+        self.assertEqual(st2, "completed")
+        self.assertEqual(txt2, "AGY-OK")
+        self.assertEqual(iso_cwds, [workdir])
+        self.assertEqual(iso_argvs[0][:3], ["/usr/bin/bwrap", "--mode", "readonly"])
+
     def test_build_prompt_readonly_hint_scoped_to_readonly_shell_disabled_engines(self) -> None:
         job = {"title": "Plan", "instruction": "Read files"}
-        agy_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="agy")
-        claude_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="claude")
-        opencode_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="opencode")
-        codex_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="codex")
-        agy_wr = node.build_prompt(job, [], "/ev", "/w", sandbox="workspace-write", agent="agy")
+        agy_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="agy", os_isolated=False)
+        claude_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="claude", os_isolated=False)
+        opencode_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="opencode", os_isolated=False)
+        codex_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent="codex", os_isolated=False)
+        agy_wr = node.build_prompt(job, [], "/ev", "/w", sandbox="workspace-write", agent="agy", os_isolated=False)
         self.assertNotIn("file writes and shell commands are disabled", agy_ro)
         self.assertIn("mounted read-only", agy_ro)
         self.assertIn("cd /w", agy_ro)
@@ -625,6 +685,12 @@ class TestUnifiedNode(unittest.TestCase):
         self.assertIn("file writes and shell commands are disabled", opencode_ro)
         self.assertNotIn("Read-only sandbox is active", codex_ro)
         self.assertNotIn("Read-only sandbox is active", agy_wr)
+
+        for eng in node.CLI_AGENTS:
+            os_ro = node.build_prompt(job, [], "/ev", "/w", sandbox="readonly", agent=eng, os_isolated=True)
+            self.assertIn("Read-only OS sandbox is active", os_ro)
+            self.assertIn("blocked by the OS", os_ro)
+            self.assertNotIn("shell commands are disabled", os_ro)
 
     def test_all_cli_adapters_satisfy_contract(self) -> None:
         job = {"title": "Contract", "instruction": "Read files"}
@@ -767,14 +833,14 @@ class TestUnifiedNode(unittest.TestCase):
                         st1, _, _ = node.execute_job(
                             "codex", {"task_id": "t1", "title": "Init", "instruction": "Hi"},
                             workdir, "workspace-write", 30, threading.Event(), lambda _s, _t: None,
-                            codex_tmux=allow_tmux,
+                            codex_tmux=allow_tmux, sandbox_backend="cli-native",
                         )
                         # Resume fails -> falls back to fresh reopen
                         st2, _, _ = node.execute_job(
                             "codex",
                             {"task_id": "t2", "title": "Res", "instruction": "Hi", "agent_session_id": "th_prev"},
                             workdir, "workspace-write", 30, threading.Event(), lambda _s, _t: None,
-                            codex_tmux=allow_tmux,
+                            codex_tmux=allow_tmux, sandbox_backend="cli-native",
                         )
                     self.assertEqual((st1, st2), ("completed", "completed"))
                     self.assertEqual(len(seen_argvs), 3)
@@ -798,7 +864,7 @@ class TestUnifiedNode(unittest.TestCase):
                 node.execute_job(
                     "codex", {"task_id": "t3", "title": "RO", "instruction": "Hi", "sandbox": "readonly"},
                     workdir, "workspace-write", 30, threading.Event(), lambda _s, _t: None,
-                    codex_tmux=True,
+                    codex_tmux=True, sandbox_backend="cli-native",
                 )
             self.assertEqual(len(ro_argvs), 1)
             self.assertNotIn("sandbox_workspace_write.network_access=true", ro_argvs[0])
@@ -816,7 +882,9 @@ class TestUnifiedNode(unittest.TestCase):
                     tok = prompt.split("print ", 1)[1].split(" (e.g.", 1)[0]
                 return (0, json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": tok}}).encode() + b"\n", b"", False)
 
-            sc_args = node.parse_args(["--self-check", "--workdir", workdir, "--agents", "codex", "--codex-tmux"])
+            sc_args = node.parse_args(
+                ["--self-check", "--workdir", workdir, "--agents", "codex", "--sandbox-backend", "cli-native", "--codex-tmux"]
+            )
             self.assertTrue(sc_args.codex_tmux)
             with (
                 mock.patch.object(node.shutil, "which", return_value="/bin/codex"),
@@ -832,7 +900,10 @@ class TestUnifiedNode(unittest.TestCase):
             # readonly node with --codex-tmux: ignored with warning (never enables network)
             sc_ro_argvs: list[list[str]] = []
             sc_ro_args = node.parse_args(
-                ["--self-check", "--workdir", workdir, "--agents", "codex", "--sandbox", "readonly", "--codex-tmux"]
+                [
+                    "--self-check", "--workdir", workdir, "--agents", "codex",
+                    "--sandbox", "readonly", "--sandbox-backend", "cli-native", "--codex-tmux",
+                ]
             )
             with (
                 mock.patch.object(node.shutil, "which", return_value="/bin/codex"),
@@ -861,7 +932,7 @@ class TestUnifiedNode(unittest.TestCase):
                     loop_args = node.parse_args([
                         "--hub", "https://agenct.example.com", "--token", "tok", "--once",
                         "--agent", "codex", "--agents", "codex", "--workdir", workdir,
-                        "--state-dir", workdir, "--sandbox", sb_flag, "--codex-tmux",
+                        "--state-dir", workdir, "--sandbox", sb_flag, "--sandbox-backend", "cli-native", "--codex-tmux",
                     ])
                     with (
                         mock.patch.object(node, "execute_job", side_effect=fake_loop_exec),
@@ -1380,12 +1451,295 @@ class TestUnifiedNode(unittest.TestCase):
             os.makedirs(os.path.join(tmp, "repo-a", ".git"))
             hdr = node.build_env_header(
                 "pc", "codex", tmp, ["codex", "agy"],
-                sandbox="workspace-write", allow_elevated=True, codex_tmux=True,
+                sandbox="workspace-write", isolation="cli-native", allow_elevated=True, codex_tmux=True,
             )
             self.assertIn("sandbox:workspace-write", hdr)
+            self.assertIn("isolation:cli-native", hdr)
             self.assertIn("elevated:1", hdr)
             self.assertIn("codex_net:1", hdr)
             self.assertLess(hdr.index("sandbox:"), hdr.index("repos:"))
+
+            hdr_bwrap = node.build_env_header(
+                "pc", "codex", tmp, ["codex", "agy"],
+                sandbox="workspace-write", isolation="bwrap", allow_elevated=True, codex_tmux=True,
+            )
+            self.assertIn("isolation:bwrap", hdr_bwrap)
+            self.assertNotIn("codex_net:1", hdr_bwrap)
+
+            hdr_direct = node.build_env_header(
+                "pc", "opencode", tmp, ["opencode"],
+                sandbox="unsafe-full", isolation="bwrap",
+            )
+            self.assertIn("sandbox:unsafe-full", hdr_direct)
+            self.assertIn("isolation:direct", hdr_direct)
+
+    def test_resolve_sandbox_backend_auto_and_explicit_fallback(self) -> None:
+        ok_proc = subprocess.CompletedProcess([], 0)
+        fail_proc = subprocess.CompletedProcess([], 1)
+
+        sb_linux = node.resolve_sandbox_backend(
+            "auto",
+            system="Linux",
+            which=lambda c: "/usr/bin/bwrap" if c == "bwrap" else None,
+            runner=lambda *_a, **_k: ok_proc,
+        )
+        self.assertEqual(sb_linux.name, "bwrap")
+        self.assertTrue(sb_linux.os_isolated)
+
+        sb_linux_fail = node.resolve_sandbox_backend(
+            "auto",
+            system="Linux",
+            which=lambda c: "/usr/bin/bwrap" if c == "bwrap" else None,
+            runner=lambda *_a, **_k: fail_proc,
+        )
+        self.assertEqual(sb_linux_fail.name, "cli-native")
+        self.assertFalse(sb_linux_fail.os_isolated)
+
+        sb_darwin = node.resolve_sandbox_backend(
+            "auto",
+            system="Darwin",
+            which=lambda c: "/usr/bin/sandbox-exec" if c == "sandbox-exec" else None,
+            runner=lambda *_a, **_k: ok_proc,
+        )
+        self.assertEqual(sb_darwin.name, "seatbelt")
+        self.assertTrue(sb_darwin.os_isolated)
+
+        sb_win = node.resolve_sandbox_backend("auto", system="Windows", which=lambda _c: "/bin/bwrap")
+        self.assertEqual(sb_win.name, "cli-native")
+
+        with redirect_stderr(io.StringIO()) as err_buf:
+            sb_explicit_fail = node.resolve_sandbox_backend(
+                "bwrap",
+                system="Linux",
+                which=lambda _c: None,
+            )
+        self.assertEqual(sb_explicit_fail.name, "cli-native")
+        self.assertIn("falling back", err_buf.getvalue())
+
+        args_default = node.parse_args(["--self-check"])
+        self.assertEqual(args_default.sandbox_backend, "auto")
+        with mock.patch.dict(os.environ, {node.SANDBOX_BACKEND_ENV: "cli-native"}):
+            self.assertEqual(node.parse_args(["--self-check"]).sandbox_backend, "cli-native")
+            self.assertEqual(
+                node.parse_args(["--self-check", "--sandbox-backend", "bwrap"]).sandbox_backend,
+                "bwrap",
+            )
+
+    def test_bubblewrap_sandbox_mounts_order_secret_masking_and_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            workdir = os.path.join(base, "work")
+            secret_dir = os.path.join(base, ".ssh")
+            secret_file = os.path.join(base, ".netrc")
+            broken_link = os.path.join(base, ".aws")
+            ev_dir = os.path.join(base, "ev")
+            in_dir = os.path.join(base, "in")
+            out_file = os.path.join(base, "out.txt")
+            state_dir = os.path.join(base, ".opencode-state")
+            for d in (workdir, secret_dir, ev_dir, in_dir, state_dir):
+                os.makedirs(d, exist_ok=True)
+            for f in (secret_file, out_file):
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write("x")
+            os.symlink(os.path.join(base, "does-not-exist"), broken_link)
+
+            bw = node.BubblewrapSandbox(bwrap_bin="/usr/bin/bwrap")
+            policy_ro = node.SandboxPolicy(
+                mode="readonly",
+                workdir=workdir,
+                evidence_dir=ev_dir,
+                in_dir=in_dir,
+                out_file=out_file,
+                state_paths=(state_dir, os.path.join(base, "missing-state")),
+                masked_paths=(secret_dir, secret_file, broken_link, workdir),
+            )
+            argv_ro, shell_ro, cwd_ro, _ = bw.wrap(["/bin/opencode", "run"], shell=False, cwd=workdir, env={"A": "1"}, policy=policy_ro)
+            self.assertFalse(shell_ro)
+            self.assertEqual(cwd_ro, workdir)
+            joined = " ".join(argv_ro)
+            self.assertIn(f"--tmpfs {os.path.realpath(secret_dir)}", joined)
+            self.assertIn(f"--ro-bind /dev/null {os.path.realpath(secret_file)}", joined)
+            self.assertNotIn(os.path.realpath(broken_link), joined)
+            self.assertNotIn(f"--tmpfs {os.path.realpath(workdir)}", joined)
+            self.assertIn(f"--ro-bind {os.path.realpath(workdir)} {os.path.realpath(workdir)}", joined)
+            self.assertLess(argv_ro.index("/tmp"), argv_ro.index(os.path.realpath(ev_dir)))
+            self.assertIn(f"--ro-bind {os.path.realpath(in_dir)} {os.path.realpath(in_dir)}", joined)
+            self.assertIn(f"--bind {os.path.realpath(out_file)} {os.path.realpath(out_file)}", joined)
+            self.assertIn(f"--bind {os.path.realpath(state_dir)} {os.path.realpath(state_dir)}", joined)
+            self.assertEqual(argv_ro[-4:], ["--", "/bin/opencode", "run"] if False else ["--chdir", workdir, "--", "/bin/opencode", "run"][-4:])
+
+            policy_wr = node.SandboxPolicy(
+                mode="workspace-write",
+                workdir=workdir,
+                evidence_dir=ev_dir,
+                masked_paths=(secret_dir,),
+            )
+            argv_custom, shell_custom, _, _ = bw.wrap("echo hi", shell=True, cwd=workdir, env={}, policy=policy_wr)
+            self.assertFalse(shell_custom)
+            self.assertIn(f"--bind {os.path.realpath(workdir)} {os.path.realpath(workdir)}", " ".join(argv_custom))
+            self.assertEqual(argv_custom[-3:], ["/bin/sh", "-c", "echo hi"])
+
+            policy_full = node.SandboxPolicy(mode="unsafe-full", workdir=workdir)
+            raw_argv, raw_shell, _, _ = bw.wrap(["/bin/true"], shell=False, cwd=workdir, env={}, policy=policy_full)
+            self.assertEqual(raw_argv, ["/bin/true"])
+            self.assertFalse(raw_shell)
+
+    def test_seatbelt_sandbox_generates_sbpl_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as base:
+            workdir = os.path.join(base, "work")
+            ev_dir = os.path.join(base, "ev")
+            secret_dir = os.path.join(base, ".ssh")
+            state_file = os.path.join(base, ".claude.json")
+            for d in (workdir, ev_dir, secret_dir):
+                os.makedirs(d, exist_ok=True)
+            with open(state_file, "w", encoding="utf-8") as fh:
+                fh.write("{}")
+
+            sb = node.SeatbeltSandbox(sandbox_exec_bin="/usr/bin/sandbox-exec")
+            ro_policy = node.SandboxPolicy(
+                mode="readonly",
+                workdir=workdir,
+                evidence_dir=ev_dir,
+                state_paths=(state_file,),
+                masked_paths=(secret_dir,),
+            )
+            ro_profile = sb.build_profile(ro_policy)
+            self.assertIn("(deny file-write*)", ro_profile)
+            self.assertNotIn(f'(allow file-write* (subpath "{workdir}"))', ro_profile)
+            self.assertIn(f'(allow file-write* (literal "{os.path.realpath(state_file)}"))', ro_profile)
+            self.assertIn(f'(deny file-read* file-write* (subpath "{os.path.realpath(secret_dir)}"))', ro_profile)
+
+            wr_policy = node.SandboxPolicy(
+                mode="workspace-write",
+                workdir=workdir,
+                evidence_dir=ev_dir,
+                masked_paths=(secret_dir,),
+            )
+            wr_profile = sb.build_profile(wr_policy)
+            self.assertIn(f'(allow file-write* (subpath "{os.path.realpath(workdir)}"))', wr_profile)
+            cmd, is_shell, _, _ = sb.wrap("ls -la", shell=True, cwd=workdir, env={}, policy=wr_policy)
+            self.assertFalse(is_shell)
+            self.assertEqual(cmd[:2], ["/usr/bin/sandbox-exec", "-p"])
+            self.assertEqual(cmd[-3:], ["/bin/sh", "-c", "ls -la"])
+
+    def test_real_bwrap_enforces_readonly_workspace_write_and_secret_masking(self) -> None:
+        if not node.probe_bwrap():
+            self.skipTest("bubblewrap unavailable in this environment")
+        bw = node.BubblewrapSandbox()
+        test_parent = os.path.expanduser("~")
+        if not os.path.isdir(test_parent) or not os.access(test_parent, os.W_OK):
+            test_parent = tempfile.gettempdir()
+        with (
+            tempfile.TemporaryDirectory() as workdir,
+            tempfile.TemporaryDirectory(prefix=".agenct-out-", dir=test_parent) as outside_dir,
+            tempfile.TemporaryDirectory(prefix=".agenct-sec-", dir=test_parent) as secret_dir,
+            tempfile.TemporaryDirectory() as ev_dir,
+        ):
+            with open(os.path.join(workdir, "hello.txt"), "w", encoding="utf-8") as fh:
+                fh.write("hello-bwrap")
+            with open(os.path.join(secret_dir, "id_ed25519"), "w", encoding="utf-8") as fh:
+                fh.write("SECRET_KEY")
+
+            ro_policy = node.SandboxPolicy(
+                mode="readonly",
+                workdir=workdir,
+                evidence_dir=ev_dir,
+                masked_paths=(secret_dir,),
+            )
+            probe_py = (
+                "import os, pathlib, sys\n"
+                "assert pathlib.Path(sys.argv[1], 'hello.txt').read_text() == 'hello-bwrap'\n"
+                "pathlib.Path(sys.argv[2], 'ev.txt').write_text('from-ro')\n"
+                "assert not os.path.exists(os.path.join(sys.argv[3], 'id_ed25519'))\n"
+                "try:\n"
+                "  open(os.path.join(sys.argv[1], 'write_fail'), 'w')\n"
+                "  raise AssertionError('readonly write unexpectedly succeeded')\n"
+                "except OSError as e:\n"
+                "  print(f'RO_ERR:{e.strerror}')\n"
+            )
+            cmd_ro, _, cwd_ro, env_ro = bw.wrap(
+                [sys.executable, "-c", probe_py, workdir, ev_dir, secret_dir],
+                shell=False, cwd=workdir, env=dict(os.environ), policy=ro_policy,
+            )
+            res_ro = subprocess.run(cmd_ro, cwd=cwd_ro, env=env_ro, capture_output=True, text=True, timeout=15)
+            self.assertEqual(res_ro.returncode, 0, msg=res_ro.stderr)
+            self.assertIn("RO_ERR:Read-only file system", res_ro.stdout)
+            with open(os.path.join(ev_dir, "ev.txt"), "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "from-ro")
+
+            wr_policy = node.SandboxPolicy(
+                mode="workspace-write",
+                workdir=workdir,
+                evidence_dir=ev_dir,
+                masked_paths=(secret_dir,),
+            )
+            probe_wr_py = (
+                "import os, pathlib, sys\n"
+                "pathlib.Path(sys.argv[1], 'ok.txt').write_text('wr-ok')\n"
+                "assert not os.path.exists(os.path.join(sys.argv[3], 'id_ed25519'))\n"
+                "try:\n"
+                "  open(os.path.join(sys.argv[2], 'escape_fail'), 'w')\n"
+                "  raise AssertionError('outside write unexpectedly succeeded')\n"
+                "except OSError as e:\n"
+                "  print(f'OUT_ERR:{e.strerror}')\n"
+            )
+            cmd_wr, _, cwd_wr, env_wr = bw.wrap(
+                [sys.executable, "-c", probe_wr_py, workdir, outside_dir, secret_dir],
+                shell=False, cwd=workdir, env=dict(os.environ), policy=wr_policy,
+            )
+            res_wr = subprocess.run(cmd_wr, cwd=cwd_wr, env=env_wr, capture_output=True, text=True, timeout=15)
+            self.assertEqual(res_wr.returncode, 0, msg=res_wr.stderr)
+            self.assertIn("OUT_ERR:Read-only file system", res_wr.stdout)
+            with open(os.path.join(workdir, "ok.txt"), "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "wr-ok")
+            self.assertFalse(os.path.exists(os.path.join(outside_dir, "escape_fail")))
+
+    def test_unsafe_full_node_still_uses_os_sandbox_when_job_tightens_readonly(self) -> None:
+        if not node.probe_bwrap():
+            self.skipTest("bubblewrap unavailable in this environment")
+        captured: list[tuple[list[str], str]] = []
+
+        def fake_run(argv, **kwargs):
+            captured.append((list(argv), kwargs["cwd"]))
+            return (0, b'{"type":"text","part":{"text":"OK"}}\n', b"", False)
+
+        with tempfile.TemporaryDirectory() as workdir:
+            with (
+                mock.patch.object(node.shutil, "which", side_effect=lambda c: "/usr/bin/bwrap" if c == "bwrap" else "/bin/opencode"),
+                mock.patch.object(node, "run_monitored", side_effect=fake_run),
+            ):
+                os_sb = node.resolve_sandbox_backend("auto")
+                self.assertTrue(os_sb.os_isolated)
+                meta_full: dict = {}
+                st1, _, _ = node.execute_job(
+                    "opencode",
+                    {"task_id": "t_full", "title": "Full", "instruction": "Run"},
+                    workdir,
+                    "unsafe-full",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                    meta_out=meta_full,
+                    sandbox_backend=os_sb,
+                )
+                self.assertEqual(st1, "completed")
+                self.assertEqual(meta_full.get("isolation"), "direct")
+                self.assertNotIn("/usr/bin/bwrap", captured[0][0][0])
+
+                meta_ro: dict = {}
+                st2, _, _ = node.execute_job(
+                    "opencode",
+                    {"task_id": "t_ro", "title": "RO", "instruction": "Check", "sandbox": "readonly"},
+                    workdir,
+                    "unsafe-full",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                    meta_out=meta_ro,
+                    sandbox_backend=os_sb,
+                )
+                self.assertEqual(st2, "completed")
+                self.assertEqual(meta_ro.get("isolation"), "bwrap")
+                self.assertEqual(captured[1][0][0], "/usr/bin/bwrap")
 
 
 if __name__ == "__main__":

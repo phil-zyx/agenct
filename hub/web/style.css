@@ -1148,15 +1148,18 @@ label.toggle input[type="checkbox"]:focus-visible { outline: 2px solid var(--bra
 .engine-pill-btn[aria-expanded="true"] .engine-pill-caret { transform: rotate(180deg); color: var(--brand); }
 .engine-menu {
   position: absolute; bottom: calc(100% + 10px); left: 0; z-index: 25;
-  min-width: 240px; padding: 6px; display: flex; flex-direction: column; gap: 2px;
+  min-width: 196px; padding: 6px; display: flex; flex-direction: column; gap: 2px;
   background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);
   transform-origin: bottom left;
 }
 .engine-menu:not(.hide) { animation: menu-in .18s var(--spring); }
 .engine-menu-head {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
-  padding: 5px 8px 6px; margin-bottom: 2px; border-bottom: 1px solid var(--line);
-  font-size: 11.5px; font-weight: 600; color: var(--muted);
+  padding: 5px 8px 4px; font-size: 11.5px; font-weight: 600; color: var(--muted);
+}
+.engine-menu-sub {
+  padding: 0 8px 6px; margin-bottom: 2px; border-bottom: 1px solid var(--line);
+  font-size: 11px; font-weight: 500; color: var(--muted);
 }
 .engine-menu-opt {
   display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%;

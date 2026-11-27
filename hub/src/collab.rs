@@ -1,7 +1,7 @@
 //! Lightweight cross-person collaboration: @colleague delegation & manual accept/deliver.
 use crate::{
     attachments,
-    auth::AuthUser,
+    auth::{sha256_hex, AuthUser},
     automation,
     config::{now_unix, truncate_bytes},
     db::record_audit,
@@ -140,6 +140,239 @@ pub async fn delegate_to_peer(
     Ok((peer_name, task_id, mode))
 }
 
+pub const ELEVATE_APPROVAL_TTL_SECS: i64 = 600;
+
+pub struct ElevatedTaskOutcome {
+    pub task_id: String,
+    pub node_id: String,
+    pub node_name: String,
+    pub title: String,
+    pub thread_id: Option<String>,
+}
+
+pub fn approval_code_hash(user_id: &str, code: &str) -> String {
+    sha256_hex(&format!("{user_id}:{}", code.trim().to_ascii_uppercase()))
+}
+
+fn elevate_task_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    uid: &str,
+    tid: &str,
+    wanted_node: Option<&str>,
+    source: &str,
+    now: i64,
+) -> Result<ElevatedTaskOutcome> {
+    struct RetryTaskRow {
+        requester_id: String,
+        status: String,
+        revision: i64,
+        title: String,
+        instruction: String,
+        thread_id: Option<String>,
+        existing_node_id: Option<String>,
+        existing_agent: String,
+        existing_role: String,
+        existing_model: String,
+        existing_effort: String,
+    }
+    let task: Option<RetryTaskRow> = tx
+        .query_row(
+            "SELECT t.requester_id, t.status, t.revision, t.title, t.instruction, t.thread_id,
+                    j.node_id, COALESCE(j.agent, ''), COALESCE(j.role, ''),
+                    COALESCE(j.model, ''), COALESCE(j.effort, '')
+             FROM tasks t
+             LEFT JOIN node_jobs j ON j.task_id = t.id
+             WHERE t.id = ?1 AND t.owner_id = ?2",
+            rusqlite::params![tid, uid],
+            |r| {
+                Ok(RetryTaskRow {
+                    requester_id: r.get(0)?,
+                    status: r.get(1)?,
+                    revision: r.get(2)?,
+                    title: r.get(3)?,
+                    instruction: r.get(4)?,
+                    thread_id: r.get(5)?,
+                    existing_node_id: r.get(6)?,
+                    existing_agent: r.get(7)?,
+                    existing_role: r.get(8)?,
+                    existing_model: r.get(9)?,
+                    existing_effort: r.get(10)?,
+                })
+            },
+        )
+        .optional()?;
+    let Some(row) = task else {
+        return Err(denied());
+    };
+    if row.requester_id != uid {
+        return Err(invalid("cross-user delegated tasks cannot be elevated"));
+    }
+    if row.status != "failed" {
+        return Err(invalid("only failed tasks can use elevated retry"));
+    }
+    let target_node = wanted_node.or(row.existing_node_id.as_deref());
+    let node = nodes::pick_node_for_task_sync(tx, uid, target_node, false, Some(&row.instruction))?
+        .ok_or_else(|| invalid("no registered node available"))?;
+    let supports_elevated = node
+        .capabilities
+        .split('|')
+        .any(|seg| seg.trim().eq_ignore_ascii_case("elevated:1"));
+    if !supports_elevated {
+        return Err(invalid(
+            "目标节点未开启单次放行支持（请在节点启动参数中加入 --allow-elevated）",
+        ));
+    }
+    let agent = if row.existing_agent.trim().is_empty() {
+        node.default_agent.clone()
+    } else {
+        row.existing_agent
+    };
+    let next_rev = row.revision + 1;
+    tx.execute(
+        "UPDATE tasks
+         SET status = 'running', blocked_reason = '', revision = ?2, updated_at = ?3
+         WHERE id = ?1",
+        params![tid, next_rev, now],
+    )?;
+    tx.execute(
+        "INSERT INTO node_jobs(
+            task_id, user_id, node_id, agent, role, model, effort, sandbox,
+            task_revision, authorization, status, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'elevated', ?8, 'manual', 'queued', ?9)
+         ON CONFLICT(task_id) DO UPDATE SET
+           node_id = excluded.node_id,
+           agent = excluded.agent,
+           role = excluded.role,
+           model = excluded.model,
+           effort = excluded.effort,
+           sandbox = 'elevated',
+           task_revision = excluded.task_revision,
+           authorization = 'manual',
+           status = 'queued',
+           lease_hash = NULL,
+           lease_until = NULL,
+           submission_hash = NULL,
+           stage = 'Queued (elevated)',
+           updated_at = excluded.updated_at",
+        params![
+            tid,
+            uid,
+            node.id,
+            agent,
+            row.existing_role,
+            row.existing_model,
+            row.existing_effort,
+            next_rev,
+            now
+        ],
+    )?;
+    tx.execute(
+        "UPDATE elevate_approvals SET used_at = ?2 WHERE task_id = ?1 AND used_at IS NULL",
+        params![tid, now],
+    )?;
+    record_audit(
+        tx,
+        uid,
+        "task_elevate",
+        "queued",
+        &row.title,
+        &format!("node={} 单次放行重试 ({source})", node.name),
+    )?;
+    Ok(ElevatedTaskOutcome {
+        task_id: tid.to_owned(),
+        node_id: node.id,
+        node_name: node.name,
+        title: row.title,
+        thread_id: row.thread_id,
+    })
+}
+
+pub async fn elevate_task_once(
+    hub: &Hub,
+    user_id: &str,
+    task_id: &str,
+    wanted_node: Option<&str>,
+    source: &str,
+) -> Result<ElevatedTaskOutcome> {
+    let uid = user_id.to_owned();
+    let tid = task_id.to_owned();
+    let wanted = wanted_node.map(str::to_owned);
+    let src = source.to_owned();
+    let outcome = hub
+        .db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let now = now_unix();
+            let outcome = elevate_task_in_tx(&tx, &uid, &tid, wanted.as_deref(), &src, now)?;
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await?;
+    hub.node_waiters.notify(user_id, &outcome.node_id);
+    hub.events.emit(
+        user_id,
+        "task",
+        json!({
+            "task_id": outcome.task_id,
+            "status": "running",
+            "node_id": outcome.node_id,
+            "elevated": true,
+            "title": outcome.title,
+            "node_name": outcome.node_name,
+        }),
+    );
+    Ok(outcome)
+}
+
+pub async fn consume_approval_code(
+    hub: &Hub,
+    user_id: &str,
+    raw_code: &str,
+) -> Result<ElevatedTaskOutcome> {
+    let code = raw_code.trim().to_ascii_uppercase();
+    if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(invalid("审批码格式无效，应为 6 位字母或数字"));
+    }
+    let code_hash = approval_code_hash(user_id, &code);
+    let uid = user_id.to_owned();
+    let outcome = hub
+        .db
+        .write(move |conn| {
+            let tx = conn.transaction()?;
+            let now = now_unix();
+            let tid: Option<String> = tx
+                .query_row(
+                    "SELECT task_id FROM elevate_approvals
+                     WHERE user_id = ?1 AND code_hash = ?2 AND used_at IS NULL AND expires_at >= ?3
+                     ORDER BY created_at DESC LIMIT 1",
+                    params![uid, code_hash, now],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(tid) = tid else {
+                return Err(invalid("审批码无效、已使用或已过期"));
+            };
+            let outcome = elevate_task_in_tx(&tx, &uid, &tid, None, "chat_approve", now)?;
+            tx.commit()?;
+            Ok(outcome)
+        })
+        .await?;
+    hub.node_waiters.notify(user_id, &outcome.node_id);
+    hub.events.emit(
+        user_id,
+        "task",
+        json!({
+            "task_id": outcome.task_id,
+            "status": "running",
+            "node_id": outcome.node_id,
+            "elevated": true,
+            "title": outcome.title,
+            "node_name": outcome.node_name,
+        }),
+    );
+    Ok(outcome)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskActionInput {
@@ -220,149 +453,13 @@ pub async fn task_action(
             ))
         }
         "retry_elevated" => {
-            let wanted_node = input.node_id.clone();
-            let (node_id, node_name, title) = hub
-                .db
-                .write(move |conn| {
-                    let tx = conn.transaction()?;
-                    struct RetryTaskRow {
-                        requester_id: String,
-                        status: String,
-                        revision: i64,
-                        title: String,
-                        instruction: String,
-                        existing_node_id: Option<String>,
-                        existing_agent: String,
-                        existing_role: String,
-                        existing_model: String,
-                        existing_effort: String,
-                    }
-                    let task: Option<RetryTaskRow> = tx
-                        .query_row(
-                            "SELECT t.requester_id, t.status, t.revision, t.title, t.instruction,
-                                    j.node_id, COALESCE(j.agent, ''), COALESCE(j.role, ''),
-                                    COALESCE(j.model, ''), COALESCE(j.effort, '')
-                             FROM tasks t
-                             LEFT JOIN node_jobs j ON j.task_id = t.id
-                             WHERE t.id = ?1 AND t.owner_id = ?2",
-                            params![tid, uid],
-                            |r| {
-                                Ok(RetryTaskRow {
-                                    requester_id: r.get(0)?,
-                                    status: r.get(1)?,
-                                    revision: r.get(2)?,
-                                    title: r.get(3)?,
-                                    instruction: r.get(4)?,
-                                    existing_node_id: r.get(5)?,
-                                    existing_agent: r.get(6)?,
-                                    existing_role: r.get(7)?,
-                                    existing_model: r.get(8)?,
-                                    existing_effort: r.get(9)?,
-                                })
-                            },
-                        )
-                        .optional()?;
-                    let Some(row) = task else {
-                        return Err(denied());
-                    };
-                    if row.requester_id != uid {
-                        return Err(invalid("cross-user delegated tasks cannot be elevated"));
-                    }
-                    if row.status != "failed" {
-                        return Err(invalid("only failed tasks can use elevated retry"));
-                    }
-                    let target_node = wanted_node.as_deref().or(row.existing_node_id.as_deref());
-                    let node = nodes::pick_node_for_task_sync(
-                        &tx,
-                        &uid,
-                        target_node,
-                        false,
-                        Some(&row.instruction),
-                    )?
-                    .ok_or_else(|| invalid("no registered node available"))?;
-                    let supports_elevated = node
-                        .capabilities
-                        .split('|')
-                        .any(|seg| seg.trim().eq_ignore_ascii_case("elevated:1"));
-                    if !supports_elevated {
-                        return Err(invalid(
-                            "目标节点未开启单次放行支持（请在节点启动参数中加入 --allow-elevated）",
-                        ));
-                    }
-                    let agent = if row.existing_agent.trim().is_empty() {
-                        node.default_agent.clone()
-                    } else {
-                        row.existing_agent
-                    };
-                    let now = now_unix();
-                    let next_rev = row.revision + 1;
-                    tx.execute(
-                        "UPDATE tasks
-                         SET status = 'running', blocked_reason = '', revision = ?2, updated_at = ?3
-                         WHERE id = ?1",
-                        params![tid, next_rev, now],
-                    )?;
-                    tx.execute(
-                        "INSERT INTO node_jobs(
-                            task_id, user_id, node_id, agent, role, model, effort, sandbox,
-                            task_revision, authorization, status, updated_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'elevated', ?8, 'manual', 'queued', ?9)
-                         ON CONFLICT(task_id) DO UPDATE SET
-                           node_id = excluded.node_id,
-                           agent = excluded.agent,
-                           role = excluded.role,
-                           model = excluded.model,
-                           effort = excluded.effort,
-                           sandbox = 'elevated',
-                           task_revision = excluded.task_revision,
-                           authorization = 'manual',
-                           status = 'queued',
-                           lease_hash = NULL,
-                           lease_until = NULL,
-                           submission_hash = NULL,
-                           stage = 'Queued (elevated)',
-                           updated_at = excluded.updated_at",
-                        params![
-                            tid,
-                            uid,
-                            node.id,
-                            agent,
-                            row.existing_role,
-                            row.existing_model,
-                            row.existing_effort,
-                            next_rev,
-                            now
-                        ],
-                    )?;
-                    record_audit(
-                        &tx,
-                        &uid,
-                        "task_elevate",
-                        "queued",
-                        &row.title,
-                        &format!("node={} 单次放行重试", node.name),
-                    )?;
-                    tx.commit()?;
-                    Ok((node.id, node.name, row.title))
-                })
-                .await?;
-            hub.node_waiters.notify(&user.id, &node_id);
-            hub.events.emit(
-                user.id,
-                "task",
-                json!({
-                    "task_id": task_id,
-                    "status": "running",
-                    "node_id": node_id,
-                    "elevated": true,
-                    "title": title,
-                    "node_name": node_name,
-                }),
-            );
+            let outcome =
+                elevate_task_once(&hub, &user.id, &task_id, input.node_id.as_deref(), "web")
+                    .await?;
             Ok(Json(json!({
                 "ok": true,
-                "task_id": task_id,
-                "node_id": node_id,
+                "task_id": outcome.task_id,
+                "node_id": outcome.node_id,
                 "sandbox": "elevated",
             })))
         }
