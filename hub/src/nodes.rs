@@ -1479,7 +1479,7 @@ pub async fn renew_lease(
 ) -> Result<Json<Value>> {
     let (user_id, node_id, _) = authenticate_node(&hub, &headers).await?;
     let clean_stage = truncate_bytes(sanitize_terminal_text(&input.stage).trim(), 120);
-    let clean_tail = truncate_bytes(sanitize_terminal_text(&input.log_tail).trim(), 360);
+    let clean_tail = truncate_bytes(sanitize_terminal_text(&input.log_tail).trim(), 900);
     let lease_hash = sha256_hex(&input.lease_token);
     let uid = user_id.clone();
     let tid = task_id.clone();

@@ -413,8 +413,15 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         elapsed,
       ].filter(Boolean).join(' · ');
       const logKey = `${task.id}:${task.revision ?? ''}`;
-      const log = view.logTail
-        ? `<details class="node-repos" data-triage-log="${esc(logKey)}"${openLogs.has(logKey) ? ' open' : ''}><summary>日志摘要</summary><div class="item-sub detail-body">${esc(view.logTail)}</div></details>`
+      const formattedLog = view.logTail
+        ? (view.logTail.includes('\n') ? view.logTail.split(/\r?\n/) : view.logTail.split(/\s+\|\s+/))
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .filter((s, idx, arr) => idx === 0 || s !== arr[idx - 1])
+            .join('\n')
+        : '';
+      const log = formattedLog
+        ? `<details class="node-repos" data-triage-log="${esc(logKey)}"${openLogs.has(logKey) ? ' open' : ''}><summary>执行动态</summary><div class="item-sub detail-body">${esc(formattedLog)}</div></details>`
         : '';
       const links = view.links.map((url) => `<div class="item-sub"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a></div>`).join('');
       return `${progress ? `<div class="item-sub">${progress}</div>` : ''}${log}${links}`;

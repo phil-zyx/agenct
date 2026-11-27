@@ -53,7 +53,7 @@ export function triageTasks(tasks) {
         progress: {
           stage: stripNoise(task.stage),
           elapsed: Number.isFinite(task.elapsed_secs) && task.elapsed_secs >= 0 ? task.elapsed_secs : null,
-          logTail: stripNoise(task.log_tail).slice(-360),
+          logTail: stripNoise(task.log_tail).slice(0, 600),
           links: externalLinks(task),
         },
       });

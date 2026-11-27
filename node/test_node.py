@@ -274,6 +274,77 @@ class TestUnifiedNode(unittest.TestCase):
         )
         self.assertEqual(node.summarize_progress_line("claude", "\x1b[31mhi\x1b[0m"), "hi")
 
+    def test_format_progress_entry_and_run_monitored_dedup_no_midline_slice(self) -> None:
+        wd = "/tmp/ws-root"
+        self.assertEqual(node.format_progress_entry("read_file: /tmp/ws-root/hub/web/style.css", wd), "查看 hub/web/style.css")
+        self.assertEqual(node.format_progress_entry("replace_file_content: /tmp/ws-root/a.js", wd), "修改 a.js")
+        self.assertEqual(node.format_progress_entry("run_command: cd /tmp/ws-root && grep -rn foo bar | head -n 5", wd), "执行 grep -rn foo bar | head -n 5")
+        self.assertEqual(node.format_progress_entry("update_steps: ...", wd), "")
+        self.assertEqual(node.format_progress_entry("exit_plan_mode: ...", wd), "规划完成，开始执行")
+        long_entry = node.format_progress_entry("run_command: " + ("echo x && " * 20), wd, max_chars=40)
+        self.assertTrue(long_entry.startswith("执行 "))
+        self.assertTrue(long_entry.endswith("…"))
+        self.assertLessEqual(len(long_entry), 40)
+
+        agy_active = '{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"tool","tool_name":"read_file","tool_info":{"parameters":{"Path":"/tmp/ws-root/a.css"}}}}'
+        agy_done = '{"event":"step_update","step_update":{"state":"DONE","step_type":"tool","tool_name":"read_file","tool_info":{"parameters":{"Path":"/tmp/ws-root/a.css"}}}}'
+        agy_summary = '{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"parameters":{"toolSummary":"Check z-index styles","CommandLine":"cd /tmp/ws-root && grep x"}}}}'
+        self.assertEqual(node.summarize_progress_line("agy", agy_active), "read_file: /tmp/ws-root/a.css")
+        self.assertEqual(node.summarize_progress_line("agy", agy_done), "")
+        self.assertEqual(node.summarize_progress_line("agy", agy_summary), "Check z-index styles")
+
+        events_seen: list[str] = []
+
+        class StubLog(node.BackendLogStream):
+            def __init__(self) -> None:
+                self._sent = False
+
+            def read_chunks(self):
+                if self._sent:
+                    return b"", b""
+                self._sent = True
+                return (
+                    b"read_file: /tmp/ws-root/a.css\n"
+                    b"read_file: /tmp/ws-root/a.css\n"
+                    b"run_command: cd /tmp/ws-root && grep a b | grep c\n",
+                    b"",
+                )
+
+            def is_done(self) -> bool:
+                return self._sent
+
+            def returncode(self) -> int | None:
+                return 0 if self._sent else None
+
+        class StubBackend(node.ExecBackend):
+            name = "stub"
+
+            def spawn(self, argv, *, shell, cwd, env, task_id=""):
+                return node.ExecHandle(backend=self.name, session_id="s1", argv=argv)
+
+            def log(self, handle):
+                return StubLog()
+
+            def attach(self, handle):
+                return None
+
+            def cleanup(self, handle, *, terminate=False, force=False):
+                pass
+
+            def list(self):
+                return []
+
+        node.run_monitored(
+            ["noop"], shell=False, cwd=wd, env={}, timeout=5,
+            cancel_event=threading.Event(),
+            progress_cb=lambda _st, tail: events_seen.append(tail),
+            stage_label="Run", backend=StubBackend(), task_id="t_fmt",
+        )
+        self.assertEqual(
+            events_seen[-1],
+            "查看 a.css\n执行 grep a b | grep c",
+        )
+
     def test_parse_claude_stream_json_and_progress(self) -> None:
         stream = "\n".join([
             '{"type":"system","subtype":"init","session_id":"cl_ses_001"}',
@@ -1446,6 +1517,84 @@ class TestUnifiedNode(unittest.TestCase):
             self.assertEqual(st, "failed")
             self.assertIn("external_directory (/proc/*)", meta.get("blocked_reason", ""))
 
+    def test_soft_sandbox_block_marks_exit0_ssh_and_sandbox_denials_failed_without_false_positives(self) -> None:
+        raw_push_err = (
+            '{"event":"step_update","step_update":{"step_type":"tool","tool_output":"git@github.com: Permission denied (publickey).\\nfatal: Could not read from remote repository."}}\n'
+            '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"推送卡在认证上了：git@github.com: Permission denied (publickey)，因为沙箱里看不到 ~/.ssh，所以没能 push。"}}\n'
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as workdir:
+            # 1. Under workspace-write, exit rc=0 soft report triggers failed + blocked_reason.
+            meta: dict = {}
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/agy"),
+                mock.patch.object(node, "run_monitored", return_value=(0, raw_push_err, b"", False)),
+            ):
+                st, _, _ = node.execute_job(
+                    "agy",
+                    {"task_id": "tsk_ssh", "title": "Push", "instruction": "git push", "sandbox": "workspace-write"},
+                    workdir,
+                    "workspace-write",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                    allow_elevated=True,
+                    sandbox_backend="cli-native",
+                    meta_out=meta,
+                )
+            self.assertEqual(st, "failed")
+            self.assertIn("Permission denied (publickey)", meta.get("blocked_reason", ""))
+
+            # 2. Under unsafe-full (elevated retry), soft block must not trigger.
+            meta_elev: dict = {}
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/agy"),
+                mock.patch.object(node, "run_monitored", return_value=(0, raw_push_err, b"", False)),
+            ):
+                st_e, _, _ = node.execute_job(
+                    "agy",
+                    {
+                        "task_id": "tsk_ssh",
+                        "title": "Push",
+                        "instruction": "git push",
+                        "sandbox": "elevated",
+                        "authorization": "manual",
+                    },
+                    workdir,
+                    "workspace-write",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                    allow_elevated=True,
+                    sandbox_backend="cli-native",
+                    meta_out=meta_elev,
+                )
+            self.assertEqual(st_e, "completed")
+            self.assertEqual(meta_elev.get("blocked_reason", ""), "")
+
+            # 3. Inspecting source files containing regex literals + healthy summary must not false-positive.
+            raw_source_inspection = (
+                '{"event":"step_update","step_update":{"step_type":"tool","tool_output":"re.compile(r\\"(Permission denied (publickey))\\")"}}\n'
+                '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"已完成代码检查，所有单元测试均通过。"}}\n'
+            ).encode("utf-8")
+            meta_ok: dict = {}
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/agy"),
+                mock.patch.object(node, "run_monitored", return_value=(0, raw_source_inspection, b"", False)),
+            ):
+                st_ok, _, _ = node.execute_job(
+                    "agy",
+                    {"task_id": "tsk_ok", "title": "Review", "instruction": "review node"},
+                    workdir,
+                    "workspace-write",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                    sandbox_backend="cli-native",
+                    meta_out=meta_ok,
+                )
+            self.assertEqual(st_ok, "completed")
+            self.assertEqual(meta_ok.get("blocked_reason", ""), "")
+
     def test_build_env_header_includes_sandbox_and_elevated_flags(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "repo-a", ".git"))
@@ -1740,6 +1889,30 @@ class TestUnifiedNode(unittest.TestCase):
                 self.assertEqual(st2, "completed")
                 self.assertEqual(meta_ro.get("isolation"), "bwrap")
                 self.assertEqual(captured[1][0][0], "/usr/bin/bwrap")
+
+    def test_opencode_rejects_model_without_provider_prefix_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as workdir:
+            with (
+                mock.patch.object(node.shutil, "which", return_value="/bin/opencode"),
+                mock.patch.object(node, "run_monitored") as run_mock,
+            ):
+                status, content, _ = node.execute_job(
+                    "opencode",
+                    {
+                        "task_id": "t_bad_mod",
+                        "title": "Check",
+                        "instruction": "Run",
+                        "model": "gemini-4-neon-high",
+                    },
+                    workdir,
+                    "workspace-write",
+                    30,
+                    threading.Event(),
+                    lambda _s, _t: None,
+                )
+        self.assertEqual(status, "failed")
+        self.assertIn("provider/model", content)
+        run_mock.assert_not_called()
 
 
 if __name__ == "__main__":

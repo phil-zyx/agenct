@@ -602,9 +602,9 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
 .work-elapsed { flex: none; font-variant-numeric: tabular-nums; }
 .work-log summary { width: fit-content; padding: 4px 0; cursor: pointer; }
 #work-log-tail {
-  max-height: 8.5em; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 12px; line-height: 1.5; margin-top: 4px; padding: 6px 8px; border-radius: 8px; background: var(--soft);
+  max-height: 9.5em; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  font-size: 12px; line-height: 1.65; color: var(--muted);
+  margin-top: 4px; padding: 8px 10px; border-radius: 8px; background: var(--soft);
 }
 .stream-live {
   width: 100%; max-width: var(--col); min-width: 0; margin: 14px auto 0; display: flex; flex-direction: column; gap: 14px;

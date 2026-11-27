@@ -421,8 +421,29 @@ _SANDBOX_BLOCK_PATTERNS = (
     re.compile(r"^\s*!\s*(permission requested:.*auto-rejecting.*)$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"(Action denied(?:\s+in\s+headless\s+mode)?\s*:[^\r\n]+)", re.IGNORECASE),
     re.compile(r"(Sandbox blocked[^\r\n]+)", re.IGNORECASE),
-    re.compile(r"(Read-only file system[^\r\n]*|Operation not permitted[^\r\n]*|Permission denied[^\r\n]*|Host key verification failed[^\r\n]*)", re.IGNORECASE),
+    re.compile(r"(Read-only file system[^\r\n]*|Operation not permitted[^\r\n]*|Permission denied[^\r\n]*|Host key verification failed[^\r\n]*|Could not read from remote repository[^\r\n]*)", re.IGNORECASE),
     re.compile(r"([^\r\n]*(?:network_access|outside the workspace|sandbox restriction)[^\r\n]*)", re.IGNORECASE),
+)
+
+_SOFT_SANDBOX_BLOCK_PATTERNS = (
+    re.compile(r"^\s*!\s*(permission requested:[^\r\n\"'\\]*auto-rejecting[^\r\n\"'\\]*)", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"(Action denied(?:\s+in\s+headless\s+mode)?\s*:[^\r\n\"'\\]+)", re.IGNORECASE),
+    re.compile(r"((?:[A-Za-z0-9_.-]+@[^\s:\"'\\]+:\s*)?Permission denied\s*\(publickey[^)]*\))", re.IGNORECASE),
+    re.compile(r"(Could not read from remote repository[^\r\n\"'\\]*)", re.IGNORECASE),
+    re.compile(r"(Host key verification failed[^\r\n\"'\\]*)", re.IGNORECASE),
+    re.compile(r"((?:Read-only file system|Operation not permitted)[^\r\n\"'\\]*)", re.IGNORECASE),
+)
+_TASK_BLOCKED_TEXT_RE = re.compile(
+    r"(?:permission denied|publickey|host key verification|could not read from remote|"
+    r"read-only file system|operation not permitted|action denied|sandbox|blocked|denied|"
+    r"unable to|failed to|cannot|could not|沙箱|权限|受阻|卡在|没能|未能|无法|失败|拦截|拒绝)",
+    re.IGNORECASE,
+)
+_SOFT_TEXT_PROOF_RE = re.compile(
+    r"(?:permission denied|publickey|~/\.ssh|\.ssh/|host key verification|"
+    r"could not read from remote|read-only file system|operation not permitted|"
+    r"action denied|permission requested|auto-rejecting|external_directory)",
+    re.IGNORECASE,
 )
 
 
@@ -437,6 +458,41 @@ def detect_sandbox_block(agent: str, raw_out: str, raw_err: str = "", text: str 
         if not hay:
             continue
         for pat in _SANDBOX_BLOCK_PATTERNS:
+            m = pat.search(hay)
+            if m:
+                msg = m.group(1).strip().lstrip("! ").strip()
+                if msg:
+                    return msg[:160]
+        if agent == "opencode" and "rule which prevents you from using this specific tool call" in hay:
+            return "OpenCode tool permission blocked directory or command access"
+    return ""
+
+
+def detect_soft_sandbox_block(
+    agent: str,
+    effective_sandbox: str,
+    raw_out: str,
+    raw_err: str = "",
+    text: str = "",
+) -> str:
+    """Detect OS/CLI sandbox blocks even when the AI CLI exited rc=0 after reporting the failure."""
+    if effective_sandbox == "unsafe-full" or not text.strip():
+        return ""
+    if not (_TASK_BLOCKED_TEXT_RE.search(text) and _SOFT_TEXT_PROOF_RE.search(text)):
+        return ""
+    for raw in (raw_err, raw_out):
+        cleaned = strip_ansi(raw)
+        if not cleaned:
+            continue
+        filtered_lines = [
+            line
+            for line in cleaned.splitlines()
+            if "re.compile(" not in line and "_SANDBOX_BLOCK" not in line and "assertIn(" not in line
+        ]
+        if not filtered_lines:
+            continue
+        hay = "\n".join(filtered_lines)
+        for pat in _SOFT_SANDBOX_BLOCK_PATTERNS:
             m = pat.search(hay)
             if m:
                 msg = m.group(1).strip().lstrip("! ").strip()
@@ -535,9 +591,15 @@ def _summarize_agy_event(ev: dict) -> str:
         su = ev.get("step_update") if isinstance(ev.get("step_update"), dict) else {}
         stype = su.get("step_type")
         if stype == "tool":
+            state = str(su.get("state") or "").upper()
+            if state == "DONE":
+                return ""
             info = su.get("tool_info") if isinstance(su.get("tool_info"), dict) else {}
             name = str(su.get("tool_name") or info.get("name") or "tool")
             parms = info.get("parameters") if isinstance(info.get("parameters"), dict) else {}
+            summary = parms.get("toolSummary")
+            if isinstance(summary, str) and summary.strip():
+                return strip_ansi(summary).strip()
             detail = (
                 parms.get("CommandLine")
                 or parms.get("Path")
@@ -549,8 +611,6 @@ def _summarize_agy_event(ev: dict) -> str:
                 or ""
             )
             return strip_ansi(f"{name}: {detail}" if detail else name).strip()
-        if stype == "agent_response":
-            return strip_ansi(str(su.get("text_delta") or "")).strip()
         return ""
     if ev_name == "result":
         res = ev.get("result") if isinstance(ev.get("result"), dict) else {}
@@ -565,6 +625,70 @@ def _summarize_agy_event(ev: dict) -> str:
     if ev_name == "error" or ev.get("error"):
         return strip_ansi(_extract_error_message(ev.get("error"), ev.get("message")) or "error").strip()
     return ""
+
+
+_PROGRESS_TOOL_LABELS = {
+    "read_file": "查看",
+    "view_file": "查看",
+    "read": "查看",
+    "edit_file": "修改",
+    "write_file": "修改",
+    "write_to_file": "修改",
+    "replace_file_content": "修改",
+    "multi_replace_file_content": "修改",
+    "edit": "修改",
+    "write": "修改",
+    "grep_search": "检索",
+    "grep": "检索",
+    "find_by_name": "检索",
+    "glob": "检索",
+    "list_dir": "检索",
+    "run_command": "执行",
+    "bash": "执行",
+}
+
+
+def format_progress_entry(text: str, workdir: str = "", max_chars: int = 84) -> str:
+    """Format a raw progress line into a concise, human-readable step without mid-line left clipping."""
+    collapsed = " ".join(strip_ansi(text).split())
+    if not collapsed:
+        return ""
+
+    prefixes: list[str] = []
+    if workdir:
+        for base in dict.fromkeys((os.path.abspath(workdir), os.path.realpath(workdir))):
+            clean_base = base.rstrip("/")
+            if clean_base and clean_base != "/":
+                prefixes.append(clean_base + "/")
+
+    def _shorten(val: str) -> str:
+        out_val = val
+        for pfx in prefixes:
+            out_val = out_val.replace(pfx, "")
+        return out_val
+
+    if ": " in collapsed:
+        tool_raw, detail = collapsed.split(": ", 1)
+    else:
+        tool_raw, detail = collapsed, ""
+    tool_key = tool_raw.strip().lower()
+    if tool_key == "update_steps":
+        return ""
+    if tool_key == "exit_plan_mode":
+        return "规划完成，开始执行"
+
+    cn_action = _PROGRESS_TOOL_LABELS.get(tool_key)
+    if cn_action:
+        body = _shorten(detail.strip())
+        if cn_action == "执行" and body:
+            body = re.sub(r"^cd\s+\S+\s*(?:&&|;)\s*", "", body).strip()
+        out = f"{cn_action} {body}".strip() if body else cn_action
+    else:
+        out = _shorten(collapsed)
+
+    if max_chars >= 4 and len(out) > max_chars:
+        out = out[: max_chars - 1].rstrip() + "…"
+    return out
 
 
 def summarize_progress_line(agent: str, raw_line: str) -> str:
@@ -2161,11 +2285,16 @@ def run_monitored(
                     line_bufs[idx] = parts[-1]
                 for raw_line in lines:
                     text = summarize_progress_line(agent_hint, decode_bytes(raw_line))
-                    if text:
-                        recent.append(text[-160:])
-                        if len(recent) > 4:
+                    entry = format_progress_entry(text, workdir=cwd) if text else ""
+                    if entry:
+                        if recent and recent[-1] == entry:
+                            continue
+                        recent.append(entry)
+                        if len(recent) > 5:
                             recent.pop(0)
-                        last_tail = " | ".join(recent)[-360:]
+                        while len("\n".join(recent).encode("utf-8")) > 850 and len(recent) > 1:
+                            recent.pop(0)
+                        last_tail = "\n".join(recent)
                         progress_cb(stage_label, last_tail)
 
     cancelled = False
@@ -3040,6 +3169,12 @@ def execute_job(
             exe = shutil.which(agent)
             if not exe:
                 return "failed", f"Agent CLI '{agent}' not found in PATH.", []
+            if agent == "opencode" and job_model and "/" not in job_model:
+                return (
+                    "failed",
+                    f"Invalid opencode model '{job_model}': opencode requires 'provider/model' format (e.g. deepseek/deepseek-flash).",
+                    [],
+                )
             out_file = None
             ro_cwd: str | None = None
             try:
@@ -3154,7 +3289,13 @@ def execute_job(
                 text = file_text or out_text or strip_ansi(raw_err).strip()
                 stream_err = detect_cli_stream_error(agent, raw_out, raw_err)
                 status = "completed" if rc == 0 and not stream_err and text else "failed"
-                if status == "failed" and meta_out is not None:
+                if status == "completed":
+                    soft_blocked = detect_soft_sandbox_block(agent, eff_sandbox, raw_out, raw_err, text)
+                    if soft_blocked:
+                        status = "failed"
+                        if meta_out is not None:
+                            meta_out["blocked_reason"] = soft_blocked
+                elif meta_out is not None:
                     blocked = detect_sandbox_block(agent, raw_out, raw_err, text)
                     if blocked:
                         meta_out["blocked_reason"] = blocked

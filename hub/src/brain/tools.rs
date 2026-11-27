@@ -308,14 +308,16 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                 },
                 None => None,
             };
-            let requested_agent = explicit_agent.or_else(|| {
-                role_opt
-                    .as_ref()
-                    .map(|r| r.agent.trim())
-                    .filter(|s| !s.is_empty())
-                    .and_then(nodes::normalize_agent_name)
-                    .map(str::to_owned)
-            });
+            let role_agent = role_opt
+                .as_ref()
+                .map(|r| r.agent.trim())
+                .filter(|s| !s.is_empty())
+                .and_then(nodes::normalize_agent_name);
+            let agent_overridden = matches!(
+                (explicit_agent.as_deref(), role_agent),
+                (Some(exp), Some(ra)) if !exp.eq_ignore_ascii_case(ra)
+            );
+            let requested_agent = explicit_agent.or_else(|| role_agent.map(str::to_owned));
 
             let requested_model = match call
                 .model
@@ -333,6 +335,7 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                         ));
                     }
                 },
+                None if agent_overridden => String::new(),
                 None => role_opt
                     .as_ref()
                     .map(|r| r.model.clone())
@@ -354,6 +357,7 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                         ));
                     }
                 },
+                None if agent_overridden => String::new(),
                 None => role_opt
                     .as_ref()
                     .map(|r| r.effort.clone())

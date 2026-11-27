@@ -171,8 +171,16 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     heroEl?.classList.toggle('is-thinking', busy);
 
     const taskId = visibleWork?.taskId;
-    const rawTail = visibleWork?.logTail || '';
-    const tail = rawTail ? rawTail.split(/\s+\|\s+/).join('\n') : '';
+    const rawTail = String(visibleWork?.logTail || '').trim();
+    const tailLines = [];
+    if (rawTail) {
+      const splitLines = rawTail.includes('\n') ? rawTail.split(/\r?\n/) : rawTail.split(/\s+\|\s+/);
+      for (const rawLine of splitLines) {
+        const line = rawLine.trim();
+        if (line && tailLines[tailLines.length - 1] !== line) tailLines.push(line);
+      }
+    }
+    const tail = tailLines.join('\n');
     if (taskId !== visibleTaskId || !tail) workLogEl.open = false;
     visibleTaskId = taskId;
     if (logTailEl.textContent !== tail) logTailEl.textContent = tail;

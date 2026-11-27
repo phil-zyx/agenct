@@ -5009,3 +5009,119 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
         .unwrap();
     assert_eq!(audit_cnt, 1);
 }
+
+#[tokio::test]
+async fn dispatch_node_engine_override_does_not_leak_role_model() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let (st, node_res) = req_json(
+        &router,
+        "POST",
+        "/api/nodes",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"name": "pc-ov", "kind": "pc"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let node_token = node_res["token"].as_str().unwrap().to_owned();
+
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({
+            "message": "/role executor agent=agy model=gemini-4-neon-high effort=high sandbox=workspace-write"
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 1. Overriding role's agent (agy -> opencode) without explicit model must drop role's agy model & effort.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node --role executor --agent opencode 修复抽屉 z-index"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 2. Explicit model alongside engine override is honored.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node --role executor --agent opencode --model deepseek/deepseek-flash 带显式模型"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // 3. Same engine keeps role's configured model & effort.
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/node --role executor 同引擎沿用角色模型"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let mut polled = Vec::new();
+    for _ in 0..3 {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/node/v1/work")
+                    .header(header::HOST, "127.0.0.1:8080")
+                    .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                    .header("x-agenct-node-protocol", "2")
+                    .header(
+                        "x-agenct-node-env",
+                        "kind:pc | os:linux | host:lab | agent:opencode | agents:agy,opencode",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let job = body["job"].clone();
+        assert!(!job.is_null());
+        polled.push(job);
+    }
+
+    assert_eq!(polled[0]["agent"], "opencode");
+    assert!(
+        polled[0]["model"].is_null(),
+        "leaked model: {:?}",
+        polled[0]
+    );
+    assert!(
+        polled[0]["effort"].is_null(),
+        "leaked effort: {:?}",
+        polled[0]
+    );
+
+    assert_eq!(polled[1]["agent"], "opencode");
+    assert_eq!(polled[1]["model"], "deepseek/deepseek-flash");
+
+    assert_eq!(polled[2]["agent"], "agy");
+    assert_eq!(polled[2]["model"], "gemini-4-neon-high");
+    assert_eq!(polled[2]["effort"], "high");
+}
+
+#[tokio::test]
