@@ -4818,6 +4818,59 @@ async fn sandbox_blocked_task_and_one_shot_manual_elevation_enforce_boundaries()
     let w3: Value =
         serde_json::from_slice(&work3.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert!(w3["job"]["sandbox"].is_null());
+    let lease3 = w3["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev3 = w3["job"]["task_revision"].as_i64().unwrap();
+
+    // Running task cannot be elevated mid-flight.
+    let (st_run, _) = req_json(
+        &router,
+        "POST",
+        &format!("/api/tasks/{task_id}/action"),
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"action": "retry_elevated"})),
+    )
+    .await;
+    assert_eq!(st_run, StatusCode::BAD_REQUEST);
+
+    // Completed task CAN be elevated on demand by owner (e.g., to finish skipped `git push`).
+    let sub3 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{task_id}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease3,
+                        "request_id": "sub-done-3",
+                        "expected_revision": rev3,
+                        "status": "completed",
+                        "content": "local commit done, push skipped due to sandbox"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub3.status(), StatusCode::OK);
+
+    let (st_done_elev, done_elev_res) = req_json(
+        &router,
+        "POST",
+        &format!("/api/tasks/{task_id}/action"),
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"action": "retry_elevated"})),
+    )
+    .await;
+    assert_eq!(st_done_elev, StatusCode::OK, "{done_elev_res}");
+    assert_eq!(done_elev_res["sandbox"], "elevated");
 
     let elev_audits: i64 = hub
         .db
@@ -4830,7 +4883,7 @@ async fn sandbox_blocked_task_and_one_shot_manual_elevation_enforce_boundaries()
         })
         .await
         .unwrap();
-    assert_eq!(elev_audits, 1);
+    assert_eq!(elev_audits, 2);
 }
 
 #[tokio::test]
@@ -4923,7 +4976,7 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
                         "status": "failed",
                         "content": "Host key verification failed.",
                         "agent": "opencode",
-                        "blocked_reason": "Host key verification failed."
+                        "blocked_reason": "Host key verification failed`，实际 `OUT_ERR`）。"
                     })
                     .to_string(),
                 ))
@@ -4944,11 +4997,19 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
         })
         .await
         .unwrap();
-    let marker = "/approve ";
+    let marker = "`/approve ";
     let idx = last_msg.find(marker).expect("approval command emitted");
     let code = last_msg[idx + marker.len()..idx + marker.len() + 6].to_owned();
     assert_eq!(code.len(), 6);
     assert!(code.bytes().all(|b| b.is_ascii_alphanumeric()));
+    assert!(
+        last_msg.contains(&format!("`/approve {code}`")),
+        "unmatched backticks corrupted approval markdown: {last_msg}"
+    );
+    assert!(
+        !last_msg.contains("）。）。"),
+        "duplicate trailing punctuation in footer: {last_msg}"
+    );
 
     // Normal Chinese sentence starting with "放行" must NOT be treated as an approval command.
     let (st, chat_normal) = req_json(

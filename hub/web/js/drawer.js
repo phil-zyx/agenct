@@ -366,6 +366,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     const ledgers = state.ledgers || [];
     const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
     const nodes = state.nodes || [];
+    const elevatedNodeIds = new Set(nodes.filter((n) => parseCapabilities(n.capabilities).elevated).map((n) => n.id));
+    const anyElevatedNode = elevatedNodeIds.size > 0;
     const uid = state.user?.id;
     const groups = triageTasks(tasks);
     const taskViews = new Map(Object.values(groups).flat().map((view) => [view.task, view]));
@@ -470,8 +472,15 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           `<button type="button" class="sm primary" data-assign="${esc(latest.id)}">${latest.status === 'failed' ? '重试' : '派给节点'}</button>`,
         );
       }
-      if (isOwner && !isCrossUser && latest.status === 'failed' && latest.blocked_reason) {
-        actions.push(`<button type="button" class="sm warn" data-elevate="${esc(latest.id)}">单次放行重试</button>`);
+      if (isOwner && !isCrossUser) {
+        const canElevateNode = latest.node_id ? elevatedNodeIds.has(latest.node_id) : anyElevatedNode;
+        if (latest.status === 'failed' && (latest.blocked_reason || canElevateNode)) {
+          actions.push(
+            `<button type="button" class="sm${latest.blocked_reason ? ' warn' : ''}" data-elevate="${esc(latest.id)}">单次放行重试</button>`,
+          );
+        } else if (latest.status === 'done' && canElevateNode) {
+          actions.push(`<button type="button" class="sm" data-elevate="${esc(latest.id)}">单次放行续跑</button>`);
+        }
       }
       if (isOwner && isCrossUser && latest.status !== 'done' && latest.status !== 'canceled') {
         actions.push(`<button type="button" class="sm" data-deliver="${esc(latest.id)}">交付结果</button>`);
@@ -721,13 +730,13 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         async () => {
           try {
             await api(`/api/tasks/${b.dataset.elevate}/action`, { method: 'POST', body: { action: 'retry_elevated' } });
-            showToast('已批准单次放行重试');
+            showToast('已批准单次放行');
             await onRefresh();
           } catch (err) {
             showToast(err.message);
           }
         },
-        { shortHint: '请长按「单次放行重试」确认仅本次放行' },
+        { shortHint: '请长按确认仅本次放行' },
       );
     });
     bodyEl.querySelectorAll('[data-deliver]').forEach((b) => {

@@ -213,8 +213,10 @@ fn elevate_task_in_tx(
     if row.requester_id != uid {
         return Err(invalid("cross-user delegated tasks cannot be elevated"));
     }
-    if row.status != "failed" {
-        return Err(invalid("only failed tasks can use elevated retry"));
+    if !matches!(row.status.as_str(), "failed" | "done" | "pending") {
+        return Err(invalid(
+            "running or canceled tasks cannot use elevated retry",
+        ));
     }
     let target_node = wanted_node.or(row.existing_node_id.as_deref());
     let node = nodes::pick_node_for_task_sync(tx, uid, target_node, false, Some(&row.instruction))?

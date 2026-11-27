@@ -1553,6 +1553,20 @@ fn sanitize_backend_name(raw: &str) -> Option<String> {
     }
 }
 
+/// Strips inline Markdown backticks, newlines, and trailing punctuation so `blocked_reason`
+/// can never corrupt surrounding `> 沙箱受阻（...）`/`` `/approve ...` `` formatting.
+fn sanitize_blocked_reason(raw: &str) -> String {
+    let collapsed = raw
+        .replace('`', "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = collapsed
+        .trim_end_matches(['.', '。', ')', '）', ' '])
+        .trim();
+    truncate_bytes(trimmed, 240)
+}
+
 pub async fn submit_result(
     State(hub): State<Hub>,
     headers: HeaderMap,
@@ -1704,9 +1718,7 @@ pub async fn submit_result(
         input
             .blocked_reason
             .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| truncate_bytes(s, 240))
+            .map(sanitize_blocked_reason)
             .unwrap_or_default()
     } else {
         String::new()

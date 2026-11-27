@@ -394,26 +394,9 @@ _SANDBOX_BLOCK_PATTERNS = (
     re.compile(r"([^\r\n]*(?:network_access|outside the workspace|sandbox restriction)[^\r\n]*)", re.IGNORECASE),
 )
 
-_SOFT_SANDBOX_BLOCK_PATTERNS = (
-    re.compile(r"^\s*!\s*(permission requested:[^\r\n\"'\\]*auto-rejecting[^\r\n\"'\\]*)", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"(Action denied(?:\s+in\s+headless\s+mode)?\s*:[^\r\n\"'\\]+)", re.IGNORECASE),
-    re.compile(r"((?:[A-Za-z0-9_.-]+@[^\s:\"'\\]+:\s*)?Permission denied\s*\(publickey[^)]*\))", re.IGNORECASE),
-    re.compile(r"(Could not read from remote repository[^\r\n\"'\\]*)", re.IGNORECASE),
-    re.compile(r"(Host key verification failed[^\r\n\"'\\]*)", re.IGNORECASE),
-    re.compile(r"((?:Read-only file system|Operation not permitted)[^\r\n\"'\\]*)", re.IGNORECASE),
-)
-_TASK_BLOCKED_TEXT_RE = re.compile(
-    r"(?:permission denied|publickey|host key verification|could not read from remote|"
-    r"read-only file system|operation not permitted|action denied|sandbox|blocked|denied|"
-    r"unable to|failed to|cannot|could not|沙箱|权限|受阻|卡在|没能|未能|无法|失败|拦截|拒绝)",
-    re.IGNORECASE,
-)
-_SOFT_TEXT_PROOF_RE = re.compile(
-    r"(?:permission denied|publickey|~/\.ssh|\.ssh/|host key verification|"
-    r"could not read from remote|read-only file system|operation not permitted|"
-    r"action denied|permission requested|auto-rejecting|external_directory)",
-    re.IGNORECASE,
-)
+def _clean_blocked_reason(msg: str) -> str:
+    cleaned = " ".join(msg.replace("`", "'").split()).lstrip("! ").rstrip("。.）) ").strip()
+    return cleaned[:160]
 
 
 def detect_sandbox_block(agent: str, raw_out: str, raw_err: str = "", text: str = "") -> str:
@@ -429,44 +412,9 @@ def detect_sandbox_block(agent: str, raw_out: str, raw_err: str = "", text: str 
         for pat in _SANDBOX_BLOCK_PATTERNS:
             m = pat.search(hay)
             if m:
-                msg = m.group(1).strip().lstrip("! ").strip()
+                msg = _clean_blocked_reason(m.group(1))
                 if msg:
-                    return msg[:160]
-        if agent == "opencode" and "rule which prevents you from using this specific tool call" in hay:
-            return "OpenCode tool permission blocked directory or command access"
-    return ""
-
-
-def detect_soft_sandbox_block(
-    agent: str,
-    effective_sandbox: str,
-    raw_out: str,
-    raw_err: str = "",
-    text: str = "",
-) -> str:
-    """Detect OS/CLI sandbox blocks even when the AI CLI exited rc=0 after reporting the failure."""
-    if effective_sandbox == "unsafe-full" or not text.strip():
-        return ""
-    if not (_TASK_BLOCKED_TEXT_RE.search(text) and _SOFT_TEXT_PROOF_RE.search(text)):
-        return ""
-    for raw in (raw_err, raw_out):
-        cleaned = strip_ansi(raw)
-        if not cleaned:
-            continue
-        filtered_lines = [
-            line
-            for line in cleaned.splitlines()
-            if "re.compile(" not in line and "_SANDBOX_BLOCK" not in line and "assertIn(" not in line
-        ]
-        if not filtered_lines:
-            continue
-        hay = "\n".join(filtered_lines)
-        for pat in _SOFT_SANDBOX_BLOCK_PATTERNS:
-            m = pat.search(hay)
-            if m:
-                msg = m.group(1).strip().lstrip("! ").strip()
-                if msg:
-                    return msg[:160]
+                    return msg
         if agent == "opencode" and "rule which prevents you from using this specific tool call" in hay:
             return "OpenCode tool permission blocked directory or command access"
     return ""
@@ -3300,13 +3248,7 @@ def execute_job(
                 text = file_text or out_text or strip_ansi(raw_err).strip()
                 stream_err = detect_cli_stream_error(agent, raw_out, raw_err)
                 status = "completed" if rc == 0 and not stream_err and text else "failed"
-                if status == "completed":
-                    soft_blocked = detect_soft_sandbox_block(agent, eff_sandbox, raw_out, raw_err, text)
-                    if soft_blocked:
-                        status = "failed"
-                        if meta_out is not None:
-                            meta_out["blocked_reason"] = soft_blocked
-                elif meta_out is not None:
+                if status == "failed" and meta_out is not None:
                     blocked = detect_sandbox_block(agent, raw_out, raw_err, text)
                     if blocked:
                         meta_out["blocked_reason"] = blocked
