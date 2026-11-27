@@ -1745,15 +1745,31 @@ class TestUnifiedNode(unittest.TestCase):
         if not node.probe_bwrap():
             self.skipTest("bubblewrap unavailable in this environment")
         bw = node.BubblewrapSandbox()
-        test_parent = os.path.expanduser("~")
-        if not os.path.isdir(test_parent) or not os.access(test_parent, os.W_OK):
-            test_parent = tempfile.gettempdir()
-        with (
-            tempfile.TemporaryDirectory() as workdir,
-            tempfile.TemporaryDirectory(prefix=".agenct-out-", dir=test_parent) as outside_dir,
-            tempfile.TemporaryDirectory(prefix=".agenct-sec-", dir=test_parent) as secret_dir,
-            tempfile.TemporaryDirectory() as ev_dir,
-        ):
+        # Prefer a writable directory outside /tmp (configurable TMPDIR, then repo dir,
+        # then ~) so bwrap's `--tmpfs /tmp` does not hide outside_dir/secret_dir when
+        # running inside a nested workspace-write sandbox where ~ is read-only.
+        tmp_real = os.path.realpath("/tmp")
+
+        def _usable_non_tmp(path: str | None) -> bool:
+            if not path or not os.path.isdir(path) or not os.access(path, os.W_OK):
+                return False
+            real = os.path.realpath(path)
+            return real != tmp_real and not real.startswith(tmp_real + os.sep)
+
+        candidates = (
+            os.environ.get("TMPDIR"),
+            str(NODE_PATH.parent.parent),
+            os.path.expanduser("~"),
+        )
+        non_tmp_parent = next((p for p in candidates if _usable_non_tmp(p)), None)
+        test_parent = non_tmp_parent or tempfile.gettempdir()
+        with tempfile.TemporaryDirectory(prefix=".agenct-bwrap-", dir=test_parent) as base_dir:
+            workdir = os.path.join(base_dir, "work")
+            outside_dir = os.path.join(base_dir, "outside")
+            secret_dir = os.path.join(base_dir, "secret")
+            ev_dir = os.path.join(base_dir, "ev")
+            for d in (workdir, outside_dir, secret_dir, ev_dir):
+                os.makedirs(d, exist_ok=True)
             with open(os.path.join(workdir, "hello.txt"), "w", encoding="utf-8") as fh:
                 fh.write("hello-bwrap")
             with open(os.path.join(secret_dir, "id_ed25519"), "w", encoding="utf-8") as fh:
@@ -1808,10 +1824,13 @@ class TestUnifiedNode(unittest.TestCase):
             )
             res_wr = subprocess.run(cmd_wr, cwd=cwd_wr, env=env_wr, capture_output=True, text=True, timeout=15)
             self.assertEqual(res_wr.returncode, 0, msg=res_wr.stderr)
-            self.assertRegex(
-                res_wr.stdout,
-                r"OUT_ERR:(?:Read-only file system|No such file or directory)",
-            )
+            if non_tmp_parent is not None:
+                self.assertIn("OUT_ERR:Read-only file system", res_wr.stdout)
+            else:
+                self.assertRegex(
+                    res_wr.stdout,
+                    r"OUT_ERR:(?:Read-only file system|No such file or directory)",
+                )
             with open(os.path.join(workdir, "ok.txt"), "r", encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "wr-ok")
             self.assertFalse(os.path.exists(os.path.join(outside_dir, "escape_fail")))
