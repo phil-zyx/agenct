@@ -1095,6 +1095,7 @@ textarea:focus, input:not([type="checkbox"]):focus, select:focus { border-color:
 .run-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .mt-10 { margin-top: 10px; }
+.mb-10 { margin-bottom: 10px; }
 .mt-6 { margin-top: 6px; }
 .flex-1 { flex: 1; min-width: 0; }
 .add-node-form .row input.flex-1,

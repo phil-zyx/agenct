@@ -2,10 +2,10 @@
 import { avatarById } from './api.js';
 import { playTap } from './sound.js';
 
-export const BUDDY_AVATAR_ID = 'buddy';
-export const IDLE_TO_REST_MS = 35_000;
+const BUDDY_AVATAR_ID = 'buddy';
+const IDLE_TO_REST_MS = 35_000;
 
-export const STATUS_META = {
+const STATUS_META = {
   idle: { label: '在线待命', hint: '在线待命' },
   resting: { label: '小憩中', hint: '暂无任务，小憩一会儿' },
   thinking: { label: '思考中', hint: '正在梳理思路与方案' },
@@ -191,11 +191,7 @@ export function renderBuddySvg() {
   return BUDDY_SVG;
 }
 
-export function renderStatusBadgeSvg() {
-  return BADGE_SVG;
-}
-
-export function deriveAgentState({
+function deriveAgentState({
   sseConnected = true,
   brainStage = '',
   streaming = false,

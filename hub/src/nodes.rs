@@ -75,9 +75,7 @@ pub struct WorkQuery {
     pub wait: u64,
 }
 
-pub const CONFIGURABLE_AGENTS: &[&str] = &[
-    "claude", "codex", "agy", "opencode", "ollama", "openai", "template",
-];
+pub const CONFIGURABLE_AGENTS: &[&str] = &["claude", "codex", "agy", "opencode"];
 
 pub const VALID_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -129,9 +127,6 @@ pub fn normalize_agent_name(raw: &str) -> Option<&'static str> {
         "codex" => Some("codex"),
         "agy" | "antigravity" => Some("agy"),
         "opencode" => Some("opencode"),
-        "ollama" => Some("ollama"),
-        "openai" => Some("openai"),
-        "template" => Some("template"),
         _ => None,
     }
 }
@@ -582,30 +577,6 @@ pub fn create_task_and_enqueue_sync(
     instruction: &str,
     authorization: &str,
 ) -> Result<(String, i64)> {
-    create_task_and_enqueue_in_thread_sync(
-        conn,
-        requester_id,
-        owner_id,
-        node_id,
-        title,
-        instruction,
-        authorization,
-        None,
-    )
-}
-
-/// Creates a task (optionally bound to an implicit backend thread) and queues a node job atomically.
-#[allow(clippy::too_many_arguments)]
-pub fn create_task_and_enqueue_in_thread_sync(
-    conn: &mut Connection,
-    requester_id: &str,
-    owner_id: &str,
-    node_id: &str,
-    title: &str,
-    instruction: &str,
-    authorization: &str,
-    thread_id: Option<&str>,
-) -> Result<(String, i64)> {
     create_task_and_enqueue_with_options_sync(
         conn,
         requester_id,
@@ -614,10 +585,7 @@ pub fn create_task_and_enqueue_in_thread_sync(
         title,
         instruction,
         authorization,
-        EnqueueOptions {
-            thread_id,
-            ..Default::default()
-        },
+        EnqueueOptions::default(),
     )
 }
 
@@ -2294,7 +2262,11 @@ mod tests {
         assert_eq!(eff2, vec!["claude", "opencode"]);
 
         // Disjoint Hub allowlist rejects unmatched engines safely.
-        let (def3, eff3, _) = resolve_node_agents("", "ollama", caps);
+        let (def3, eff3, _) = resolve_node_agents(
+            "",
+            "claude",
+            "kind:pc | os:linux | agent:opencode | agents:codex,opencode",
+        );
         assert_eq!(def3, "");
         assert!(eff3.is_empty());
     }

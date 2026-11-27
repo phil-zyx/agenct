@@ -140,7 +140,7 @@ try {
   await page.click('#send-btn');
   await page.waitForFunction(() => document.body.textContent.includes('已将任务派发给在线执行节点'));
 
-  // 5. Run the real Python node daemon (--once) in template mode to claim & submit the job.
+  // 5. Run the real Python node daemon (--once) with --cmd to claim & submit the job.
   execFileSync(
     'python3',
     [
@@ -148,7 +148,7 @@ try {
       '--hub', hubOrigin,
       '--token', nodeToken,
       '--kind', 'cloud',
-      '--agent', 'template',
+      '--cmd', 'python3 -c "print(\'Node Result: e2e ok\')"',
       '--workdir', workDir,
       '--state-dir', path.join(tmpDir, 'node-state'),
       '--once',

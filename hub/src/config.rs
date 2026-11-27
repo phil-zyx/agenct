@@ -349,6 +349,67 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
+async fn validate_outbound_host(
+    host: &str,
+    port: u16,
+    ip_blocked_msg: &'static str,
+    dns_fail_msg: &'static str,
+    dns_blocked_msg: &'static str,
+) -> Result<(), &'static str> {
+    let host_trim = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host_trim.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Err(ip_blocked_msg);
+        }
+        return Ok(());
+    }
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| dns_fail_msg)?;
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if is_blocked_ip(addr.ip()) {
+            return Err(dns_blocked_msg);
+        }
+    }
+    if !saw_any {
+        return Err(dns_fail_msg);
+    }
+    Ok(())
+}
+
+/// Connection-time DNS resolver that rejects any loopback, private, CGNAT, or link-local/metadata IP
+/// at the exact moment `reqwest` connects, eliminating DNS Rebinding TOCTOU windows.
+pub struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            if addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "DNS resolution returned no addresses",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            if addrs.iter().any(|addr| is_blocked_ip(addr.ip())) {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "outbound host resolves to a blocked private/internal IP",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 /// Validates an IM webhook URL against SSRF (official HTTPS domains by default + DNS IP checks).
 pub async fn validate_im_webhook_url(
     provider: &str,
@@ -386,33 +447,25 @@ pub async fn validate_im_webhook_url(
     }
 
     if !allow_private {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            if is_blocked_ip(ip) {
-                return Err("webhook target IP is blocked");
-            }
-        } else {
-            let port = url.port_or_known_default().unwrap_or(443);
-            let addrs = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .map_err(|_| "webhook host DNS resolution failed")?;
-            let mut saw_any = false;
-            for addr in addrs {
-                saw_any = true;
-                if is_blocked_ip(addr.ip()) {
-                    return Err("webhook host resolves to a blocked private/internal IP");
-                }
-            }
-            if !saw_any {
-                return Err("webhook host resolved to no addresses");
-            }
-        }
+        let port = url.port_or_known_default().unwrap_or(443);
+        validate_outbound_host(
+            &host,
+            port,
+            "webhook target IP is blocked",
+            "webhook host DNS resolution failed",
+            "webhook host resolves to a blocked private/internal IP",
+        )
+        .await?;
     }
     Ok(trimmed.to_owned())
 }
 
-/// Validates a user-configured OpenAI-compatible `/chat/completions` URL against SSRF:
-/// HTTPS + public IP only, unless the operator set AGENCT_ALLOW_PRIVATE_OUTBOUND.
-pub async fn validate_llm_url(raw: &str, allow_private: bool) -> Result<String, &'static str> {
+/// Synchronous static validation for a user-configured `/chat/completions` URL
+/// (scheme, syntax, path suffix, and literal private/loopback IP checks).
+pub fn check_llm_url_static(
+    raw: &str,
+    allow_private: bool,
+) -> Result<(String, String, u16), &'static str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.len() > 512 {
         return Err("模型接口地址无效");
@@ -431,30 +484,36 @@ pub async fn validate_llm_url(raw: &str, allow_private: bool) -> Result<String, 
         return Err("模型接口地址必须以 /chat/completions 结尾（OpenAI 兼容格式）");
     }
     let host = url.host_str().ok_or("模型接口地址缺少主机名")?.to_owned();
+    let port = url.port_or_known_default().unwrap_or(443);
     if !allow_private {
         let host_trim = host.trim_start_matches('[').trim_end_matches(']');
         if let Ok(ip) = host_trim.parse::<IpAddr>() {
             if is_blocked_ip(ip) {
                 return Err("不允许指向内网/本机地址的模型接口");
             }
-        } else {
-            let port = url.port_or_known_default().unwrap_or(443);
-            let addrs = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .map_err(|_| "模型接口域名解析失败")?;
-            let mut saw_any = false;
-            for addr in addrs {
-                saw_any = true;
-                if is_blocked_ip(addr.ip()) {
-                    return Err("模型接口域名解析到了内网/本机地址");
-                }
-            }
-            if !saw_any {
-                return Err("模型接口域名解析失败");
-            }
         }
     }
-    Ok(trimmed.to_owned())
+    Ok((trimmed.to_owned(), host, port))
+}
+
+/// Validates a user-configured OpenAI-compatible `/chat/completions` URL against SSRF:
+/// HTTPS + public IP only, unless the operator set AGENCT_ALLOW_PRIVATE_OUTBOUND.
+pub async fn validate_llm_url(raw: &str, allow_private: bool) -> Result<String, &'static str> {
+    let (trimmed, host, port) = check_llm_url_static(raw, allow_private)?;
+    if !allow_private {
+        let host_trim = host.trim_start_matches('[').trim_end_matches(']');
+        if host_trim.parse::<IpAddr>().is_err() {
+            validate_outbound_host(
+                &host,
+                port,
+                "不允许指向内网/本机地址的模型接口",
+                "模型接口域名解析失败",
+                "模型接口域名解析到了内网/本机地址",
+            )
+            .await?;
+        }
+    }
+    Ok(trimmed)
 }
 
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -524,5 +583,24 @@ mod tests {
         assert!(out.starts_with("头部结论"));
         assert!(out.contains("…(省略中间)…"));
         assert!(out.ends_with("继续啃 P0-1 崩溃修复。"));
+    }
+
+    #[tokio::test]
+    async fn public_dns_resolver_blocks_localhost() {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(std::sync::Arc::new(super::PublicDnsResolver))
+            .build()
+            .unwrap();
+        let err = client
+            .get("http://localhost:9/")
+            .send()
+            .await
+            .expect_err("localhost must be blocked at connect-time DNS resolution");
+        let chain = format!("{err:?}");
+        assert!(
+            chain.contains("blocked private/internal IP") || err.is_connect(),
+            "unexpected error: {chain}"
+        );
     }
 }

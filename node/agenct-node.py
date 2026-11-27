@@ -2,8 +2,8 @@
 """Unified Agenct Execution Node (PC Node & Cloud Container Node).
 
 Polls Agenct Hub using exclusive lease protocol 2, executes assigned jobs using
-local coding agent CLIs (claude / codex / agy / opencode / ollama / openai /
-custom --cmd / template), renews leases with live progress, journals results for
+local coding agent CLIs (claude / codex / agy / opencode / custom --cmd),
+renews leases with live progress, journals results for
 crash-safe replay, and submits results + evidence attachments back to Hub.
 
 Security defaults:
@@ -26,6 +26,7 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,15 +38,13 @@ import urllib.request
 import uuid
 
 PROTOCOL_VERSION = "2"
-VALID_AGENTS = ("auto", "claude", "codex", "agy", "opencode", "ollama", "openai", "template")
 CLI_AGENTS = ("claude", "codex", "agy", "opencode")
+VALID_AGENTS = ("auto", *CLI_AGENTS)
 VALID_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 VALID_EXEC_BACKENDS = ("auto", "tmux", "conpty", "wt-tail", "pipe")
 VALID_SANDBOX_BACKENDS = ("auto", "bwrap", "seatbelt", "cli-native")
-VALID_TMUX_MODES = ("auto", "on", "off")
 EXEC_BACKEND_ENV = "AGENCT_EXEC_BACKEND"
 SANDBOX_BACKEND_ENV = "AGENCT_SANDBOX_BACKEND"
-_TMUX_ALIAS_MAP = {"auto": "auto", "on": "tmux", "off": "pipe"}
 _DEFAULT_MASKED_SECRET_NAMES = (
     ".ssh",
     ".agenct",
@@ -222,18 +221,6 @@ def _parse_opencode_stream(raw: str) -> tuple[str | None, str | None, bool]:
     return _combine_stream_body_and_errors(body, errors), session_id, bool(errors)
 
 
-def parse_opencode_json_result(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, session_id) from `opencode run --format json` JSONL output."""
-    text, sid, _ = _parse_opencode_stream(raw)
-    return text, sid
-
-
-def parse_opencode_json(raw: str) -> str | None:
-    """Backward-compatible helper returning only the extracted final text."""
-    text, _ = parse_opencode_json_result(raw)
-    return text
-
-
 def _parse_claude_stream(raw: str) -> tuple[str | None, str | None, bool]:
     """Extract (final_text, session_id, has_error) from `claude -p --output-format stream-json --verbose`."""
     parsed_any = False
@@ -293,12 +280,6 @@ def _parse_claude_stream(raw: str) -> tuple[str | None, str | None, bool]:
     return _combine_stream_body_and_errors(body, errors), session_id, has_err
 
 
-def parse_claude_stream_json(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, session_id) from `claude -p --output-format stream-json --verbose` JSONL."""
-    text, sid, _ = _parse_claude_stream(raw)
-    return text, sid
-
-
 def _parse_codex_stream(raw: str) -> tuple[str | None, str | None, bool]:
     """Extract (final_text, thread_id, has_error) from `codex exec --json` JSONL output."""
     parsed_any = False
@@ -324,12 +305,6 @@ def _parse_codex_stream(raw: str) -> tuple[str | None, str | None, bool]:
     if not parsed_any:
         return None, None, False
     return _combine_stream_body_and_errors(last_agent_msg, errors), session_id, has_err or bool(errors)
-
-
-def parse_codex_json_result(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, thread_id) from `codex exec --json` JSONL output."""
-    text, sid, _ = _parse_codex_stream(raw)
-    return text, sid
 
 
 def _parse_agy_stream(raw: str) -> tuple[str | None, str | None, bool]:
@@ -386,12 +361,6 @@ def _parse_agy_stream(raw: str) -> tuple[str | None, str | None, bool]:
         return None, None, False
     body = result_fallback if result_fallback is not None else "".join(chunks)
     return _combine_stream_body_and_errors(body, errors), session_id, bool(errors)
-
-
-def parse_agy_stream_json(raw: str) -> tuple[str | None, str | None]:
-    """Extract (final_text, conversation_id) from `agy -p ... --output-format stream-json` JSONL."""
-    text, sid, _ = _parse_agy_stream(raw)
-    return text, sid
 
 
 def parse_cli_output(agent: str, raw: str) -> tuple[str | None, str | None]:
@@ -747,6 +716,36 @@ def truncate_utf8(text: str, max_bytes: int = MAX_RESULT_BYTES) -> str:
     return encoded[:budget].decode("utf-8", errors="ignore") + suffix
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse HTTP 3xx redirects so Bearer tokens never leak or downgrade."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_HTTP_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+_SCRUBBED_CHILD_ENV_KEYS = (
+    "AGENCT_NODE_TOKEN",
+    "AGENCT_CLOUD_NODE_TOKEN",
+    "AGENCT_MASTER_KEY",
+    "AGENCT_MASTER_KEY_FILE",
+    "AGENCT_MASTER_KEY_OLD",
+    "AGENCT_MASTER_KEY_OLD_FILE",
+    "AGENCT_LOGIN_TOKEN",
+    "AGENCT_GITLAB_CLIENT_SECRET",
+    "AGENCT_GITLAB_CLIENT_SECRET_FILE",
+    "AGENCT_GITLAB_WEBHOOK_SECRET",
+)
+
+
+def _build_child_base_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    for key in _SCRUBBED_CHILD_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
 def http_json(
     url: str,
     token: str,
@@ -766,21 +765,13 @@ def http_json(
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _HTTP_OPENER.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def discover_available_agents() -> list[str]:
-    """Return all locally available engines in priority order (fallback to ['template'])."""
-    found: list[str] = []
-    for tool in CLI_AGENTS:
-        if shutil.which(tool):
-            found.append(tool)
-    if os.environ.get("AGENCT_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY"):
-        found.append("openai")
-    if os.environ.get("OLLAMA_MODEL"):
-        found.append("ollama")
-    return found or ["template"]
+    """Return all locally available CLI engines in priority order."""
+    return [tool for tool in CLI_AGENTS if shutil.which(tool)]
 
 
 def resolve_node_agents(
@@ -792,7 +783,7 @@ def resolve_node_agents(
 
     - Custom --cmd runs exclusively as 'custom:<cmd>'.
     - Without --agents, an explicit --agent stays pinned to that single engine (safe default),
-      while '--agent auto' uses '--agents' if provided or all discovered engines.
+      while '--agent auto' uses '--agents' if provided or all discovered CLI engines.
     - With '--agents auto' or '--agents claude,codex,...', all listed/discovered engines are enabled.
     """
     if cmd:
@@ -822,8 +813,10 @@ def resolve_node_agents(
         if pref not in allowed:
             allowed = [pref, *allowed]
         default_agent = pref
-    else:
+    elif allowed:
         default_agent = allowed[0]
+    else:
+        default_agent = ""
     return default_agent, allowed
 
 
@@ -992,8 +985,10 @@ def materialize_attachments(
 
 
 def collect_evidence(evidence_dir: str) -> list[dict]:
-    if not os.path.isdir(evidence_dir):
+    if not os.path.isdir(evidence_dir) or os.path.islink(evidence_dir):
         return []
+    base_real = os.path.realpath(evidence_dir)
+    no_follow = getattr(os, "O_NOFOLLOW", None)
     out: list[dict] = []
     for name in sorted(os.listdir(evidence_dir)):
         ext = os.path.splitext(name)[1].lower()
@@ -1001,14 +996,30 @@ def collect_evidence(evidence_dir: str) -> list[dict]:
         if not mime:
             continue
         full = os.path.join(evidence_dir, name)
-        if not os.path.isfile(full):
+        if os.path.islink(full):
             continue
         try:
-            if os.path.getsize(full) > MAX_EVIDENCE_BYTES:
+            real = os.path.realpath(full)
+            if os.path.commonpath([base_real, real]) != base_real or real == base_real:
                 continue
-            with open(full, "rb") as fh:
-                raw = fh.read()
-            if not raw:
+            if no_follow is not None:
+                fd = os.open(full, os.O_RDONLY | no_follow)
+                try:
+                    st = os.fstat(fd)
+                    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > MAX_EVIDENCE_BYTES:
+                        continue
+                    with os.fdopen(fd, "rb") as fh:
+                        fd = -1
+                        raw = fh.read(MAX_EVIDENCE_BYTES + 1)
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+            else:
+                if not os.path.isfile(full) or os.path.getsize(full) > MAX_EVIDENCE_BYTES:
+                    continue
+                with open(full, "rb") as fh:
+                    raw = fh.read(MAX_EVIDENCE_BYTES + 1)
+            if not raw or len(raw) > MAX_EVIDENCE_BYTES:
                 continue
             out.append({
                 "name": name,
@@ -3107,7 +3118,7 @@ def execute_job(
             agent=agent,
             os_isolated=os_isolated,
         )
-        env = dict(os.environ)
+        env = _build_child_base_env()
         env["AGENCT_WORKDIR"] = workdir
         env["AGENCT_EVIDENCE_DIR"] = evidence_dir
         env["AGENCT_PROMPT"] = prompt
@@ -3309,37 +3320,7 @@ def execute_job(
                     except OSError:
                         pass
 
-        if agent in ("openai", "ollama"):
-            api_url = (
-                os.environ.get("AGENCT_LLM_URL")
-                or ("http://127.0.0.1:11434/v1/chat/completions" if agent == "ollama" else "https://api.openai.com/v1/chat/completions")
-            )
-            api_key = os.environ.get("AGENCT_LLM_API_KEY") or os.environ.get("OPENAI_API_KEY") or "ollama"
-            model = job_model or os.environ.get("AGENCT_LLM_MODEL") or os.environ.get("OLLAMA_MODEL") or "gpt-4o-mini"
-            req_body = json.dumps({
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.2,
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                api_url,
-                data=req_body,
-                headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=min(timeout, 120)) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            text = str((((data.get("choices") or [{}])[0]).get("message") or {}).get("content") or "").strip()
-            return ("completed", truncate_utf8(text), []) if text else ("failed", "Empty LLM response.", [])
-
-        # Built-in template fallback
-        content = (
-            f"### Node Result: {job.get('title') or job.get('task_id')}\n\n"
-            f"- Workdir: `{workdir}`\n"
-            f"- Mode: template (install claude/codex/agy or set --cmd for execution)\n\n"
-            f"Instruction received:\n> {job.get('instruction') or ''}"
-        )
-        return "completed", truncate_utf8(content), []
+        return "failed", f"Unsupported execution engine: {agent}", []
     except subprocess.TimeoutExpired as exc:
         raw_out = decode_bytes(exc.stdout)
         _, captured_sid = parse_cli_output(agent, raw_out)
@@ -3409,6 +3390,12 @@ def run_node_loop(args: argparse.Namespace) -> int:
         args.codex_tmux and sandbox == "workspace-write" and not os_sandbox_backend.os_isolated
     )
     agent, allowed_agents = resolve_node_agents(args.agent, args.agents, args.cmd)
+    if not allowed_agents:
+        print(
+            "Error: no CLI execution engine found (install claude/codex/agy/opencode or pass --cmd).",
+            file=sys.stderr,
+        )
+        return 2
     state_dir = os.path.abspath(args.state_dir or os.path.join(os.path.expanduser("~"), ".agenct"))
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     journal = ExecutionJournal(state_dir)
@@ -3772,12 +3759,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Execution backend: auto, tmux, conpty, wt-tail, or pipe (default: auto)",
     )
-    p.add_argument(
-        "--tmux",
-        choices=VALID_TMUX_MODES,
-        default=None,
-        help="Compatibility alias for --exec-backend (auto->auto, on->tmux, off->pipe)",
-    )
     p.add_argument("--state-dir", default="", help="Local state/journal directory")
     p.add_argument("--poll", type=float, default=3.0, help="Fallback idle poll interval in seconds")
     p.add_argument("--wait", type=int, default=25, help="Long-poll wait seconds (0 disables long-polling)")
@@ -3798,16 +3779,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Run real headless pre-flight checks for enabled CLI engines and exit",
     )
     parsed = p.parse_args(argv)
-    if parsed.exec_backend is not None:
-        if parsed.tmux is not None and _TMUX_ALIAS_MAP[parsed.tmux] != parsed.exec_backend:
-            print(
-                f"Warning: both --exec-backend={parsed.exec_backend} and --tmux={parsed.tmux} were passed; "
-                f"using --exec-backend={parsed.exec_backend}.",
-                file=sys.stderr,
-            )
-    elif parsed.tmux is not None:
-        parsed.exec_backend = _TMUX_ALIAS_MAP[parsed.tmux]
-    else:
+    if parsed.exec_backend is None:
         raw_env_backend = (os.environ.get(EXEC_BACKEND_ENV) or "").strip().lower()
         if raw_env_backend in VALID_EXEC_BACKENDS:
             parsed.exec_backend = raw_env_backend
@@ -3815,8 +3787,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             if raw_env_backend:
                 print(f"Warning: invalid {EXEC_BACKEND_ENV}: {raw_env_backend!r}; using 'auto'.", file=sys.stderr)
             parsed.exec_backend = "auto"
-    if parsed.tmux is None:
-        parsed.tmux = "auto"
     if parsed.sandbox_backend is None:
         raw_env_sb = (os.environ.get(SANDBOX_BACKEND_ENV) or "").strip().lower()
         if raw_env_sb in VALID_SANDBOX_BACKENDS:

@@ -16,7 +16,7 @@ use crate::{
     config::{now_unix, truncate_bytes, truncate_head_tail_bytes},
     db::record_audit,
     denied, invalid,
-    llm::{ChatMessage, LlmTurnError},
+    llm::ChatMessage,
     nodes,
     secrets::{SecretCipher, SCOPE_GITLAB},
     Error, Hub, Result,
@@ -27,7 +27,8 @@ use axum::{
     Json,
 };
 use parser::{
-    default_reply_for_tools, native_calls_to_tool_calls, parse_brain_response, strip_thread_tags,
+    default_reply_for_tools, native_calls_to_tool_calls, recover_inline_tool_calls,
+    strip_thread_tags,
 };
 use prompt::{
     build_system_prompt, tool_definitions, DEFAULT_AGENT_NAME, DEFAULT_MEMORY_MD, DEFAULT_SOUL_MD,
@@ -40,7 +41,6 @@ use std::{
     collections::HashSet,
     time::{Duration, Instant},
 };
-use threads::resolve_or_create_thread;
 use tools::{execute_tool, ToolOutcome, TOOL_OBSERVATION_MAX_BYTES};
 use uuid::Uuid;
 
@@ -1666,11 +1666,11 @@ pub async fn run_task_callback(
         &[
             "update_ledger",
             "update_memory",
-            "close_thread",
+            "manage_thread",
             "dispatch_node",
         ]
     } else {
-        &["update_ledger", "update_memory", "close_thread"]
+        &["update_ledger", "update_memory", "manage_thread"]
     };
 
     let truncated_result = truncate_bytes(result_content.trim(), 6000);
@@ -1933,8 +1933,7 @@ fn build_openai_messages(
     messages
 }
 
-/// Primary agent loop using OpenAI native tool calling + SSE streaming, with automatic
-/// fallback to JSON-envelope mode if the upstream model rejects `tools` parameters.
+/// Primary agent loop using OpenAI native tool calling + SSE streaming.
 async fn agent_loop(
     hub: &Hub,
     user_id: &str,
@@ -1953,7 +1952,6 @@ async fn agent_loop(
         &snap.rules,
         &snap.contacts,
         snap.gitlab_configured,
-        true,
     );
     system_prompt.push_str(mode.prompt_suffix);
 
@@ -2004,20 +2002,11 @@ async fn agent_loop(
                 batcher.flush();
                 r
             }
-            Err(LlmTurnError::UnsupportedParams(_)) if step == 0 && !tools_schema.is_empty() => {
-                if mode.interactive {
-                    hub.events.emit(user_id, "delta", json!({"reset": true}));
-                }
-                return agent_loop_json_fallback(
-                    hub, user_id, message, snap, mode, &models, &prepared,
-                )
-                .await;
-            }
-            Err(e) if step == 0 => return Err(e.into()),
+            Err(e) if step == 0 => return Err(e),
             Err(e) => {
                 eprintln!(
                     "[brain] followup step={step} failed user={user_id}: {}",
-                    Error::from(e).1
+                    e.1
                 );
                 batcher.flush();
                 break;
@@ -2029,9 +2018,9 @@ async fn agent_loop(
         if used_native {
             final_reply = resp.content.clone();
         } else if resp.content.contains("<tool_call>") || resp.content.contains("<function_call>") {
-            let recovered = parse_brain_response(&resp.content);
-            final_reply = recovered.reply;
-            parsed_calls = recovered.tools;
+            let (recovered_reply, recovered_tools) = recover_inline_tool_calls(&resp.content);
+            final_reply = recovered_reply;
+            parsed_calls = recovered_tools;
         } else {
             final_reply = resp.content.clone();
         }
@@ -2131,127 +2120,6 @@ async fn agent_loop(
     })
 }
 
-/// Legacy JSON-envelope fallback for models/endpoints that reject OpenAI `tools` parameters.
-async fn agent_loop_json_fallback(
-    hub: &Hub,
-    user_id: &str,
-    message: &str,
-    snap: &TurnSnapshot,
-    mode: &AgentMode<'_>,
-    models: &crate::models::ResolvedModels,
-    prepared: &PreparedImages,
-) -> Result<AgentOutput> {
-    let mut system_prompt = build_system_prompt(
-        &snap.profile,
-        &snap.rolling_summary,
-        &snap.roles,
-        &snap.threads,
-        &snap.ledgers,
-        &snap.nodes,
-        &snap.crons,
-        &snap.rules,
-        &snap.contacts,
-        snap.gitlab_configured,
-        false,
-    );
-    system_prompt.push_str(mode.prompt_suffix);
-
-    let mut ctx = TurnContext {
-        hub,
-        user_id,
-        message,
-        node_list: &snap.nodes,
-        matched_rule_target: snap.matched_rule.as_ref().map(|r| r.target_node_id.clone()),
-        active_thread_id: mode.initial_thread_id.clone(),
-        dispatched_tasks: Vec::new(),
-        done_keys: HashSet::new(),
-        interactive: mode.interactive,
-        allowed_tools: mode.allowed_tools,
-        callback_depth: mode.callback_depth,
-    };
-
-    let mut convo = snap.history.clone();
-    let mut prompt_msg = if prepared.context.is_empty() {
-        message.to_owned()
-    } else {
-        format!("{message}\n\n{}", prepared.context)
-    };
-    let mut step_images = prepared.inline.clone();
-    let mut final_reply = String::new();
-    let mut unresolved: Vec<ToolOutcome> = Vec::new();
-
-    for step in 0..MAX_AGENT_STEPS {
-        let images = std::mem::take(&mut step_images);
-        let raw_llm = match models
-            .brain
-            .complete_with_images(&system_prompt, &convo, &prompt_msg, &images, true)
-            .await
-        {
-            Ok(raw) => raw,
-            Err(err) if step == 0 => return Err(err),
-            Err(_) => break,
-        };
-        let parsed = parse_brain_response(&raw_llm);
-        final_reply = parsed.reply;
-
-        let resolved = resolve_or_create_thread(
-            hub,
-            user_id,
-            parsed.thread_id.as_deref(),
-            parsed.thread_title.as_deref(),
-            message,
-            None,
-        )
-        .await?;
-        if resolved.is_some() {
-            ctx.active_thread_id = resolved;
-        } else if step == 0 && mode.initial_thread_id.is_none() {
-            ctx.active_thread_id = None;
-        }
-
-        let mut outcomes = Vec::with_capacity(parsed.tools.len());
-        for call in &parsed.tools {
-            outcomes.push(execute_tool(&mut ctx, call).await);
-        }
-        if !outcomes.iter().any(|o| o.needs_followup) {
-            unresolved.clear();
-            break;
-        }
-        let last_step = step + 1 == MAX_AGENT_STEPS;
-        if !last_step {
-            ctx.stage("正在根据工具结果整理回复…");
-            convo.push(ChatMessage {
-                role: "user".into(),
-                content: truncate_bytes(&prompt_msg, 8000),
-            });
-            convo.push(ChatMessage {
-                role: "assistant".into(),
-                content: truncate_bytes(raw_llm.trim(), 4000),
-            });
-            prompt_msg = format_tool_results(&outcomes);
-        }
-        unresolved = outcomes;
-    }
-
-    for o in unresolved.iter().filter(|o| o.needs_followup) {
-        if !o.user_note.trim().is_empty() {
-            final_reply.push_str("\n\n");
-            final_reply.push_str(o.user_note.trim());
-        }
-    }
-    final_reply = strip_thread_tags(&final_reply);
-    if final_reply.trim().is_empty() {
-        final_reply = "好的，已处理。".into();
-    }
-
-    Ok(AgentOutput {
-        reply: final_reply,
-        thread_id: ctx.active_thread_id,
-        tasks: ctx.dispatched_tasks,
-        user_context: prepared.persist_context.clone(),
-    })
-}
-
 /// Atomically completes the user message and stores the assistant reply linked via `reply_to`.
 #[allow(clippy::too_many_arguments)]
 async fn persist_turn(
@@ -2328,10 +2196,8 @@ async fn persist_turn(
 }
 
 fn format_tool_results(outcomes: &[ToolOutcome]) -> String {
-    let mut out = format!(
-        "{}\n以下是你上一步调用工具的执行结果（由系统自动回传，不是用户发言）：\n",
-        crate::llm::TOOL_RESULTS_MARKER
-    );
+    let mut out =
+        String::from("以下是你上一步调用工具的执行结果（由系统自动回传，不是用户发言）：\n");
     for o in outcomes {
         out.push_str(&format!(
             "- [{}] {}：{}\n",
@@ -2342,7 +2208,7 @@ fn format_tool_results(outcomes: &[ToolOutcome]) -> String {
     }
     out.push_str(
         "\n请基于以上结果给出面向用户的最终完整回复（会替换上一步的 reply）。\
-         如确有必要可继续调用工具，但不要重复已成功的调用。仍严格按同样的 JSON 格式输出。",
+         如确有必要可继续调用工具，但不要重复已成功的调用。",
     );
     out
 }

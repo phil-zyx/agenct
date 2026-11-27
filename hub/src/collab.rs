@@ -9,11 +9,17 @@ use crate::{
 };
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     Json,
 };
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 
 /// Delegates a lightweight collaborative task from requester to an active peer.
@@ -324,18 +330,85 @@ pub async fn elevate_task_once(
     Ok(outcome)
 }
 
+const APPROVAL_LIMIT_WINDOW: Duration = Duration::from_secs(600);
+const APPROVAL_MAX_FAILURES: usize = 5;
+
+/// Per-user sliding-window rate limiter protecting `/approve <code>` against brute-force guessing.
+#[derive(Clone, Default)]
+pub struct ApprovalLimiter {
+    failures: Arc<Mutex<HashMap<String, VecDeque<Instant>>>>,
+}
+
+impl ApprovalLimiter {
+    fn prune(q: &mut VecDeque<Instant>, now: Instant) {
+        while q
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= APPROVAL_LIMIT_WINDOW)
+        {
+            q.pop_front();
+        }
+    }
+
+    pub fn check_allowed(&self, user_id: &str) -> bool {
+        let mut map = self.failures.lock().expect("approval limiter mutex");
+        let now = Instant::now();
+        map.retain(|_, q| {
+            Self::prune(q, now);
+            !q.is_empty()
+        });
+        map.get(user_id)
+            .is_none_or(|q| q.len() < APPROVAL_MAX_FAILURES)
+    }
+
+    pub fn record_failure(&self, user_id: &str) {
+        let mut map = self.failures.lock().expect("approval limiter mutex");
+        let now = Instant::now();
+        let q = map.entry(user_id.to_owned()).or_default();
+        Self::prune(q, now);
+        q.push_back(now);
+    }
+
+    pub fn reset(&self, user_id: &str) {
+        self.failures
+            .lock()
+            .expect("approval limiter mutex")
+            .remove(user_id);
+    }
+}
+
 pub async fn consume_approval_code(
     hub: &Hub,
     user_id: &str,
     raw_code: &str,
 ) -> Result<ElevatedTaskOutcome> {
+    if !hub.approval_limiter.check_allowed(user_id) {
+        return Err(crate::Error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "审批码错误次数过多，请稍后再试",
+        ));
+    }
     let code = raw_code.trim().to_ascii_uppercase();
     if code.len() != 6 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        hub.approval_limiter.record_failure(user_id);
+        let uid = user_id.to_owned();
+        let _ = hub
+            .db
+            .write(move |conn| {
+                record_audit(
+                    conn,
+                    &uid,
+                    "task_elevate_denied",
+                    "failed",
+                    "单次放行审批码校验失败",
+                    "invalid_code_format",
+                )
+            })
+            .await;
         return Err(invalid("审批码格式无效，应为 6 位字母或数字"));
     }
     let code_hash = approval_code_hash(user_id, &code);
     let uid = user_id.to_owned();
-    let outcome = hub
+    let res = hub
         .db
         .write(move |conn| {
             let tx = conn.transaction()?;
@@ -350,13 +423,27 @@ pub async fn consume_approval_code(
                 )
                 .optional()?;
             let Some(tid) = tid else {
-                return Err(invalid("审批码无效、已使用或已过期"));
+                record_audit(
+                    &tx,
+                    &uid,
+                    "task_elevate_denied",
+                    "failed",
+                    "单次放行审批码校验失败",
+                    "invalid_or_expired_code",
+                )?;
+                tx.commit()?;
+                return Ok(None);
             };
             let outcome = elevate_task_in_tx(&tx, &uid, &tid, None, "chat_approve", now)?;
             tx.commit()?;
-            Ok(outcome)
+            Ok(Some(outcome))
         })
         .await?;
+    let Some(outcome) = res else {
+        hub.approval_limiter.record_failure(user_id);
+        return Err(invalid("审批码无效、已使用或已过期"));
+    };
+    hub.approval_limiter.reset(user_id);
     hub.node_waiters.notify(user_id, &outcome.node_id);
     hub.events.emit(
         user_id,

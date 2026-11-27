@@ -3,7 +3,7 @@
 //! falls back to the server defaults from the environment.
 use crate::{
     auth::AuthUser,
-    config::{now_unix, validate_llm_url, LlmConfig},
+    config::{check_llm_url_static, now_unix, validate_llm_url, LlmConfig},
     invalid,
     llm::LlmClient,
     secrets::SCOPE_USER_MODELS,
@@ -47,7 +47,7 @@ fn client_for(hub: &Hub, ep: &ModelEndpoint) -> LlmClient {
             api_key: ep.api_key.clone(),
             model: ep.model.clone(),
         },
-        hub.http.clone(),
+        hub.user_http.clone(),
     )
 }
 
@@ -72,11 +72,17 @@ pub async fn load(hub: &Hub, user_id: &str) -> Result<UserModels> {
 pub async fn resolve(hub: &Hub, user_id: &str) -> Result<ResolvedModels> {
     let cfg = load(hub, user_id).await?;
     let (brain, brain_sees_images) = match &cfg.brain {
-        Some(ep) => (client_for(hub, ep), ep.supports_images),
+        Some(ep) => {
+            check_llm_url_static(&ep.url, hub.config.allow_private_outbound).map_err(invalid)?;
+            (client_for(hub, ep), ep.supports_images)
+        }
         None => (hub.llm.clone(), hub.config.llm_supports_images),
     };
     let vision = match &cfg.vision {
-        Some(ep) => Some(client_for(hub, ep)),
+        Some(ep) => {
+            check_llm_url_static(&ep.url, hub.config.allow_private_outbound).map_err(invalid)?;
+            Some(client_for(hub, ep))
+        }
         None => hub
             .config
             .vision_llm
@@ -113,6 +119,7 @@ fn endpoint_view(ep: &Option<ModelEndpoint>) -> Value {
 
 fn settings_view(hub: &Hub, cfg: &UserModels) -> Value {
     json!({
+        "secrets_encrypted": hub.secrets.is_enabled(),
         "brain": endpoint_view(&cfg.brain),
         "vision": endpoint_view(&cfg.vision),
         "server_default": {

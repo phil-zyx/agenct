@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -277,13 +277,26 @@ pub async fn guard(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
     );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     h.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; \
-             connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
-        ),
+        header::HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
     );
+    if !hub.config.local_http {
+        h.insert(
+            header::STRICT_TRANSPORT_SECURITY,
+            HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        );
+    }
+    if !h.contains_key(header::CONTENT_SECURITY_POLICY) {
+        h.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; \
+                 connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            ),
+        );
+    }
     response
 }
 
@@ -682,10 +695,45 @@ pub async fn set_member_status(
 /// User id of the single local owner account.
 pub const LOCAL_OWNER_ID: &str = "local-owner";
 const LOCAL_TOKEN_FILE: &str = "login-token";
+const LOCAL_LOGIN_WINDOW: Duration = Duration::from_secs(60);
+const LOCAL_LOGIN_MAX_FAILURES: usize = 10;
 
-/// Serializes local login attempts; failed attempts hold it during a penalty delay, capping
-/// brute force at roughly one guess per second regardless of concurrency.
-static LOCAL_LOGIN_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Non-blocking sliding-window failure limiter per Hub instance (avoids holding a mutex across `.await`).
+#[derive(Clone, Default)]
+pub struct LocalLoginLimiter {
+    failures: Arc<Mutex<VecDeque<Instant>>>,
+}
+
+impl LocalLoginLimiter {
+    fn prune_locked(q: &mut VecDeque<Instant>, now: Instant) {
+        while q
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= LOCAL_LOGIN_WINDOW)
+        {
+            q.pop_front();
+        }
+    }
+
+    pub fn check_allowed(&self) -> bool {
+        let mut q = self.failures.lock().expect("local login limiter mutex");
+        Self::prune_locked(&mut q, Instant::now());
+        q.len() < LOCAL_LOGIN_MAX_FAILURES
+    }
+
+    pub fn record_failure(&self) {
+        let mut q = self.failures.lock().expect("local login limiter mutex");
+        let now = Instant::now();
+        Self::prune_locked(&mut q, now);
+        q.push_back(now);
+    }
+
+    pub fn reset(&self) {
+        self.failures
+            .lock()
+            .expect("local login limiter mutex")
+            .clear();
+    }
+}
 
 fn write_token_file(cfg: &crate::config::Config, token: &str) -> Option<std::path::PathBuf> {
     if cfg.is_memory_db() {
@@ -758,7 +806,12 @@ pub async fn local_login(
     if !hub.config.local_login {
         return Err(denied());
     }
-    let _gate = LOCAL_LOGIN_GATE.lock().await;
+    if !hub.local_login_limiter.check_allowed() {
+        return Err(Error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many failed login attempts, retry later",
+        ));
+    }
     let token = input.token.trim().to_owned();
     let stored: Option<String> = hub
         .db
@@ -776,9 +829,11 @@ pub async fn local_login(
             crate::config::constant_time_eq(h.as_bytes(), sha256_hex(&token).as_bytes())
         });
     if !valid {
-        tokio::time::sleep(Duration::from_millis(1000)).await;
+        hub.local_login_limiter.record_failure();
+        tokio::time::sleep(Duration::from_millis(300)).await;
         return Err(Error(StatusCode::UNAUTHORIZED, "invalid login token"));
     }
+    hub.local_login_limiter.reset();
 
     let username = std::env::var("AGENCT_LOCAL_USERNAME")
         .ok()

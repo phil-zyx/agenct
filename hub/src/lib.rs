@@ -59,7 +59,11 @@ pub struct Hub {
     pub secrets: secrets::SecretCipher,
     pub events: events::EventBus,
     pub http: reqwest::Client,
+    /// Hardened client for user-configured outbound targets (custom LLM/vision & IM webhooks).
+    pub user_http: reqwest::Client,
     pub oauth_pending: auth::OAuthPendingStore,
+    pub local_login_limiter: auth::LocalLoginLimiter,
+    pub approval_limiter: collab::ApprovalLimiter,
     pub attachments_dir: PathBuf,
     pub scheduler_notify: Arc<tokio::sync::Notify>,
     pub scheduler: Arc<automation::SchedulerState>,
@@ -83,6 +87,17 @@ impl Hub {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(60))
             .build()?;
+        let user_http = if cfg.allow_private_outbound {
+            http.clone()
+        } else {
+            reqwest::Client::builder()
+                .no_proxy()
+                .user_agent("agenct-hub/2.0")
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(60))
+                .dns_resolver(Arc::new(config::PublicDnsResolver))
+                .build()?
+        };
         let llm = llm::LlmClient::new(cfg.llm.clone(), http.clone());
         if let Some((token, saved)) = db
             .write_blocking(|conn| auth::init_local_login(conn, &cfg))
@@ -103,7 +118,10 @@ impl Hub {
             secrets,
             events: events::EventBus::default(),
             http,
+            user_http,
             oauth_pending: auth::OAuthPendingStore::default(),
+            local_login_limiter: auth::LocalLoginLimiter::default(),
+            approval_limiter: collab::ApprovalLimiter::default(),
             attachments_dir,
             scheduler_notify: Arc::new(tokio::sync::Notify::new()),
             scheduler: Arc::new(automation::SchedulerState::default()),

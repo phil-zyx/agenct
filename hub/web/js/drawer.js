@@ -2,7 +2,7 @@
 import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 import { renderBuddySvg } from './avatar.js';
 import { playTap, playToggle } from './sound.js';
-import { stripNoise, triageTasks } from './triage.js';
+import { stripNoise, triageTasks, cleanPreviewLine } from './triage.js';
 import { COPY_BTN_HTML, bindHoldAction, initDelegatedCopy } from './ui.js';
 
 export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread }) {
@@ -77,22 +77,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     member_status: '成员状态',
   };
 
-  function cleanPreviewLine(raw, limit = 64) {
-    const clean = stripNoise(raw);
-    if (!clean) return '';
-    const lines = clean
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith('```') && !/^[-*_]{3,}$/.test(l));
-    const line = (lines[0] || clean.split('\n')[0] || '')
-      .replace(/^#+\s*/, '')
-      .replace(/^>\s*/, '')
-      .replace(/\*\*/g, '')
-      .trim();
-    if (!line) return '';
-    return line.length > limit ? `${line.slice(0, limit)}…` : line;
-  }
-
   function formatStage(stage) {
     const s = String(stage || '').trim();
     if (!s || s === 'done' || s === 'failed') return '';
@@ -114,7 +98,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       <details class="node-repos"><summary>${esc(moreLabel)}</summary><div class="item-sub detail-body">${esc(clean)}</div></details>`;
   }
 
-  const NODE_ENGINES = ['claude', 'codex', 'agy', 'opencode', 'ollama', 'openai'];
+  const NODE_ENGINES = ['claude', 'codex', 'agy', 'opencode'];
 
   function engineSelectOptions(selected = '') {
     return [
@@ -1005,6 +989,11 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           <input type="password" name="${slot}_key" placeholder="${ep ? '留空保持不变' : 'sk-...'}" autocomplete="off">`;
 
     settingsBody.innerHTML = `
+      ${
+        models.secrets_encrypted === false
+          ? '<div class="sandbox-block-note mb-10">安全提示：服务器尚未配置 AGENCT_MASTER_KEY，用户自定义 API Key、GitLab PAT 与 IM Webhook 当前以明文存储在 SQLite 中。生产部署建议设置 AGENCT_MASTER_KEY 并运行 agenct-hub reencrypt-secrets。</div>'
+          : ''
+      }
       <section class="panel-card">
         <h3>大脑模型</h3>
         <p class="note">不配置则使用服务器默认：${esc(def.brain_model || '-')}${def.brain_supports_images ? '（支持图片）' : '（仅文字）'}${def.vision_model ? `，识图：${esc(def.vision_model)}` : ''}</p>

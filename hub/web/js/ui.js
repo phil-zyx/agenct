@@ -1,8 +1,8 @@
 // Shared Bencho-inspired UI helpers: copy-field morph, hold-to-confirm, and liquid glide tooltips.
-import { showToast } from './api.js';
+import { copyBtnHtml, showToast } from './api.js';
 import { playDone, playTap, playWarn } from './sound.js';
 
-export const COPY_BTN_HTML = `<button type="button" class="copy-btn" aria-label="复制内容" title="复制"><svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-copy"/></svg><svg class="ic ic-check" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-check"/></svg></button>`;
+export const COPY_BTN_HTML = copyBtnHtml('复制内容');
 
 export async function writeClipboard(text) {
   if (navigator.clipboard?.writeText) {

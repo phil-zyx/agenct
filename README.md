@@ -16,8 +16,8 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite v1) ──▶
 **只保留一套（零双轨、零历史包袱）：**
 - **认证**：单人模式的本地登录令牌（零配置），或可选的 GitLab OAuth 2.0 团队登录（PKCE S256）；均为 SQLite 会话 + CSRF/Origin/Host 校验；节点使用 `agn_` Bearer Token。
 - **单一运行时**：Hub 直连任意 OpenAI 兼容 `/chat/completions` 接口（支持 DeepSeek、OpenAI、Ollama）。每个用户可在「设置 → 大脑模型」配置自己的大脑模型（可标记支持图片）和可选的识图模型，未配置时使用服务器默认（`AGENCT_LLM_*` / `AGENCT_VISION_*`）。
-- **单一大脑**：`SOUL.md` + `MEMORY.md` + 专项活账本（`ledgers`）+ 定时任务 + 分发规则 + 工具调用（`update_memory` / `update_ledger` / `manage_cron` / `manage_rule` / `fetch_gitlab_commits` / `dispatch_node` / `delegate_colleague`）。
-- **单一存储**：SQLite v1（13 张规范表，WAL 模式，`spawn_blocking` 读写隔离），附件二进制落盘 + 显式 ACL 授权表，只追加审计表。
+- **单一大脑**：`SOUL.md` + `MEMORY.md` + 专项活账本（`ledgers`）+ 定时任务 + 分发规则 + 工具调用（`update_memory` / `update_ledger` / `manage_cron` / `manage_rule` / `manage_role` / `manage_node` / `manage_thread` / `fetch_gitlab_commits` / `dispatch_node` / `delegate_colleague`）。
+- **单一存储**：SQLite（18 张规范表 + FTS5 全文检索，WAL 模式，`spawn_blocking` 读写隔离），附件二进制落盘 + 显式 ACL 授权表，只追加审计表。
 - **单一执行协议**：本地 PC 节点与云端常驻容器节点共用同一份 `node/agenct-node.py` 和排他租约协议 2。
 - **单一实时通道**：`/api/bootstrap` 初始加载 + `/api/events` 真 SSE 推送。
 
@@ -92,7 +92,7 @@ codex exec --skip-git-repo-check -s workspace-write -c sandbox_workspace_write.n
 
 #### 跨平台执行后端探测（`--exec-backend`）
 
-`node/agenct-node.py` 支持通过 `--exec-backend {auto,tmux,conpty,wt-tail,pipe}`（默认 `auto`，兼容别名 `--tmux {auto,on,off}` 分别映射到 `auto`/`tmux`/`pipe`，与 `--codex-tmux` 正交）自动选择并静默降级执行后端，并在任务回执中附带实际命中的 `backend` 字段：
+`node/agenct-node.py` 支持通过 `--exec-backend {auto,tmux,conpty,wt-tail,pipe}`（默认 `auto`，与 `--codex-tmux` 正交）自动选择并静默降级执行后端，并在任务回执中附带实际命中的 `backend` 字段：
 
 - **Linux / macOS / WSL2**：`auto` 优先探测 `tmux`（命名会话 `agenct-<task>-<id>`，支持 `tmux attach -t <session>`，输出经 Wrapper 原始管道采集不折行 JSONL）；不可用时静默降级为 `pipe`。WSL2 严格按 Linux 路径处理，**不会**调用 `/mnt/c` 下的 `wt.exe`。
 - **Windows**：`auto` 按 `conpty`（需探测到 `pywinpty` 或 `node-pty`，经 Wrapper 采集原始输出避免 ConPTY 折行切碎 JSONL）→ `wt-tail`（白名单调用 `wt.exe -w 0 new-tab --title "agenct:<task>" pwsh -NoExit -Command "Get-Content -Wait <log>"`，缺失或 Store 别名不可用时降级）→ `pipe` 顺序降级；运行日志写入 `%USERPROFILE%\.agenct\runs\` 而非 `/tmp`。
@@ -103,8 +103,7 @@ codex exec --skip-git-repo-check -s workspace-write -c sandbox_workspace_write.n
 # 1. Linux / macOS / WSL2：验证默认 auto 探测（有可用 tmux 走 tmux，无则静默降级 pipe）
 python3 -m unittest discover -s node -p 'test_*.py' -v
 python3 node/agenct-node.py --self-check --agents codex --exec-backend auto
-# 兼容别名验证（与 --codex-tmux 互不影响）
-python3 node/agenct-node.py --self-check --agents codex --tmux off
+python3 node/agenct-node.py --self-check --agents codex --exec-backend pipe
 # 若命中 tmux，另开终端可查看/附着会话：
 tmux list-sessions | grep '^agenct-'
 ```

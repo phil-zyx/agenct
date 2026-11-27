@@ -135,24 +135,6 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
             Ok(ToolOutcome::done(tool, "已更新持续事项。"))
         }
         "manage_thread" => apply_manage_thread(ctx, call).await,
-        "close_thread" => {
-            let target = call
-                .thread_id
-                .as_deref()
-                .or(ctx.active_thread_id.as_deref())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned);
-            match target {
-                Some(tid) => {
-                    archive_thread(hub, user_id, &tid).await?;
-                    hub.events
-                        .emit(user_id.to_owned(), "brain", json!({"updated": "threads"}));
-                    Ok(ToolOutcome::done(tool, format!("已归档线程 {tid}。")))
-                }
-                None => Ok(ToolOutcome::done(tool, "没有可归档的线程，已忽略。")),
-            }
-        }
         "manage_cron" => {
             ctx.stage("正在更新定时任务…");
             apply_manage_cron(hub, user_id, call).await?;

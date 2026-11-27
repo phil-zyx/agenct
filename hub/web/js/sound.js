@@ -42,10 +42,6 @@ export function cycleSoundMode() {
   return setSoundMode(next);
 }
 
-export function setSoundEnabled(on) {
-  return setSoundMode(on ? 'bubble' : 'off') !== 'off';
-}
-
 function getContext() {
   try {
     const Ctx = window.AudioContext || window.webkitAudioContext;

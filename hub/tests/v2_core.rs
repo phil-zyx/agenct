@@ -6,7 +6,7 @@ use agenct_hub::{
 use axum::{
     body::Body,
     http::{header, Request, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::{get, post},
     Json, Router,
 };
@@ -2051,7 +2051,7 @@ async fn repo_aware_routing_picks_online_node_matching_repo() {
 }
 
 #[tokio::test]
-async fn native_tool_calling_streaming_and_json_fallback_work() {
+async fn native_tool_calling_and_streaming_work() {
     let mock_calls = Arc::new(AtomicUsize::new(0));
     let mock_calls_stream = mock_calls.clone();
     let mock_app = Router::new()
@@ -2112,30 +2112,6 @@ async fn native_tool_calling_streaming_and_json_fallback_work() {
                             .unwrap()
                     }
                 }
-            }),
-        )
-        .route(
-            "/v1/fallback/chat/completions",
-            post(|Json(body): Json<Value>| async move {
-                if body.get("tools").is_some() {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": {"message": "tools unsupported"}})),
-                    )
-                        .into_response();
-                }
-                assert_eq!(body["response_format"]["type"], "json_object");
-                (
-                    StatusCode::OK,
-                    Json(json!({
-                        "choices": [{
-                            "message": {
-                                "content": "{\"reply\":\"兼容模式成功\",\"tools\":[]}"
-                            }
-                        }]
-                    })),
-                )
-                    .into_response()
             }),
         );
 
@@ -2198,36 +2174,6 @@ async fn native_tool_calling_streaming_and_json_fallback_work() {
         .await
         .unwrap();
     assert!(memory.contains("偏爱简洁直接的汇报"), "{memory}");
-
-    // Scenario B: upstream rejects `tools` with 400 -> automatic fallback to JSON-envelope mode.
-    let (st, _) = req_json(
-        &router,
-        "PUT",
-        "/api/settings/models",
-        Some(&cookie),
-        Some(&csrf),
-        Some(json!({
-            "brain": {
-                "url": format!("http://127.0.0.1:{}/v1/fallback/chat/completions", addr.port()),
-                "model": "legacy-json-model",
-                "api_key": "sk-legacy-123456"
-            }
-        })),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-
-    let (st, fallback_chat) = req_json(
-        &router,
-        "POST",
-        "/api/chat",
-        Some(&cookie),
-        Some(&csrf),
-        Some(json!({"message": "你好"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK, "{fallback_chat}");
-    assert_eq!(fallback_chat["reply"], "兼容模式成功");
 
     server.abort();
 }
@@ -5567,4 +5513,282 @@ async fn chat_endpoint_async_failure_emits_sse_error_and_marks_failed() {
         .await
         .unwrap();
     assert_eq!(db_status, "failed");
+}
+
+#[tokio::test]
+async fn runtime_ssrf_guard_secrets_flag_and_local_login_rate_limit() {
+    // 1. `secrets_encrypted` reflects AGENCT_MASTER_KEY configuration.
+    let hub_plain = Hub::open(local_only_config()).unwrap();
+    let router_plain = app(hub_plain.clone());
+    let (st, cookie, body) = post_local_login(
+        &router_plain,
+        "local-test-token-0123456789",
+        Some("http://127.0.0.1:8080"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let cookie = cookie.unwrap();
+    let csrf = body["csrf_token"].as_str().unwrap().to_owned();
+    let (st, settings_plain) = req_json(
+        &router_plain,
+        "GET",
+        "/api/settings/models",
+        Some(&cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(settings_plain["secrets_encrypted"], false);
+
+    let mut enc_cfg = local_only_config();
+    enc_cfg.master_key = Some("0123456789abcdef0123456789abcdef".into());
+    let hub_enc = Hub::open(enc_cfg).unwrap();
+    let router_enc = app(hub_enc.clone());
+    let (st, cookie_enc, body_enc) = post_local_login(
+        &router_enc,
+        "local-test-token-0123456789",
+        Some("http://127.0.0.1:8080"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, settings_enc) = req_json(
+        &router_enc,
+        "GET",
+        "/api/settings/models",
+        Some(&cookie_enc.unwrap()),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(settings_enc["secrets_encrypted"], true);
+    let _ = body_enc;
+
+    // 2. Runtime SSRF re-check rejects persisted literal private/loopback URL when allow_private_outbound=false.
+    hub_plain
+        .db
+        .write(|conn| {
+            conn.execute(
+                "INSERT INTO user_models(user_id, config_json, updated_at) VALUES (?1, ?2, 1)",
+                rusqlite::params![
+                    "local-owner",
+                    r#"{"brain":{"url":"http://127.0.0.1:9/v1/chat/completions","api_key":"sk-x","model":"m"}}"#
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (st, err_body) = req_json(
+        &router_plain,
+        "POST",
+        "/api/settings/models/test",
+        Some(&cookie),
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{err_body}");
+
+    // 3. Sliding-window local login rate limit returns 429 after 10 failures without blocking a separate Hub.
+    for attempt in 0..10 {
+        let (st, _, _) =
+            post_local_login(&router_plain, "wrong-token", Some("http://127.0.0.1:8080")).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "attempt {attempt}");
+    }
+    let (st, _, rate_body) =
+        post_local_login(&router_plain, "wrong-token", Some("http://127.0.0.1:8080")).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{rate_body}");
+
+    // Independent Hub instance's limiter remains unaffected.
+    let (st, _, _) = post_local_login(
+        &router_enc,
+        "local-test-token-0123456789",
+        Some("http://127.0.0.1:8080"),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn security_headers_attachment_isolation_and_approval_rate_limit() {
+    let mut https_cfg = test_config("https://git.example.com");
+    https_cfg.public_origin = "https://agenct.example.com".into();
+    https_cfg.local_http = false;
+    let hub = Hub::open(https_cfg).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    let upload_att = |name: &str, mime: &str, data: &str| {
+        let r = router.clone();
+        let ck = cookie.clone();
+        let cs = csrf.clone();
+        let body = json!({
+            "name": name,
+            "mime_type": mime,
+            "data_base64": STANDARD.encode(data),
+        })
+        .to_string();
+        async move {
+            let resp = r
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/attachments")
+                        .header(header::HOST, "agenct.example.com")
+                        .header(header::ORIGIN, "https://agenct.example.com")
+                        .header(header::COOKIE, format!("__Host-agenct-session={ck}"))
+                        .header("x-csrf-token", cs)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let val: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, val)
+        }
+    };
+
+    // 1. Standard HTTPS endpoints include HSTS, X-Frame-Options, Permissions-Policy, and page CSP.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header(header::HOST, "agenct.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    assert_eq!(h["x-frame-options"], "DENY");
+    assert_eq!(
+        h["permissions-policy"],
+        "camera=(), microphone=(), geolocation=()"
+    );
+    assert_eq!(
+        h["strict-transport-security"],
+        "max-age=31536000; includeSubDomains"
+    );
+    assert!(h["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("default-src 'self'"));
+
+    // 2. Non-image attachments force attachment disposition + sandbox CSP; images keep inline + sandbox CSP.
+    let (st, txt_up) = upload_att("report.txt", "text/plain", "hello security").await;
+    assert_eq!(st, StatusCode::OK, "{txt_up}");
+    let txt_id = txt_up["id"].as_str().unwrap();
+    let txt_dl = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/attachments/{txt_id}"))
+                .header(header::HOST, "agenct.example.com")
+                .header(header::COOKIE, format!("__Host-agenct-session={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(txt_dl.status(), StatusCode::OK);
+    assert!(txt_dl.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment;"));
+    assert_eq!(
+        txt_dl.headers()["content-security-policy"],
+        "default-src 'none'; sandbox"
+    );
+
+    let png_bytes = STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+X2ZkAAAAASUVORK5CYII=")
+        .unwrap();
+    let (st, png_up) = {
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/attachments")
+                    .header(header::HOST, "agenct.example.com")
+                    .header(header::ORIGIN, "https://agenct.example.com")
+                    .header(header::COOKIE, format!("__Host-agenct-session={cookie}"))
+                    .header("x-csrf-token", &csrf)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "shot.png",
+                            "mime_type": "image/png",
+                            "data_base64": STANDARD.encode(&png_bytes),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (
+            st,
+            serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+        )
+    };
+    assert_eq!(st, StatusCode::OK, "{png_up}");
+    let png_id = png_up["id"].as_str().unwrap();
+    let png_dl = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/attachments/{png_id}"))
+                .header(header::HOST, "agenct.example.com")
+                .header(header::COOKIE, format!("__Host-agenct-session={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(png_dl.status(), StatusCode::OK);
+    assert!(png_dl.headers()["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("inline;"));
+    assert_eq!(
+        png_dl.headers()["content-security-policy"],
+        "default-src 'none'; sandbox"
+    );
+
+    // 3. `/approve` code verification enforces per-user rate limit (5 failures -> 429) and logs failures.
+    for _ in 0..5 {
+        let err = agenct_hub::collab::consume_approval_code(&hub, "u-alice", "WRONG1")
+            .await
+            .err()
+            .expect("wrong approval code must fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+    let blocked = agenct_hub::collab::consume_approval_code(&hub, "u-alice", "WRONG1")
+        .await
+        .err()
+        .expect("6th attempt must be rate-limited");
+    assert_eq!(blocked.0, StatusCode::TOO_MANY_REQUESTS);
+
+    let denied_audits: i64 = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT count(*) FROM audit_logs WHERE user_id='u-alice' AND action='task_elevate_denied'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(denied_audits, 5);
 }

@@ -228,12 +228,12 @@ class TestUnifiedNode(unittest.TestCase):
             self.assertEqual(items[0]["name"], "shot.png")
             self.assertEqual(items[0]["mime_type"], "image/png")
 
-    def test_template_execution_succeeds_without_cli(self) -> None:
+    def test_custom_cmd_succeeds_and_unsupported_engine_fails(self) -> None:
         with tempfile.TemporaryDirectory() as workdir:
             import threading
 
             status, content, atts = node.execute_job(
-                "template",
+                'custom:python3 -c "print(\'Custom OK\')"',
                 {"task_id": "tsk_1", "title": "Hello", "instruction": "Inspect repo"},
                 workdir,
                 "workspace-write",
@@ -242,8 +242,21 @@ class TestUnifiedNode(unittest.TestCase):
                 lambda _s, _t: None,
             )
             self.assertEqual(status, "completed")
-            self.assertIn("Inspect repo", content)
+            self.assertIn("Custom OK", content)
             self.assertEqual(atts, [])
+
+            bad_status, bad_content, bad_atts = node.execute_job(
+                "template",
+                {"task_id": "tsk_2", "title": "Bad", "instruction": "Nope"},
+                workdir,
+                "workspace-write",
+                10,
+                threading.Event(),
+                lambda _s, _t: None,
+            )
+            self.assertEqual(bad_status, "failed")
+            self.assertIn("Unsupported execution engine", bad_content)
+            self.assertEqual(bad_atts, [])
 
     def test_strip_ansi_removes_escape_codes_and_control_chars(self) -> None:
         raw = "\x1b[0m\r\n\x1b[32;1m> build · deepseek\x1b[0m\n\x1b]0;title\x07结果：ok\x00\n\t缩进"
@@ -259,11 +272,10 @@ class TestUnifiedNode(unittest.TestCase):
             '{"type":"text","sessionID":"ses_abc12345","part":{"type":"text","messageID":"m2","text":"\\u001b[0m当前活跃会话：\\n- `agy` (3 windows)\\n- `cc` (5 windows)"}}',
             '{"type":"step_finish","sessionID":"ses_abc12345","part":{"type":"step-finish","reason":"stop"}}',
         ])
-        parsed, sid = node.parse_opencode_json_result(stream)
+        parsed, sid = node.parse_cli_output("opencode", stream)
         self.assertEqual(parsed, "当前活跃会话：\n- `agy` (3 windows)\n- `cc` (5 windows)")
         self.assertEqual(sid, "ses_abc12345")
-        self.assertEqual(node.parse_opencode_json(stream), parsed)
-        self.assertIsNone(node.parse_opencode_json("plain text output"))
+        self.assertEqual(node.parse_cli_output("opencode", "plain text output"), (None, None))
 
     def test_summarize_progress_line_formats_opencode_events(self) -> None:
         ev = '{"type":"tool_use","part":{"type":"tool","tool":"bash","state":{"title":"tmux ls","input":{"command":"tmux ls"}}}}'
@@ -352,7 +364,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"type":"assistant","session_id":"cl_ses_001","message":{"content":[{"type":"text","text":"Working tree is clean."}]}}',
             '{"type":"result","subtype":"success","session_id":"cl_ses_001","result":"All checks passed."}',
         ])
-        text, sid = node.parse_claude_stream_json(stream)
+        text, sid = node.parse_cli_output("claude", stream)
         self.assertEqual(text, "All checks passed.")
         self.assertEqual(sid, "cl_ses_001")
         self.assertEqual(
@@ -369,7 +381,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"type":"item.started","item":{"id":"i1","type":"command_execution","command":"cargo test"}}',
             '{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"20 tests passed."}}',
         ])
-        text, sid = node.parse_codex_json_result(stream)
+        text, sid = node.parse_cli_output("codex", stream)
         self.assertEqual(text, "20 tests passed.")
         self.assertEqual(sid, "019a0000-1111-2222-3333-444455556666")
         self.assertEqual(
@@ -386,10 +398,9 @@ class TestUnifiedNode(unittest.TestCase):
             '{"event":"step_update","step_update":{"conversation_id":"4c7141d8-84b2-4dd3-9dbc-c17204891d47","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"Done: 2 files found."}}',
             '{"event":"result","result":{"conversation_id":"4c7141d8-84b2-4dd3-9dbc-c17204891d47","status":"SUCCESS","response":"Done: 2 files found.\\n"}}',
         ])
-        text, sid = node.parse_agy_stream_json(stream)
+        text, sid = node.parse_cli_output("agy", stream)
         self.assertEqual(text, "Done: 2 files found.")
         self.assertEqual(sid, "4c7141d8-84b2-4dd3-9dbc-c17204891d47")
-        self.assertEqual(node.parse_cli_output("agy", stream), ("Done: 2 files found.", "4c7141d8-84b2-4dd3-9dbc-c17204891d47"))
         self.assertEqual(
             node.summarize_progress_line("agy", stream.splitlines()[2]),
             "run_command: ls -la",
@@ -400,7 +411,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"event":"init","conversation_id":"811f01b5-3dcf-46f7-a376-4af546dae32c"}',
             '{"event":"result","result":{"conversation_id":"811f01b5-3dcf-46f7-a376-4af546dae32c","status":"SUCCESS","response":"","denied_actions":[{"action":"command","display_name":"Bash"}]}}',
         ])
-        d_text, d_sid = node.parse_agy_stream_json(denied_stream)
+        d_text, d_sid = node.parse_cli_output("agy", denied_stream)
         self.assertIn("Bash", d_text or "")
         self.assertEqual(d_sid, "811f01b5-3dcf-46f7-a376-4af546dae32c")
         self.assertTrue(node.detect_cli_stream_error("agy", denied_stream))
@@ -415,7 +426,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"event":"step_update","step_update":{"conversation_id":"811f01b5-3dcf-46f7-a376-4af546dae32c","step_index":1,"state":"DONE","step_type":"agent_response","text_delta":"I\'ll start with a read-only survey..."}}',
             '{"event":"result","result":{"conversation_id":"811f01b5-3dcf-46f7-a376-4af546dae32c","status":"SUCCESS","response":"","denied_actions":[{"action":"command","display_name":"Bash"}]}}',
         ])
-        pd_text, _ = node.parse_agy_stream_json(partial_denied_stream)
+        pd_text, _ = node.parse_cli_output("agy", partial_denied_stream)
         self.assertIn("I'll start with a read-only survey...", pd_text or "")
         self.assertIn("Action denied in headless mode: Bash", pd_text or "")
         self.assertTrue(node.detect_cli_stream_error("agy", partial_denied_stream))
@@ -424,7 +435,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"event":"init","conversation_id":"811f01b5-3dcf-46f7-a376-4af546dae32c"}',
             '{"event":"result","result":{"conversation_id":"811f01b5-3dcf-46f7-a376-4af546dae32c","status":"ERROR","response":""}}',
         ])
-        es_text, _ = node.parse_agy_stream_json(err_status_stream)
+        es_text, _ = node.parse_cli_output("agy", err_status_stream)
         self.assertIn("ERROR", es_text or "")
         self.assertTrue(node.detect_cli_stream_error("agy", err_status_stream))
 
@@ -796,7 +807,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"type":"assistant","session_id":"cl_1","message":{"content":[{"type":"text","text":"Starting..."}]}}',
             '{"type":"result","subtype":"success","is_error":true,"session_id":"cl_1","result":"Partial","permission_denials":[{"tool_name":"Bash"}]}',
         ])
-        cl_text, cl_sid = node.parse_claude_stream_json(cl_err)
+        cl_text, cl_sid = node.parse_cli_output("claude", cl_err)
         self.assertEqual(cl_sid, "cl_1")
         self.assertIn("Partial", cl_text or "")
         self.assertIn("Action denied in headless mode: Bash", cl_text or "")
@@ -807,7 +818,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"Checking repo..."}}',
             '{"type":"turn.failed","error":{"message":"Sandbox blocked operation"}}',
         ])
-        cx_text, _ = node.parse_codex_json_result(cx_err)
+        cx_text, _ = node.parse_cli_output("codex", cx_err)
         self.assertIn("Checking repo...", cx_text or "")
         self.assertIn("Sandbox blocked operation", cx_text or "")
         self.assertTrue(node.detect_cli_stream_error("codex", cx_err))
@@ -816,7 +827,7 @@ class TestUnifiedNode(unittest.TestCase):
             '{"type":"text","sessionID":"ses_1234","part":{"type":"text","messageID":"m1","text":"Looking..."}}',
             '{"type":"error","sessionID":"ses_1234","error":{"data":{"message":"Model rate limited"}}}',
         ])
-        oc_text, _ = node.parse_opencode_json_result(oc_err)
+        oc_text, _ = node.parse_cli_output("opencode", oc_err)
         self.assertIn("Looking...", oc_text or "")
         self.assertIn("Model rate limited", oc_text or "")
         self.assertTrue(node.detect_cli_stream_error("opencode", oc_err))
@@ -1022,12 +1033,11 @@ class TestUnifiedNode(unittest.TestCase):
                     if not expected_flag:
                         self.assertIn("--codex-tmux only takes effect under sandbox=workspace-write", loop_err.getvalue())
 
-    def test_exec_backend_cli_args_tmux_alias_and_codex_tmux_orthogonality(self) -> None:
+    def test_exec_backend_cli_args_and_codex_tmux_orthogonality(self) -> None:
         base = ["--hub", "https://agenct.example.com"]
         with mock.patch.dict(os.environ, {}, clear=True):
             args_default = node.parse_args(base)
             self.assertEqual(args_default.exec_backend, "auto")
-            self.assertEqual(args_default.tmux, "auto")
             self.assertFalse(args_default.codex_tmux)
 
             for choice in ("auto", "tmux", "conpty", "wt-tail", "pipe"):
@@ -1035,25 +1045,14 @@ class TestUnifiedNode(unittest.TestCase):
                 self.assertEqual(parsed.exec_backend, choice)
                 self.assertFalse(parsed.codex_tmux)
 
-            # Compatibility alias --tmux {auto,on,off} -> exec_backend {auto,tmux,pipe}
-            self.assertEqual(node.parse_args([*base, "--tmux", "auto"]).exec_backend, "auto")
-            self.assertEqual(node.parse_args([*base, "--tmux", "on"]).exec_backend, "tmux")
-            self.assertEqual(node.parse_args([*base, "--tmux", "off"]).exec_backend, "pipe")
-
             # Orthogonal to --codex-tmux: neither flag alters the other's semantics
-            ortho1 = node.parse_args([*base, "--tmux", "on"])
+            ortho1 = node.parse_args([*base, "--exec-backend", "tmux"])
             self.assertEqual(ortho1.exec_backend, "tmux")
             self.assertFalse(ortho1.codex_tmux)
 
             ortho2 = node.parse_args([*base, "--codex-tmux", "--exec-backend", "pipe"])
             self.assertEqual(ortho2.exec_backend, "pipe")
             self.assertTrue(ortho2.codex_tmux)
-
-            # Explicit --exec-backend takes precedence over conflicting --tmux with warning
-            with redirect_stderr(io.StringIO()) as err:
-                both = node.parse_args([*base, "--exec-backend", "pipe", "--tmux", "on"])
-            self.assertEqual(both.exec_backend, "pipe")
-            self.assertIn("using --exec-backend=pipe", err.getvalue())
 
         with mock.patch.dict(os.environ, {"AGENCT_EXEC_BACKEND": "wt-tail"}, clear=True):
             self.assertEqual(node.parse_args(base).exec_backend, "wt-tail")
@@ -1436,7 +1435,7 @@ class TestUnifiedNode(unittest.TestCase):
 
                 def fake_http(url, _token, *, method, **kwargs):
                     if url.endswith("/work"):
-                        return {"job": {"task_id": "tsk_be", "task_revision": 1, "lease_token": "l", "agent": "template"}}
+                        return {"job": {"task_id": "tsk_be", "task_revision": 1, "lease_token": "l", "agent": ""}}
                     if url.endswith("/submit"):
                         self.assertEqual(method, "POST")
                         submitted_payloads.append(kwargs["body"])
@@ -1446,7 +1445,7 @@ class TestUnifiedNode(unittest.TestCase):
                 # Default CLI args (no --exec-backend passed -> auto)
                 args = node.parse_args([
                     "--hub", "https://agenct.example.com", "--token", "tok", "--once",
-                    "--agent", "template", "--agents", "template",
+                    "--cmd", "python3 -c \"print('ok')\"",
                     "--workdir", workdir, "--state-dir", workdir,
                 ])
                 self.assertEqual(args.exec_backend, "auto")
@@ -1913,6 +1912,68 @@ class TestUnifiedNode(unittest.TestCase):
         self.assertEqual(status, "failed")
         self.assertIn("provider/model", content)
         run_mock.assert_not_called()
+
+    def test_security_env_scrubbing_evidence_symlink_and_no_redirect(self) -> None:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import urllib.error
+
+        # 1. Sensitive Hub/Node tokens and master keys are scrubbed from child process env.
+        with tempfile.TemporaryDirectory() as workdir, mock.patch.dict(
+            os.environ,
+            {
+                "AGENCT_NODE_TOKEN": "agn_secret_node_token_1234",
+                "AGENCT_MASTER_KEY": "secret_master_key_0123456789abcdef",
+                "AGENCT_GITLAB_CLIENT_SECRET": "secret_gl_client",
+            },
+        ):
+            status, out, _ = node.execute_job(
+                'custom:python3 -c "import os; print(sorted(k for k in os.environ if k.startswith(\'AGENCT_\')))"',
+                {"task_id": "t_env", "title": "Env", "instruction": "Check"},
+                workdir,
+                "workspace-write",
+                15,
+                threading.Event(),
+                lambda _s, _t: None,
+            )
+            self.assertEqual(status, "completed")
+            self.assertNotIn("AGENCT_NODE_TOKEN", out)
+            self.assertNotIn("AGENCT_MASTER_KEY", out)
+            self.assertNotIn("AGENCT_GITLAB_CLIENT_SECRET", out)
+            self.assertIn("AGENCT_WORKDIR", out)
+
+        # 2. collect_evidence skips symlinks pointing outside evidence_dir.
+        with tempfile.TemporaryDirectory() as outer, tempfile.TemporaryDirectory() as ev_dir:
+            secret_path = os.path.join(outer, "secret.txt")
+            with open(secret_path, "w", encoding="utf-8") as fh:
+                fh.write("TOP_SECRET")
+            ok_path = os.path.join(ev_dir, "ok.txt")
+            with open(ok_path, "w", encoding="utf-8") as fh:
+                fh.write("SAFE_DATA")
+            os.symlink(secret_path, os.path.join(ev_dir, "leak.txt"))
+            items = node.collect_evidence(ev_dir)
+            self.assertEqual([i["name"] for i in items], ["ok.txt"])
+            self.assertEqual(base64.b64decode(items[0]["data_base64"]), b"SAFE_DATA")
+
+        # 3. http_json refuses HTTP 3xx redirects rather than forwarding Bearer tokens.
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:9/steal")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                node.http_json(f"http://127.0.0.1:{srv.server_port}/node/v1/work", "agn_tok")
+            self.assertEqual(ctx.exception.code, 302)
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

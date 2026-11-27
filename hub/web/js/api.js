@@ -32,6 +32,10 @@ export async function api(path, { method = 'GET', body } = {}) {
   return data;
 }
 
+export function copyBtnHtml(label = '复制内容') {
+  return `<button type="button" class="copy-btn" aria-label="${esc(label)}" title="复制"><svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-copy"/></svg><svg class="ic ic-check" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-check"/></svg></button>`;
+}
+
 export function esc(str) {
   return String(str ?? '')
     .replaceAll('&', '&amp;')
@@ -105,7 +109,7 @@ export function renderMarkdown(raw) {
       }
       if (i < lines.length) i++;
       out.push(
-        `<div class="md-code-wrap"><button type="button" class="copy-btn" aria-label="复制代码" title="复制"><svg class="ic ic-copy" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-copy"/></svg><svg class="ic ic-check" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-check"/></svg></button><pre class="md-pre"><code>${esc(codeLines.join('\n'))}</code></pre></div>`,
+        `<div class="md-code-wrap">${copyBtnHtml('复制代码')}<pre class="md-pre"><code>${esc(codeLines.join('\n'))}</code></pre></div>`,
       );
       continue;
     }

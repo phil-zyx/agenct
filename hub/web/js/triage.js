@@ -16,7 +16,7 @@ function previewLines(raw) {
     .filter((line) => line && !/^[-*_]{3,}$/.test(line));
 }
 
-function cleanPreviewLine(raw, limit = 96) {
+export function cleanPreviewLine(raw, limit = 96) {
   const line = previewLines(raw)[0] || '';
   return line.length > limit ? `${line.slice(0, limit)}…` : line;
 }

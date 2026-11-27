@@ -337,12 +337,24 @@ pub async fn download(
         .map_err(|_| Error(StatusCode::INTERNAL_SERVER_ERROR, "attachment read error"))?
         .map_err(|_| denied())?;
 
-    let disposition = format!("inline; filename=\"{}\"", name.replace('"', "_"));
+    let disposition_kind = if mime_type.starts_with("image/") {
+        "inline"
+    } else {
+        "attachment"
+    };
+    let disposition = format!(
+        "{disposition_kind}; filename=\"{}\"",
+        name.replace('"', "_")
+    );
     Ok((
         StatusCode::OK,
         [
             (header::CONTENT_TYPE, mime_type),
             (header::CONTENT_DISPOSITION, disposition),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox".to_owned(),
+            ),
         ],
         bytes,
     )

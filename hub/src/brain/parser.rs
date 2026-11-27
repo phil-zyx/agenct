@@ -1,22 +1,11 @@
-//! Brain response parsing, native tool_call normalization, and tag cleanup.
+//! Brain inline `<tool_call>` recovery, native tool_call normalization, and tag cleanup.
 use crate::llm::LlmToolCall;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-#[derive(Deserialize)]
-pub(super) struct BrainResponse {
-    #[serde(default)]
-    pub(super) reply: String,
-    #[serde(default)]
-    pub(super) thread_id: Option<String>,
-    #[serde(default)]
-    pub(super) thread_title: Option<String>,
-    #[serde(default)]
-    pub(super) tools: Vec<ToolCall>,
-}
-
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 pub(super) struct ToolCall {
+    #[serde(default)]
     pub(super) tool: String,
     #[serde(default)]
     pub(super) action: Option<String>,
@@ -89,39 +78,7 @@ pub(super) struct ToolCall {
 fn minimal_tool_call(name: &str) -> ToolCall {
     ToolCall {
         tool: name.to_owned(),
-        action: None,
-        name: None,
-        avatar_id: None,
-        soul_md: None,
-        memory_append: None,
-        memory_replace: None,
-        ledger_id: None,
-        thread_id: None,
-        thread_title: None,
-        title: None,
-        status: None,
-        notes_append: None,
-        notes_replace: None,
-        cron_id: None,
-        daily_time_cst: None,
-        interval_minutes: None,
-        instruction: None,
-        target: None,
-        rule_id: None,
-        keyword: None,
-        node_id: None,
-        agent: None,
-        default_agent: None,
-        allowed_agents: None,
-        role: None,
-        description: None,
-        model: None,
-        effort: None,
-        sandbox: None,
-        prompt: None,
-        prefer_cloud: None,
-        on_complete: None,
-        peer: None,
+        ..Default::default()
     }
 }
 
@@ -219,20 +176,10 @@ fn strip_hallucinated_tags(raw: &str) -> String {
     s.trim().to_owned()
 }
 
-pub(super) fn parse_brain_response(raw: &str) -> BrainResponse {
+pub(super) fn recover_inline_tool_calls(raw: &str) -> (String, Vec<ToolCall>) {
     let cleaned = strip_hallucinated_tags(raw);
     if let (Some(s), Some(e)) = (cleaned.find('{'), cleaned.rfind('}')) {
-        let json_slice = &cleaned[s..=e];
-        if let Ok(mut parsed) = serde_json::from_str::<BrainResponse>(json_slice) {
-            if !parsed.reply.trim().is_empty() || !parsed.tools.is_empty() {
-                if parsed.reply.trim().is_empty() {
-                    parsed.reply = default_reply_for_tools(&parsed.tools);
-                }
-                return parsed;
-            }
-        }
-        // Fallback 1: model emitted a bare tool object like `{"tool":"fetch_gitlab_commits"}`.
-        if let Ok(single_tool) = serde_json::from_str::<ToolCall>(json_slice) {
+        if let Ok(single_tool) = serde_json::from_str::<ToolCall>(&cleaned[s..=e]) {
             if !single_tool.tool.trim().is_empty() {
                 let prose = format!("{} {}", cleaned[..s].trim(), cleaned[e + 1..].trim())
                     .trim()
@@ -243,16 +190,10 @@ pub(super) fn parse_brain_response(raw: &str) -> BrainResponse {
                 } else {
                     prose
                 };
-                return BrainResponse {
-                    reply,
-                    thread_id: None,
-                    thread_title: None,
-                    tools,
-                };
+                return (reply, tools);
             }
         }
     }
-    // Fallback 2: model emitted a bare JSON array of ToolCalls `[{"tool":"..."}]`.
     if let (Some(s), Some(e)) = (cleaned.find('['), cleaned.rfind(']')) {
         if let Ok(tools) = serde_json::from_str::<Vec<ToolCall>>(&cleaned[s..=e]) {
             if !tools.is_empty() && tools.iter().all(|t| !t.tool.trim().is_empty()) {
@@ -264,26 +205,16 @@ pub(super) fn parse_brain_response(raw: &str) -> BrainResponse {
                 } else {
                     prose
                 };
-                return BrainResponse {
-                    reply,
-                    thread_id: None,
-                    thread_title: None,
-                    tools,
-                };
+                return (reply, tools);
             }
         }
     }
-    BrainResponse {
-        reply: cleaned,
-        thread_id: None,
-        thread_title: None,
-        tools: Vec::new(),
-    }
+    (cleaned, Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{native_calls_to_tool_calls, parse_brain_response, strip_thread_tags};
+    use super::{native_calls_to_tool_calls, recover_inline_tool_calls, strip_thread_tags};
     use crate::llm::LlmToolCall;
 
     #[test]
@@ -309,29 +240,21 @@ mod tests {
 
     #[test]
     fn recovers_bare_tool_call_with_hallucinated_xml_tag() {
-        let parsed = parse_brain_response(r#"{"tool":"fetch_gitlab_commits"}</tool_call>"#);
-        assert_eq!(parsed.tools.len(), 1);
-        assert_eq!(parsed.tools[0].tool, "fetch_gitlab_commits");
-        assert!(!parsed.reply.contains("</tool_call>"));
-        assert!(!parsed.reply.contains('{'));
+        let (reply, tools) =
+            recover_inline_tool_calls(r#"{"tool":"fetch_gitlab_commits"}</tool_call>"#);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool, "fetch_gitlab_commits");
+        assert!(!reply.contains("</tool_call>"));
+        assert!(!reply.contains('{'));
     }
 
     #[test]
     fn recovers_prose_plus_tool_call_tag_and_strips_think() {
         let raw = r#"<think>internal</think>好的，我来查一下。<tool_call>{"tool":"dispatch_node","title":"查 Atlas 提交","instruction":"git log"}</tool_call>"#;
-        let parsed = parse_brain_response(raw);
-        assert_eq!(parsed.reply, "好的，我来查一下。");
-        assert_eq!(parsed.tools.len(), 1);
-        assert_eq!(parsed.tools[0].tool, "dispatch_node");
-    }
-
-    #[test]
-    fn synthesizes_reply_when_tools_envelope_omits_reply() {
-        let parsed = parse_brain_response(
-            r#"{"reply":"","tools":[{"tool":"dispatch_node","title":"t","instruction":"i"}]}"#,
-        );
-        assert_eq!(parsed.tools.len(), 1);
-        assert!(parsed.reply.contains("已派发给执行节点"));
+        let (reply, tools) = recover_inline_tool_calls(raw);
+        assert_eq!(reply, "好的，我来查一下。");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].tool, "dispatch_node");
     }
 
     #[test]

@@ -33,26 +33,8 @@ pub struct LlmTurnResponse {
     pub tool_calls: Vec<LlmToolCall>,
 }
 
-/// Error returned by `complete_turn_stream` so unsupported native `tools` parameters can fall back cleanly.
-#[derive(Debug)]
-pub enum LlmTurnError {
-    UnsupportedParams(Error),
-    Other(Error),
-}
-
-impl From<LlmTurnError> for Error {
-    fn from(e: LlmTurnError) -> Self {
-        match e {
-            LlmTurnError::UnsupportedParams(err) | LlmTurnError::Other(err) => err,
-        }
-    }
-}
-
 /// Marker in the system prompt of image-captioning calls (also used by the offline stub).
 pub const VISION_CAPTION_MARKER: &str = "VISION_CAPTION_TASK";
-
-/// Prefix of the synthetic message that feeds tool execution results back into the model.
-pub const TOOL_RESULTS_MARKER: &str = "TOOL_RESULTS";
 /// Marker in headless async task callback prompts (also used by the offline stub).
 pub const TASK_CALLBACK_MARKER: &str = "TASK_CALLBACK_EVENT";
 /// Marker in headless automatic node-result distillation prompts (also used by the offline stub).
@@ -265,7 +247,7 @@ impl LlmClient {
         tools: &[Value],
         stream: bool,
         mut on_delta: F,
-    ) -> std::result::Result<LlmTurnResponse, LlmTurnError>
+    ) -> Result<LlmTurnResponse>
     where
         F: FnMut(&str),
     {
@@ -301,18 +283,13 @@ impl LlmClient {
                             err.is_timeout(),
                             err.is_connect()
                         );
-                        LlmTurnError::Other(Error(StatusCode::BAD_GATEWAY, "LLM request failed"))
+                        Error(StatusCode::BAD_GATEWAY, "LLM request failed")
                     })?;
 
                 let status = resp.status().as_u16();
                 if !resp.status().is_success() {
                     eprintln!("[llm] stream http error status={status} model={model}");
-                    let err = map_http_error(status);
-                    return if matches!(status, 400 | 422) {
-                        Err(LlmTurnError::UnsupportedParams(err))
-                    } else {
-                        Err(LlmTurnError::Other(err))
-                    };
+                    return Err(map_http_error(status));
                 }
 
                 let is_sse = resp
@@ -347,29 +324,24 @@ impl LlmClient {
                     let mut tool_acc: BTreeMap<usize, LlmToolCall> = BTreeMap::new();
 
                     loop {
-                        let chunk =
-                            match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, resp.chunk()).await {
-                                Ok(Ok(Some(chunk))) => chunk,
-                                Ok(Ok(None)) => break,
-                                Ok(Err(err)) => {
-                                    eprintln!(
-                                        "[llm] stream chunk failed model={} timeout={}: {err}",
-                                        model,
-                                        err.is_timeout()
-                                    );
-                                    return Err(LlmTurnError::Other(Error(
-                                        StatusCode::BAD_GATEWAY,
-                                        "LLM stream failed",
-                                    )));
-                                }
-                                Err(_) => {
-                                    eprintln!("[llm] stream chunk timeout model={model}");
-                                    return Err(LlmTurnError::Other(Error(
-                                        StatusCode::BAD_GATEWAY,
-                                        "LLM stream timed out",
-                                    )));
-                                }
-                            };
+                        let chunk = match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, resp.chunk())
+                            .await
+                        {
+                            Ok(Ok(Some(chunk))) => chunk,
+                            Ok(Ok(None)) => break,
+                            Ok(Err(err)) => {
+                                eprintln!(
+                                    "[llm] stream chunk failed model={} timeout={}: {err}",
+                                    model,
+                                    err.is_timeout()
+                                );
+                                return Err(Error(StatusCode::BAD_GATEWAY, "LLM stream failed"));
+                            }
+                            Err(_) => {
+                                eprintln!("[llm] stream chunk timeout model={model}");
+                                return Err(Error(StatusCode::BAD_GATEWAY, "LLM stream timed out"));
+                            }
+                        };
                         byte_buf.extend_from_slice(&chunk);
                         while let Some(nl) = byte_buf.iter().position(|b| *b == b'\n') {
                             let line_bytes: Vec<u8> = byte_buf.drain(..=nl).collect();
@@ -386,10 +358,7 @@ impl LlmClient {
                     let tool_calls = finalize_tool_calls(tool_acc.into_values().collect());
                     if visible_content.trim().is_empty() && tool_calls.is_empty() {
                         eprintln!("[llm] stream returned empty completion model={model}");
-                        return Err(LlmTurnError::Other(Error(
-                            StatusCode::BAD_GATEWAY,
-                            "empty LLM completion",
-                        )));
+                        return Err(Error(StatusCode::BAD_GATEWAY, "empty LLM completion"));
                     }
                     return Ok(LlmTurnResponse {
                         content: visible_content.trim().to_owned(),
@@ -399,7 +368,7 @@ impl LlmClient {
 
                 let val: Value = resp.json().await.map_err(|err| {
                     eprintln!("[llm] non-stream invalid json model={model}: {err}");
-                    LlmTurnError::Other(Error(StatusCode::BAD_GATEWAY, "invalid LLM JSON response"))
+                    Error(StatusCode::BAD_GATEWAY, "invalid LLM JSON response")
                 })?;
                 let msg = &val["choices"][0]["message"];
                 if let Some(raw_text) = msg["content"].as_str() {
@@ -428,10 +397,7 @@ impl LlmClient {
                     .unwrap_or_default();
                 let tool_calls = finalize_tool_calls(raw_tools);
                 if visible_content.trim().is_empty() && tool_calls.is_empty() {
-                    return Err(LlmTurnError::Other(Error(
-                        StatusCode::BAD_GATEWAY,
-                        "empty LLM completion",
-                    )));
+                    return Err(Error(StatusCode::BAD_GATEWAY, "empty LLM completion"));
                 }
                 Ok(LlmTurnResponse {
                     content: visible_content.trim().to_owned(),
@@ -674,12 +640,9 @@ fn stub_turn<F: FnMut(&str)>(
     messages: &[Value],
     stream: bool,
     on_delta: &mut F,
-) -> std::result::Result<LlmTurnResponse, LlmTurnError> {
+) -> Result<LlmTurnResponse> {
     let Some(last) = messages.last() else {
-        return Err(LlmTurnError::Other(Error(
-            StatusCode::BAD_GATEWAY,
-            "empty stub messages",
-        )));
+        return Err(Error(StatusCode::BAD_GATEWAY, "empty stub messages"));
     };
     let last_role = last["role"].as_str().unwrap_or("");
     if last_role == "tool" {
@@ -705,10 +668,10 @@ fn stub_turn<F: FnMut(&str)>(
     let (user_text, images) = extract_user_text_and_images(last);
     let trimmed = user_text.trim();
     if trimmed == STUB_FAIL_COMMAND {
-        return Err(LlmTurnError::Other(Error(
+        return Err(Error(
             StatusCode::BAD_GATEWAY,
             "LLM provider returned error",
-        )));
+        ));
     }
 
     let resp = if images > 0 {
@@ -960,7 +923,7 @@ fn stub_digest_reply(trimmed: &str) -> String {
 }
 
 /// Deterministic stub for offline unit/integration tests without hitting external APIs.
-fn stub_reply(system: &str, user_message: &str, images: usize, json_mode: bool) -> String {
+fn stub_reply(system: &str, user_message: &str, images: usize, _json_mode: bool) -> String {
     if system.contains(VISION_CAPTION_MARKER) {
         return format!("[STUB 识图] {images} 张图片：终端里显示 error: connection refused");
     }
@@ -973,148 +936,7 @@ fn stub_reply(system: &str, user_message: &str, images: usize, json_mode: bool) 
         })
         .to_string();
     }
-    let trimmed = user_message.trim();
-    if !json_mode {
-        return format!("[STUB] 收到：{trimmed}");
-    }
-    if images > 0 {
-        return json!({
-            "reply": format!("（看到 {images} 张图片）收到你的消息：{trimmed}"),
-            "tools": []
-        })
-        .to_string();
-    }
-    if trimmed.starts_with(TASK_DIGEST_MARKER) {
-        return json!({
-            "reply": stub_digest_reply(trimmed),
-            "thread_id": Value::Null,
-            "tools": []
-        })
-        .to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix(TOOL_RESULTS_MARKER) {
-        let first = rest
-            .lines()
-            .map(str::trim)
-            .find(|l| l.starts_with("- "))
-            .unwrap_or("")
-            .trim_start_matches("- ");
-        let snippet: String = first.chars().take(160).collect();
-        return json!({
-            "reply": format!("已根据工具结果整理：{snippet}"),
-            "thread_id": Value::Null,
-            "tools": []
-        })
-        .to_string();
-    }
-    if trimmed.starts_with("/gitlab") {
-        return json!({
-            "reply": "我来查一下 GitLab 提交记录。",
-            "tools": [{"tool": "fetch_gitlab_commits"}]
-        })
-        .to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("/node_thread ") {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let tid = parts.next().unwrap_or("").trim();
-        let instr = parts.next().unwrap_or("").trim();
-        if !tid.is_empty() && !instr.is_empty() {
-            return json!({
-                "reply": format!("已沿用上下文线程 {tid} 派发任务：{instr}"),
-                "thread_id": tid,
-                "tools": [{"tool": "dispatch_node", "thread_id": tid, "instruction": instr, "title": instr}]
-            })
-            .to_string();
-        }
-    }
-    if let Some(rest) = trimmed.strip_prefix("/role ") {
-        if let Some((reply, mut args)) = parse_stub_role_cmd(rest) {
-            args["tool"] = json!("manage_role");
-            return json!({
-                "reply": reply,
-                "tools": [args]
-            })
-            .to_string();
-        }
-    }
-    if let Some(rest) = trimmed.strip_prefix("/nodecfg ") {
-        if let Some((reply, mut args)) = parse_stub_node_cfg_cmd(rest) {
-            args["tool"] = json!("manage_node");
-            return json!({
-                "reply": reply,
-                "tools": [args]
-            })
-            .to_string();
-        }
-    }
-    if let Some(rest) = trimmed.strip_prefix("/node ") {
-        let parsed = parse_stub_node_flags(rest);
-        let mut call = json!({"tool": "dispatch_node", "instruction": parsed.instruction, "title": parsed.instruction});
-        if let Some(ag) = parsed.agent {
-            call["agent"] = json!(ag);
-        }
-        if let Some(r) = parsed.role {
-            call["role"] = json!(r);
-        }
-        if let Some(m) = parsed.model {
-            call["model"] = json!(m);
-        }
-        if let Some(e) = parsed.effort {
-            call["effort"] = json!(e);
-        }
-        if let Some(sb) = parsed.sandbox {
-            call["sandbox"] = json!(sb);
-        }
-        if let Some(tid) = parsed.thread_id {
-            call["thread_id"] = json!(tid);
-        }
-        if let Some(nid) = parsed.node_id {
-            call["node_id"] = json!(nid);
-        }
-        return json!({
-            "reply": format!("已将任务派发给在线执行节点：{}", parsed.instruction),
-            "tools": [call]
-        })
-        .to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("/remember ") {
-        return json!({
-            "reply": format!("好的，已写入长期记忆：{rest}"),
-            "tools": [{"tool": "update_memory", "memory_append": rest}]
-        })
-        .to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("/ledger ") {
-        return json!({
-            "reply": format!("已更新专项活账本：{rest}"),
-            "tools": [{"tool": "update_ledger", "action": "upsert", "title": rest, "notes_append": rest}]
-        })
-        .to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("/cron ") {
-        return json!({
-            "reply": format!("已创建定时任务：{rest}"),
-            "tools": [{"tool": "manage_cron", "action": "add", "interval_minutes": 60, "instruction": rest}]
-        })
-        .to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix('@') {
-        let mut parts = rest.splitn(2, char::is_whitespace);
-        let peer = parts.next().unwrap_or("").trim();
-        let body = parts.next().unwrap_or("").trim();
-        if !peer.is_empty() && !body.is_empty() {
-            return json!({
-                "reply": format!("已转告 @{peer}：{body}"),
-                "tools": [{"tool": "delegate_colleague", "peer": peer, "instruction": body}]
-            })
-            .to_string();
-        }
-    }
-    json!({
-        "reply": format!("收到你的消息：{trimmed}"),
-        "tools": []
-    })
-    .to_string()
+    format!("[STUB] 收到：{}", user_message.trim())
 }
 
 #[cfg(test)]

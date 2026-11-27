@@ -212,7 +212,12 @@ pub async fn maybe_notify(hub: &Hub, user_id: &str, event_kind: &str, title: &st
         return;
     }
     let payload = build_card_payload(&cfg.provider, title, content);
-    let _ = hub.http.post(&cfg.webhook_url).json(&payload).send().await;
+    let _ = hub
+        .user_http
+        .post(&cfg.webhook_url)
+        .json(&payload)
+        .send()
+        .await;
 }
 
 pub async fn test_webhook(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Value>> {
@@ -235,7 +240,7 @@ pub async fn test_webhook(State(hub): State<Hub>, AuthUser(user): AuthUser) -> R
         &format!("账号 `{}` 的实时通知已连通。", user.username),
     );
     let resp = hub
-        .http
+        .user_http
         .post(&cfg.webhook_url)
         .json(&payload)
         .send()

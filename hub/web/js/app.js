@@ -237,7 +237,11 @@ async function boot() {
         await api('/auth/local', { method: 'POST', body: { token: localForm.token.value.trim() } });
         location.replace('/');
       } catch (err) {
-        loginErr.textContent = err.message === 'invalid login token' ? '登录令牌不正确。' : `登录失败：${err.message}`;
+        if (err.status === 429) {
+          loginErr.textContent = '尝试次数过多，请稍后再试。';
+        } else {
+          loginErr.textContent = err.message === 'invalid login token' ? '登录令牌不正确。' : `登录失败：${err.message}`;
+        }
         loginErr.classList.remove('hide');
         btn.disabled = false;
       }

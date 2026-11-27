@@ -31,9 +31,9 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite WAL) ──�
 | `hub/src/lib.rs` | `Hub` 状态容器、统一 `Error`/`Result`、全部 HTTP 路由与中间件装配 |
 | `hub/src/config.rs` | 环境变量解析、Origin 规范化、SSRF/外发 URL 校验、常量时间比较等安全原语 |
 | `hub/src/secrets.rs` | `AGENCT_MASTER_KEY` AES-256-GCM 静态加密（按 `scope` + `user_id` 绑定 AAD）、向后兼容读取与离线密钥轮换 |
-| `hub/src/db.rs` | SQLite Schema（当前 `SCHEMA_VERSION = 11`，含 `messages_fts` trigram 全文索引、军团角色 `agent_roles`、多引擎节点配置与任务回调字段）、迁移、进程级 `.lock` 排他锁、`audit_logs` 只追加触发器 |
+| `hub/src/db.rs` | SQLite Schema（当前 `SCHEMA_VERSION = 15`，含 `messages_fts` trigram 全文索引、军团角色 `agent_roles`、多引擎节点配置与任务回调字段）、迁移、进程级 `.lock` 排他锁、`audit_logs` 只追加触发器 |
 | `hub/src/auth.rs` | 单人本地令牌登录 & 可选 GitLab OAuth 2.0 (PKCE S256)、SQLite Session、Host/Origin/CSRF 守卫中间件与 `AuthUser` 提取器 |
-| `hub/src/brain/` | 单一大脑模块（`mod.rs`、`prompt.rs`、`tools.rs`、`parser.rs`、`roles.rs`、`threads.rs`、`compact.rs`）：`SOUL.md` + `MEMORY.md` + 活账本 `ledgers` + 军团角色 `agent_roles` + 隐式工作线程 `threads` + 滚动摘要压缩 + 原生 Tool Calling（带 JSON 回退）+ 异步回调闭环（`on_complete`）、`/api/bootstrap`、`/api/messages` 分页与 `/api/search` FTS5 全文搜索 |
+| `hub/src/brain/` | 单一大脑模块（`mod.rs`、`prompt.rs`、`tools.rs`、`parser.rs`、`roles.rs`、`threads.rs`、`compact.rs`）：`SOUL.md` + `MEMORY.md` + 活账本 `ledgers` + 军团角色 `agent_roles` + 隐式工作线程 `threads` + 滚动摘要压缩 + 原生 Tool Calling（带内联 `<tool_call>` 兜底）+ 异步回调闭环（`on_complete`）、`/api/bootstrap`、`/api/messages` 分页与 `/api/search` FTS5 全文搜索 |
 | `hub/src/llm.rs` | OpenAI 兼容 `/chat/completions` 客户端（支持原生 `tools`、SSE 流式读取、`<think>` 过滤、图片多模态输入）与 `AGENCT_LLM_STUB=1` 确定性测试桩 |
 | `hub/src/models.rs` | 每用户自定义大脑模型与识图（vision）模型配置及连通性测试 |
 | `hub/src/nodes.rs` | 节点注册与多引擎配置、令牌轮换、安装脚本分发、Protocol 2 任务拉取（支持长轮询唤醒、`repos:` 与引擎路由）/租约续期/引擎绑定会话隔离与结果提交 |
@@ -44,8 +44,8 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite WAL) ──�
 | `hub/src/integrations/gitlab.rs` | SSRF 加固的 GitLab Webhook、Todo 轮询、提交摘要与受控回复 |
 | `hub/src/integrations/im.rs` | SSRF 加固的飞书/企微/钉钉 IM Webhook 集成 |
 | `hub/tests/v2_core.rs` | Rust 集成与回归测试（使用内存 SQLite 与 LLM Stub） |
-| `hub/web/` | 原生 ESM 前端：`index.html`、`style.css`、`js/{app,api,chat,drawer,sse}.js`、静态头像/品牌资源 |
-| `node/agenct-node.py` | 统一执行节点客户端（支持 `claude`/`codex`/`agy`/`opencode`/`ollama`/`openai`/自定义命令） |
+| `hub/web/` | 原生 ESM 前端：`index.html`、`style.css`、`js/{app,api,avatar,chat,drawer,palette,sound,sse,triage,ui}.js`、静态头像/品牌资源 |
+| `node/agenct-node.py` | 统一执行节点客户端（支持 `claude`/`codex`/`agy`/`opencode`/自定义 `--cmd`） |
 | `node/test_node.py` | 节点单元测试 |
 | `scripts/backup.py` | SQLite 在线快照 + 附件打包备份与恢复 |
 | `scripts/e2e_*.mjs` | Playwright 端到端冒烟与本地登录测试 |
@@ -68,7 +68,7 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite WAL) ──�
 
 3. **SSRF 与外发边界**
    - 所有用户可控的外发 URL（自定义 LLM、IM Webhook、GitLab Origin）必须通过 `hub/src/config.rs` 校验；默认禁止非 HTTPS 及环回/私有/元数据 IP（仅在 `AGENCT_ALLOW_PRIVATE_OUTBOUND=1` 时放宽）。
-   - `Hub.http` 禁用代理与自动重定向（`no_proxy` + `Policy::none()`），不要绕过此客户端直连外部地址。
+   - `Hub.http` 禁用代理与自动重定向（`no_proxy` + `Policy::none()`）；用户可控外发（自定义 LLM、IM Webhook）统一走挂载 `PublicDnsResolver` 的 `Hub.user_http`，不要绕过这两个客户端直连外部地址。
 
 4. **SQLite 存储与审计约束**
    - 所有数据库访问必须经由 `db::Db` 的阻塞读写隔离接口，严禁在 Tokio 异步线程中直接阻塞操作 SQLite。
