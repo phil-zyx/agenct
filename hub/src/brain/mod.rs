@@ -184,7 +184,7 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
             let mut task_stmt = conn.prepare(
                 "SELECT t.id, t.requester_id, t.owner_id, t.thread_id, t.title, t.instruction, t.status,
                         t.result, t.blocked_reason, t.revision, t.updated_at,
-                        j.node_id, j.status, j.stage, j.log_tail, j.role, j.agent, j.model
+                        j.node_id, j.status, j.stage, j.log_tail, j.role, j.agent, j.model, j.sandbox
                  FROM tasks t
                  LEFT JOIN node_jobs j ON j.task_id = t.id
                  WHERE t.owner_id = ?1 OR t.requester_id = ?1
@@ -211,6 +211,7 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                         "role": r.get::<_, Option<String>>(15)?,
                         "agent": r.get::<_, Option<String>>(16)?,
                         "model": r.get::<_, Option<String>>(17)?,
+                        "sandbox": r.get::<_, Option<String>>(18)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1464,6 +1465,8 @@ pub(super) struct TurnContext<'a> {
     pub(super) matched_rule_target: Option<String>,
     pub(super) active_thread_id: Option<String>,
     pub(super) dispatched_tasks: Vec<Value>,
+    /// Guaranteed `(code, markdown_note)` prompts for pending one-shot elevation requests.
+    pub(super) approval_prompts: Vec<(String, String)>,
     /// Keys of side-effecting calls that already succeeded this turn (prevents follow-up
     /// steps from re-dispatching the same job).
     pub(super) done_keys: HashSet<String>,
@@ -1963,6 +1966,7 @@ async fn agent_loop(
         matched_rule_target: snap.matched_rule.as_ref().map(|r| r.target_node_id.clone()),
         active_thread_id: mode.initial_thread_id.clone(),
         dispatched_tasks: Vec::new(),
+        approval_prompts: Vec::new(),
         done_keys: HashSet::new(),
         interactive: mode.interactive,
         allowed_tools: mode.allowed_tools,
@@ -2105,6 +2109,15 @@ async fn agent_loop(
                 final_reply.push_str("\n\n");
             }
             final_reply.push_str(o.user_note.trim());
+        }
+    }
+    for (code, note) in &ctx.approval_prompts {
+        let needle = format!("/APPROVE {}", code.to_ascii_uppercase());
+        if !final_reply.to_ascii_uppercase().contains(&needle) {
+            if !final_reply.trim().is_empty() {
+                final_reply.push_str("\n\n");
+            }
+            final_reply.push_str(note);
         }
     }
     final_reply = strip_thread_tags(&final_reply);

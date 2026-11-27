@@ -458,7 +458,11 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     }
 
     function renderBlockedHtml(t) {
-      if (!t || t.status !== 'failed' || !t.blocked_reason) return '';
+      if (!t) return '';
+      if (t.status === 'pending' && t.sandbox === 'elevated') {
+        return '<div class="sandbox-block-note">待确认单次放行：回复聊天中的 /approve 审批码或长按下方按钮后执行</div>';
+      }
+      if (t.status !== 'failed' || !t.blocked_reason) return '';
       return `<div class="sandbox-block-note">沙箱受阻：${esc(t.blocked_reason)}</div>`;
     }
 
@@ -466,15 +470,18 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       if (!latest) return [];
       const isOwner = latest.owner_id === uid;
       const isCrossUser = latest.requester_id !== latest.owner_id;
+      const isPendingElev = latest.status === 'pending' && latest.sandbox === 'elevated';
       const actions = [];
-      if (isOwner && (latest.status === 'pending' || latest.status === 'failed')) {
+      if (isOwner && !isPendingElev && (latest.status === 'pending' || latest.status === 'failed')) {
         actions.push(
           `<button type="button" class="sm primary" data-assign="${esc(latest.id)}">${latest.status === 'failed' ? '重试' : '派给节点'}</button>`,
         );
       }
       if (isOwner && !isCrossUser) {
         const canElevateNode = latest.node_id ? elevatedNodeIds.has(latest.node_id) : anyElevatedNode;
-        if (latest.status === 'failed' && (latest.blocked_reason || canElevateNode)) {
+        if (isPendingElev && canElevateNode) {
+          actions.push(`<button type="button" class="sm warn" data-elevate="${esc(latest.id)}">单次放行执行</button>`);
+        } else if (latest.status === 'failed' && (latest.blocked_reason || canElevateNode)) {
           actions.push(
             `<button type="button" class="sm${latest.blocked_reason ? ' warn' : ''}" data-elevate="${esc(latest.id)}">单次放行重试</button>`,
           );

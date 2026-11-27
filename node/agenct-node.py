@@ -53,6 +53,12 @@ _DEFAULT_MASKED_SECRET_NAMES = (
     ".kube",
     ".netrc",
     ".git-credentials",
+    ".npmrc",
+    ".pypirc",
+    ".docker",
+    os.path.join(".config", "gh"),
+    os.path.join(".config", "glab-cli"),
+    os.path.join(".config", "git", "credentials"),
 )
 MAX_RESULT_BYTES = 16_000
 DEFAULT_NODE_TIMEOUT = 3600
@@ -686,11 +692,36 @@ _SCRUBBED_CHILD_ENV_KEYS = (
     "AGENCT_GITLAB_WEBHOOK_SECRET",
 )
 
+_SANDBOX_SCRUBBED_ENV_KEYS = (
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "GITLAB_TOKEN",
+    "GITLAB_PRIVATE_TOKEN",
+    "GLAB_TOKEN",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "NPM_TOKEN",
+)
 
-def _build_child_base_env(base_env: dict[str, str] | None = None) -> dict[str, str]:
+
+def _build_child_base_env(
+    base_env: dict[str, str] | None = None,
+    *,
+    sandbox: str = "workspace-write",
+) -> dict[str, str]:
     env = dict(os.environ if base_env is None else base_env)
     for key in _SCRUBBED_CHILD_ENV_KEYS:
         env.pop(key, None)
+    if sandbox != "unsafe-full":
+        for key in _SANDBOX_SCRUBBED_ENV_KEYS:
+            env.pop(key, None)
     return env
 
 
@@ -1021,6 +1052,11 @@ def build_prompt(
                 f"Read-only sandbox is active: {workdir} is mounted read-only "
                 f"(use absolute paths or 'cd {workdir}' before read-only shell commands like git log/status)."
             )
+    if sandbox != "unsafe-full":
+        parts.append(
+            "Host credentials (~/.ssh, ~/.config/gh, SSH_AUTH_SOCK, git/cloud tokens) are intentionally isolated in this sandbox; "
+            "if an action requires host credentials (such as git push or remote SSH), report that clearly instead of probing alternative tokens or credential helpers."
+        )
     parts.append(
         f"For text queries, output the final Markdown answer directly without creating files. "
         f"Only save screenshots or downloadable artifact files to {evidence_dir} if explicitly requested."
@@ -3066,7 +3102,7 @@ def execute_job(
             agent=agent,
             os_isolated=os_isolated,
         )
-        env = _build_child_base_env()
+        env = _build_child_base_env(sandbox=eff_sandbox)
         env["AGENCT_WORKDIR"] = workdir
         env["AGENCT_EVIDENCE_DIR"] = evidence_dir
         env["AGENCT_PROMPT"] = prompt

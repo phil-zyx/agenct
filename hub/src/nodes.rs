@@ -647,6 +647,71 @@ pub fn create_task_and_enqueue_with_options_sync(
     Ok((task_id, 1))
 }
 
+/// Creates a `pending` (non-executable) task staged for one-shot `elevated` execution and issues
+/// a 6-character `/approve <code>` token. Nodes cannot claim the job until human approval bumps
+/// `tasks.status = 'running'` and `revision = 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn create_pending_elevated_task_sync(
+    conn: &mut Connection,
+    requester_id: &str,
+    owner_id: &str,
+    node_id: &str,
+    title: &str,
+    instruction: &str,
+    opts: EnqueueOptions<'_>,
+) -> Result<(String, String)> {
+    let now = now_unix();
+    let task_id = format!("tsk_{}", &Uuid::new_v4().simple().to_string()[..12]);
+    let clean_title = truncate_bytes(title.trim(), 160);
+    let clean_instr = truncate_bytes(instruction.trim(), 8000);
+    let clean_cb = truncate_bytes(opts.on_complete.trim(), 1000);
+    let clean_agent = opts.agent.trim();
+    let clean_role = truncate_bytes(opts.role.trim(), 64);
+    let clean_model = truncate_bytes(opts.model.trim(), 128);
+    let clean_effort = truncate_bytes(opts.effort.trim(), 16);
+    let code = crate::auth::random_token()[..6].to_ascii_uppercase();
+    let code_hash = crate::collab::approval_code_hash(owner_id, &code);
+    let expires_at = now + crate::collab::ELEVATE_APPROVAL_TTL_SECS;
+
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO tasks(id, requester_id, owner_id, thread_id, title, instruction, status, revision, on_complete, callback_depth, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?8, ?9, ?9)",
+        params![
+            task_id,
+            requester_id,
+            owner_id,
+            opts.thread_id,
+            clean_title,
+            clean_instr,
+            clean_cb,
+            opts.callback_depth,
+            now
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO node_jobs(task_id, user_id, node_id, agent, role, model, effort, sandbox, task_revision, authorization, status, stage, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'elevated', 0, 'manual', 'queued', '待确认单次放行', ?8)",
+        params![
+            task_id,
+            owner_id,
+            node_id,
+            clean_agent,
+            clean_role,
+            clean_model,
+            clean_effort,
+            now
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO elevate_approvals(task_id, user_id, code_hash, expires_at, used_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+        params![task_id, owner_id, code_hash, expires_at, now],
+    )?;
+    tx.commit()?;
+    Ok((task_id, code))
+}
+
 pub async fn list(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Vec<NodeView>>> {
     let uid = user.id;
     let nodes = hub.db.read(move |conn| list_nodes_sync(conn, &uid)).await?;

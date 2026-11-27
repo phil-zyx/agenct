@@ -491,6 +491,7 @@ struct StubNodeArgs<'a> {
     model: Option<&'a str>,
     effort: Option<&'a str>,
     sandbox: Option<&'a str>,
+    require_elevation: bool,
     thread_id: Option<&'a str>,
     node_id: Option<&'a str>,
     instruction: &'a str,
@@ -506,6 +507,7 @@ fn parse_stub_node_flags(mut rest: &str) -> StubNodeArgs<'_> {
             "--model ",
             "--effort ",
             "--sandbox ",
+            "--require-elevation ",
             "--thread ",
             "--node ",
         ]
@@ -528,6 +530,9 @@ fn parse_stub_node_flags(mut rest: &str) -> StubNodeArgs<'_> {
             "--model " => out.model = Some(val),
             "--effort " => out.effort = Some(val),
             "--sandbox " => out.sandbox = Some(val),
+            "--require-elevation " => {
+                out.require_elevation = matches!(val, "1" | "true" | "yes");
+            }
             "--thread " => out.thread_id = Some(val),
             "--node " => out.node_id = Some(val),
             _ => {}
@@ -793,6 +798,9 @@ fn stub_turn<F: FnMut(&str)>(
         }
         if let Some(sb) = parsed.sandbox {
             args["sandbox"] = json!(sb);
+        }
+        if parsed.require_elevation {
+            args["require_elevation"] = json!(true);
         }
         if let Some(tid) = parsed.thread_id {
             args["thread_id"] = json!(tid);

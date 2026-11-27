@@ -5113,6 +5113,113 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
         .await
         .unwrap();
     assert_eq!(audit_cnt, 1);
+
+    // Finish w2 first so the node queue is idle before testing proactive require_elevation.
+    let lease2 = w2["job"]["lease_token"].as_str().unwrap().to_owned();
+    let rev2 = w2["job"]["task_revision"].as_i64().unwrap();
+    let sub2 = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/node/v1/tasks/{task_id}/submit"))
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "lease_token": lease2,
+                        "request_id": "sub-im-done-2",
+                        "expected_revision": rev2,
+                        "status": "completed",
+                        "content": "pushed ok"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sub2.status(), StatusCode::OK);
+
+    // Proactive Chat-First `require_elevation=true`: creates `pending` task + `/approve` code,
+    // NEVER executes before human approval, and runs `elevated` right after `/approve`.
+    let (st, req_elev_chat) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": "/node --require-elevation true git push origin master"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{req_elev_chat}");
+    assert_eq!(req_elev_chat["tasks"][0]["status"], "pending");
+    assert_eq!(req_elev_chat["tasks"][0]["sandbox"], "elevated");
+    let pending_tid = req_elev_chat["tasks"][0]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let reply2 = req_elev_chat["reply"].as_str().unwrap();
+    let idx2 = reply2
+        .find("`/approve ")
+        .expect("guaranteed approval prompt in chat reply");
+    let code2 = reply2[idx2 + "`/approve ".len()..idx2 + "`/approve ".len() + 6].to_owned();
+
+    // Node polling BEFORE human approval MUST receive null job.
+    let poll_before = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let pb: Value =
+        serde_json::from_slice(&poll_before.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert!(
+        pb["job"].is_null(),
+        "pending elevated task leaked to node before approval: {pb}"
+    );
+
+    // Human approves via Web chat `/approve <code>` -> task enters queue with sandbox="elevated".
+    let (st_app, app_res) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({"message": format!("/approve {code2}")})),
+    )
+    .await;
+    assert_eq!(st_app, StatusCode::OK, "{app_res}");
+
+    let poll_after = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/node/v1/work")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::AUTHORIZATION, format!("Bearer {node_token}"))
+                .header("x-agenct-node-protocol", "2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let pa: Value =
+        serde_json::from_slice(&poll_after.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(pa["job"]["task_id"], pending_tid);
+    assert_eq!(pa["job"]["sandbox"], "elevated");
+    assert_eq!(pa["job"]["authorization"], "manual");
 }
 
 #[tokio::test]

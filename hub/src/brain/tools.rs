@@ -77,6 +77,11 @@ fn side_effect_key(call: &ToolCall) -> Option<String> {
             call.agent.as_deref().unwrap_or(""),
             call.model.as_deref().unwrap_or(""),
             call.sandbox.as_deref().unwrap_or(""),
+            if call.require_elevation == Some(true) {
+                "1"
+            } else {
+                "0"
+            },
             call.peer.as_deref().unwrap_or(""),
             call.keyword.as_deref().unwrap_or(""),
             call.instruction.as_deref().unwrap_or("").trim(),
@@ -425,6 +430,14 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                     }
                 }
             };
+            let require_elevation = call.require_elevation.unwrap_or(false);
+            if require_elevation && ctx.allowed_tools.is_some() {
+                return Ok(ToolOutcome::failed(
+                    tool,
+                    "受限后台任务不允许发起单次放行申请。",
+                    "（后台任务不允许自动申请单次放行。）",
+                ));
+            }
             let role_name = role_opt.as_ref().map(|r| r.name.as_str()).unwrap_or("");
             let on_complete = if ctx.callback_depth < super::MAX_CALLBACK_DEPTH {
                 call.on_complete.as_deref().unwrap_or("").trim()
@@ -441,6 +454,7 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                 &requested_model,
                 &requested_effort,
                 &requested_sandbox,
+                require_elevation,
                 &title,
                 &instr,
                 task_thread_id.as_deref(),
@@ -449,7 +463,7 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
             )
             .await?
             {
-                Ok(info) => {
+                Ok(mut info) => {
                     if let Some(ref tid) = task_thread_id {
                         ctx.active_thread_id = Some(tid.clone());
                     }
@@ -467,6 +481,29 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                         meta_parts.push(m);
                     }
                     let meta_str = meta_parts.join(" / ");
+                    if let Some(code) = info
+                        .as_object_mut()
+                        .and_then(|m| m.remove("approval_code"))
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                    {
+                        let node_name = info["node_name"].as_str().unwrap_or("");
+                        let task_id_s = info["task_id"].as_str().unwrap_or("");
+                        let note = format!(
+                            "> 待确认单次放行（{node_name} · {title}）：请回复 `/approve {code}`（10 分钟内有效）或在右侧抽屉长按「单次放行执行」。"
+                        );
+                        ctx.approval_prompts.push((code.clone(), note));
+                        let observation = format!(
+                            "已创建待人工确认的单次放行任务 {task_id_s}（目标节点 {node_name}，{meta_str}，尚未入队执行），审批码为 `{code}`（10 分钟内有效）。请简短说明需访问宿主机凭据/外部路径的原因，并明确告知用户回复 `/approve {code}` 或在右侧抽屉长按「单次放行执行」。"
+                        );
+                        ctx.dispatched_tasks.push(info);
+                        return Ok(ToolOutcome {
+                            tool: tool.to_owned(),
+                            ok: true,
+                            observation,
+                            user_note: String::new(),
+                            needs_followup: true,
+                        });
+                    }
                     let observation = format!(
                         "已派发任务 {} 到节点 {}（{}，{}），节点完成后结果会自动发回聊天。",
                         info["task_id"].as_str().unwrap_or(""),
@@ -1096,6 +1133,7 @@ async fn dispatch_to_node(
     model: &str,
     effort: &str,
     sandbox: &str,
+    require_elevation: bool,
     title: &str,
     instruction: &str,
     thread_id: Option<&str>,
@@ -1145,6 +1183,18 @@ async fn dispatch_to_node(
                     )));
                 }
             }
+            if require_elevation {
+                let supports_elevated = node
+                    .capabilities
+                    .split('|')
+                    .any(|seg| seg.trim().eq_ignore_ascii_case("elevated:1"));
+                if !supports_elevated {
+                    return Ok(Err(format!(
+                        "节点 {} 未开启单次放行支持（请在节点启动参数中加入 --allow-elevated）",
+                        node.name
+                    )));
+                }
+            }
             let job_agent = req_ag
                 .as_deref()
                 .unwrap_or(node.default_agent.as_str())
@@ -1154,6 +1204,57 @@ async fn dispatch_to_node(
             } else {
                 node.effective_default_agent.clone()
             };
+            if require_elevation {
+                let (task_id, code) = nodes::create_pending_elevated_task_sync(
+                    conn,
+                    &uid,
+                    &uid,
+                    &node.id,
+                    &t,
+                    &instr,
+                    nodes::EnqueueOptions {
+                        thread_id: thr.as_deref(),
+                        on_complete: &cb,
+                        callback_depth,
+                        agent: &job_agent,
+                        role: &role_db,
+                        model: &model_db,
+                        effort: &effort_db,
+                        sandbox: "elevated",
+                    },
+                )?;
+                if let Some(ref tid) = thr {
+                    conn.execute(
+                        "UPDATE threads SET node_id = COALESCE(node_id, ?3), updated_at = ?4
+                         WHERE id = ?1 AND user_id = ?2",
+                        params![tid, uid, node.id, now_unix()],
+                    )?;
+                }
+                record_audit(
+                    conn,
+                    &uid,
+                    "task_elevate_requested",
+                    "pending",
+                    &format!("{} -> {}", node.name, t),
+                    &truncate_bytes(&instr, 200),
+                )?;
+                return Ok(Ok(json!({
+                    "task_id": task_id,
+                    "thread_id": thr,
+                    "node_id": node.id,
+                    "node_name": node.name,
+                    "node_kind": node.kind,
+                    "agent": effective_agent,
+                    "role": role_db,
+                    "model": model_db,
+                    "effort": effort_db,
+                    "sandbox": "elevated",
+                    "status": "pending",
+                    "mode": "pending_approval",
+                    "approval_code": code,
+                    "online": node.online,
+                })));
+            }
             let (task_id, _) = nodes::create_task_and_enqueue_with_options_sync(
                 conn,
                 &uid,
@@ -1204,8 +1305,10 @@ async fn dispatch_to_node(
         })
         .await?;
     if let Ok(ref info) = res {
-        if let Some(nid) = info["node_id"].as_str() {
-            hub.node_waiters.notify(user_id, nid);
+        if info["mode"].as_str() != Some("pending_approval") {
+            if let Some(nid) = info["node_id"].as_str() {
+                hub.node_waiters.notify(user_id, nid);
+            }
         }
         hub.events.emit(user_id.to_owned(), "task", info.clone());
     }

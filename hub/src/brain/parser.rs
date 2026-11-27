@@ -66,6 +66,8 @@ pub(super) struct ToolCall {
     #[serde(default)]
     pub(super) sandbox: Option<String>,
     #[serde(default)]
+    pub(super) require_elevation: Option<bool>,
+    #[serde(default)]
     pub(super) prompt: Option<String>,
     #[serde(default)]
     pub(super) prefer_cloud: Option<bool>,

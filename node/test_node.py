@@ -1911,17 +1911,36 @@ class TestUnifiedNode(unittest.TestCase):
         from http.server import BaseHTTPRequestHandler, HTTPServer
         import urllib.error
 
-        # 1. Sensitive Hub/Node tokens and master keys are scrubbed from child process env.
+        # 1. Sensitive Hub/Node tokens, master keys, and sandboxed host credentials are scrubbed.
+        masked = node.default_masked_paths("/home/tester")
+        self.assertIn(os.path.join("/home/tester", ".config", "gh"), masked)
+        self.assertIn(os.path.join("/home/tester", ".config", "glab-cli"), masked)
+        self.assertIn(os.path.join("/home/tester", ".config", "git", "credentials"), masked)
+        self.assertIn(os.path.join("/home/tester", ".docker"), masked)
+
+        sample_env = {
+            "AGENCT_NODE_TOKEN": "agn_secret_node_token_1234",
+            "AGENCT_MASTER_KEY": "secret_master_key_0123456789abcdef",
+            "AGENCT_GITLAB_CLIENT_SECRET": "secret_gl_client",
+            "GH_TOKEN": "gho_secret_token",
+            "GITHUB_TOKEN": "ghp_secret_token",
+            "SSH_AUTH_SOCK": "/tmp/ssh-agent.sock",
+        }
+        sb_env = node._build_child_base_env(sample_env, sandbox="workspace-write")
+        self.assertNotIn("GH_TOKEN", sb_env)
+        self.assertNotIn("GITHUB_TOKEN", sb_env)
+        self.assertNotIn("SSH_AUTH_SOCK", sb_env)
+        elev_env = node._build_child_base_env(sample_env, sandbox="unsafe-full")
+        self.assertEqual(elev_env.get("GH_TOKEN"), "gho_secret_token")
+        self.assertEqual(elev_env.get("SSH_AUTH_SOCK"), "/tmp/ssh-agent.sock")
+        self.assertNotIn("AGENCT_NODE_TOKEN", elev_env)
+
         with tempfile.TemporaryDirectory() as workdir, mock.patch.dict(
             os.environ,
-            {
-                "AGENCT_NODE_TOKEN": "agn_secret_node_token_1234",
-                "AGENCT_MASTER_KEY": "secret_master_key_0123456789abcdef",
-                "AGENCT_GITLAB_CLIENT_SECRET": "secret_gl_client",
-            },
+            sample_env,
         ):
             status, out, _ = node.execute_job(
-                'custom:python3 -c "import os; print(sorted(k for k in os.environ if k.startswith(\'AGENCT_\')))"',
+                'custom:python3 -c "import os; print(sorted(k for k in os.environ if k.startswith((\'AGENCT_\', \'GH_\', \'GITHUB_\', \'SSH_\'))))"',
                 {"task_id": "t_env", "title": "Env", "instruction": "Check"},
                 workdir,
                 "workspace-write",
@@ -1933,6 +1952,9 @@ class TestUnifiedNode(unittest.TestCase):
             self.assertNotIn("AGENCT_NODE_TOKEN", out)
             self.assertNotIn("AGENCT_MASTER_KEY", out)
             self.assertNotIn("AGENCT_GITLAB_CLIENT_SECRET", out)
+            self.assertNotIn("GH_TOKEN", out)
+            self.assertNotIn("GITHUB_TOKEN", out)
+            self.assertNotIn("SSH_AUTH_SOCK", out)
             self.assertIn("AGENCT_WORKDIR", out)
 
         # 2. collect_evidence skips symlinks pointing outside evidence_dir.
