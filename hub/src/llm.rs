@@ -60,6 +60,9 @@ pub const TASK_DIGEST_MARKER: &str = "TASK_DIGEST_EVENT";
 /// Stub-only command that simulates an upstream LLM failure (for offline tests).
 const STUB_FAIL_COMMAND: &str = "/stub_fail";
 
+/// Per-chunk SSE idle timeout so stalled upstream streams fail cleanly instead of hanging.
+const STREAM_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
 #[derive(Default)]
 struct ThinkStreamFilter {
     in_think: bool,
@@ -225,16 +228,26 @@ impl LlmClient {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|_| Error(StatusCode::BAD_GATEWAY, "LLM request failed"))?;
+                    .map_err(|err| {
+                        eprintln!(
+                            "[llm] complete send failed model={} timeout={} connect={}: {err}",
+                            model,
+                            err.is_timeout(),
+                            err.is_connect()
+                        );
+                        Error(StatusCode::BAD_GATEWAY, "LLM request failed")
+                    })?;
 
                 if !resp.status().is_success() {
-                    return Err(map_http_error(resp.status().as_u16()));
+                    let code = resp.status().as_u16();
+                    eprintln!("[llm] complete http error status={code} model={model}");
+                    return Err(map_http_error(code));
                 }
 
-                let val: Value = resp
-                    .json()
-                    .await
-                    .map_err(|_| Error(StatusCode::BAD_GATEWAY, "invalid LLM JSON response"))?;
+                let val: Value = resp.json().await.map_err(|err| {
+                    eprintln!("[llm] complete invalid json model={model}: {err}");
+                    Error(StatusCode::BAD_GATEWAY, "invalid LLM JSON response")
+                })?;
 
                 val["choices"][0]["message"]["content"]
                     .as_str()
@@ -281,12 +294,19 @@ impl LlmClient {
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|_| {
+                    .map_err(|err| {
+                        eprintln!(
+                            "[llm] stream send failed model={} timeout={} connect={}: {err}",
+                            model,
+                            err.is_timeout(),
+                            err.is_connect()
+                        );
                         LlmTurnError::Other(Error(StatusCode::BAD_GATEWAY, "LLM request failed"))
                     })?;
 
                 let status = resp.status().as_u16();
                 if !resp.status().is_success() {
+                    eprintln!("[llm] stream http error status={status} model={model}");
                     let err = map_http_error(status);
                     return if matches!(status, 400 | 422) {
                         Err(LlmTurnError::UnsupportedParams(err))
@@ -326,9 +346,30 @@ impl LlmClient {
                     let mut byte_buf: Vec<u8> = Vec::new();
                     let mut tool_acc: BTreeMap<usize, LlmToolCall> = BTreeMap::new();
 
-                    while let Some(chunk) = resp.chunk().await.map_err(|_| {
-                        LlmTurnError::Other(Error(StatusCode::BAD_GATEWAY, "LLM stream failed"))
-                    })? {
+                    loop {
+                        let chunk =
+                            match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, resp.chunk()).await {
+                                Ok(Ok(Some(chunk))) => chunk,
+                                Ok(Ok(None)) => break,
+                                Ok(Err(err)) => {
+                                    eprintln!(
+                                        "[llm] stream chunk failed model={} timeout={}: {err}",
+                                        model,
+                                        err.is_timeout()
+                                    );
+                                    return Err(LlmTurnError::Other(Error(
+                                        StatusCode::BAD_GATEWAY,
+                                        "LLM stream failed",
+                                    )));
+                                }
+                                Err(_) => {
+                                    eprintln!("[llm] stream chunk timeout model={model}");
+                                    return Err(LlmTurnError::Other(Error(
+                                        StatusCode::BAD_GATEWAY,
+                                        "LLM stream timed out",
+                                    )));
+                                }
+                            };
                         byte_buf.extend_from_slice(&chunk);
                         while let Some(nl) = byte_buf.iter().position(|b| *b == b'\n') {
                             let line_bytes: Vec<u8> = byte_buf.drain(..=nl).collect();
@@ -344,6 +385,7 @@ impl LlmClient {
 
                     let tool_calls = finalize_tool_calls(tool_acc.into_values().collect());
                     if visible_content.trim().is_empty() && tool_calls.is_empty() {
+                        eprintln!("[llm] stream returned empty completion model={model}");
                         return Err(LlmTurnError::Other(Error(
                             StatusCode::BAD_GATEWAY,
                             "empty LLM completion",
@@ -355,7 +397,8 @@ impl LlmClient {
                     });
                 }
 
-                let val: Value = resp.json().await.map_err(|_| {
+                let val: Value = resp.json().await.map_err(|err| {
+                    eprintln!("[llm] non-stream invalid json model={model}: {err}");
                     LlmTurnError::Other(Error(StatusCode::BAD_GATEWAY, "invalid LLM JSON response"))
                 })?;
                 let msg = &val["choices"][0]["message"];

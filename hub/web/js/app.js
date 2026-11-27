@@ -586,6 +586,9 @@ async function boot() {
         playDone();
       } else if (task?.status === 'failed') playWarn();
     },
+    onMessage(msg) {
+      chatUI.onMessageEvent?.(msg);
+    },
     onSync(kind) {
       if (kind === 'resync') chatUI.setStage('');
       scheduleRefresh();

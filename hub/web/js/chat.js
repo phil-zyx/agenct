@@ -42,7 +42,9 @@ export function initChat({ state, onRefresh, onActivityChange }) {
 
   let pendingAtts = [];
   let lastFailed = null;
-  let sending = false;
+  let submitting = false;
+  let activeTurn = null;
+  const turnEvents = new Map();
   let optimisticMsg = null;
   let optimisticBaseLastId = 0;
   let streamingText = '';
@@ -392,7 +394,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
 
   formEl.onsubmit = async (ev) => {
     ev.preventDefault();
-    if (sending) return;
+    if (submitting || activeTurn) return;
     let text = inputEl.value.trim();
     if (!text && !pendingAtts.length) return;
     if (pendingAtts.length) {
@@ -405,7 +407,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
         .join('\n');
       text = text ? `${text}\n\n${refs}` : refs;
     }
-    sending = true;
+    submitting = true;
     sendBtn.disabled = true;
     playSend();
     clearTimeout(launchTimer);
@@ -423,6 +425,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       content: text,
       thread_id: activeThread ? activeThread.id : null,
       request_id: requestId,
+      status: 'pending',
       created_at: Math.floor(Date.now() / 1000),
     };
     inputEl.value = '';
@@ -439,29 +442,74 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     try {
       const chatBody = { message: text, request_id: requestId };
       if (activeThread) chatBody.thread_id = activeThread.id;
-      await api('/api/chat', {
+      const res = await api('/api/chat', {
         method: 'POST',
         body: chatBody,
       });
-      lastFailed = null;
-      optimisticMsg = null;
-      clearStreaming();
-      await onRefresh();
+      submitting = false;
+      if (res?.status === 'accepted') {
+        activeTurn = { id: res.message_id || 0, requestId, text, work: turnWork };
+        const syncedMsg = (state.messages || []).find(
+          (m) =>
+            m.role === 'user' &&
+            ((res.message_id && m.id === res.message_id) ||
+              (requestId && m.request_id === requestId)),
+        );
+        const terminalEv =
+          (res.message_id && turnEvents.get(`id:${res.message_id}`)) ||
+          (requestId && turnEvents.get(`req:${requestId}`));
+        if (syncedMsg && syncedMsg.status !== 'pending') {
+          syncTurnState();
+        } else if (terminalEv) {
+          await onRefresh().catch(() => syncTurnState());
+        } else {
+          syncTurnState();
+        }
+      } else {
+        lastFailed = null;
+        activeTurn = null;
+        optimisticMsg = null;
+        clearStreaming();
+        sendBtn.disabled = false;
+        typingEl.classList.add('hide');
+        if (brainWork === turnWork) setStage('');
+        await onRefresh();
+        if (!document.activeElement || document.activeElement === document.body) {
+          inputEl.focus();
+        }
+      }
     } catch (err) {
-      playWarn();
-      lastFailed = { text, requestId };
+      submitting = false;
       optimisticMsg = null;
       clearStreaming();
       await onRefresh().catch(() => render());
-      inputEl.value = text;
-      syncComposerState();
-      showToast(`发送失败：${err.message}`);
-    } finally {
-      sending = false;
-      sendBtn.disabled = false;
-      typingEl.classList.add('hide');
-      if (brainWork === turnWork) setStage('');
-      inputEl.focus();
+      const serverMsg = (state.messages || []).find((m) => m.request_id === requestId);
+      if (serverMsg?.status === 'complete') {
+        lastFailed = null;
+        activeTurn = null;
+        sendBtn.disabled = false;
+        typingEl.classList.add('hide');
+        if (brainWork === turnWork) setStage('');
+      } else if (
+        serverMsg?.status === 'pending' ||
+        (err.status === 409 && /already being processed/i.test(String(err.message || '')))
+      ) {
+        lastFailed = null;
+        activeTurn = { id: serverMsg?.id || 0, requestId, text, work: turnWork };
+        syncTurnState();
+        showToast('连接波动，消息仍在后台处理，完成后会自动显示');
+      } else {
+        playWarn();
+        activeTurn = null;
+        sendBtn.disabled = false;
+        typingEl.classList.add('hide');
+        if (brainWork === turnWork) setStage('');
+        lastFailed = { text, requestId };
+        inputEl.value = text;
+        syncComposerState();
+        showToast(`发送失败：${err.message}`);
+        inputEl.focus();
+      }
     }
   };
 
@@ -563,6 +611,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       scrollAfterRender = true;
       switchingThread = false;
       syncScrollBottom();
+      syncTurnState();
       return;
     }
     const stickBottom = !hasBootRendered || switchingThread || Boolean(optimisticMsg) || distFromBottom() <= 160;
@@ -595,7 +644,11 @@ export function initChat({ state, onRefresh, onActivityChange }) {
         ${actionsHtml}
         <div>${renderMarkdown(m.content)}</div>
         <div class="msg-meta">${esc(fmtTime(m.created_at))}${
-          m.status === 'failed' ? ' · 未送达，可重新发送' : ''
+          m.status === 'failed'
+            ? ' · 未送达，可重新发送'
+            : m.role === 'user' && m.status === 'pending'
+              ? ' · 处理中…'
+              : ''
         }</div>
       </div>`;
       })
@@ -614,6 +667,116 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
     syncScrollBottom();
     scrollAfterRender = true;
+    syncTurnState();
+  }
+
+  function recordTurnEvent(key, value) {
+    if (!key) return;
+    if (turnEvents.has(key)) turnEvents.delete(key);
+    turnEvents.set(key, value);
+    while (turnEvents.size > 32) {
+      const oldest = turnEvents.keys().next().value;
+      turnEvents.delete(oldest);
+    }
+  }
+
+  function onMessageEvent(ev) {
+    if (!ev || (!ev.done && !ev.failed)) return;
+    const entry = {
+      status: ev.failed ? 'failed' : 'complete',
+      error: typeof ev.error === 'string' ? ev.error : '',
+    };
+    if (ev.message_id) recordTurnEvent(`id:${ev.message_id}`, entry);
+    if (ev.request_id) recordTurnEvent(`req:${ev.request_id}`, entry);
+  }
+
+  function syncTurnState() {
+    const msgsAll = state.messages || [];
+    const pendingMsg = [...msgsAll]
+      .reverse()
+      .find((m) => m.role === 'user' && m.status === 'pending');
+
+    if (pendingMsg) {
+      const sameTurn =
+        activeTurn &&
+        ((pendingMsg.id && activeTurn.id === pendingMsg.id) ||
+          (pendingMsg.request_id && activeTurn.requestId === pendingMsg.request_id));
+      const work = sameTurn
+        ? activeTurn.work
+        : brainWork || { stage: 'connecting', startedAt: performance.now() };
+      activeTurn = {
+        id: pendingMsg.id || 0,
+        requestId: pendingMsg.request_id || '',
+        text: pendingMsg.content || '',
+        work,
+      };
+      if (!brainWork) {
+        brainWork = work;
+        renderWork();
+      }
+      sendBtn.disabled = true;
+      if (!streamingText) typingEl.classList.remove('hide');
+      return;
+    }
+
+    if (submitting) return;
+
+    if (activeTurn) {
+      const finished = activeTurn;
+      const maxMsgId = msgsAll.reduce((mx, m) => Math.max(mx, m.id || 0), 0);
+      const finishedMsg = [...msgsAll]
+        .reverse()
+        .find(
+          (m) =>
+            m.role === 'user' &&
+            ((finished.id && m.id === finished.id) ||
+              (finished.requestId && m.request_id === finished.requestId)),
+        );
+      const terminalEv =
+        (finished.id && turnEvents.get(`id:${finished.id}`)) ||
+        (finished.requestId && turnEvents.get(`req:${finished.requestId}`));
+      const settled =
+        Boolean(finishedMsg && finishedMsg.status !== 'pending') ||
+        Boolean(terminalEv) ||
+        (finished.id && maxMsgId >= finished.id);
+      if (!settled) {
+        sendBtn.disabled = true;
+        if (!streamingText) typingEl.classList.remove('hide');
+        return;
+      }
+
+      activeTurn = null;
+      optimisticMsg = null;
+      clearStreaming();
+      typingEl.classList.add('hide');
+      sendBtn.disabled = false;
+      if (brainWork) setStage('');
+
+      if (finishedMsg?.status === 'failed' || terminalEv?.status === 'failed') {
+        const errText = terminalEv?.error || '';
+        const textToRetry = finishedMsg?.content || finished.text || '';
+        const retryReqId = finishedMsg?.request_id || finished.requestId || '';
+        playWarn();
+        if (textToRetry && retryReqId) {
+          lastFailed = { text: textToRetry, requestId: retryReqId };
+          if (!inputEl.value.trim()) {
+            inputEl.value = textToRetry;
+            syncComposerState();
+          }
+        }
+        showToast(errText ? `发送失败：${errText}` : '消息处理失败，可重新发送');
+      } else {
+        lastFailed = null;
+        const activeTag = document.activeElement?.tagName;
+        if (!activeTag || activeTag === 'BODY') {
+          inputEl.focus();
+        }
+      }
+      return;
+    }
+
+    sendBtn.disabled = false;
+    typingEl.classList.add('hide');
   }
 
   async function setThreadFilter(threadId, title) {
@@ -839,8 +1002,14 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
   });
 
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && activeTurn) {
+      onRefresh().catch(() => {});
+    }
+  });
+
   initDelegatedCopy(listEl);
   syncComposerState();
   renderEnginePill();
-  return { render, setStage, onDelta, onTask, syncTasks, insertMention, setThreadFilter, renderEnginePill, flashIslandDone, switchEngine };
+  return { render, setStage, onDelta, onTask, onMessageEvent, syncTasks, insertMention, setThreadFilter, renderEnginePill, flashIslandDone, switchEngine };
 }

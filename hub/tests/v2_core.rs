@@ -77,7 +77,7 @@ async fn seed_user(
     hub.issue_session(id.to_owned(), 3600).await.unwrap()
 }
 
-async fn req_json(
+async fn req_json_raw(
     router: &Router,
     method: &str,
     uri: &str,
@@ -110,6 +110,104 @@ async fn req_json(
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let parsed = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     (status, parsed)
+}
+
+async fn req_json(
+    router: &Router,
+    method: &str,
+    uri: &str,
+    cookie: Option<&str>,
+    csrf: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    if !(method == "POST" && uri == "/api/chat" && cookie.is_some() && csrf.is_some()) {
+        return req_json_raw(router, method, uri, cookie, csrf, body).await;
+    }
+    let (_, pre_boot) = req_json_raw(router, "GET", "/api/bootstrap", cookie, None, None).await;
+    let prev_task_ids: HashSet<String> = pre_boot["tasks"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| t["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let (st, accepted) = req_json_raw(router, method, uri, cookie, csrf, body).await;
+    if st != StatusCode::ACCEPTED {
+        return (st, accepted);
+    }
+    let msg_id = accepted["message_id"]
+        .as_i64()
+        .expect("202 /api/chat must return message_id");
+
+    for _ in 0..400 {
+        let (bst, boot) = req_json_raw(router, "GET", "/api/bootstrap", cookie, None, None).await;
+        if bst != StatusCode::OK {
+            return (bst, boot);
+        }
+        let msgs = boot["messages"].as_array().cloned().unwrap_or_default();
+        if let Some(user_msg) = msgs.iter().find(|m| m["id"].as_i64() == Some(msg_id)) {
+            let m_status = user_msg["status"].as_str().unwrap_or("");
+            if m_status == "failed" {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    json!({"error": "chat turn failed", "message_id": msg_id}),
+                );
+            }
+            if m_status == "complete" {
+                let reply = msgs
+                    .iter()
+                    .find(|m| {
+                        m["role"].as_str() == Some("assistant")
+                            && m["reply_to"].as_i64() == Some(msg_id)
+                    })
+                    .and_then(|m| m["content"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let new_tasks: Vec<Value> = boot["tasks"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter(|t| {
+                                t["id"]
+                                    .as_str()
+                                    .is_some_and(|id| !prev_task_ids.contains(id))
+                            })
+                            .map(|t| {
+                                let mut obj = t.clone();
+                                if let Some(map) = obj.as_object_mut() {
+                                    if let Some(id) = map.get("id").cloned() {
+                                        map.insert("task_id".into(), id);
+                                    }
+                                    let mode = if map.get("status").and_then(Value::as_str)
+                                        == Some("pending")
+                                    {
+                                        "pending_manual"
+                                    } else {
+                                        "auto_queued"
+                                    };
+                                    map.insert("mode".into(), json!(mode));
+                                }
+                                obj
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return (
+                    StatusCode::OK,
+                    json!({
+                        "reply": reply,
+                        "thread_id": user_msg["thread_id"],
+                        "tasks": new_tasks,
+                        "message_id": msg_id,
+                    }),
+                );
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for async /api/chat message_id={msg_id} to settle");
 }
 
 #[tokio::test]
@@ -5125,3 +5223,348 @@ async fn dispatch_node_engine_override_does_not_leak_role_model() {
 }
 
 #[tokio::test]
+async fn chat_turn_completes_when_caller_future_is_dropped() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_millis(160)).await;
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "后台继续完成后持久化成功"
+                    }
+                }]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let mut cfg = test_config("https://git.example.com");
+    cfg.llm = LlmConfig::OpenAi {
+        url: format!("http://{addr}/v1/chat/completions"),
+        api_key: "test".into(),
+        model: "mock".into(),
+    };
+    let hub = Hub::open(cfg).unwrap();
+    let _ = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+
+    // Simulate HTTP client aborting after 40ms while the mock LLM responds at 160ms.
+    let timed = tokio::time::timeout(
+        Duration::from_millis(40),
+        agenct_hub::brain::run_turn(
+            &hub,
+            "u-alice",
+            "hello detached",
+            Some("req-detach-1"),
+            None,
+        ),
+    )
+    .await;
+    assert!(timed.is_err(), "caller must drop before mock LLM replies");
+
+    let mut completed_msg: Option<(i64, String)> = None;
+    for _ in 0..80 {
+        let row: Option<(i64, String)> = hub
+            .db
+            .read(|conn| {
+                Ok(rusqlite::OptionalExtension::optional(conn.query_row(
+                    "SELECT id, status FROM messages WHERE user_id='u-alice' AND request_id='req-detach-1'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ))?)
+            })
+            .await
+            .unwrap();
+        if let Some((mid, status)) = row {
+            if status == "complete" {
+                completed_msg = Some((mid, status));
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let (user_msg_id, status) = completed_msg.expect("detached turn must complete in background");
+    assert_eq!(status, "complete");
+
+    let reply: String = hub
+        .db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT content FROM messages WHERE user_id='u-alice' AND reply_to=?1 AND role='assistant'",
+                [user_msg_id],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(reply, "后台继续完成后持久化成功");
+
+    // Replaying the same request_id returns the persisted reply instead of 409 Conflict.
+    let replay = agenct_hub::brain::run_turn(
+        &hub,
+        "u-alice",
+        "hello detached",
+        Some("req-detach-1"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["reply"], "后台继续完成后持久化成功");
+
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn chat_turn_marks_failed_on_upstream_error_and_allows_retry() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let _ = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+
+    let err = agenct_hub::brain::run_turn(
+        &hub,
+        "u-alice",
+        "/stub_fail",
+        Some("req-fail-retry-1"),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+
+    let status: String = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT status FROM messages WHERE user_id='u-alice' AND request_id='req-fail-retry-1'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(status, "failed");
+
+    let ok = agenct_hub::brain::run_turn(
+        &hub,
+        "u-alice",
+        "retry works now",
+        Some("req-fail-retry-1"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(ok["reply"].as_str().is_some_and(|s| !s.is_empty()));
+
+    let status_after: String = hub
+        .db
+        .read(|conn| {
+            Ok(conn.query_row(
+                "SELECT status FROM messages WHERE user_id='u-alice' AND request_id='req-fail-retry-1'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .await
+        .unwrap();
+    assert_eq!(status_after, "complete");
+}
+
+#[tokio::test]
+async fn chat_endpoint_returns_202_immediately_and_delivers_via_sse() {
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "202 真异步 SSE 交付成功"
+                    }
+                }]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+
+    let mut cfg = test_config("https://git.example.com");
+    cfg.llm = LlmConfig::OpenAi {
+        url: format!("http://{addr}/v1/chat/completions"),
+        api_key: "test".into(),
+        model: "mock".into(),
+    };
+    let hub = Hub::open(cfg).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+    let mut sse_rx = hub.events.subscribe("u-alice");
+
+    let started = Instant::now();
+    let (st, acc) = req_json_raw(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "async ping", "request_id": "req-async-202"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{acc}");
+    assert!(
+        started.elapsed() < Duration::from_millis(150),
+        "/api/chat should return 202 immediately without waiting for 200ms LLM"
+    );
+    assert_eq!(acc["status"], "accepted");
+    assert_eq!(acc["request_id"], "req-async-202");
+    let msg_id = acc["message_id"].as_i64().unwrap();
+    assert!(msg_id > 0);
+
+    // Same request_id while in-flight rejects with 409; concurrent turn also rejects with 409.
+    let (st_dup, _) = req_json_raw(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "async ping", "request_id": "req-async-202"})),
+    )
+    .await;
+    assert_eq!(st_dup, StatusCode::CONFLICT);
+
+    let (st_other, _) = req_json_raw(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "concurrent msg", "request_id": "req-async-concurrent"})),
+    )
+    .await;
+    assert_eq!(st_other, StatusCode::CONFLICT);
+
+    // Wait for SSE completion event.
+    let mut saw_done = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(200), sse_rx.recv()).await {
+            if ev.kind == "message" {
+                let data: Value = serde_json::from_str(&ev.data).unwrap_or(Value::Null);
+                if data["done"] == true && data["message_id"] == msg_id {
+                    assert_eq!(data["request_id"], "req-async-202");
+                    saw_done = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(saw_done, "must emit SSE message done event with message_id");
+
+    let (bst, boot) =
+        req_json_raw(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
+    assert_eq!(bst, StatusCode::OK);
+    let msgs = boot["messages"].as_array().unwrap();
+    let u_row = msgs
+        .iter()
+        .find(|m| m["id"].as_i64() == Some(msg_id))
+        .unwrap();
+    assert_eq!(u_row["status"], "complete");
+    let a_row = msgs
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["reply_to"].as_i64() == Some(msg_id))
+        .unwrap();
+    assert_eq!(a_row["content"], "202 真异步 SSE 交付成功");
+
+    // Replaying the same request_id returns 200 OK with cached reply.
+    let (st_replay, replay) = req_json_raw(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "async ping", "request_id": "req-async-202"})),
+    )
+    .await;
+    assert_eq!(st_replay, StatusCode::OK);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["reply"], "202 真异步 SSE 交付成功");
+
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn chat_endpoint_async_failure_emits_sse_error_and_marks_failed() {
+    use std::time::Duration;
+
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+    let mut sse_rx = hub.events.subscribe("u-alice");
+
+    let (st, acc) = req_json_raw(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "/stub_fail", "request_id": "req-async-fail"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{acc}");
+    let msg_id = acc["message_id"].as_i64().unwrap();
+
+    let mut failed_err: Option<String> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(200), sse_rx.recv()).await {
+            if ev.kind == "message" {
+                let data: Value = serde_json::from_str(&ev.data).unwrap_or(Value::Null);
+                if data["failed"] == true && data["message_id"] == msg_id {
+                    assert_eq!(data["request_id"], "req-async-fail");
+                    failed_err = data["error"].as_str().map(str::to_owned);
+                    break;
+                }
+            }
+        }
+    }
+    let err_str = failed_err.expect("must emit SSE message failed event");
+    assert!(!err_str.is_empty());
+
+    let db_status: String = hub
+        .db
+        .read(move |conn| {
+            Ok(
+                conn.query_row("SELECT status FROM messages WHERE id = ?1", [msg_id], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(db_status, "failed");
+}

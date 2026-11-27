@@ -155,8 +155,8 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
             let crons = automation::list_crons_sync(conn, &uid)?;
 
             let mut msg_stmt = conn.prepare(
-                "SELECT id, peer_id, thread_id, role, content, request_id, status, created_at FROM (
-                    SELECT id, peer_id, thread_id, role, content, request_id, status, created_at
+                "SELECT id, peer_id, thread_id, role, content, request_id, status, reply_to, created_at FROM (
+                    SELECT id, peer_id, thread_id, role, content, request_id, status, reply_to, created_at
                     FROM messages WHERE user_id = ?1
                     ORDER BY id DESC LIMIT 61
                  ) ORDER BY id ASC",
@@ -171,7 +171,8 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                         "content": r.get::<_, String>(4)?,
                         "request_id": r.get::<_, Option<String>>(5)?,
                         "status": r.get::<_, String>(6)?,
-                        "created_at": r.get::<_, i64>(7)?,
+                        "reply_to": r.get::<_, Option<i64>>(7)?,
+                        "created_at": r.get::<_, i64>(8)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -296,7 +297,7 @@ pub async fn list_messages(
         .db
         .read(move |conn| {
             let mut sql = String::from(
-                "SELECT id, peer_id, thread_id, role, content, request_id, status, created_at
+                "SELECT id, peer_id, thread_id, role, content, request_id, status, reply_to, created_at
                  FROM messages WHERE user_id = ?1",
             );
             let mut args: Vec<SqlValue> = vec![SqlValue::Text(uid)];
@@ -322,7 +323,8 @@ pub async fn list_messages(
                         "content": r.get::<_, String>(4)?,
                         "request_id": r.get::<_, Option<String>>(5)?,
                         "status": r.get::<_, String>(6)?,
-                        "created_at": r.get::<_, i64>(7)?,
+                        "reply_to": r.get::<_, Option<i64>>(7)?,
+                        "created_at": r.get::<_, i64>(8)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -815,7 +817,7 @@ pub async fn chat(
     State(hub): State<Hub>,
     AuthUser(user): AuthUser,
     Json(input): Json<ChatInput>,
-) -> Result<Json<Value>> {
+) -> Result<(StatusCode, Json<Value>)> {
     let msg = input.message.trim();
     if msg.is_empty() || msg.len() > 8000 {
         return Err(invalid("message must be 1..8000 bytes"));
@@ -856,15 +858,28 @@ pub async fn chat(
             return Err(invalid("invalid thread_id"));
         }
     }
-    let out = run_turn(
+    match start_turn(
         &hub,
         &user.id,
         msg,
         input.request_id.as_deref(),
         pinned_tid.as_deref(),
     )
-    .await?;
-    Ok(Json(out))
+    .await?
+    {
+        StartTurnResult::Replay(val) => Ok((StatusCode::OK, Json(val))),
+        StartTurnResult::Started {
+            message_id,
+            handle: _,
+        } => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "status": "accepted",
+                "message_id": message_id,
+                "request_id": input.request_id,
+            })),
+        )),
+    }
 }
 
 /// Maximum LLM calls per chat turn (initial call + tool-result follow-ups).
@@ -945,21 +960,58 @@ fn parse_approve_command(message: &str) -> Option<String> {
     }
 }
 
-/// Unified single-brain turn execution used by both Web UI and inbound IM webhook.
-///
-/// Lifecycle of the user message: inserted as `pending` → `complete` together with the
-/// assistant reply (linked via `reply_to`), or `failed` if the turn cannot produce a reply.
-/// A failed `request_id` may be retried; a completed one is replayed idempotently.
-pub async fn run_turn(
+struct PendingTurnGuard {
+    hub: Hub,
+    user_id: String,
+    user_msg_id: i64,
+    request_id: Option<String>,
+    finished: bool,
+}
+
+impl Drop for PendingTurnGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            let hub = self.hub.clone();
+            let uid = self.user_id.clone();
+            let mid = self.user_msg_id;
+            let rid = self.request_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    mark_turn_failed(&hub, &uid, mid, rid.as_deref(), "chat turn aborted").await;
+                });
+            }
+        }
+    }
+}
+
+/// Immediate result of initiating a single-brain turn (`Replay` vs detached `Started` handle).
+pub enum StartTurnResult {
+    Replay(Value),
+    Started {
+        message_id: i64,
+        handle: tokio::task::JoinHandle<Result<Value>>,
+    },
+}
+
+/// Starts a single-brain turn in a detached background task after synchronously claiming the
+/// `pending` user message row in SQLite. Callers can either return immediately (`202 Accepted`
+/// for HTTP `/api/chat`) or `.await` the returned `JoinHandle` (`run_turn` for IM & tests).
+pub async fn start_turn(
     hub: &Hub,
     user_id: &str,
     message: &str,
     request_id: Option<&str>,
     pinned_thread_id: Option<&str>,
-) -> Result<Value> {
+) -> Result<StartTurnResult> {
     if let Some(rid) = request_id {
         match lookup_request(hub, user_id, rid).await? {
-            RequestState::Replay(reply) => return Ok(json!({"reply": reply, "replayed": true})),
+            RequestState::Replay(reply) => {
+                return Ok(StartTurnResult::Replay(json!({
+                    "status": "complete",
+                    "reply": reply,
+                    "replayed": true,
+                })));
+            }
             RequestState::InFlight => {
                 return Err(Error(
                     StatusCode::CONFLICT,
@@ -970,59 +1022,194 @@ pub async fn run_turn(
         }
     }
 
-    // Per-user turn serialization gate.
+    // Per-user turn serialization gate (owned lock moves into the detached task).
     let gate = hub.user_gate(user_id);
-    let _guard = gate
+    let guard = gate
         .try_lock_owned()
         .map_err(|_| Error(StatusCode::CONFLICT, "another chat turn is already running"))?;
 
-    let snapshot =
-        load_snapshot_and_claim(hub, user_id, message, request_id, pinned_thread_id).await?;
-    let user_msg_id = snapshot.user_msg_id;
-    hub.events
-        .emit(user_id.to_owned(), "message", json!({"pending": true}));
+    let (claimed_tx, claimed_rx) = tokio::sync::oneshot::channel::<Result<i64>>();
+    let hub_owned = hub.clone();
+    let uid_owned = user_id.to_owned();
+    let msg_owned = message.to_owned();
+    let rid_owned = request_id.map(str::to_owned);
+    let pinned_owned = pinned_thread_id.map(str::to_owned);
 
-    if let Some(code) = parse_approve_command(message) {
-        match crate::collab::consume_approval_code(hub, user_id, &code).await {
+    let handle = tokio::spawn(async move {
+        run_turn_detached(
+            guard,
+            claimed_tx,
+            hub_owned,
+            uid_owned,
+            msg_owned,
+            rid_owned,
+            pinned_owned,
+        )
+        .await
+    });
+
+    match claimed_rx.await {
+        Ok(Ok(message_id)) => Ok(StartTurnResult::Started { message_id, handle }),
+        Ok(Err(err)) => Err(err),
+        Err(_) => Err(Error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chat turn aborted",
+        )),
+    }
+}
+
+/// Unified single-brain turn execution used by inbound IM webhooks and synchronous callers.
+pub async fn run_turn(
+    hub: &Hub,
+    user_id: &str,
+    message: &str,
+    request_id: Option<&str>,
+    pinned_thread_id: Option<&str>,
+) -> Result<Value> {
+    match start_turn(hub, user_id, message, request_id, pinned_thread_id).await? {
+        StartTurnResult::Replay(val) => Ok(val),
+        StartTurnResult::Started { handle, .. } => match handle.await {
+            Ok(res) => res,
+            Err(join_err) => {
+                eprintln!("[brain] turn task panicked for user {user_id}: {join_err}");
+                Err(Error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "chat turn aborted",
+                ))
+            }
+        },
+    }
+}
+
+async fn run_turn_detached(
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    claimed_tx: tokio::sync::oneshot::Sender<Result<i64>>,
+    hub: Hub,
+    user_id: String,
+    message: String,
+    request_id: Option<String>,
+    pinned_thread_id: Option<String>,
+) -> Result<Value> {
+    let snapshot = match load_snapshot_and_claim(
+        &hub,
+        &user_id,
+        &message,
+        request_id.as_deref(),
+        pinned_thread_id.as_deref(),
+    )
+    .await
+    {
+        Ok(snap) => snap,
+        Err(err) => {
+            let _ = claimed_tx.send(Err(Error(err.0, err.1)));
+            return Err(err);
+        }
+    };
+    let user_msg_id = snapshot.user_msg_id;
+    let mut turn_guard = PendingTurnGuard {
+        hub: hub.clone(),
+        user_id: user_id.clone(),
+        user_msg_id,
+        request_id: request_id.clone(),
+        finished: false,
+    };
+    hub.events.emit(
+        user_id.clone(),
+        "message",
+        json!({
+            "pending": true,
+            "message_id": user_msg_id,
+            "request_id": request_id,
+        }),
+    );
+    let _ = claimed_tx.send(Ok(user_msg_id));
+
+    if let Some(code) = parse_approve_command(&message) {
+        let res = match crate::collab::consume_approval_code(&hub, &user_id, &code).await {
             Ok(outcome) => {
                 let reply = format!(
                     "已授权单次放行重试「{}」，已重新派发到节点 {}（仅本次生效）。",
                     outcome.title, outcome.node_name
                 );
-                let tid = outcome
-                    .thread_id
-                    .or_else(|| pinned_thread_id.map(str::to_owned));
-                match persist_turn(hub, user_id, message, user_msg_id, tid, &reply, "").await {
-                    Ok(final_reply) => {
-                        return Ok(json!({
-                            "reply": final_reply,
-                            "approved_task_id": outcome.task_id,
-                        }))
-                    }
-                    Err(err) => {
-                        mark_turn_failed(hub, user_id, user_msg_id).await;
-                        return Err(err);
-                    }
-                }
+                let tid = outcome.thread_id.or_else(|| pinned_thread_id.clone());
+                persist_turn(
+                    &hub,
+                    &user_id,
+                    &message,
+                    user_msg_id,
+                    request_id.as_deref(),
+                    tid,
+                    &reply,
+                    "",
+                )
+                .await
+                .map(|final_reply| {
+                    json!({
+                        "reply": final_reply,
+                        "approved_task_id": outcome.task_id,
+                    })
+                })
             }
             Err(err) => {
                 let reply = format!("单次放行未生效：{}。", err.1);
-                let tid = pinned_thread_id.map(str::to_owned);
-                match persist_turn(hub, user_id, message, user_msg_id, tid, &reply, "").await {
-                    Ok(final_reply) => return Ok(json!({"reply": final_reply})),
-                    Err(p_err) => {
-                        mark_turn_failed(hub, user_id, user_msg_id).await;
-                        return Err(p_err);
-                    }
-                }
+                persist_turn(
+                    &hub,
+                    &user_id,
+                    &message,
+                    user_msg_id,
+                    request_id.as_deref(),
+                    pinned_thread_id.clone(),
+                    &reply,
+                    "",
+                )
+                .await
+                .map(|final_reply| json!({"reply": final_reply}))
             }
-        }
+        };
+        return match res {
+            Ok(out) => {
+                turn_guard.finished = true;
+                Ok(out)
+            }
+            Err(err) => {
+                eprintln!(
+                    "[brain] turn failed user={} msg_id={} status={} err={}",
+                    user_id,
+                    user_msg_id,
+                    err.0.as_u16(),
+                    err.1
+                );
+                mark_turn_failed(&hub, &user_id, user_msg_id, request_id.as_deref(), err.1).await;
+                turn_guard.finished = true;
+                Err(err)
+            }
+        };
     }
 
-    match drive_turn(hub, user_id, message, snapshot, pinned_thread_id).await {
-        Ok(out) => Ok(out),
+    match drive_turn(
+        &hub,
+        &user_id,
+        &message,
+        snapshot,
+        request_id.as_deref(),
+        pinned_thread_id.as_deref(),
+    )
+    .await
+    {
+        Ok(out) => {
+            turn_guard.finished = true;
+            Ok(out)
+        }
         Err(err) => {
-            mark_turn_failed(hub, user_id, user_msg_id).await;
+            eprintln!(
+                "[brain] turn failed user={} msg_id={} status={} err={}",
+                user_id,
+                user_msg_id,
+                err.0.as_u16(),
+                err.1
+            );
+            mark_turn_failed(&hub, &user_id, user_msg_id, request_id.as_deref(), err.1).await;
+            turn_guard.finished = true;
             Err(err)
         }
     }
@@ -1208,9 +1395,9 @@ async fn load_snapshot_and_claim(
             let user_msg_id = match existing {
                 Some((id, status)) if status == "failed" => {
                     tx.execute(
-                        "UPDATE messages SET status='pending', content=?2, thread_id=NULL, created_at=?3
+                        "UPDATE messages SET status='pending', content=?2, thread_id=?3, created_at=?4
                          WHERE id=?1",
-                        params![id, msg_owned, now],
+                        params![id, msg_owned, pinned_owned, now],
                     )?;
                     id
                 }
@@ -1222,9 +1409,9 @@ async fn load_snapshot_and_claim(
                 }
                 None => {
                     tx.execute(
-                        "INSERT INTO messages(user_id, role, content, request_id, status, created_at)
-                         VALUES (?1, 'user', ?2, ?3, 'pending', ?4)",
-                        params![uid, msg_owned, rid_owned, now],
+                        "INSERT INTO messages(user_id, thread_id, role, content, request_id, status, created_at)
+                         VALUES (?1, ?2, 'user', ?3, ?4, 'pending', ?5)",
+                        params![uid, pinned_owned, msg_owned, rid_owned, now],
                     )?;
                     tx.last_insert_rowid()
                 }
@@ -1236,7 +1423,13 @@ async fn load_snapshot_and_claim(
         .await
 }
 
-async fn mark_turn_failed(hub: &Hub, user_id: &str, user_msg_id: i64) {
+async fn mark_turn_failed(
+    hub: &Hub,
+    user_id: &str,
+    user_msg_id: i64,
+    request_id: Option<&str>,
+    error_msg: &str,
+) {
     let uid = user_id.to_owned();
     let _ = hub
         .db
@@ -1250,7 +1443,16 @@ async fn mark_turn_failed(hub: &Hub, user_id: &str, user_msg_id: i64) {
         .await;
     hub.events.emit(user_id, "delta", json!({"done": true}));
     hub.events.emit(user_id, "stage", json!({"stage": ""}));
-    hub.events.emit(user_id, "message", json!({"failed": true}));
+    hub.events.emit(
+        user_id,
+        "message",
+        json!({
+            "failed": true,
+            "message_id": user_msg_id,
+            "request_id": request_id,
+            "error": error_msg,
+        }),
+    );
 }
 
 /// Mutable per-turn state shared across agent steps.
@@ -1309,6 +1511,7 @@ async fn drive_turn(
     user_id: &str,
     message: &str,
     snap: TurnSnapshot,
+    request_id: Option<&str>,
     pinned_thread_id: Option<&str>,
 ) -> Result<Value> {
     let focus_suffix = match pinned_thread_id {
@@ -1334,6 +1537,7 @@ async fn drive_turn(
         user_id,
         message,
         snap.user_msg_id,
+        request_id,
         out.thread_id.clone(),
         &out.reply,
         &out.user_context,
@@ -1810,7 +2014,11 @@ async fn agent_loop(
                 .await;
             }
             Err(e) if step == 0 => return Err(e.into()),
-            Err(_) => {
+            Err(e) => {
+                eprintln!(
+                    "[brain] followup step={step} failed user={user_id}: {}",
+                    Error::from(e).1
+                );
                 batcher.flush();
                 break;
             }
@@ -2045,16 +2253,19 @@ async fn agent_loop_json_fallback(
 }
 
 /// Atomically completes the user message and stores the assistant reply linked via `reply_to`.
+#[allow(clippy::too_many_arguments)]
 async fn persist_turn(
     hub: &Hub,
     user_id: &str,
     message: &str,
     user_msg_id: i64,
+    request_id: Option<&str>,
     thread_id: Option<String>,
     final_reply: &str,
     user_context: &str,
 ) -> Result<String> {
     let uid = user_id.to_owned();
+    let tid_ev = thread_id.clone();
     let context_db = truncate_bytes(user_context.trim(), 6000);
     let reply_db = truncate_bytes(final_reply.trim(), 16_000);
     let reply_ret = reply_db.clone();
@@ -2103,7 +2314,16 @@ async fn persist_turn(
 
     hub.events.emit(user_id, "delta", json!({"done": true}));
     hub.events.emit(user_id, "stage", json!({"stage": ""}));
-    hub.events.emit(user_id, "message", json!({"done": true}));
+    hub.events.emit(
+        user_id,
+        "message",
+        json!({
+            "done": true,
+            "message_id": user_msg_id,
+            "request_id": request_id,
+            "thread_id": tid_ev,
+        }),
+    );
     Ok(reply_ret)
 }
 
