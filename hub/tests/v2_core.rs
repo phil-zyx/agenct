@@ -1868,11 +1868,29 @@ async fn manual_deliver_invalidates_active_node_lease_and_cancel_notifies_peer()
         .unwrap();
     assert_eq!(renew.status(), StatusCode::CONFLICT);
 
-    // Cross-user delegation: Bob cancels -> Alice receives SSE event, and delivering a canceled task is rejected.
+    // Cross-user delegation: requester bootstrap reports owner_name; Bob cancels -> Alice receives SSE event, and delivering a canceled task is rejected.
     let (_, delegated_id, _) =
         agenct_hub::collab::delegate_to_peer(&hub, "u-alice", "bob", "check logs")
             .await
             .unwrap();
+    let (st, alice_boot) = req_json(
+        &router,
+        "GET",
+        "/api/bootstrap",
+        Some(&alice_cookie),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let delegated_row = alice_boot["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["id"] == delegated_id)
+        .expect("delegated task visible to requester in bootstrap");
+    assert_eq!(delegated_row["owner_id"], "u-bob");
+    assert_eq!(delegated_row["owner_name"], "Bob");
     let mut alice_rx = hub.events.subscribe("u-alice");
     let (st, _) = req_json(
         &router,

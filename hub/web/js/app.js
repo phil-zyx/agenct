@@ -172,8 +172,9 @@ async function refresh() {
       : '';
     const onlineCount = (state.nodes || []).filter((n) => n.online).length;
     nodePill.textContent = `${onlineCount} 节点在线`;
+    const myUid = state.user?.id;
     const activeTasks = (state.tasks || []).filter(
-      (t) => t.status === 'pending' || t.status === 'running',
+      (t) => (!myUid || t.owner_id === myUid) && (t.status === 'pending' || t.status === 'running'),
     ).length;
     railBadge.textContent = activeTasks > 0 ? String(activeTasks) : '';
     avatarUI.setAvatar(state.profile?.avatar_id);

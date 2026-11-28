@@ -359,6 +359,23 @@ try {
     }));
     data.messages = [...filler, ...realMsgs].slice(-60);
     data.has_more_messages = true;
+    data.tasks = [
+      ...(data.tasks || []),
+      {
+        id: 'tsk_e2e_outbound_collab',
+        requester_id: data.user?.id || 'gl-user',
+        owner_id: 'gl-peer-bob',
+        owner_name: 'Bob',
+        thread_id: null,
+        title: '来自 E2E User 的协作：帮忙核查线上日志',
+        instruction: '帮忙核查线上日志',
+        status: 'pending',
+        result: null,
+        blocked_reason: '',
+        revision: 0,
+        updated_at: 1700000100,
+      },
+    ];
     try {
       await route.fulfill({ response: resp, json: data });
     } catch (err) {
@@ -396,11 +413,25 @@ try {
   );
   assert.equal(await page.locator('.msg-user:has-text("dedup-window-60")').count(), 1);
   await page.unroute('**/api/chat', delayChatHandler);
-  await page.unroute('**/api/bootstrap', padHandler);
   await page.click('#muse-head-toggle');
 
-  // 7. Verify 2-tab Muse drawer (Work Threads + Context Menu + Soul/Memory + Heat Grid), live dynamic avatar picker & Settings view.
+  // 7. Verify outbound delegation isolation (no red badge / not in attention workbench), 2-tab Muse drawer & Settings view.
   await page.waitForSelector('#drawer-body .panel-card h3');
+  assert.equal(await page.locator('#rail-badge').textContent(), '', 'outbound pending collab must not light rail badge');
+  const drawerText = await page.locator('#drawer-body').textContent();
+  assert.ok(!drawerText.includes('来自 E2E User 的协作'), 'requester must not see inbound title perspective');
+  const liveText = (await page.locator('#drawer-body .workbench-live').count()) > 0
+    ? await page.locator('#drawer-body .workbench-live').textContent()
+    : '';
+  assert.ok(
+    !liveText.includes('帮忙核查线上日志') && !liveText.includes('Bob'),
+    'outbound collab must not appear in attention workbench',
+  );
+  const outboundFoldText = await page.locator('#drawer-body [data-drawer-fold="outbound-collab"]').textContent();
+  assert.ok(outboundFoldText.includes('委派给 Bob：帮忙核查线上日志'));
+  assert.ok(outboundFoldText.includes('待对方处理'));
+  assert.ok(outboundFoldText.includes('撤回协作'));
+  await page.unroute('**/api/bootstrap', padHandler);
   const firstThreadMore = page.locator('#task-pane .thread-card [data-thread-menu]').first();
   if ((await firstThreadMore.count()) > 0) {
     await firstThreadMore.click();

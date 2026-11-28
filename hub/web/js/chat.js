@@ -376,7 +376,9 @@ export function initChat({ state, onRefresh, onActivityChange, onOpenSoulMeter }
 
   function syncTasks(tasks, version) {
     const next = new Map();
+    const myUid = state.user?.id;
     for (const task of tasks) {
+      if (myUid && task.owner_id !== myUid) continue;
       if (task.status !== 'running') continue;
       const status = task.job_status || task.status;
       if (status !== 'running' && status !== 'queued') continue;
@@ -655,7 +657,10 @@ export function initChat({ state, onRefresh, onActivityChange, onOpenSoulMeter }
     const groups = [];
     if (kind === '/') {
       const cmds = [];
-      const hasElev = (state.tasks || []).some((t) => t.status === 'pending' && t.sandbox === 'elevated');
+      const myUid = state.user?.id;
+      const hasElev = (state.tasks || []).some(
+        (t) => (!myUid || t.owner_id === myUid) && t.status === 'pending' && t.sandbox === 'elevated',
+      );
       if (hasElev) {
         cmds.push({
           title: '/approve',

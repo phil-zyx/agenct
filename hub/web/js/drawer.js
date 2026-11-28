@@ -569,13 +569,16 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       return `${progress ? `<div class="item-sub">${progress}</div>` : ''}${log}${links}`;
     }
 
-    // Group tasks by implicit thread_id; legacy unthreaded self-tasks collapse by title.
+    // Group tasks by implicit thread_id; outbound delegations go to their own neutral fold.
     const tasksByThread = new Map();
     const legacyGroups = new Map();
     const standaloneCollab = [];
+    const outboundCollab = [];
 
     for (const t of tasks) {
-      if (t.thread_id) {
+      if (uid && t.owner_id !== uid) {
+        outboundCollab.push(t);
+      } else if (t.thread_id) {
         if (!tasksByThread.has(t.thread_id)) tasksByThread.set(t.thread_id, []);
         tasksByThread.get(t.thread_id).push(t);
       } else if (t.requester_id !== t.owner_id) {
@@ -645,7 +648,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         actions.push(`<button type="button" class="sm" data-deliver="${esc(latest.id)}">交付结果</button>`);
       }
       if (latest.status === 'pending' || latest.status === 'running') {
-        actions.push(`<button type="button" class="sm danger" data-cancel="${esc(latest.id)}">取消</button>`);
+        actions.push(`<button type="button" class="sm danger" data-cancel="${esc(latest.id)}">${isOwner ? '取消' : '撤回协作'}</button>`);
       }
       return actions;
     }
@@ -796,10 +799,52 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         `<details class="node-repos mt-10" data-drawer-fold="archived-threads"${openFolds.has('archived-threads') ? ' open' : ''}><summary>已归档话题 (${archivedThreads.length})</summary><div class="mt-6">${archivedThreads.map((thr) => renderThreadCard(thr)).join('')}</div></details>`,
       );
     }
+    const OUTBOUND_STATUS_META = {
+      pending: { label: '待对方处理', cls: '' },
+      running: { label: '对方执行中', cls: '' },
+      done: { label: '对方已交付', cls: 'ok' },
+      failed: { label: '未完成', cls: '' },
+      canceled: { label: '已撤回', cls: '' },
+    };
+
+    const renderOutboundCollabCard = (t) => {
+      const peerName =
+        t.owner_name ||
+        (state.contacts || []).find((c) => c.id === t.owner_id)?.display_name ||
+        t.owner_id;
+      const rawTopic =
+        String(t.title || '').replace(/^来自\s+.+?\s+的协作：/, '').trim() ||
+        cleanPreviewLine(t.instruction, 40) ||
+        '协作事项';
+      const stMeta = OUTBOUND_STATUS_META[t.status] || { label: TASK_STATUS_LABEL[t.status] || t.status, cls: '' };
+      const waitNote = t.status === 'pending' || t.status === 'running' ? `等待 ${peerName} 处理` : `发给 ${peerName}`;
+      const { preview } = taskViews.get(t) || { preview: '' };
+      const actions = taskActionsHtml(t);
+      return `
+        <div class="item">
+          <div class="item-head">
+            <span>委派给 ${esc(peerName)}：${esc(rawTopic)}</span>
+            <span class="badge ${esc(stMeta.cls)}">${esc(stMeta.label)}</span>
+          </div>
+          <div class="thread-meta">${esc(waitNote)} · ${esc(fmtTime(t.updated_at))}</div>
+          ${preview ? `<div class="item-sub">${esc(preview)}</div>` : ''}
+          ${renderTaskProgress(t)}
+          ${renderRunsDetails([t])}
+          ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
+        </div>`;
+    };
+
+    const outboundCollabCards = outboundCollab.map(renderOutboundCollabCard);
+
     const extraDoneCards = [...doneCollabCards, ...doneLegacyCards];
     if (extraDoneCards.length) {
       threadBodyParts.push(
         `<details class="node-repos mt-10"><summary>近期单次任务 (${extraDoneCards.length})</summary><div class="mt-6">${extraDoneCards.join('')}</div></details>`,
+      );
+    }
+    if (outboundCollabCards.length) {
+      threadBodyParts.push(
+        `<details class="node-repos mt-10" data-drawer-fold="outbound-collab"${openFolds.has('outbound-collab') ? ' open' : ''}><summary>我发出的协作 (${outboundCollabCards.length})</summary><div class="mt-6">${outboundCollabCards.join('')}</div></details>`,
       );
     }
     const threadsSectionHtml = `

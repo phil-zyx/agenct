@@ -156,9 +156,11 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
             let mut task_stmt = conn.prepare(
                 "SELECT t.id, t.requester_id, t.owner_id, t.thread_id, t.title, t.instruction, t.status,
                         t.result, t.blocked_reason, t.revision, t.updated_at,
-                        j.node_id, j.status, j.stage, j.log_tail, j.role, j.agent, j.model, j.sandbox
+                        j.node_id, j.status, j.stage, j.log_tail, j.role, j.agent, j.model, j.sandbox,
+                        ou.display_name
                  FROM tasks t
                  LEFT JOIN node_jobs j ON j.task_id = t.id
+                 LEFT JOIN users ou ON ou.id = t.owner_id
                  WHERE t.owner_id = ?1 OR t.requester_id = ?1
                  ORDER BY t.updated_at DESC LIMIT 40",
             )?;
@@ -184,6 +186,7 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                         "agent": r.get::<_, Option<String>>(16)?,
                         "model": r.get::<_, Option<String>>(17)?,
                         "sandbox": r.get::<_, Option<String>>(18)?,
+                        "owner_name": r.get::<_, Option<String>>(19)?,
                     }))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
