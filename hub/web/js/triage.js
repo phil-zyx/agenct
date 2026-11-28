@@ -10,7 +10,7 @@ function previewLines(raw) {
   return stripNoise(raw)
     .replace(/^[ \t]*```[^\n]*(?:\n[\s\S]*?^[ \t]*```[^\n]*|[\s\S]*$)/gm, '')
     .split('\n')
-    .map((line) => line.trim().replace(/^(?:#+\s*|>\s*|[-*+]\s+|\d+[.)]\s+)+/, '').replace(/\*\*/g, '').trim())
+    .map((line) => line.trim().replace(/^(?:#+\s*|>\s*|[-*+]\s+|\d+[.)]\s+)+/, '').replace(/\*\*/g, '').replace(/`/g, '').trim())
     .filter((line) => line && !/^[-*_]{3,}$/.test(line));
 }
 

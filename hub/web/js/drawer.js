@@ -506,12 +506,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         const canElevateNode = latest.node_id ? elevatedNodeIds.has(latest.node_id) : anyElevatedNode;
         if (isPendingElev && canElevateNode) {
           actions.push(`<button type="button" class="sm warn" data-elevate="${esc(latest.id)}">单次放行执行</button>`);
-        } else if (latest.status === 'failed' && (latest.blocked_reason || canElevateNode)) {
-          actions.push(
-            `<button type="button" class="sm${latest.blocked_reason ? ' warn' : ''}" data-elevate="${esc(latest.id)}">单次放行重试</button>`,
-          );
-        } else if (latest.status === 'done' && canElevateNode) {
-          actions.push(`<button type="button" class="sm" data-elevate="${esc(latest.id)}">单次放行续跑</button>`);
+        } else if (latest.status === 'failed' && latest.blocked_reason && canElevateNode) {
+          actions.push(`<button type="button" class="sm warn" data-elevate="${esc(latest.id)}">单次放行重试</button>`);
         }
       }
       if (isOwner && isCrossUser && latest.status !== 'done' && latest.status !== 'canceled') {
@@ -523,80 +519,61 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       return actions;
     }
 
-    function renderThreadCard(thr) {
+    function renderThreadCard(thr, { attention = false } = {}) {
       const runs = tasksByThread.get(thr.id) || [];
       const latest = runs[0] || null;
+      const ledger = thr.ledger_id ? ledgerById.get(thr.ledger_id) : null;
+      const ledgerHtml = ledger
+        ? `<div class="engine-tags"><span class="engine-tag">${esc(ledger.title)}</span></div>`
+        : '';
+      const preview = taskViews.get(latest)?.preview || cleanPreviewLine(thr.summary, 72);
+      const previewHtml = preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
+      const updatedAt = latest?.updated_at || thr.updated_at;
+
+      if (!attention) {
+        return `
+        <div class="item thread-card" role="button" tabindex="0" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">
+          <div class="item-head">
+            <span>${esc(thr.title)}</span>
+            ${updatedAt ? `<span class="thread-time">${esc(fmtTime(updatedAt))}</span>` : ''}
+          </div>
+          ${previewHtml}
+          ${ledgerHtml}
+        </div>`;
+      }
+
       const isRunning = runs.some((r) => r.status === 'running');
       const isPending = runs.some((r) => r.status === 'pending');
-
-      let badgeText = thr.status === 'archived' ? '已归档' : '进行中';
-      let badgeCls = thr.status === 'active' ? 'ok' : '';
+      const isPendingElev = latest?.status === 'pending' && latest?.sandbox === 'elevated';
+      let badgeText = '失败';
+      let badgeCls = '';
       if (isRunning) {
         badgeText = '执行中';
+        badgeCls = 'warn';
+      } else if (isPendingElev) {
+        badgeText = '待放行';
         badgeCls = 'warn';
       } else if (isPending) {
         badgeText = '待处理';
         badgeCls = 'warn';
-      } else if (latest?.status === 'failed' && thr.status === 'active') {
-        badgeText = '失败';
-        badgeCls = '';
-      } else if (latest?.status === 'done' && thr.status === 'active') {
-        badgeText = '已完成';
-        badgeCls = 'ok';
       }
-
-      const metaParts = [];
-      const ledger = thr.ledger_id ? ledgerById.get(thr.ledger_id) : null;
-      const roleParts = [latest?.role, latest?.agent, latest?.model].filter(Boolean);
-      if (roleParts.length) metaParts.push(roleParts.join(' / '));
-      if (thr.node_id) {
-        metaParts.push(thr.has_session ? `节点 ${thr.node_id} · 可续接` : `节点 ${thr.node_id}`);
-      }
-      if (thr.turn_count > 0) metaParts.push(`${thr.turn_count} 轮`);
-      if (runs.length > 1) metaParts.push(`${runs.length} 次执行`);
-      if (thr.updated_at) metaParts.push(fmtTime(thr.updated_at));
-      const metaHtml = metaParts.length ? `<div class="thread-meta">${esc(metaParts.join(' · '))}</div>` : '';
-      const ledgerHtml = ledger
-        ? `<div class="engine-tags"><span class="engine-tag">${esc(ledger.title)}</span></div>`
-        : '';
-
-      const preview = taskViews.get(latest)?.preview || cleanPreviewLine(thr.summary, 72);
-      const previewHtml = preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
-      const detailsHtml = renderRunsDetails(runs);
-
       const actions = taskActionsHtml(latest);
-      actions.push(
-        `<button type="button" class="sm" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">进入话题</button>`,
-      );
-      actions.push(
-        `<button type="button" class="sm" data-rename-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">改名</button>`,
-      );
-      if (thr.status === 'active') {
-        actions.push(`<button type="button" class="sm" data-archive-thread="${esc(thr.id)}">归档</button>`);
-      } else {
-        actions.push(`<button type="button" class="sm" data-restore-thread="${esc(thr.id)}">恢复</button>`);
-        actions.push(`<button type="button" class="sm danger" data-del-thread="${esc(thr.id)}">删除</button>`);
-      }
 
       return `
-        <div class="item">
+        <div class="item thread-card" role="button" tabindex="0" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">
           <div class="item-head">
             <span>${esc(thr.title)}</span>
             <span class="badge ${badgeCls}">${esc(badgeText)}</span>
           </div>
           ${ledgerHtml}
-          ${metaHtml}
           ${renderBlockedHtml(latest)}
           ${previewHtml}
           ${renderTaskProgress(latest)}
-          ${detailsHtml}
           ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
         </div>`;
     }
 
     const isAttentionTask = (t) => !!t && (t.status === 'running' || t.status === 'pending' || t.status === 'failed');
-    const activeThreads = threads.filter((t) => t.status === 'active');
-    const archivedThreads = threads.filter((t) => t.status !== 'active');
     const threadsByLedger = new Map();
     for (const thr of threads) {
       if (thr.ledger_id) {
@@ -605,13 +582,15 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     }
 
     const attentionCards = [];
-    const idleActiveThreadCards = [];
-    for (const thr of activeThreads) {
+    const attentionThreadIds = new Set();
+    for (const thr of threads) {
       const latest = tasksByThread.get(thr.id)?.[0];
-      const card = renderThreadCard(thr);
-      if (isAttentionTask(latest)) attentionCards.push(card);
-      else idleActiveThreadCards.push(card);
+      if (isAttentionTask(latest)) {
+        attentionThreadIds.add(thr.id);
+        attentionCards.push(renderThreadCard(thr, { attention: true }));
+      }
     }
+    const idleThreads = threads.filter((thr) => !attentionThreadIds.has(thr.id));
 
     const renderCollabCard = (t) => {
       const stLabel = TASK_STATUS_LABEL[t.status] || t.status;
@@ -671,22 +650,17 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       ? `<section class="panel-card workbench-live"><h3><span>待处理 / 执行中 (${attentionCards.length})</span><span class="note">实时状态</span></h3>${attentionCards.join('')}</section>`
       : '';
 
-    const showRecentArchived = idleActiveThreadCards.length === 0 && attentionCards.length === 0 && archivedThreads.length > 0;
-    const visibleArchived = showRecentArchived ? archivedThreads.slice(0, 3) : [];
-    const foldedArchived = showRecentArchived ? archivedThreads.slice(3) : archivedThreads;
+    const visibleThreads = idleThreads.slice(0, 5);
+    const moreThreads = idleThreads.slice(5);
     const threadBodyParts = [];
-    if (idleActiveThreadCards.length) {
-      threadBodyParts.push(idleActiveThreadCards.join(''));
-    } else if (visibleArchived.length) {
-      threadBodyParts.push('<p class="workbench-subnote">暂无进行中线程，以下为最近历史话题（可点「进入话题」续接）</p>');
-      threadBodyParts.push(visibleArchived.map(renderThreadCard).join(''));
+    if (visibleThreads.length) {
+      threadBodyParts.push(visibleThreads.map((thr) => renderThreadCard(thr)).join(''));
     } else if (!attentionCards.length) {
-      threadBodyParts.push('<p class="note">暂无工作线程，在对话中派发任务或新建话题会自动生成</p>');
+      threadBodyParts.push('<p class="note">暂无历史话题，在对话中派发任务或讨论会自动生成</p>');
     }
-    if (foldedArchived.length) {
-      const label = showRecentArchived ? `更多历史线程 (${foldedArchived.length})` : `历史已归档线程 (${foldedArchived.length})`;
+    if (moreThreads.length) {
       threadBodyParts.push(
-        `<details class="node-repos mt-10"><summary>${label}</summary><div class="mt-6">${foldedArchived.map(renderThreadCard).join('')}</div></details>`,
+        `<details class="node-repos mt-10"><summary>更早话题 (${moreThreads.length})</summary><div class="mt-6">${moreThreads.map((thr) => renderThreadCard(thr)).join('')}</div></details>`,
       );
     }
     const extraDoneCards = [...doneCollabCards, ...doneLegacyCards];
@@ -697,7 +671,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     }
     const threadsSectionHtml = `
       <section class="panel-card">
-        <h3><span>工作线程 (${activeThreads.length})</span><span class="note">话题与会话</span></h3>
+        <h3><span>最近话题 (${threads.length})</span><span class="note">点击继续</span></h3>
         ${threadBodyParts.join('')}
       </section>`;
 
@@ -706,7 +680,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           .map((l) => {
             const linkedCount = threadsByLedger.get(l.id) || 0;
             const linkedMeta = linkedCount
-              ? `<div class="thread-meta">关联 ${linkedCount} 个工作线程</div>`
+              ? `<div class="thread-meta">关联 ${linkedCount} 个话题</div>`
               : '';
             return `
         <div class="item">
@@ -716,7 +690,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           </div>
           ${linkedMeta}
           ${compactTextHtml(l.notes, 64, '查看全文')}
-          <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
         </div>`;
           })
           .join('')
@@ -856,62 +829,16 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         { shortHint: '请长按「取消」确认中止任务' },
       );
     });
-    bodyEl.querySelectorAll('[data-filter-thread]').forEach((b) => {
-      b.onclick = () => onFilterThread?.(b.dataset.filterThread, b.dataset.threadTitle);
-    });
-    bodyEl.querySelectorAll('[data-rename-thread]').forEach((b) => {
-      b.onclick = async () => {
-        const nextTitle = window.prompt('输入新的话题标题：', b.dataset.threadTitle || '');
-        if (!nextTitle?.trim() || nextTitle.trim() === b.dataset.threadTitle) return;
-        try {
-          await api(`/api/threads/${b.dataset.renameThread}`, {
-            method: 'PUT',
-            body: { title: nextTitle.trim() },
-          });
-          showToast('话题名称已更新');
-          await onRefresh();
-        } catch (err) {
-          showToast(err.message);
-        }
+    bodyEl.querySelectorAll('[data-filter-thread]').forEach((el) => {
+      el.onclick = (ev) => {
+        if (ev.target.closest('button, a, details, summary, input, select')) return;
+        onFilterThread?.(el.dataset.filterThread, el.dataset.threadTitle);
       };
-    });
-    bodyEl.querySelectorAll('[data-archive-thread]').forEach((b) => {
-      b.onclick = async () => {
-        try {
-          await api(`/api/threads/${b.dataset.archiveThread}`, { method: 'PUT', body: { status: 'archived' } });
-          showToast('线程已归档');
-          await onRefresh();
-        } catch (err) {
-          showToast(err.message);
+      el.onkeydown = (ev) => {
+        if ((ev.key === 'Enter' || ev.key === ' ') && ev.target === el) {
+          ev.preventDefault();
+          onFilterThread?.(el.dataset.filterThread, el.dataset.threadTitle);
         }
-      };
-    });
-    bodyEl.querySelectorAll('[data-restore-thread]').forEach((b) => {
-      b.onclick = async () => {
-        try {
-          await api(`/api/threads/${b.dataset.restoreThread}`, { method: 'PUT', body: { status: 'active' } });
-          showToast('线程已恢复');
-          await onRefresh();
-        } catch (err) {
-          showToast(err.message);
-        }
-      };
-    });
-    bodyEl.querySelectorAll('[data-del-thread]').forEach((b) => {
-      b.onclick = async () => {
-        try {
-          await api(`/api/threads/${b.dataset.delThread}`, { method: 'DELETE' });
-          showToast('线程已删除');
-          await onRefresh();
-        } catch (err) {
-          showToast(err.message);
-        }
-      };
-    });
-    bodyEl.querySelectorAll('[data-del-ledger]').forEach((b) => {
-      b.onclick = async () => {
-        await api(`/api/ledgers/${b.dataset.delLedger}`, { method: 'DELETE' });
-        await onRefresh();
       };
     });
     bodyEl.querySelectorAll('[data-del-cron]').forEach((b) => {
