@@ -471,10 +471,11 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
                     };
                     let notes = raw_notes.replace("\r\n", "\n").replace('\n', " ");
                     let notes = notes.trim();
-                    let bullet = if notes.is_empty() {
+                    let notes_compact = crate::config::truncate_head_tail_bytes(notes, 180, 360);
+                    let bullet = if notes_compact.is_empty() {
                         format!("- **{title}**（{status_zh}）")
                     } else {
-                        format!("- **{title}**（{status_zh}）：{notes}")
+                        format!("- **{title}**（{status_zh}）：{notes_compact}")
                     };
                     by_user.entry(uid).or_default().push(bullet);
                 }
@@ -498,13 +499,13 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
                     } else {
                         format!("{}\n\n{section}", mem.trim_end())
                     };
-                    let bounded = crate::config::truncate_bytes(&merged, 12_000);
+                    let bounded = crate::config::truncate_bytes(&merged, 8000);
                     tx.execute(
                         "UPDATE agent_profiles SET memory_md = ?2, updated_at = ?3 WHERE user_id = ?1",
                         rusqlite::params![uid, bounded, now],
                     )?;
                 } else {
-                    let bounded = crate::config::truncate_bytes(&section, 12_000);
+                    let bounded = crate::config::truncate_bytes(&section, 8000);
                     tx.execute(
                         "INSERT INTO agent_profiles(user_id, name, soul_md, memory_md, avatar_id, updated_at)
                          VALUES (?1, 'Agenct', '', ?2, 'agenct', ?3)",
@@ -1219,12 +1220,33 @@ mod tests {
                  CREATE INDEX idx_ledgers_user ON ledgers(user_id, updated_at DESC);
                  INSERT INTO users VALUES ('u1', 1, 'alice', 'Alice', 1, 'active', 100);
                  INSERT INTO users VALUES ('u2', 2, 'bob', 'Bob', 0, 'active', 100);
-                 INSERT INTO agent_profiles VALUES ('u1', 'Agenct', 'soul', '已有记忆', 'agenct', '', 0, 100);
                  INSERT INTO threads VALUES ('thr_1', 'u1', 'Deploy', 'active', 'sum', 'ldg_1', 'homelab', 'ses_1', 'codex', '', '', 2, 100);
-                 INSERT INTO ledgers VALUES ('ldg_1', 'u1', 'Tidalis 初版交付', 'active', '已完成核心导出', 200);
-                 INSERT INTO ledgers VALUES ('ldg_2', 'u1', '头像循环动效', 'muted', '待素材到位', 150);
                  INSERT INTO ledgers VALUES ('ldg_3', 'u2', '测试专项', 'done', '', 120);
                  PRAGMA user_version = 15;",
+            )
+            .unwrap();
+            let long_existing = format!("已有记忆头部\n{}", "- 历史规则条目。\n".repeat(160));
+            conn.execute(
+                "INSERT INTO agent_profiles VALUES ('u1', 'Agenct', 'soul', ?1, 'agenct', '', 0, 100)",
+                [long_existing],
+            )
+            .unwrap();
+            let l1_notes = format!("Tidalis开头。{}Tidalis尾部", "中间流水。".repeat(120));
+            let l2_notes = format!("Agenct开头。{}Agenct尾部", "中间记录。".repeat(150));
+            let l3_notes = format!("Avatar开头。{}Avatar尾部", "素材记录。".repeat(120));
+            conn.execute(
+                "INSERT INTO ledgers VALUES ('ldg_1', 'u1', 'Tidalis 初版交付', 'active', ?1, 300)",
+                [l1_notes],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ledgers VALUES ('ldg_2', 'u1', 'agenct v2 单栈重构', 'active', ?1, 250)",
+                [l2_notes],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO ledgers VALUES ('ldg_4', 'u1', '头像循环动效', 'muted', ?1, 200)",
+                [l3_notes],
             )
             .unwrap();
         }
@@ -1259,10 +1281,15 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(u1_mem.contains("已有记忆"));
+        assert!(u1_mem.len() <= 8000);
+        assert!(u1_mem.contains("已有记忆头部"));
         assert!(u1_mem.contains("## 历史长期项目"));
-        assert!(u1_mem.contains("**Tidalis 初版交付**（跟进中）：已完成核心导出"));
-        assert!(u1_mem.contains("**头像循环动效**（已静默）：待素材到位"));
+        assert!(u1_mem.contains("**Tidalis 初版交付**（跟进中）：Tidalis开头"));
+        assert!(u1_mem.contains("Tidalis尾部"));
+        assert!(u1_mem.contains("**agenct v2 单栈重构**（跟进中）：Agenct开头"));
+        assert!(u1_mem.contains("Agenct尾部"));
+        assert!(u1_mem.contains("**头像循环动效**（已静默）：Avatar开头"));
+        assert!(u1_mem.contains("Avatar尾部"));
 
         let u2_mem: String = conn
             .query_row(

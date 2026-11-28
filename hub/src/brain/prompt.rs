@@ -190,7 +190,7 @@ pub(super) fn build_system_prompt(
     gitlab_configured: bool,
 ) -> String {
     let soul = truncate_bytes(&profile.soul_md, 1500);
-    let memory = truncate_head_tail_bytes(&profile.memory_md, 1400, 2200);
+    let memory = truncate_head_tail_bytes(&profile.memory_md, 1800, 3000);
     let summary_section = if rolling_summary.trim().is_empty() {
         "（暂无早期历史摘要）".into()
     } else {
