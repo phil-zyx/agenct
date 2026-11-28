@@ -286,6 +286,7 @@ try {
     null,
     { timeout: 5000 },
   );
+  await page.click('#roles-card > summary');
   const delRole = page.waitForResponse(
     (r) => r.url().endsWith('/api/roles/planner') && r.request().method() === 'DELETE',
   );

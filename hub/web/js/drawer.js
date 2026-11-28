@@ -2,7 +2,7 @@
 import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 import { renderBuddySvg } from './avatar.js';
 import { playTap, playToggle } from './sound.js';
-import { stripNoise, triageTasks, cleanPreviewLine } from './triage.js';
+import { stripNoise, describeTask, cleanPreviewLine } from './triage.js';
 import { COPY_BTN_HTML, bindHoldAction, initDelegatedCopy } from './ui.js';
 
 export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread }) {
@@ -142,7 +142,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     };
   }
 
-  function rolesCardHtml(roles) {
+  function rolesCardHtml(roles, { foldable = false, open = false } = {}) {
     const SANDBOX_LABEL = { readonly: '只读', 'workspace-write': '可写' };
     const rolesHtml = roles.length
       ? roles
@@ -174,17 +174,29 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           .join('')
       : '<p class="note">尚未配置军团角色。在对话中直接说，例如：<br>「配置 planner 用 agy / claude-opus-5-5-high（只读规划），executor 用 codex / gpt-6.2-sol（可写执行）」</p>';
 
-    return `
-      <section class="panel-card" id="roles-card">
-        <h3><span>我的军团 (${roles.length})</span><span class="note">对话配置</span></h3>
+    const body = `
         ${rolesHtml}
         <div class="row">
           <button type="button" id="chat-tune-roles" class="sm primary">去对话调整</button>
-        </div>
+        </div>`;
+
+    if (foldable) {
+      return `
+      <details class="panel-card drawer-fold" id="roles-card" data-drawer-fold="roles"${open ? ' open' : ''}>
+        <summary><span>我的军团 (${roles.length})</span><span class="drawer-fold-meta">对话配置</span></summary>
+        ${body}
+      </details>`;
+    }
+
+    return `
+      <section class="panel-card" id="roles-card">
+        <h3><span>我的军团 (${roles.length})</span><span class="note">对话配置</span></h3>
+        ${body}
       </section>`;
   }
 
-  function nodesCardHtml(nodes) {
+  function nodesCardHtml(nodes, { foldable = false, open = false } = {}) {
+    const onlineCount = nodes.filter((n) => n.online).length;
     const nodesHtml = nodes.length
       ? nodes
           .map((n) => {
@@ -247,9 +259,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           .join('')
       : '<p class="note">尚未接入执行节点</p>';
 
-    return `
-      <section class="panel-card">
-        <h3>我的节点 (${nodes.length})</h3>
+    const body = `
         ${nodesHtml}
         <details class="node-repos mt-10" ${nodes.length === 0 ? 'open' : ''}>
           <summary>+ 添加新节点</summary>
@@ -268,7 +278,20 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             </div>
           </form>
         </details>
-        ${lastInstallCmd ? `<div class="install-box">${COPY_BTN_HTML}<strong>一次性接入命令：</strong><br><code>${esc(lastInstallCmd)}</code></div>` : ''}
+        ${lastInstallCmd ? `<div class="install-box">${COPY_BTN_HTML}<strong>一次性接入命令：</strong><br><code>${esc(lastInstallCmd)}</code></div>` : ''}`;
+
+    if (foldable) {
+      return `
+      <details class="panel-card drawer-fold" data-drawer-fold="nodes"${open ? ' open' : ''}>
+        <summary><span>我的节点 (${nodes.length})</span><span class="drawer-fold-meta">${onlineCount} 在线</span></summary>
+        ${body}
+      </details>`;
+    }
+
+    return `
+      <section class="panel-card">
+        <h3>我的节点 (${nodes.length})</h3>
+        ${body}
       </section>`;
   }
 
@@ -369,10 +392,12 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     const elevatedNodeIds = new Set(nodes.filter((n) => parseCapabilities(n.capabilities).elevated).map((n) => n.id));
     const anyElevatedNode = elevatedNodeIds.size > 0;
     const uid = state.user?.id;
-    const groups = triageTasks(tasks);
-    const taskViews = new Map(Object.values(groups).flat().map((view) => [view.task, view]));
+    const taskViews = new Map(tasks.map((task) => [task, describeTask(task)]));
     const openLogs = new Set(
       Array.from(bodyEl.querySelectorAll('[data-triage-log][open]'), (el) => el.dataset.triageLog),
+    );
+    const openFolds = new Set(
+      Array.from(bodyEl.querySelectorAll('[data-drawer-fold][open]'), (el) => el.dataset.drawerFold),
     );
     const runningIds = new Set();
 
@@ -569,24 +594,30 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         </div>`;
     }
 
+    const isAttentionTask = (t) => !!t && (t.status === 'running' || t.status === 'pending' || t.status === 'failed');
     const activeThreads = threads.filter((t) => t.status === 'active');
     const archivedThreads = threads.filter((t) => t.status !== 'active');
+    const threadsByLedger = new Map();
+    for (const thr of threads) {
+      if (thr.ledger_id) {
+        threadsByLedger.set(thr.ledger_id, (threadsByLedger.get(thr.ledger_id) || 0) + 1);
+      }
+    }
 
-    const taskCards = new Map();
-    const otherCards = [];
+    const attentionCards = [];
+    const idleActiveThreadCards = [];
     for (const thr of activeThreads) {
       const latest = tasksByThread.get(thr.id)?.[0];
       const card = renderThreadCard(thr);
-      if (latest) taskCards.set(latest, card);
-      else otherCards.push(card);
+      if (isAttentionTask(latest)) attentionCards.push(card);
+      else idleActiveThreadCards.push(card);
     }
 
-    // Cross-user delegated tasks (not tied to a thread).
-    for (const t of standaloneCollab) {
+    const renderCollabCard = (t) => {
       const stLabel = TASK_STATUS_LABEL[t.status] || t.status;
-      const { preview } = taskViews.get(t);
+      const { preview } = taskViews.get(t) || { preview: '' };
       const actions = taskActionsHtml(t);
-      taskCards.set(t, `
+      return `
         <div class="item">
           <div class="item-head">
             <span>${esc(t.title)}</span>
@@ -597,23 +628,18 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           ${renderTaskProgress(t)}
           ${renderRunsDetails([t])}
           ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
-        </div>`);
-    }
+        </div>`;
+    };
 
-    // Active ledgers unified into the same thread list.
-    for (const l of ledgers) {
-      otherCards.push(`
-        <div class="item">
-          <div class="item-head">
-            <span>${esc(l.title)}</span>
-            <span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span>
-          </div>
-          ${compactTextHtml(l.notes, 64, '查看全文')}
-          <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
-        </div>`);
+    const doneCollabCards = [];
+    for (const t of standaloneCollab) {
+      const card = renderCollabCard(t);
+      if (isAttentionTask(t)) attentionCards.push(card);
+      else doneCollabCards.push(card);
     }
 
     // Legacy unthreaded self-tasks grouped cleanly by title (eliminates duplicate cards).
+    const doneLegacyCards = [];
     for (const [title, runs] of legacyGroups.entries()) {
       const latest = runs[0];
       const isRunning = latest.status === 'running';
@@ -622,9 +648,9 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       if (latest.node_id) metaParts.push(`节点 ${latest.node_id}`);
       if (runs.length > 1) metaParts.push(`${runs.length} 次执行`);
       if (latest.updated_at) metaParts.push(fmtTime(latest.updated_at));
-      const { preview } = taskViews.get(latest);
+      const { preview } = taskViews.get(latest) || { preview: '' };
       const actions = taskActionsHtml(latest);
-      taskCards.set(latest, `
+      const card = `
         <div class="item">
           <div class="item-head">
             <span>${esc(title)}</span>
@@ -636,24 +662,76 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           ${renderTaskProgress(latest)}
           ${renderRunsDetails(runs)}
           ${actions.length ? `<div class="row">${actions.join('')}</div>` : ''}
-        </div>`);
+        </div>`;
+      if (isAttentionTask(latest)) attentionCards.push(card);
+      else doneLegacyCards.push(card);
     }
 
-    const triageHtml = [
-      ['decision', '待决策'],
-      ['conclusion', '结论'],
-      ['summary', '摘要+外链'],
-    ].map(([group, title]) => {
-      const cards = groups[group].map(({ task }) => taskCards.get(task)).filter(Boolean);
-      if (group === 'summary') cards.push(...otherCards);
-      return cards.length
-        ? `<section class="panel-card task-triage" data-triage-group="${group}"><h3>${title} (${cards.length})</h3>${cards.join('')}</section>`
-        : '';
-    }).join('');
-
-    const archivedHtml = archivedThreads.length
-      ? `<details class="node-repos mt-10"><summary>已归档线程 (${archivedThreads.length})</summary><div class="mt-6">${archivedThreads.map(renderThreadCard).join('')}</div></details>`
+    const attentionHtml = attentionCards.length
+      ? `<section class="panel-card workbench-live"><h3><span>待处理 / 执行中 (${attentionCards.length})</span><span class="note">实时状态</span></h3>${attentionCards.join('')}</section>`
       : '';
+
+    const showRecentArchived = idleActiveThreadCards.length === 0 && attentionCards.length === 0 && archivedThreads.length > 0;
+    const visibleArchived = showRecentArchived ? archivedThreads.slice(0, 3) : [];
+    const foldedArchived = showRecentArchived ? archivedThreads.slice(3) : archivedThreads;
+    const threadBodyParts = [];
+    if (idleActiveThreadCards.length) {
+      threadBodyParts.push(idleActiveThreadCards.join(''));
+    } else if (visibleArchived.length) {
+      threadBodyParts.push('<p class="workbench-subnote">暂无进行中线程，以下为最近历史话题（可点「进入话题」续接）</p>');
+      threadBodyParts.push(visibleArchived.map(renderThreadCard).join(''));
+    } else if (!attentionCards.length) {
+      threadBodyParts.push('<p class="note">暂无工作线程，在对话中派发任务或新建话题会自动生成</p>');
+    }
+    if (foldedArchived.length) {
+      const label = showRecentArchived ? `更多历史线程 (${foldedArchived.length})` : `历史已归档线程 (${foldedArchived.length})`;
+      threadBodyParts.push(
+        `<details class="node-repos mt-10"><summary>${label}</summary><div class="mt-6">${foldedArchived.map(renderThreadCard).join('')}</div></details>`,
+      );
+    }
+    const extraDoneCards = [...doneCollabCards, ...doneLegacyCards];
+    if (extraDoneCards.length) {
+      threadBodyParts.push(
+        `<details class="node-repos mt-10"><summary>近期单次任务 (${extraDoneCards.length})</summary><div class="mt-6">${extraDoneCards.join('')}</div></details>`,
+      );
+    }
+    const threadsSectionHtml = `
+      <section class="panel-card">
+        <h3><span>工作线程 (${activeThreads.length})</span><span class="note">话题与会话</span></h3>
+        ${threadBodyParts.join('')}
+      </section>`;
+
+    const ledgersHtml = ledgers.length
+      ? ledgers
+          .map((l) => {
+            const linkedCount = threadsByLedger.get(l.id) || 0;
+            const linkedMeta = linkedCount
+              ? `<div class="thread-meta">关联 ${linkedCount} 个工作线程</div>`
+              : '';
+            return `
+        <div class="item">
+          <div class="item-head">
+            <span>${esc(l.title)}</span>
+            <span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span>
+          </div>
+          ${linkedMeta}
+          ${compactTextHtml(l.notes, 64, '查看全文')}
+          <div class="row"><button type="button" class="sm danger" data-del-ledger="${esc(l.id)}">删除</button></div>
+        </div>`;
+          })
+          .join('')
+      : '<p class="note">暂无长期项目，在对话中说明长期跟进事项会自动记录</p>';
+
+    const ledgersSectionHtml = `
+      <section class="panel-card">
+        <h3><span>长期项目 (${ledgers.length})</span><span class="note">持续事项主线</span></h3>
+        ${ledgersHtml}
+      </section>`;
+
+    const hasActiveOrFailedCron = crons.some((c) => c.last_status === 'failed' || c.last_status === 'running');
+    const cronsOpen = openFolds.has('crons') || hasActiveOrFailedCron;
+    const rolesOpen = openFolds.has('roles');
+    const nodesOpen = openFolds.has('nodes') || nodes.length === 0 || Boolean(lastInstallCmd);
 
     const cronsHtml = crons.length
       ? crons
@@ -686,11 +764,12 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       : '<p class="note">暂无定时任务，直接对话即可创建</p>';
 
     bodyEl.innerHTML = `
-      ${triageHtml || '<p class="note">暂无活跃工作线程，在对话中发起任务或跟进事项会自动生成</p>'}
-      ${archivedHtml ? `<section class="panel-card">${archivedHtml}</section>` : ''}
+      ${attentionHtml}
+      ${threadsSectionHtml}
+      ${ledgersSectionHtml}
 
-      <section class="panel-card">
-        <h3>定时任务 (${crons.length})</h3>
+      <details class="panel-card drawer-fold" data-drawer-fold="crons"${cronsOpen ? ' open' : ''}>
+        <summary><span>定时任务 (${crons.length})</span><span class="drawer-fold-meta">${hasActiveOrFailedCron ? '需关注' : '自动运行'}</span></summary>
         ${cronsHtml}
         <details class="node-repos mt-10">
           <summary>+ 手动添加定时</summary>
@@ -707,11 +786,11 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             </div>
           </form>
         </details>
-      </section>
+      </details>
 
-      ${rolesCardHtml(roles)}
+      ${rolesCardHtml(roles, { foldable: true, open: rolesOpen })}
 
-      ${nodesCardHtml(nodes)}`;
+      ${nodesCardHtml(nodes, { foldable: true, open: nodesOpen })}`;
 
     for (const id of taskTimers.keys()) {
       if (!runningIds.has(id)) taskTimers.delete(id);

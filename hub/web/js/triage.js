@@ -1,5 +1,3 @@
-const CONFIRMATION = /^(?:待(?:用户|人工)?(?:确认|决策)(?:\s*[:：]|$)|(?:请(?:你|您|用户)?|(?:仍)?需要(?:你|您|用户|人工))(?:先)?(?:确认|决定|选择)|(?:please confirm|(?:user|human) (?:confirmation|approval) (?:is )?required)\b)/i;
-
 export function stripNoise(raw) {
   return String(raw || '')
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
@@ -38,26 +36,18 @@ function externalLinks(task) {
   return [...links];
 }
 
-export function triageTasks(tasks) {
-  const groups = { decision: [], conclusion: [], summary: [] };
-  for (const task of tasks) {
-    const confirmation = task.status === 'done' && previewLines(task.result).find((line) => CONFIRMATION.test(line));
-    if (task.status === 'failed' || confirmation) {
-      groups.decision.push({ task, preview: cleanPreviewLine(confirmation || task.blocked_reason || task.result) });
-    } else if (task.status === 'done' || task.status === 'canceled') {
-      groups.conclusion.push({ task, preview: cleanPreviewLine(task.result) });
-    } else {
-      groups.summary.push({
-        task,
-        preview: cleanPreviewLine(task.result || task.instruction),
-        progress: {
+export function describeTask(task) {
+  if (!task) return { preview: '', progress: null };
+  const isLive = task.status === 'running' || task.status === 'pending';
+  return {
+    preview: cleanPreviewLine(task.blocked_reason || task.result || task.instruction),
+    progress: isLive
+      ? {
           stage: stripNoise(task.stage),
           elapsed: Number.isFinite(task.elapsed_secs) && task.elapsed_secs >= 0 ? task.elapsed_secs : null,
           logTail: stripNoise(task.log_tail).slice(0, 600),
           links: externalLinks(task),
-        },
-      });
-    }
-  }
-  return groups;
+        }
+      : null,
+  };
 }
