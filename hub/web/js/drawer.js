@@ -1023,37 +1023,36 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
 
       <section class="panel-card">
         <h3>IM 随身双向接入（免公网端口）</h3>
-        <p class="note">Hub 主动从内网外连企业微信/钉钉长连接网关，无需公网 IP 或端口映射；首次需用手机给机器人发 <code>/bind 口令</code> 锁定本人账号。</p>
+        <p class="note">支持团队共享同一企微/钉钉机器人：每位成员用自己账号生成口令并给机器人发送 <code>/bind 口令</code>，发言时按成员身份自动路由到各自的 Agenct 空间、记忆与节点。</p>
         ${(() => {
           const wecom = im.wecom || {};
           const dd = im.dingtalk || {};
-          const allBound = (!wecom.enabled || Boolean(wecom.bound_user_id)) && (!dd.enabled || Boolean(dd.bound_staff_id));
-          if (allBound && !im.bind_pending) lastImBindCode = '';
-          const statusBadge = (st, enabled) => {
-            if (!enabled) return '<span class="badge">未启用</span>';
-            const s = st?.state || 'connecting';
-            if (s === 'connected') return '<span class="badge ok">已连接</span>';
-            if (s === 'error') return '<span class="badge">连接异常</span>';
-            return '<span class="badge warn">连接中</span>';
+          const sharedWecom = Boolean(im.shared_wecom_online);
+          const sharedDd = Boolean(im.shared_dingtalk_online);
+          const hasOwnCreds = Boolean(wecom.configured || dd.configured);
+          const showCredsOpen = hasOwnCreds || Boolean(state.user?.is_admin) || (!sharedWecom && !sharedDd);
+          const statusBadge = (st, enabled, shared) => {
+            if (enabled) {
+              const s = st?.state || 'connecting';
+              if (s === 'connected') return '<span class="badge ok">长连接在线</span>';
+              if (s === 'error') return '<span class="badge">连接异常</span>';
+              return '<span class="badge warn">连接中</span>';
+            }
+            return shared ? '<span class="badge ok">团队机器人在线</span>' : '<span class="badge">未接入</span>';
           };
           const bindNotice = lastImBindCode
             ? `<div class="sandbox-block-note mb-10">
-                 <div>请用你的企业微信或钉钉单聊给机器人发送下方配对口令（15 分钟内有效）：</div>
+                 <div>请用你的企业微信或钉钉（单聊或群聊 <code>@机器人</code>）发送下方配对口令（15 分钟内有效）：</div>
                  <div class="install-box mt-6"><code>/bind ${esc(lastImBindCode)}</code>${COPY_BTN_HTML}</div>
                </div>`
             : im.bind_pending
               ? '<div class="sandbox-block-note mb-10">已有生效中的配对口令待验证；若忘记可点击下方「重新生成口令」。</div>'
               : '';
-          return `
-            ${bindNotice}
-            <form id="im-form">
+          const credsInner = `
               <div class="item">
                 <div class="item-head">
                   <strong>企业微信 · 智能机器人（API 长连接）</strong>
-                  <div class="row mt-0">
-                    ${statusBadge(wecom.status, wecom.enabled)}
-                    ${wecom.bound_user_id ? `<span class="badge ok">已绑定 ${esc(wecom.bound_user_id)}</span>` : (wecom.enabled ? '<span class="badge warn">待配对</span>' : '')}
-                  </div>
+                  <div class="row mt-0">${statusBadge(wecom.status, wecom.enabled, sharedWecom)}</div>
                 </div>
                 ${wecom.status?.state === 'error' && wecom.status?.last_error ? `<p class="note cron-failed">${esc(wecom.status.last_error)}</p>` : ''}
                 <label class="toggle"><span>启用企业微信长连接</span><input type="checkbox" name="wecom_enabled" ${wecom.enabled ? 'checked' : ''}></label>
@@ -1061,16 +1060,12 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
                 <input type="text" name="wecom_bot_id" value="${esc(wecom.bot_id || '')}" placeholder="工作台 → 智能机器人 → API 长连接 → Bot ID">
                 <label class="field-label">Secret ${wecom.configured ? `(已保存 ${esc(wecom.secret_preview)})` : '(未配置)'}</label>
                 <input type="password" name="wecom_secret" placeholder="${wecom.configured ? '留空保持不变' : '机器人 Secret'}" autocomplete="off">
-                ${wecom.bound_user_id ? '<div class="row"><button type="button" id="im-unbind-wecom" class="sm danger">解绑企微账号</button></div>' : ''}
               </div>
 
               <div class="item">
                 <div class="item-head">
                   <strong>钉钉 · 企业内部机器人（Stream 模式）</strong>
-                  <div class="row mt-0">
-                    ${statusBadge(dd.status, dd.enabled)}
-                    ${dd.bound_staff_id ? `<span class="badge ok">已绑定 ${esc(dd.bound_staff_id)}</span>` : (dd.enabled ? '<span class="badge warn">待配对</span>' : '')}
-                  </div>
+                  <div class="row mt-0">${statusBadge(dd.status, dd.enabled, sharedDd)}</div>
                 </div>
                 ${dd.status?.state === 'error' && dd.status?.last_error ? `<p class="note cron-failed">${esc(dd.status.last_error)}</p>` : ''}
                 <label class="toggle"><span>启用钉钉 Stream 长连接</span><input type="checkbox" name="dingtalk_enabled" ${dd.enabled ? 'checked' : ''}></label>
@@ -1078,8 +1073,30 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
                 <input type="text" name="dingtalk_client_id" value="${esc(dd.client_id || '')}" placeholder="钉钉开放平台 → 企业内部应用 → AppKey">
                 <label class="field-label">Client Secret（AppSecret）${dd.configured ? `(已保存 ${esc(dd.secret_preview)})` : '(未配置)'}</label>
                 <input type="password" name="dingtalk_client_secret" placeholder="${dd.configured ? '留空保持不变' : 'AppSecret'}" autocomplete="off">
-                ${dd.bound_staff_id ? '<div class="row"><button type="button" id="im-unbind-dd" class="sm danger">解绑钉钉账号</button></div>' : ''}
+              </div>`;
+          return `
+            <div class="item mb-10">
+              <div class="item-head">
+                <strong>我的账号配对状态</strong>
+                <div class="row mt-0">
+                  ${wecom.bound_user_id ? `<span class="badge ok">企微 ${esc(wecom.bound_user_id)}</span>` : `<span class="badge ${sharedWecom ? 'warn' : ''}">${sharedWecom ? '企微待配对' : '企微未绑定'}</span>`}
+                  ${dd.bound_staff_id ? `<span class="badge ok">钉钉 ${esc(dd.bound_staff_id)}</span>` : `<span class="badge ${sharedDd ? 'warn' : ''}">${sharedDd ? '钉钉待配对' : '钉钉未绑定'}</span>`}
+                </div>
               </div>
+              <div class="row">
+                <button type="button" id="im-bind-btn" class="primary sm">${im.bind_pending ? '重新生成口令' : '生成配对口令'}</button>
+                <button type="button" id="im-test-btn" class="sm">发送测试</button>
+                ${wecom.bound_user_id ? '<button type="button" id="im-unbind-wecom" class="sm danger">解绑企微</button>' : ''}
+                ${dd.bound_staff_id ? '<button type="button" id="im-unbind-dd" class="sm danger">解绑钉钉</button>' : ''}
+              </div>
+            </div>
+            ${bindNotice}
+            <form id="im-form">
+              ${
+                showCredsOpen
+                  ? credsInner
+                  : `<details class="mt-6"><summary>机器人连接凭证（管理员已接入团队机器人，成员无需填写，直接上方生成口令配对即可）</summary>${credsInner}</details>`
+              }
 
               <details class="mt-6" ${im.configured ? 'open' : ''}>
                 <summary>可选：群自定义机器人单向通知 Webhook</summary>
@@ -1099,8 +1116,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
 
               <div class="row">
                 <button type="submit" class="primary sm">保存配置</button>
-                <button type="button" id="im-bind-btn" class="sm">${im.bind_pending ? '重新生成口令' : '生成配对口令'}</button>
-                <button type="button" id="im-test-btn" class="sm">发送测试</button>
               </div>
             </form>`;
         })()}

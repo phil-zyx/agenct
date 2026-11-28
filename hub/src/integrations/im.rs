@@ -385,9 +385,37 @@ impl ImRuntime {
             .unwrap_or_default()
     }
 
-    fn get_wecom_tx(&self, user_id: &str) -> Option<mpsc::Sender<Value>> {
+    fn get_any_wecom_tx(&self, preferred_uid: &str) -> Option<mpsc::Sender<Value>> {
         let inner = self.inner.lock().expect("im_runtime mutex");
-        inner.users.get(user_id).and_then(|u| u.wecom_tx.clone())
+        if let Some(tx) = inner
+            .users
+            .get(preferred_uid)
+            .and_then(|u| u.wecom_tx.clone())
+        {
+            return Some(tx);
+        }
+        inner.users.values().find_map(|u| u.wecom_tx.clone())
+    }
+
+    fn has_any_wecom_connected(&self) -> bool {
+        let inner = self.inner.lock().expect("im_runtime mutex");
+        inner.users.values().any(|u| u.wecom_tx.is_some())
+    }
+
+    fn is_dingtalk_connected(&self, user_id: &str) -> bool {
+        let inner = self.inner.lock().expect("im_runtime mutex");
+        inner
+            .users
+            .get(user_id)
+            .is_some_and(|u| u.dingtalk_status.state == "connected")
+    }
+
+    fn has_any_dingtalk_connected(&self) -> bool {
+        let inner = self.inner.lock().expect("im_runtime mutex");
+        inner
+            .users
+            .values()
+            .any(|u| u.dingtalk_status.state == "connected")
     }
 
     fn cache_dd_session_webhook(&self, user_id: &str, url: String, expires_at: i64) {
@@ -526,17 +554,12 @@ fn percent_encode(raw: &str) -> String {
 pub fn clean_im_text(raw: &str, is_group: bool) -> String {
     let mut s = raw.trim();
     if is_group {
-        loop {
-            let trimmed = s.trim_start();
-            if let Some(after_at) = trimmed.strip_prefix('@') {
-                if let Some(ws) = after_at.find(char::is_whitespace) {
-                    s = &after_at[ws..];
-                    continue;
-                }
+        if let Some(after_at) = s.strip_prefix('@') {
+            if let Some(ws) = after_at.find(char::is_whitespace) {
+                s = &after_at[ws..];
+            } else {
                 return String::new();
             }
-            s = trimmed;
-            break;
         }
     }
     s.trim().to_owned()
@@ -556,7 +579,12 @@ pub fn parse_bind_command(text: &str) -> Option<String> {
     }
 }
 
-fn config_summary_json(cfg: &ImConfig, wecom_st: &ChannelStatus, dd_st: &ChannelStatus) -> Value {
+fn config_summary_json(
+    cfg: &ImConfig,
+    wecom_st: &ChannelStatus,
+    dd_st: &ChannelStatus,
+    runtime: &ImRuntime,
+) -> Value {
     let now = now_unix();
     let bind_pending = !cfg.bind_code_hash.is_empty() && cfg.bind_code_expires_at > now;
     json!({
@@ -576,6 +604,8 @@ fn config_summary_json(cfg: &ImConfig, wecom_st: &ChannelStatus, dd_st: &Channel
             "bound_staff_id": cfg.dingtalk.bound_staff_id,
             "status": dd_st,
         },
+        "shared_wecom_online": runtime.has_any_wecom_connected(),
+        "shared_dingtalk_online": runtime.has_any_dingtalk_connected(),
         "provider": cfg.provider,
         "configured": !cfg.webhook_url.is_empty(),
         "webhook_secret_configured": !cfg.webhook_secret.is_empty(),
@@ -584,6 +614,38 @@ fn config_summary_json(cfg: &ImConfig, wecom_st: &ChannelStatus, dd_st: &Channel
         "notify_delegation": cfg.notify_delegation,
         "notify_delivery": cfg.notify_delivery,
     })
+}
+
+async fn load_all_active_im_configs(hub: &Hub) -> Result<Vec<(String, String, String, ImConfig)>> {
+    let secrets = hub.secrets.clone();
+    hub.db
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT u.id, u.username, u.display_name, i.config_json
+                 FROM users u
+                 JOIN integrations i ON i.user_id = u.id
+                 WHERE u.status = 'active' AND i.kind = 'im'
+                 ORDER BY u.created_at ASC",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut out = Vec::with_capacity(rows.len());
+            for (uid, uname, dname, raw) in rows {
+                if let Ok(cfg) = secrets.decrypt_json::<ImConfig>(SCOPE_IM, &uid, Some(raw)) {
+                    out.push((uid, uname, dname, cfg));
+                }
+            }
+            Ok(out)
+        })
+        .await
 }
 
 async fn load_im_config(hub: &Hub, user_id: &str) -> Result<ImConfig> {
@@ -633,7 +695,12 @@ async fn save_im_config_db(
 pub async fn get_config(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Value>> {
     let cfg = load_im_config(&hub, &user.id).await?;
     let (wecom_st, dd_st) = hub.im_runtime.get_statuses(&user.id);
-    Ok(Json(config_summary_json(&cfg, &wecom_st, &dd_st)))
+    Ok(Json(config_summary_json(
+        &cfg,
+        &wecom_st,
+        &dd_st,
+        &hub.im_runtime,
+    )))
 }
 
 fn validate_custom_ws_url(raw: &str, allow_private: bool) -> Result<String> {
@@ -822,7 +889,7 @@ pub async fn save_config(
     hub.events.emit(&user.id, "im", json!({"updated": true}));
 
     let (wecom_st, dd_st) = hub.im_runtime.get_statuses(&user.id);
-    let mut out = config_summary_json(&cfg, &wecom_st, &dd_st);
+    let mut out = config_summary_json(&cfg, &wecom_st, &dd_st, &hub.im_runtime);
     out["ok"] = json!(true);
     out["bind_code"] = json!(issued_bind_code);
     Ok(Json(out))
@@ -942,28 +1009,23 @@ async fn send_wecom_proactive(
     title: &str,
     content: &str,
 ) -> std::result::Result<(), &'static str> {
-    if !cfg.enabled || cfg.bound_user_id.is_empty() {
+    if cfg.bound_user_id.is_empty() {
         return Err("wecom not bound");
     }
     let tx = hub
         .im_runtime
-        .get_wecom_tx(user_id)
+        .get_any_wecom_tx(user_id)
         .ok_or("wecom websocket disconnected")?;
-    let chat_id = if cfg.push_chat_id.is_empty() {
-        cfg.bound_user_id.as_str()
-    } else {
-        cfg.push_chat_id.as_str()
-    };
-    let chat_type = if cfg.push_chat_type == 2 { 2 } else { 1 };
     let body_md = truncate_bytes(&format!("**{title}**\n\n{}", content.trim()), 1800);
+    // Always deliver personal proactive alerts (task results, delegations, /approve codes) 1v1.
     let frame = json!({
         "cmd": "aibot_send_msg",
         "headers": {
             "req_id": format!("push_{}", Uuid::new_v4().simple()),
         },
         "body": {
-            "chatid": chat_id,
-            "chat_type": chat_type,
+            "chatid": cfg.bound_user_id,
+            "chat_type": 1,
             "msgtype": "markdown",
             "markdown": {"content": body_md},
         }
@@ -1071,6 +1133,32 @@ async fn send_dingtalk_session_webhook(
     Ok(())
 }
 
+async fn resolve_dingtalk_bot_for_push(
+    hub: &Hub,
+    user_id: &str,
+    user_cfg: &DingTalkBotConfig,
+) -> Option<(String, DingTalkBotConfig)> {
+    if user_cfg.enabled && !user_cfg.client_id.is_empty() && !user_cfg.client_secret.is_empty() {
+        return Some((user_id.to_owned(), user_cfg.clone()));
+    }
+    let all = load_all_active_im_configs(hub).await.ok()?;
+    let mut fallback = None;
+    for (uid, _, _, cfg) in all {
+        if cfg.dingtalk.enabled
+            && !cfg.dingtalk.client_id.is_empty()
+            && !cfg.dingtalk.client_secret.is_empty()
+        {
+            if hub.im_runtime.is_dingtalk_connected(&uid) {
+                return Some((uid, cfg.dingtalk));
+            }
+            if fallback.is_none() {
+                fallback = Some((uid, cfg.dingtalk));
+            }
+        }
+    }
+    fallback
+}
+
 async fn send_dingtalk_proactive(
     hub: &Hub,
     user_id: &str,
@@ -1078,36 +1166,40 @@ async fn send_dingtalk_proactive(
     title: &str,
     content: &str,
 ) -> std::result::Result<(), &'static str> {
-    if !cfg.enabled || cfg.bound_staff_id.is_empty() {
+    if cfg.bound_staff_id.is_empty() {
         return Err("dingtalk not bound");
     }
-    if let Ok(token) = fetch_dingtalk_token(hub, user_id, cfg).await {
-        let api_base = resolved_dd_api_base(cfg, hub.config.allow_private_outbound);
-        let robot_code = if cfg.robot_code.is_empty() {
-            cfg.client_id.as_str()
-        } else {
-            cfg.robot_code.as_str()
-        };
-        let msg_param = json!({
-            "title": truncate_bytes(title, 120),
-            "text": truncate_bytes(content.trim(), 1800),
-        })
-        .to_string();
-        if let Ok(resp) = hub
-            .user_http
-            .post(format!("{api_base}/v1.0/robot/oToMessages/batchSend"))
-            .header("x-acs-dingtalk-access-token", token)
-            .json(&json!({
-                "robotCode": robot_code,
-                "userIds": [cfg.bound_staff_id],
-                "msgKey": "sampleMarkdown",
-                "msgParam": msg_param,
-            }))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                return Ok(());
+    if let Some((bot_owner_uid, bot_cfg)) = resolve_dingtalk_bot_for_push(hub, user_id, cfg).await {
+        if let Ok(token) = fetch_dingtalk_token(hub, &bot_owner_uid, &bot_cfg).await {
+            let api_base = resolved_dd_api_base(&bot_cfg, hub.config.allow_private_outbound);
+            let robot_code = if !cfg.robot_code.is_empty() {
+                cfg.robot_code.as_str()
+            } else if !bot_cfg.robot_code.is_empty() {
+                bot_cfg.robot_code.as_str()
+            } else {
+                bot_cfg.client_id.as_str()
+            };
+            let msg_param = json!({
+                "title": truncate_bytes(title, 120),
+                "text": truncate_bytes(content.trim(), 1800),
+            })
+            .to_string();
+            if let Ok(resp) = hub
+                .user_http
+                .post(format!("{api_base}/v1.0/robot/oToMessages/batchSend"))
+                .header("x-acs-dingtalk-access-token", token)
+                .json(&json!({
+                    "robotCode": robot_code,
+                    "userIds": [cfg.bound_staff_id],
+                    "msgKey": "sampleMarkdown",
+                    "msgParam": msg_param,
+                }))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    return Ok(());
+                }
             }
         }
     }
@@ -1129,10 +1221,10 @@ pub async fn maybe_notify(hub: &Hub, user_id: &str, event_kind: &str, title: &st
     if !enabled {
         return;
     }
-    if cfg.wecom.enabled && !cfg.wecom.bound_user_id.is_empty() {
+    if !cfg.wecom.bound_user_id.is_empty() {
         let _ = send_wecom_proactive(hub, user_id, &cfg.wecom, title, content).await;
     }
-    if cfg.dingtalk.enabled && !cfg.dingtalk.bound_staff_id.is_empty() {
+    if !cfg.dingtalk.bound_staff_id.is_empty() {
         let _ = send_dingtalk_proactive(hub, user_id, &cfg.dingtalk, title, content).await;
     }
     if !cfg.webhook_url.is_empty() {
@@ -1142,8 +1234,8 @@ pub async fn maybe_notify(hub: &Hub, user_id: &str, event_kind: &str, title: &st
 
 pub async fn test_webhook(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Result<Json<Value>> {
     let cfg = load_im_config(&hub, &user.id).await?;
-    let has_wecom = cfg.wecom.enabled && !cfg.wecom.bound_user_id.is_empty();
-    let has_dd = cfg.dingtalk.enabled && !cfg.dingtalk.bound_staff_id.is_empty();
+    let has_wecom = !cfg.wecom.bound_user_id.is_empty();
+    let has_dd = !cfg.dingtalk.bound_staff_id.is_empty();
     let has_hook = !cfg.webhook_url.is_empty();
     if !has_wecom && !has_dd && !has_hook {
         return Err(invalid(
@@ -1188,82 +1280,93 @@ enum ImChannel {
     DingTalk,
 }
 
-enum AuthDecision {
-    BindReply(String),
-    Authorized(String),
-    Unauthorized(Option<String>),
+enum RouteDecision {
+    DirectReply(String),
+    Routed { user_id: String, text: String },
+    Ignore,
 }
 
 struct InboundMeta<'a> {
     channel: ImChannel,
     sender_id: &'a str,
-    chat_id: &'a str,
     is_group: bool,
     robot_code: &'a str,
 }
 
-async fn authorize_or_bind_im_sender(
+async fn resolve_or_bind_im_sender(
     hub: &Hub,
-    user_id: &str,
     meta: InboundMeta<'_>,
     raw_text: &str,
-) -> AuthDecision {
+) -> RouteDecision {
     let text = clean_im_text(raw_text, meta.is_group);
     if text.is_empty() {
-        return AuthDecision::Unauthorized(None);
+        return RouteDecision::Ignore;
     }
+    let ch_name = match meta.channel {
+        ImChannel::WeCom => "wecom",
+        ImChannel::DingTalk => "dingtalk",
+    };
+    let Ok(all_cfgs) = load_all_active_im_configs(hub).await else {
+        return RouteDecision::Ignore;
+    };
+
     if let Some(code) = parse_bind_command(&text) {
-        let rate_key = format!("im_bind:{user_id}:{}", meta.sender_id);
+        let rate_key = format!("im_bind:{ch_name}:{}", meta.sender_id);
         if !hub.approval_limiter.check_allowed(&rate_key) {
-            return AuthDecision::BindReply("尝试次数过多，请 10 分钟后再试。".into());
+            return RouteDecision::DirectReply("尝试次数过多，请 10 分钟后再试。".into());
         }
-        let Ok(mut cfg) = load_im_config(hub, user_id).await else {
-            return AuthDecision::BindReply("读取 IM 配置失败。".into());
-        };
         let hash = sha256_hex(&code);
-        if cfg.bind_code_hash.is_empty()
-            || now_unix() > cfg.bind_code_expires_at
-            || !constant_time_eq(cfg.bind_code_hash.as_bytes(), hash.as_bytes())
-        {
+        let now = now_unix();
+        let matched = all_cfgs.iter().find(|(_, _, _, cfg)| {
+            !cfg.bind_code_hash.is_empty()
+                && cfg.bind_code_expires_at >= now
+                && constant_time_eq(cfg.bind_code_hash.as_bytes(), hash.as_bytes())
+        });
+        let Some((matched_uid, matched_uname, matched_dname, matched_cfg_ref)) = matched else {
             hub.approval_limiter.record_failure(&rate_key);
-            return AuthDecision::BindReply(
-                "配对口令无效或已过期，请在网页「设置 → IM 接入」重新生成口令。".into(),
+            return RouteDecision::DirectReply(
+                "配对口令无效或已过期，请在网页「设置 → IM 随身双向接入」重新生成口令。".into(),
             );
+        };
+        if let Some((_, other_uname, _, _)) = all_cfgs.iter().find(|(uid, _, _, cfg)| {
+            uid != matched_uid
+                && match meta.channel {
+                    ImChannel::WeCom => cfg.wecom.bound_user_id == meta.sender_id,
+                    ImChannel::DingTalk => cfg.dingtalk.bound_staff_id == meta.sender_id,
+                }
+        }) {
+            return RouteDecision::DirectReply(format!(
+                "该账号已绑定至 @{other_uname}，如需切换请先在原账号设置中解绑。"
+            ));
         }
+
         hub.approval_limiter.reset(&rate_key);
-        let ch_name = match meta.channel {
+        let mut updated = matched_cfg_ref.clone();
+        match meta.channel {
             ImChannel::WeCom => {
-                cfg.wecom.bound_user_id = meta.sender_id.to_owned();
-                cfg.wecom.push_chat_id = if meta.is_group && !meta.chat_id.is_empty() {
-                    meta.chat_id.to_owned()
-                } else {
-                    meta.sender_id.to_owned()
-                };
-                cfg.wecom.push_chat_type = if meta.is_group && !meta.chat_id.is_empty() {
-                    2
-                } else {
-                    1
-                };
-                "wecom"
+                updated.wecom.bound_user_id = meta.sender_id.to_owned();
+                updated.wecom.push_chat_id = meta.sender_id.to_owned();
+                updated.wecom.push_chat_type = 1;
             }
             ImChannel::DingTalk => {
-                cfg.dingtalk.bound_staff_id = meta.sender_id.to_owned();
+                updated.dingtalk.bound_staff_id = meta.sender_id.to_owned();
                 if !meta.robot_code.trim().is_empty() {
-                    cfg.dingtalk.robot_code = meta.robot_code.trim().to_owned();
+                    updated.dingtalk.robot_code = meta.robot_code.trim().to_owned();
                 }
-                "dingtalk"
             }
-        };
-        let all_bound = (!cfg.wecom.enabled || !cfg.wecom.bound_user_id.is_empty())
-            && (!cfg.dingtalk.enabled || !cfg.dingtalk.bound_staff_id.is_empty());
-        if all_bound {
-            cfg.bind_code_hash.clear();
-            cfg.bind_code_expires_at = 0;
+        }
+        let wecom_pending = updated.wecom.bound_user_id.is_empty()
+            && (updated.wecom.enabled || hub.im_runtime.has_any_wecom_connected());
+        let dd_pending = updated.dingtalk.bound_staff_id.is_empty()
+            && (updated.dingtalk.enabled || hub.im_runtime.has_any_dingtalk_connected());
+        if !wecom_pending && !dd_pending {
+            updated.bind_code_hash.clear();
+            updated.bind_code_expires_at = 0;
         }
         if save_im_config_db(
             hub,
-            user_id,
-            &cfg,
+            matched_uid,
+            &updated,
             Some((
                 "im_bind",
                 &format!("绑定 {ch_name} 账号 {}", meta.sender_id),
@@ -1272,40 +1375,37 @@ async fn authorize_or_bind_im_sender(
         .await
         .is_err()
         {
-            return AuthDecision::BindReply("保存绑定状态失败。".into());
+            return RouteDecision::DirectReply("保存绑定状态失败。".into());
         }
         hub.events.emit(
-            user_id,
+            matched_uid,
             "im",
             json!({"bound": ch_name, "sender_id": meta.sender_id}),
         );
-        return AuthDecision::BindReply(format!(
-            "已成功绑定账号（{}）。现在可以直接发送指令、接收任务汇报，或发送 `/approve <审批码>` 放行任务。",
+        return RouteDecision::DirectReply(format!(
+            "已成功绑定到 Agenct 账号「{matched_dname} (@{matched_uname})」（{ch_name}: {}）。现在单聊或在群里 @我，都会进入你自己的专属智能体空间，也可以直接发送 `/approve <审批码>` 放行任务。",
             meta.sender_id
         ));
     }
 
-    let Ok(cfg) = load_im_config(hub, user_id).await else {
-        return AuthDecision::Unauthorized(None);
-    };
-    let bound = match meta.channel {
-        ImChannel::WeCom => cfg.wecom.bound_user_id,
-        ImChannel::DingTalk => cfg.dingtalk.bound_staff_id,
-    };
-    if bound.is_empty() {
-        return AuthDecision::Unauthorized(Some(
-            "尚未绑定账号：请在 Agenct「设置 → IM 接入」生成配对口令，并在此发送 `/bind <6位口令>` 完成绑定。".into(),
-        ));
+    let owner = all_cfgs
+        .into_iter()
+        .find(|(_, _, _, cfg)| match meta.channel {
+            ImChannel::WeCom => cfg.wecom.bound_user_id == meta.sender_id,
+            ImChannel::DingTalk => cfg.dingtalk.bound_staff_id == meta.sender_id,
+        });
+    match owner {
+        Some((uid, _, _, _)) => {
+            if text.len() > 4000 {
+                return RouteDecision::DirectReply("消息过长，请控制在 4000 字节以内。".into());
+            }
+            RouteDecision::Routed { user_id: uid, text }
+        }
+        None => RouteDecision::DirectReply(format!(
+            "你尚未绑定个人 Agenct 账号：请先登录 {} ，在「设置 → IM 随身双向接入」点击「生成配对口令」，再发送 `/bind <6位口令>` 即可启用你自己的专属智能体。",
+            hub.config.public_origin
+        )),
     }
-    if meta.sender_id != bound {
-        return AuthDecision::Unauthorized(
-            (!meta.is_group).then(|| "此智能体仅限已绑定的本人账号使用。".into()),
-        );
-    }
-    if text.len() > 4000 {
-        return AuthDecision::BindReply("消息过长，请控制在 4000 字节以内。".into());
-    }
-    AuthDecision::Authorized(text)
 }
 
 fn resolved_wecom_ws_url(cfg: &WeComBotConfig, allow_private: bool) -> String {
@@ -1510,46 +1610,37 @@ async fn run_wecom_once(
                 };
                 let chattype = body["chattype"].as_str().unwrap_or("single");
                 let is_group = chattype == "group";
-                let chat_id = body["chatid"].as_str().unwrap_or("").trim().to_owned();
                 let sender_id = body["from"]["userid"].as_str().unwrap_or("").trim().to_owned();
                 if sender_id.is_empty() {
                     continue;
                 }
 
                 let hub_c = hub.clone();
-                let uid_c = user_id.to_owned();
                 let tx_c = tx.clone();
                 tokio::spawn(async move {
-                    handle_wecom_callback(
-                        hub_c, uid_c, tx_c, req_id, msgid, sender_id, chat_id, is_group, raw_text,
-                    )
-                    .await;
+                    handle_wecom_callback(hub_c, tx_c, req_id, msgid, sender_id, is_group, raw_text)
+                        .await;
                 });
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn handle_wecom_callback(
     hub: Hub,
-    user_id: String,
     tx: mpsc::Sender<Value>,
     req_id: String,
     msgid: String,
     sender_id: String,
-    chat_id: String,
     is_group: bool,
     raw_text: String,
 ) {
     let stream_id = format!("st_{}", Uuid::new_v4().simple());
-    let prompt_text = match authorize_or_bind_im_sender(
+    let (target_uid, prompt_text) = match resolve_or_bind_im_sender(
         &hub,
-        &user_id,
         InboundMeta {
             channel: ImChannel::WeCom,
             sender_id: &sender_id,
-            chat_id: &chat_id,
             is_group,
             robot_code: "",
         },
@@ -1557,30 +1648,24 @@ async fn handle_wecom_callback(
     )
     .await
     {
-        AuthDecision::BindReply(msg) => {
+        RouteDecision::DirectReply(msg) => {
             let _ = tx
                 .send(wecom_stream_frame(&req_id, &stream_id, &msg, true))
                 .await;
             return;
         }
-        AuthDecision::Unauthorized(Some(msg)) => {
-            let _ = tx
-                .send(wecom_stream_frame(&req_id, &stream_id, &msg, true))
-                .await;
-            return;
-        }
-        AuthDecision::Unauthorized(None) => return,
-        AuthDecision::Authorized(t) => t,
+        RouteDecision::Ignore => return,
+        RouteDecision::Routed { user_id, text } => (user_id, text),
     };
 
-    let mut ev_rx = hub.events.subscribe(&user_id);
+    let mut ev_rx = hub.events.subscribe(&target_uid);
     let _ = tx
         .send(wecom_stream_frame(&req_id, &stream_id, "思考中…", false))
         .await;
 
     let turn_req_id = format!("wecom:{msgid}");
     let hub_turn = hub.clone();
-    let uid_turn = user_id.clone();
+    let uid_turn = target_uid.clone();
     let mut turn_handle = tokio::spawn(async move {
         run_turn(&hub_turn, &uid_turn, &prompt_text, Some(&turn_req_id), None).await
     });
@@ -1826,7 +1911,6 @@ async fn run_dingtalk_once(
                         .trim()
                         .to_owned();
                     let is_group = data["conversationType"].as_str() == Some("2");
-                    let chat_id = data["conversationId"].as_str().unwrap_or("").trim().to_owned();
                     let robot_code = data["robotCode"].as_str().unwrap_or("").trim().to_owned();
                     let session_webhook =
                         data["sessionWebhook"].as_str().unwrap_or("").trim().to_owned();
@@ -1834,25 +1918,17 @@ async fn run_dingtalk_once(
                         .as_i64()
                         .map(|ms| if ms > 10_000_000_000 { ms / 1000 } else { ms })
                         .unwrap_or(0);
-                    if !session_webhook.is_empty() {
-                        hub.im_runtime
-                            .cache_dd_session_webhook(user_id, session_webhook.clone(), exp_sec);
-                    }
 
                     let hub_c = hub.clone();
-                    let uid_c = user_id.to_owned();
-                    let cfg_c = cfg.clone();
                     tokio::spawn(async move {
                         handle_dingtalk_callback(
                             hub_c,
-                            uid_c,
-                            cfg_c,
                             dedup_id,
                             sender_id,
-                            chat_id,
                             robot_code,
                             is_group,
                             session_webhook,
+                            exp_sec,
                             raw_text,
                         )
                         .await;
@@ -1866,23 +1942,19 @@ async fn run_dingtalk_once(
 #[allow(clippy::too_many_arguments)]
 async fn handle_dingtalk_callback(
     hub: Hub,
-    user_id: String,
-    cfg: DingTalkBotConfig,
     dedup_id: String,
     sender_id: String,
-    chat_id: String,
     robot_code: String,
     is_group: bool,
     session_webhook: String,
+    exp_sec: i64,
     raw_text: String,
 ) {
-    let prompt_text = match authorize_or_bind_im_sender(
+    let (target_uid, prompt_text) = match resolve_or_bind_im_sender(
         &hub,
-        &user_id,
         InboundMeta {
             channel: ImChannel::DingTalk,
             sender_id: &sender_id,
-            chat_id: &chat_id,
             is_group,
             robot_code: &robot_code,
         },
@@ -1890,28 +1962,24 @@ async fn handle_dingtalk_callback(
     )
     .await
     {
-        AuthDecision::BindReply(msg) => {
+        RouteDecision::DirectReply(msg) => {
             if !session_webhook.is_empty() {
-                let _ =
-                    send_dingtalk_session_webhook(&hub, &session_webhook, "Agenct 绑定结果", &msg)
-                        .await;
+                let _ = send_dingtalk_session_webhook(&hub, &session_webhook, "Agenct 提示", &msg)
+                    .await;
             }
             return;
         }
-        AuthDecision::Unauthorized(Some(msg)) => {
-            if !session_webhook.is_empty() {
-                let _ =
-                    send_dingtalk_session_webhook(&hub, &session_webhook, "Agenct 访问提示", &msg)
-                        .await;
-            }
-            return;
-        }
-        AuthDecision::Unauthorized(None) => return,
-        AuthDecision::Authorized(t) => t,
+        RouteDecision::Ignore => return,
+        RouteDecision::Routed { user_id, text } => (user_id, text),
     };
 
+    if !session_webhook.is_empty() {
+        hub.im_runtime
+            .cache_dd_session_webhook(&target_uid, session_webhook.clone(), exp_sec);
+    }
+
     let req_id = format!("dd:{dedup_id}");
-    let reply = match run_turn(&hub, &user_id, &prompt_text, Some(&req_id), None).await {
+    let reply = match run_turn(&hub, &target_uid, &prompt_text, Some(&req_id), None).await {
         Ok(val) => val["reply"].as_str().unwrap_or("好的，已处理。").to_owned(),
         Err(err) => format!("处理失败：{}", err.1),
     };
@@ -1921,12 +1989,16 @@ async fn handle_dingtalk_callback(
             .await
             .is_ok();
     if !sent_via_hook {
-        let mut updated_cfg = cfg;
-        updated_cfg.bound_staff_id = sender_id;
-        if !robot_code.is_empty() {
-            updated_cfg.robot_code = robot_code;
-        }
-        let _ = send_dingtalk_proactive(&hub, &user_id, &updated_cfg, "Agenct 回复", &reply).await;
+        let user_dd_cfg = load_im_config(&hub, &target_uid)
+            .await
+            .map(|c| c.dingtalk)
+            .unwrap_or_else(|_| DingTalkBotConfig {
+                bound_staff_id: sender_id,
+                robot_code,
+                ..Default::default()
+            });
+        let _ =
+            send_dingtalk_proactive(&hub, &target_uid, &user_dd_cfg, "Agenct 回复", &reply).await;
     }
 }
 
@@ -1941,7 +2013,7 @@ mod tests {
             clean_im_text("  @Agenct   /bind a1b2c3 ", true),
             "/bind a1b2c3"
         );
-        assert_eq!(clean_im_text("@Bot1 @Bot2 你好世界", true), "你好世界");
+        assert_eq!(clean_im_text("@Agenct @bob 请核查", true), "@bob 请核查");
         assert_eq!(clean_im_text("  hello  ", false), "hello");
 
         assert_eq!(parse_bind_command("/bind k7m4p9"), Some("K7M4P9".into()));

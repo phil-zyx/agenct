@@ -5021,7 +5021,7 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
     assert!(bind_reply["body"]["stream"]["content"]
         .as_str()
         .unwrap()
-        .contains("已成功绑定账号"));
+        .contains("已成功绑定"));
 
     // Dispatch a task to Alice's node.
     let (st, chat) = req_json(
@@ -5597,7 +5597,7 @@ async fn wecom_and_dingtalk_ws_long_connection_bind_chat_and_proactive_push_work
     assert!(wc_bind_resp["body"]["stream"]["content"]
         .as_str()
         .unwrap()
-        .contains("已成功绑定账号"));
+        .contains("已成功绑定"));
 
     wc_in_tx
         .send(json!({
@@ -5738,8 +5738,8 @@ async fn wecom_and_dingtalk_ws_long_connection_bind_chat_and_proactive_push_work
     })
     .await
     .unwrap();
-    assert_eq!(wc_push["body"]["chatid"], "wc_grp_1");
-    assert_eq!(wc_push["body"]["chat_type"], 2);
+    assert_eq!(wc_push["body"]["chatid"], "lee_wc");
+    assert_eq!(wc_push["body"]["chat_type"], 1);
 
     let batch_snapshot = dd_batch.lock().await.clone();
     assert_eq!(batch_snapshot.len(), 1);
@@ -5749,6 +5749,309 @@ async fn wecom_and_dingtalk_ws_long_connection_bind_chat_and_proactive_push_work
     let parsed_param: Value =
         serde_json::from_str(batch_snapshot[0]["msgParam"].as_str().unwrap()).unwrap();
     assert!(parsed_param["text"].as_str().unwrap().contains("已连通"));
+}
+
+#[tokio::test]
+async fn shared_wecom_bot_routes_group_colleagues_to_isolated_accounts_and_collab_pushes() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let mut cfg = test_config("https://git.example.com");
+    cfg.allow_private_outbound = true;
+    let hub = Hub::open(cfg).unwrap();
+    let (alice_c, alice_csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let (bob_c, bob_csrf) = seed_user(&hub, "u-bob", "bob", "Bob", false).await;
+    let router = app(hub.clone());
+
+    let wc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wc_addr = wc_listener.local_addr().unwrap();
+    let (wc_in_tx, mut wc_in_rx) = mpsc::unbounded_channel::<Value>();
+    let (wc_out_tx, mut wc_out_rx) = mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = wc_listener.accept().await else {
+            return;
+        };
+        let mut ws = accept_async(stream).await.unwrap();
+        let sub = ws.next().await.unwrap().unwrap();
+        let sub_v: Value = serde_json::from_str(sub.to_text().unwrap()).unwrap();
+        ws.send(Message::Text(
+            json!({"headers": sub_v["headers"], "errcode": 0, "errmsg": "ok"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            tokio::select! {
+                Some(v) = wc_in_rx.recv() => {
+                    if ws.send(Message::Text(v.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                msg = ws.next() => {
+                    let Some(Ok(frame)) = msg else { break };
+                    if let Message::Text(t) = frame {
+                        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            let _ = wc_out_tx.send(v);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 1. Alice configures shared WeCom bot and binds `alice_wx`.
+    let (st, alice_im) = req_json(
+        &router,
+        "PUT",
+        "/api/integrations/im",
+        Some(&alice_c),
+        Some(&alice_csrf),
+        Some(json!({
+            "wecom": {
+                "enabled": true,
+                "bot_id": "wc_shared",
+                "secret": "wc_shared_sec",
+                "ws_url": format!("ws://{wc_addr}")
+            },
+            "issue_bind_code": true
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let alice_code = alice_im["bind_code"].as_str().unwrap().to_owned();
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (_, im_g) = req_json(
+                &router,
+                "GET",
+                "/api/integrations/im",
+                Some(&bob_c),
+                None,
+                None,
+            )
+            .await;
+            if im_g["shared_wecom_online"] == true {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("bob should see shared_wecom_online=true");
+
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "sh_bind_a"},
+            "body": {
+                "msgid": "sh_m_bind_a",
+                "chattype": "group",
+                "chatid": "grp_team",
+                "from": {"userid": "alice_wx"},
+                "msgtype": "text",
+                "text": {"content": format!("@Agenct /bind {alice_code}")}
+            }
+        }))
+        .unwrap();
+    let bind_a = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["headers"]["req_id"] == "sh_bind_a" && v["body"]["stream"]["finish"] == true {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(bind_a["body"]["stream"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Alice (@alice)"));
+
+    // 2. Unbound stranger `@Agenct` in group gets setup instructions and cannot touch Alice's space.
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "sh_unbound"},
+            "body": {
+                "msgid": "sh_m_unbound",
+                "chattype": "group",
+                "chatid": "grp_team",
+                "from": {"userid": "charlie_wx"},
+                "msgtype": "text",
+                "text": {"content": "@Agenct /remember Charlie入侵"}
+            }
+        }))
+        .unwrap();
+    let unbound_resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["headers"]["req_id"] == "sh_unbound" && v["body"]["stream"]["finish"] == true {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(unbound_resp["body"]["stream"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("尚未绑定个人 Agenct 账号"));
+
+    // 3. Bob (non-admin colleague, no bot credentials needed) issues his own bind code and binds `bob_wx`.
+    let (st, bob_im) = req_json(
+        &router,
+        "PUT",
+        "/api/integrations/im",
+        Some(&bob_c),
+        Some(&bob_csrf),
+        Some(json!({"issue_bind_code": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{bob_im}");
+    let bob_code = bob_im["bind_code"].as_str().unwrap().to_owned();
+
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "sh_bind_b"},
+            "body": {
+                "msgid": "sh_m_bind_b",
+                "chattype": "group",
+                "chatid": "grp_team",
+                "from": {"userid": "bob_wx"},
+                "msgtype": "text",
+                "text": {"content": format!("@Agenct /bind {bob_code}")}
+            }
+        }))
+        .unwrap();
+    let bind_b = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["headers"]["req_id"] == "sh_bind_b" && v["body"]["stream"]["finish"] == true {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(bind_b["body"]["stream"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Bob (@bob)"));
+
+    // 4. Both speak in the same group: each message routes strictly to the sender's own isolated account.
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "sh_mem_a"},
+            "body": {
+                "msgid": "sh_m_mem_a",
+                "chattype": "group",
+                "chatid": "grp_team",
+                "from": {"userid": "alice_wx"},
+                "msgtype": "text",
+                "text": {"content": "@Agenct /remember Alice机密123"}
+            }
+        }))
+        .unwrap();
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "sh_mem_b"},
+            "body": {
+                "msgid": "sh_m_mem_b",
+                "chattype": "group",
+                "chatid": "grp_team",
+                "from": {"userid": "bob_wx"},
+                "msgtype": "text",
+                "text": {"content": "@Agenct /remember Bob机密456"}
+            }
+        }))
+        .unwrap();
+    let mut got_a = false;
+    let mut got_b = false;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !(got_a && got_b) {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["body"]["stream"]["finish"] == true {
+                if v["headers"]["req_id"] == "sh_mem_a" {
+                    got_a = true;
+                } else if v["headers"]["req_id"] == "sh_mem_b" {
+                    got_b = true;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    let (alice_mem, bob_mem): (String, String) = hub
+        .db
+        .read(|conn| {
+            let a: String = conn.query_row(
+                "SELECT memory_md FROM agent_profiles WHERE user_id='u-alice'",
+                [],
+                |r| r.get(0),
+            )?;
+            let b: String = conn.query_row(
+                "SELECT memory_md FROM agent_profiles WHERE user_id='u-bob'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((a, b))
+        })
+        .await
+        .unwrap();
+    assert!(
+        alice_mem.contains("Alice机密123")
+            && !alice_mem.contains("Bob机密456")
+            && !alice_mem.contains("Charlie入侵")
+    );
+    assert!(bob_mem.contains("Bob机密456") && !bob_mem.contains("Alice机密123"));
+
+    // 5. Alice delegates to `@bob` via shared WeCom group -> Bob receives 1v1 private push (`chatid=bob_wx, chat_type=1`).
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "sh_del_a"},
+            "body": {
+                "msgid": "sh_m_del_a",
+                "chattype": "group",
+                "chatid": "grp_team",
+                "from": {"userid": "alice_wx"},
+                "msgtype": "text",
+                "text": {"content": "@Agenct @bob 请协助核查接口"}
+            }
+        }))
+        .unwrap();
+    let bob_push = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["cmd"] == "aibot_send_msg" && v["body"]["chatid"] == "bob_wx" {
+                break v;
+            }
+        }
+    })
+    .await
+    .expect("delegation should push 1v1 privately to Bob via shared WeCom WS");
+    assert_eq!(bob_push["body"]["chat_type"], 1);
+
+    // 6. Bob can also trigger `/api/integrations/im/test` using the shared WS connection.
+    let (st_bob_test, bob_test_res) = req_json(
+        &router,
+        "POST",
+        "/api/integrations/im/test",
+        Some(&bob_c),
+        Some(&bob_csrf),
+        None,
+    )
+    .await;
+    assert_eq!(st_bob_test, StatusCode::OK, "{bob_test_res}");
+    assert_eq!(bob_test_res["delivered"], json!(["wecom"]));
 }
 
 #[tokio::test]
