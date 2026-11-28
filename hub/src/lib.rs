@@ -68,6 +68,7 @@ pub struct Hub {
     pub scheduler_notify: Arc<tokio::sync::Notify>,
     pub scheduler: Arc<automation::SchedulerState>,
     pub node_waiters: nodes::NodeWaiters,
+    pub im_runtime: integrations::im::ImRuntime,
     gates: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     compacting: Arc<Mutex<HashSet<String>>>,
 }
@@ -126,6 +127,7 @@ impl Hub {
             scheduler_notify: Arc::new(tokio::sync::Notify::new()),
             scheduler: Arc::new(automation::SchedulerState::default()),
             node_waiters: nodes::NodeWaiters::default(),
+            im_runtime: integrations::im::ImRuntime::default(),
             gates: Arc::new(Mutex::new(HashMap::new())),
             compacting: Arc::new(Mutex::new(HashSet::new())),
         })
@@ -146,6 +148,10 @@ impl Hub {
     pub fn end_compaction(&self, user_id: &str) {
         let mut set = self.compacting.lock().expect("compacting mutex");
         set.remove(user_id);
+    }
+
+    pub async fn start_im_workers(&self) {
+        self.im_runtime.start_all(self).await;
     }
 }
 
@@ -239,7 +245,6 @@ pub fn app(hub: Hub) -> Router {
             post(integrations::im::test_webhook),
         )
         .route("/webhooks/gitlab", post(integrations::gitlab::webhook))
-        .route("/webhooks/im", post(integrations::im::inbound_webhook))
         // Static Web UI
         .fallback_service(tower_http::services::ServeDir::new(static_dir))
         .layer(DefaultBodyLimit::max(64 * 1024))

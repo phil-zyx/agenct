@@ -1319,6 +1319,8 @@ pub(super) struct TurnContext<'a> {
     pub(super) allowed_tools: Option<&'a [&'a str]>,
     /// Current async callback recursion depth (`0` for interactive chat & cron).
     pub(super) callback_depth: i64,
+    /// True when the turn originated from an IM channel (so notifications don't echo redundantly).
+    pub(super) from_im: bool,
 }
 
 impl TurnContext<'_> {
@@ -1349,6 +1351,7 @@ struct AgentMode<'a> {
     allowed_tools: Option<&'a [&'a str]>,
     callback_depth: i64,
     initial_thread_id: Option<String>,
+    from_im: bool,
 }
 
 /// Runs an interactive chat turn: agent loop, then atomically persists the final reply.
@@ -1370,12 +1373,14 @@ async fn drive_turn(
         }
         None => String::new(),
     };
+    let from_im = request_id.is_some_and(|r| r.starts_with("wecom:") || r.starts_with("dd:"));
     let mode = AgentMode {
         prompt_suffix: &focus_suffix,
         interactive: true,
         allowed_tools: None,
         callback_depth: 0,
         initial_thread_id: pinned_thread_id.map(str::to_owned),
+        from_im,
     };
     let out = agent_loop(hub, user_id, message, &snap, &mode).await?;
     let reply = persist_turn(
@@ -1420,6 +1425,7 @@ pub async fn run_headless(
         allowed_tools: Some(allowed_tools),
         callback_depth: 0,
         initial_thread_id: None,
+        from_im: false,
     };
     agent_loop(hub, user_id, instruction, &snap, &mode).await
 }
@@ -1591,6 +1597,7 @@ pub async fn run_task_callback(
         allowed_tools: Some(allowed_tools),
         callback_depth: next_depth,
         initial_thread_id: task_thread_id.clone(),
+        from_im: false,
     };
 
     match agent_loop(&hub, &user_id, &instruction, &snap, &mode).await {
@@ -1808,6 +1815,7 @@ async fn agent_loop(
         interactive: mode.interactive,
         allowed_tools: mode.allowed_tools,
         callback_depth: mode.callback_depth,
+        from_im: mode.from_im,
     };
 
     let models = crate::models::resolve(hub, user_id).await?;

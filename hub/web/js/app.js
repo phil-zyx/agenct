@@ -594,6 +594,13 @@ async function boot() {
     },
     onSync(kind) {
       if (kind === 'resync') chatUI.setStage('');
+      if (kind === 'im' && !settingsView.classList.contains('hide')) {
+        const active = document.activeElement;
+        const editing = active && settingsView.contains(active) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName);
+        if (!editing) {
+          drawerUI.loadIntegrations().then(() => drawerUI.renderSettingsPane());
+        }
+      }
       scheduleRefresh();
     },
   });

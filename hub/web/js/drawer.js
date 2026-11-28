@@ -15,6 +15,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
 
   let activeTab = 'tasks';
   let lastInstallCmd = '';
+  let lastImBindCode = '';
   let integrations = { gitlab: null, im: null, models: null };
   const taskTimers = new Map();
   let elapsedTimer = null;
@@ -73,6 +74,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     task_deliver: '交付结果',
     gitlab_config: 'GitLab 配置',
     gitlab_mention: 'GitLab 提及',
+    im_config: 'IM 配置',
+    im_bind: 'IM 绑定',
     member_status: '成员状态',
   };
 
@@ -1019,19 +1022,88 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       </section>
 
       <section class="panel-card">
-        <h3>IM 通知通道（飞书 / 企微 / 钉钉）</h3>
-        <form id="im-form">
-          <label class="field-label">平台</label>
-          <select name="provider">
-            ${['feishu', 'wecom', 'dingtalk'].map((k) => `<option value="${k}" ${im.provider === k ? 'selected' : ''}>${k}</option>`).join('')}
-          </select>
-          <label class="field-label">Webhook URL ${im.configured ? '(已配置)' : '(未配置)'}</label>
-          <input type="url" name="webhook_url" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/...">
-          <div class="row">
-            <button type="submit" class="primary sm">保存</button>
-            <button type="button" id="im-test-btn" class="sm">发送测试</button>
-          </div>
-        </form>
+        <h3>IM 随身双向接入（免公网端口）</h3>
+        <p class="note">Hub 主动从内网外连企业微信/钉钉长连接网关，无需公网 IP 或端口映射；首次需用手机给机器人发 <code>/bind 口令</code> 锁定本人账号。</p>
+        ${(() => {
+          const wecom = im.wecom || {};
+          const dd = im.dingtalk || {};
+          const allBound = (!wecom.enabled || Boolean(wecom.bound_user_id)) && (!dd.enabled || Boolean(dd.bound_staff_id));
+          if (allBound && !im.bind_pending) lastImBindCode = '';
+          const statusBadge = (st, enabled) => {
+            if (!enabled) return '<span class="badge">未启用</span>';
+            const s = st?.state || 'connecting';
+            if (s === 'connected') return '<span class="badge ok">已连接</span>';
+            if (s === 'error') return '<span class="badge">连接异常</span>';
+            return '<span class="badge warn">连接中</span>';
+          };
+          const bindNotice = lastImBindCode
+            ? `<div class="sandbox-block-note mb-10">
+                 <div>请用你的企业微信或钉钉单聊给机器人发送下方配对口令（15 分钟内有效）：</div>
+                 <div class="install-box mt-6"><code>/bind ${esc(lastImBindCode)}</code>${COPY_BTN_HTML}</div>
+               </div>`
+            : im.bind_pending
+              ? '<div class="sandbox-block-note mb-10">已有生效中的配对口令待验证；若忘记可点击下方「重新生成口令」。</div>'
+              : '';
+          return `
+            ${bindNotice}
+            <form id="im-form">
+              <div class="item">
+                <div class="item-head">
+                  <strong>企业微信 · 智能机器人（API 长连接）</strong>
+                  <div class="row mt-0">
+                    ${statusBadge(wecom.status, wecom.enabled)}
+                    ${wecom.bound_user_id ? `<span class="badge ok">已绑定 ${esc(wecom.bound_user_id)}</span>` : (wecom.enabled ? '<span class="badge warn">待配对</span>' : '')}
+                  </div>
+                </div>
+                ${wecom.status?.state === 'error' && wecom.status?.last_error ? `<p class="note cron-failed">${esc(wecom.status.last_error)}</p>` : ''}
+                <label class="toggle"><span>启用企业微信长连接</span><input type="checkbox" name="wecom_enabled" ${wecom.enabled ? 'checked' : ''}></label>
+                <label class="field-label">Bot ID</label>
+                <input type="text" name="wecom_bot_id" value="${esc(wecom.bot_id || '')}" placeholder="工作台 → 智能机器人 → API 长连接 → Bot ID">
+                <label class="field-label">Secret ${wecom.configured ? `(已保存 ${esc(wecom.secret_preview)})` : '(未配置)'}</label>
+                <input type="password" name="wecom_secret" placeholder="${wecom.configured ? '留空保持不变' : '机器人 Secret'}" autocomplete="off">
+                ${wecom.bound_user_id ? '<div class="row"><button type="button" id="im-unbind-wecom" class="sm danger">解绑企微账号</button></div>' : ''}
+              </div>
+
+              <div class="item">
+                <div class="item-head">
+                  <strong>钉钉 · 企业内部机器人（Stream 模式）</strong>
+                  <div class="row mt-0">
+                    ${statusBadge(dd.status, dd.enabled)}
+                    ${dd.bound_staff_id ? `<span class="badge ok">已绑定 ${esc(dd.bound_staff_id)}</span>` : (dd.enabled ? '<span class="badge warn">待配对</span>' : '')}
+                  </div>
+                </div>
+                ${dd.status?.state === 'error' && dd.status?.last_error ? `<p class="note cron-failed">${esc(dd.status.last_error)}</p>` : ''}
+                <label class="toggle"><span>启用钉钉 Stream 长连接</span><input type="checkbox" name="dingtalk_enabled" ${dd.enabled ? 'checked' : ''}></label>
+                <label class="field-label">Client ID（AppKey）</label>
+                <input type="text" name="dingtalk_client_id" value="${esc(dd.client_id || '')}" placeholder="钉钉开放平台 → 企业内部应用 → AppKey">
+                <label class="field-label">Client Secret（AppSecret）${dd.configured ? `(已保存 ${esc(dd.secret_preview)})` : '(未配置)'}</label>
+                <input type="password" name="dingtalk_client_secret" placeholder="${dd.configured ? '留空保持不变' : 'AppSecret'}" autocomplete="off">
+                ${dd.bound_staff_id ? '<div class="row"><button type="button" id="im-unbind-dd" class="sm danger">解绑钉钉账号</button></div>' : ''}
+              </div>
+
+              <details class="mt-6" ${im.configured ? 'open' : ''}>
+                <summary>可选：群自定义机器人单向通知 Webhook</summary>
+                <label class="field-label">平台</label>
+                <select name="provider">
+                  ${['wecom', 'dingtalk', 'feishu'].map((k) => `<option value="${k}" ${(im.provider || 'wecom') === k ? 'selected' : ''}>${k}</option>`).join('')}
+                </select>
+                <label class="field-label">Webhook URL ${im.configured ? '(已配置)' : '(未配置)'}</label>
+                <input type="url" name="webhook_url" placeholder="${im.configured ? '留空保持不变' : 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...'}">
+                <label class="field-label">加签密钥（可选，钉钉/飞书群机器人）${im.webhook_secret_configured ? '(已保存)' : ''}</label>
+                <input type="password" name="webhook_secret" placeholder="${im.webhook_secret_configured ? '留空保持不变' : 'SEC...'}" autocomplete="off">
+                ${im.configured ? '<div class="row"><button type="button" id="im-clear-webhook" class="sm danger">清除群 Webhook</button></div>' : ''}
+              </details>
+
+              <label class="toggle mt-6"><span>收到同事协作请求时通知</span><input type="checkbox" name="notify_delegation" ${im.notify_delegation !== false ? 'checked' : ''}></label>
+              <label class="toggle"><span>任务完成、单次放行或定时汇报时通知</span><input type="checkbox" name="notify_delivery" ${im.notify_delivery !== false ? 'checked' : ''}></label>
+
+              <div class="row">
+                <button type="submit" class="primary sm">保存配置</button>
+                <button type="button" id="im-bind-btn" class="sm">${im.bind_pending ? '重新生成口令' : '生成配对口令'}</button>
+                <button type="button" id="im-test-btn" class="sm">发送测试</button>
+              </div>
+            </form>`;
+        })()}
       </section>`;
 
     bindNodeHandlers(settingsBody);
@@ -1119,28 +1191,60 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         showToast(err.message);
       }
     };
-    document.getElementById('im-form').onsubmit = async (ev) => {
-      ev.preventDefault();
-      const f = ev.target;
+    const saveImPayload = async (body, okMsg) => {
       try {
-        const res = await api('/api/integrations/im', {
-          method: 'PUT',
-          body: {
-            provider: f.provider.value,
-            webhook_url: f.webhook_url.value.trim() || null,
-          },
-        });
-        showToast(res.inbound_token ? `已保存（入站令牌：${res.inbound_token}）` : 'IM 配置已保存');
+        const res = await api('/api/integrations/im', { method: 'PUT', body });
+        if (res.bind_code) {
+          lastImBindCode = res.bind_code;
+          showToast(`已生成配对口令：/bind ${res.bind_code}`);
+        } else {
+          showToast(okMsg);
+        }
         await loadIntegrations();
         renderSettingsPane();
       } catch (err) {
         showToast(err.message);
       }
     };
+    document.getElementById('im-form').onsubmit = async (ev) => {
+      ev.preventDefault();
+      const f = ev.target;
+      const body = {
+        wecom: {
+          enabled: f.wecom_enabled.checked,
+          bot_id: f.wecom_bot_id.value.trim(),
+          secret: f.wecom_secret.value.trim() || null,
+        },
+        dingtalk: {
+          enabled: f.dingtalk_enabled.checked,
+          client_id: f.dingtalk_client_id.value.trim(),
+          client_secret: f.dingtalk_client_secret.value.trim() || null,
+        },
+        provider: f.provider.value,
+        webhook_url: f.webhook_url.value.trim() || null,
+        webhook_secret: f.webhook_secret.value.trim() || null,
+        notify_delegation: f.notify_delegation.checked,
+        notify_delivery: f.notify_delivery.checked,
+      };
+      await saveImPayload(body, 'IM 配置已保存');
+    };
+    document.getElementById('im-bind-btn').onclick = async () => {
+      await saveImPayload({ issue_bind_code: true }, '已生成配对口令');
+    };
+    document.getElementById('im-unbind-wecom')?.addEventListener('click', async () => {
+      await saveImPayload({ wecom: { clear_bind: true }, issue_bind_code: true }, '已解绑企微账号');
+    });
+    document.getElementById('im-unbind-dd')?.addEventListener('click', async () => {
+      await saveImPayload({ dingtalk: { clear_bind: true }, issue_bind_code: true }, '已解绑钉钉账号');
+    });
+    document.getElementById('im-clear-webhook')?.addEventListener('click', async () => {
+      await saveImPayload({ clear_webhook: true, clear_webhook_secret: true }, '已清除群 Webhook');
+    });
     document.getElementById('im-test-btn').onclick = async () => {
       try {
-        await api('/api/integrations/im/test', { method: 'POST' });
-        showToast('测试消息已发送');
+        const res = await api('/api/integrations/im/test', { method: 'POST' });
+        const channels = (res.delivered || []).join('、');
+        showToast(channels ? `测试消息已发送（${channels}）` : '测试消息已发送');
       } catch (err) {
         showToast(err.message);
       }

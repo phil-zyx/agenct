@@ -478,6 +478,20 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                             "> 待确认单次放行（{node_name} · {title}）：请回复 `/approve {code}`（10 分钟内有效）或在右侧抽屉长按「单次放行执行」。"
                         );
                         ctx.approval_prompts.push((code.clone(), note));
+                        if !ctx.from_im {
+                            let h_bg = hub.clone();
+                            let uid_bg = user_id.to_owned();
+                            let im_title = format!("待确认单次放行：{title}");
+                            let im_body = format!(
+                                "节点「{node_name}」等待确认单次放行。\n\n回复 `/approve {code}`（10 分钟内有效）即可立即执行。"
+                            );
+                            tokio::spawn(async move {
+                                crate::integrations::im::maybe_notify(
+                                    &h_bg, &uid_bg, "delivery", &im_title, &im_body,
+                                )
+                                .await;
+                            });
+                        }
                         let observation = format!(
                             "已创建待人工确认的单次放行任务 {task_id_s}（目标节点 {node_name}，{meta_str}，尚未入队执行），审批码为 `{code}`（10 分钟内有效）。请简短说明需访问宿主机凭据/外部路径的原因，并明确告知用户回复 `/approve {code}` 或在右侧抽屉长按「单次放行执行」。"
                         );

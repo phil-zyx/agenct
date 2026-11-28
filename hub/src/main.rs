@@ -42,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bind = config.bind;
     let origin = config.public_origin.clone();
     let hub = Hub::open(config)?;
+    hub.start_im_workers().await;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!(
         "Agenct Hub v2 listening on http://{bind} (origin={origin}, llm={}, secrets={})",
@@ -66,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         res = &mut server => res?,
         () = &mut scheduler => return Err("scheduler exited unexpectedly".into()),
         _ = tokio::signal::ctrl_c() => {
+            hub.im_runtime.shutdown_all();
             drop(scheduler);
             shutdown.notify_one();
             server.await?;

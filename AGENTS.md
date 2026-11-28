@@ -42,7 +42,7 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite WAL) ──�
 | `hub/src/attachments.rs` | 附件上传/下载、Magic-byte 校验、磁盘落盘与 `attachment_grants` ACL 鉴权 |
 | `hub/src/events.rs` | 按 `user_id` 隔离的真 SSE 事件总线（`/api/events`，含对话流式 `delta` 推送） |
 | `hub/src/integrations/gitlab.rs` | SSRF 加固的 GitLab Webhook、Todo 轮询、提交摘要与受控回复 |
-| `hub/src/integrations/im.rs` | SSRF 加固的飞书/企微/钉钉 IM Webhook 集成 |
+| `hub/src/integrations/im.rs` | SSRF 加固的企业微信（API 长连接）/ 钉钉（Stream + OpenAPI）双向接入、`/bind` 本人配对及可选群 Webhook 加签通知 |
 | `hub/tests/v2_core.rs` | Rust 集成与回归测试（使用内存 SQLite 与 LLM Stub） |
 | `hub/web/` | 原生 ESM 前端：`index.html`、`style.css`、`js/{app,api,avatar,chat,drawer,palette,sound,sse,triage,ui}.js`、静态头像/品牌资源 |
 | `node/agenct-node.py` | 统一执行节点客户端（支持 `claude`/`codex`/`agy`/`opencode`/自定义 `--cmd`） |
@@ -62,7 +62,7 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite WAL) ──�
 
 2. **认证、CSRF、静态加密与最小权限**
    - 浏览器状态变更接口必须经过 `auth::guard` 的 Host、Origin 与 `X-CSRF-Token` 校验；受鉴权路由统一使用 `auth::AuthUser` 提取器（自动复用 `guard` 注入的 `User` 并强制校验 `status == "active"`）；前端统一通过 `hub/web/js/api.js` 的 `api()` 发起请求。
-   - 用户自定义模型 API Key、GitLab PAT 与 IM Webhook 配置在配置 `AGENCT_MASTER_KEY` 时一律经 `hub/src/secrets.rs` 静态加密（`enc:v1:`）落盘；新增敏感用户配置字段时不要绕过 `SecretCipher`。
+   - 用户自定义模型 API Key、GitLab PAT 与 IM 接入凭据/Webhook 配置在配置 `AGENCT_MASTER_KEY` 时一律经 `hub/src/secrets.rs` 静态加密（`enc:v1:`）落盘；新增敏感用户配置字段时不要绕过 `SecretCipher`。
    - `automation_permissions`（`auto_accept`、`auto_deliver`、`gitlab_execute`、`gitlab_reply`）全部默认关闭；权限撤销必须立即失效对应的排队/运行中节点租约。
    - 路由默认请求体上限为 64 KiB（仅 `/api/attachments` 放宽到 8 MiB、`/node/v1/tasks/{id}/submit` 放宽到 16 MiB），新增接口不要随意放大全局限制。
 

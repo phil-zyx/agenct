@@ -2732,14 +2732,25 @@ async fn secrets_encryption_at_rest_and_rotation() {
         Some(&alice_c),
         Some(&alice_csrf),
         Some(json!({
+            "wecom": {
+                "enabled": false,
+                "bot_id": "wecom-bot-alice",
+                "secret": "wecom-sec-secret-111"
+            },
+            "dingtalk": {
+                "enabled": false,
+                "client_id": "dd-client-alice",
+                "client_secret": "dd-sec-secret-222"
+            },
             "provider": "feishu",
             "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook-xyz",
-            "rotate_inbound_token": true
+            "webhook_secret": "wh-sec-333",
+            "issue_bind_code": true
         })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{im_res}");
-    let inbound_token = im_res["inbound_token"].as_str().unwrap().to_owned();
+    assert!(im_res["bind_code"].as_str().is_some_and(|c| c.len() == 6));
 
     // Verify raw SQLite cells store AEAD ciphertext without leaking any plaintext secrets.
     let (raw_model, raw_gl, raw_im): (String, String, String) = hub
@@ -2772,13 +2783,16 @@ async fn secrets_encryption_at_rest_and_rotation() {
             "sk-secret-vision-key-4321",
         ),
         ("gitlab", &raw_gl, "glpat-super-secret-token-7777"),
-        ("im", &raw_im, "secret-hook-xyz"),
+        ("im_hook", &raw_im, "secret-hook-xyz"),
+        ("im_wecom", &raw_im, "wecom-sec-secret-111"),
+        ("im_dd", &raw_im, "dd-sec-secret-222"),
+        ("im_whsec", &raw_im, "wh-sec-333"),
     ] {
         assert!(cell.starts_with("enc:v1:"), "{label} should be encrypted");
         assert!(!cell.contains(needle), "{label} leaked plaintext");
     }
 
-    // Read APIs and inbound webhook decrypt transparently.
+    // Read APIs decrypt transparently and mask stored secrets.
     let (st, m_get) = req_json(
         &router,
         "GET",
@@ -2803,6 +2817,21 @@ async fn secrets_encryption_at_rest_and_rotation() {
     assert_eq!(st, StatusCode::OK);
     assert_eq!(gl_get["token_preview"], "glpa****7777");
 
+    let (st, im_get) = req_json(
+        &router,
+        "GET",
+        "/api/integrations/im",
+        Some(&alice_c),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(im_get["wecom"]["secret_preview"], "****-111");
+    assert_eq!(im_get["dingtalk"]["secret_preview"], "****-222");
+    assert_eq!(im_get["webhook_secret_configured"], true);
+
+    // Obsolete unstandardised /webhooks/im route has been removed (ServeDir fallback rejects POST with 405).
     let hook_resp = router
         .clone()
         .oneshot(
@@ -2811,15 +2840,19 @@ async fn secrets_encryption_at_rest_and_rotation() {
                 .uri("/webhooks/im")
                 .header(header::HOST, "127.0.0.1:8080")
                 .header(header::CONTENT_TYPE, "application/json")
-                .header("x-agenct-im-token", inbound_token)
-                .body(Body::from(
-                    json!({"text": "hello from im webhook"}).to_string(),
-                ))
+                .body(Body::from(json!({"text": "legacy"}).to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(hook_resp.status(), StatusCode::OK);
+    assert!(
+        matches!(
+            hook_resp.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "unexpected status for removed /webhooks/im: {}",
+        hook_resp.status()
+    );
 
     // Seed a legacy plaintext row for Bob and verify transparent read + offline reencryption & rotation.
     hub.db
@@ -4859,10 +4892,54 @@ async fn sandbox_blocked_task_and_one_shot_manual_elevation_enforce_boundaries()
 
 #[tokio::test]
 async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
-    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let mut cfg = test_config("https://git.example.com");
+    cfg.allow_private_outbound = true;
+    let hub = Hub::open(cfg).unwrap();
     let (alice_c, alice_csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
     let (_bob_c, _bob_csrf) = seed_user(&hub, "u-bob", "bob", "Bob", false).await;
     let router = app(hub.clone());
+
+    // Local mock WeCom AI Bot WebSocket server.
+    let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_addr = ws_listener.local_addr().unwrap();
+    let (to_ws_tx, mut to_ws_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let (from_ws_tx, mut from_ws_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = ws_listener.accept().await else {
+            return;
+        };
+        let mut ws = accept_async(stream).await.unwrap();
+        let sub_msg = ws.next().await.unwrap().unwrap();
+        let sub_val: Value = serde_json::from_str(sub_msg.to_text().unwrap()).unwrap();
+        assert_eq!(sub_val["cmd"], "aibot_subscribe");
+        ws.send(Message::Text(
+            json!({"headers": sub_val["headers"], "errcode": 0, "errmsg": "ok"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            tokio::select! {
+                Some(out) = to_ws_rx.recv() => {
+                    if ws.send(Message::Text(out.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                incoming = ws.next() => {
+                    let Some(Ok(frame)) = incoming else { break };
+                    if let Message::Text(t) = frame {
+                        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            let _ = from_ws_tx.send(v);
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     let (st, created) = req_json(
         &router,
@@ -4883,14 +4960,68 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
         Some(&alice_c),
         Some(&alice_csrf),
         Some(json!({
-            "provider": "feishu",
-            "webhook_url": "https://open.feishu.cn/open-apis/bot/v2/hook/test-im-hook",
-            "rotate_inbound_token": true
+            "wecom": {
+                "enabled": true,
+                "bot_id": "bot-im-approve",
+                "secret": "sec-im-approve",
+                "ws_url": format!("ws://{ws_addr}")
+            },
+            "issue_bind_code": true
         })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{im_cfg}");
-    let inbound_token = im_cfg["inbound_token"].as_str().unwrap().to_owned();
+    let bind_code = im_cfg["bind_code"].as_str().unwrap().to_owned();
+
+    // Bind Alice's WeCom user via `/bind <code>` over WebSocket.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (_, boot_im) = req_json(
+                &router,
+                "GET",
+                "/api/integrations/im",
+                Some(&alice_c),
+                None,
+                None,
+            )
+            .await;
+            if boot_im["wecom"]["status"]["state"] == "connected" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("wecom ws connected");
+
+    to_ws_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "wc_bind_1"},
+            "body": {
+                "msgid": "msg_bind_1",
+                "chattype": "single",
+                "chatid": "",
+                "from": {"userid": "alice_wx"},
+                "msgtype": "text",
+                "text": {"content": format!("/bind {bind_code}")}
+            }
+        }))
+        .unwrap();
+    let bind_reply = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let f = from_ws_rx.recv().await.unwrap();
+            if f["cmd"] == "aibot_respond_msg" && f["body"]["stream"]["finish"] == true {
+                break f;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(bind_reply["body"]["stream"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("已成功绑定账号"));
 
     // Dispatch a task to Alice's node.
     let (st, chat) = req_json(
@@ -5005,33 +5136,40 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
         .expect("cross-user code must fail");
     assert_eq!(err_bob.0, StatusCode::BAD_REQUEST);
 
-    // Alice approves via IM webhook (/webhooks/im) using lowercase /approve <code> -> elevated job queued!
-    let im_req = router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/webhooks/im")
-                .header(header::HOST, "127.0.0.1:8080")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header("x-agenct-im-token", &inbound_token)
-                .body(Body::from(
-                    json!({"text": format!(" /approve {} ", code.to_ascii_lowercase())})
-                        .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
+    // Alice approves via WeCom long-connection using lowercase /approve <code> -> elevated job queued!
+    to_ws_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "wc_approve_1"},
+            "body": {
+                "msgid": "msg_approve_1",
+                "chattype": "single",
+                "chatid": "",
+                "from": {"userid": "alice_wx"},
+                "msgtype": "text",
+                "text": {"content": format!(" /approve {} ", code.to_ascii_lowercase())}
+            }
+        }))
         .unwrap();
-    assert_eq!(im_req.status(), StatusCode::OK);
-    let im_body: Value =
-        serde_json::from_slice(&im_req.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let app_reply = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let f = from_ws_rx.recv().await.unwrap();
+            if f["cmd"] == "aibot_respond_msg"
+                && f["headers"]["req_id"] == "wc_approve_1"
+                && f["body"]["stream"]["finish"] == true
+            {
+                break f;
+            }
+        }
+    })
+    .await
+    .unwrap();
     assert!(
-        im_body["reply"]
+        app_reply["body"]["stream"]["content"]
             .as_str()
             .unwrap()
             .contains("已授权单次放行重试"),
-        "{im_body}"
+        "{app_reply}"
     );
 
     let w2_resp = router
@@ -5191,6 +5329,426 @@ async fn im_and_chat_approve_code_elevates_blocked_task_once_without_llm() {
     assert_eq!(pa["job"]["task_id"], pending_tid);
     assert_eq!(pa["job"]["sandbox"], "elevated");
     assert_eq!(pa["job"]["authorization"], "manual");
+
+    // Web-initiated require_elevation also proactively notified Alice on her bound WeCom bot.
+    let pushed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let f = from_ws_rx.recv().await.unwrap();
+            if f["cmd"] == "aibot_send_msg"
+                && f["body"]["markdown"]["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains(&code2))
+            {
+                break f;
+            }
+        }
+    })
+    .await
+    .expect("elevation approval code should push proactively to bound IM");
+    assert_eq!(pushed["body"]["chatid"], "alice_wx");
+}
+
+#[tokio::test]
+async fn wecom_and_dingtalk_ws_long_connection_bind_chat_and_proactive_push_work() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::sync::{mpsc, Mutex};
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    let mut cfg = test_config("https://git.example.com");
+    cfg.allow_private_outbound = true;
+    let hub = Hub::open(cfg).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    // 1. Mock WeCom WS server.
+    let wc_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wc_addr = wc_listener.local_addr().unwrap();
+    let (wc_in_tx, mut wc_in_rx) = mpsc::unbounded_channel::<Value>();
+    let (wc_out_tx, mut wc_out_rx) = mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = wc_listener.accept().await else {
+            return;
+        };
+        let mut ws = accept_async(stream).await.unwrap();
+        let sub = ws.next().await.unwrap().unwrap();
+        let sub_v: Value = serde_json::from_str(sub.to_text().unwrap()).unwrap();
+        assert_eq!(sub_v["cmd"], "aibot_subscribe");
+        assert_eq!(sub_v["body"]["bot_id"], "wc_bot_1");
+        assert_eq!(sub_v["body"]["secret"], "wc_sec_1");
+        ws.send(Message::Text(
+            json!({"headers": sub_v["headers"], "errcode": 0, "errmsg": "ok"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+        loop {
+            tokio::select! {
+                Some(v) = wc_in_rx.recv() => {
+                    if ws.send(Message::Text(v.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                msg = ws.next() => {
+                    let Some(Ok(frame)) = msg else { break };
+                    if let Message::Text(t) = frame {
+                        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            let _ = wc_out_tx.send(v);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // 2. Mock DingTalk WS server + HTTP gateway/OpenAPI/sessionWebhook server.
+    let dd_ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dd_ws_addr = dd_ws_listener.local_addr().unwrap();
+    let (dd_in_tx, mut dd_in_rx) = mpsc::unbounded_channel::<Value>();
+    let (dd_out_tx, mut dd_out_rx) = mpsc::unbounded_channel::<Value>();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = dd_ws_listener.accept().await else {
+            return;
+        };
+        let mut ws = accept_async(stream).await.unwrap();
+        loop {
+            tokio::select! {
+                Some(v) = dd_in_rx.recv() => {
+                    if ws.send(Message::Text(v.to_string().into())).await.is_err() {
+                        break;
+                    }
+                }
+                msg = ws.next() => {
+                    let Some(Ok(frame)) = msg else { break };
+                    if let Message::Text(t) = frame {
+                        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            let _ = dd_out_tx.send(v);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    let dd_hooks = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let dd_batch = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let dd_http_app = Router::new()
+        .route(
+            "/v1.0/gateway/connections/open",
+            post({
+                let ws_ep = format!("ws://{dd_ws_addr}/connect");
+                move |Json(body): Json<Value>| {
+                    let ep = ws_ep.clone();
+                    async move {
+                        assert_eq!(body["clientId"], "dd_client_1");
+                        assert_eq!(body["clientSecret"], "dd_sec_1");
+                        Json(json!({"endpoint": ep, "ticket": "tkt+abc/123"}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1.0/oauth2/accessToken",
+            post(|Json(body): Json<Value>| async move {
+                assert_eq!(body["appKey"], "dd_client_1");
+                Json(json!({"accessToken": "dd_tok_live", "expireIn": 7200}))
+            }),
+        )
+        .route(
+            "/v1.0/robot/oToMessages/batchSend",
+            post({
+                let cap = dd_batch.clone();
+                move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+                    let cap = cap.clone();
+                    async move {
+                        assert_eq!(
+                            headers
+                                .get("x-acs-dingtalk-access-token")
+                                .and_then(|v| v.to_str().ok()),
+                            Some("dd_tok_live")
+                        );
+                        cap.lock().await.push(body);
+                        Json(json!({"processQueryKey": "pq_1"}))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/session_hook",
+            post({
+                let cap = dd_hooks.clone();
+                move |Json(body): Json<Value>| {
+                    let cap = cap.clone();
+                    async move {
+                        cap.lock().await.push(body);
+                        Json(json!({"errcode": 0, "errmsg": "ok"}))
+                    }
+                }
+            }),
+        );
+    let dd_http_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dd_http_addr = dd_http_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(dd_http_listener, dd_http_app).await;
+    });
+
+    // Save both IM channels and get one-time bind code.
+    let (st, saved) = req_json(
+        &router,
+        "PUT",
+        "/api/integrations/im",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({
+            "wecom": {
+                "enabled": true,
+                "bot_id": "wc_bot_1",
+                "secret": "wc_sec_1",
+                "ws_url": format!("ws://{wc_addr}")
+            },
+            "dingtalk": {
+                "enabled": true,
+                "client_id": "dd_client_1",
+                "client_secret": "dd_sec_1",
+                "api_base": format!("http://{dd_http_addr}")
+            }
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{saved}");
+    let bind_code = saved["bind_code"].as_str().unwrap().to_owned();
+
+    // Wait for both WS workers to connect.
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let (_, cfg_get) = req_json(
+                &router,
+                "GET",
+                "/api/integrations/im",
+                Some(&cookie),
+                None,
+                None,
+            )
+            .await;
+            if cfg_get["wecom"]["status"]["state"] == "connected"
+                && cfg_get["dingtalk"]["status"]["state"] == "connected"
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("both wecom and dingtalk connected");
+
+    // A) WeCom: stranger rejected, owner binds with `@Agenct /bind <code>`, chats, receives streamed reply.
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "wc_stranger"},
+            "body": {
+                "msgid": "wc_m_0",
+                "chattype": "single",
+                "from": {"userid": "intruder"},
+                "msgtype": "text",
+                "text": {"content": "secret info"}
+            }
+        }))
+        .unwrap();
+    let stranger_resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["headers"]["req_id"] == "wc_stranger" && v["body"]["stream"]["finish"] == true {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(stranger_resp["body"]["stream"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("尚未绑定"));
+
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "wc_bind"},
+            "body": {
+                "msgid": "wc_m_1",
+                "chattype": "group",
+                "chatid": "wc_grp_1",
+                "from": {"userid": "lee_wc"},
+                "msgtype": "text",
+                "text": {"content": format!("@Agenct  /bind {bind_code} ")}
+            }
+        }))
+        .unwrap();
+    let wc_bind_resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["headers"]["req_id"] == "wc_bind" && v["body"]["stream"]["finish"] == true {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(wc_bind_resp["body"]["stream"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("已成功绑定账号"));
+
+    wc_in_tx
+        .send(json!({
+            "cmd": "aibot_msg_callback",
+            "headers": {"req_id": "wc_chat"},
+            "body": {
+                "msgid": "wc_m_2",
+                "chattype": "single",
+                "from": {"userid": "lee_wc"},
+                "msgtype": "text",
+                "text": {"content": "ping from wecom"}
+            }
+        }))
+        .unwrap();
+    let wc_chat_resp = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["headers"]["req_id"] == "wc_chat" && v["body"]["stream"]["finish"] == true {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(wc_chat_resp["body"]["stream"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("收到你的消息：ping from wecom"));
+
+    // B) DingTalk: SYSTEM/ping echoes opaque, CALLBACK ACKs 200, binds via same code (until DingTalk bound too), chats via sessionWebhook.
+    dd_in_tx
+        .send(json!({
+            "type": "SYSTEM",
+            "headers": {"topic": "ping", "messageId": "dd_ping_1", "contentType": "application/json"},
+            "data": "{\"opaque\":\"opq-99\"}"
+        }))
+        .unwrap();
+    let dd_pong = tokio::time::timeout(std::time::Duration::from_secs(3), dd_out_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dd_pong["code"], 200);
+    assert_eq!(dd_pong["headers"]["messageId"], "dd_ping_1");
+    assert_eq!(dd_pong["data"], "{\"opaque\":\"opq-99\"}");
+
+    let dd_hook_url = format!("http://{dd_http_addr}/session_hook");
+    dd_in_tx
+        .send(json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "dd_cb_1"},
+            "data": json!({
+                "msgId": "dd_m_1",
+                "senderStaffId": "lee_dd",
+                "conversationType": "1",
+                "conversationId": "dd_cid_1",
+                "robotCode": "dd_rc_1",
+                "sessionWebhook": dd_hook_url,
+                "text": {"content": format!("绑定 {bind_code}")}
+            }).to_string()
+        }))
+        .unwrap();
+    let dd_ack1 = tokio::time::timeout(std::time::Duration::from_secs(3), dd_out_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dd_ack1["code"], 200);
+    assert_eq!(dd_ack1["headers"]["messageId"], "dd_cb_1");
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if !dd_hooks.lock().await.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("dingtalk bind confirmation posted to sessionWebhook");
+
+    dd_in_tx
+        .send(json!({
+            "type": "CALLBACK",
+            "headers": {"topic": "/v1.0/im/bot/messages/get", "messageId": "dd_cb_2"},
+            "data": json!({
+                "msgId": "dd_m_2",
+                "senderStaffId": "lee_dd",
+                "conversationType": "1",
+                "conversationId": "dd_cid_1",
+                "robotCode": "dd_rc_1",
+                "sessionWebhook": format!("http://{dd_http_addr}/session_hook"),
+                "text": {"content": "hello dingtalk"}
+            }).to_string()
+        }))
+        .unwrap();
+    let dd_ack2 = tokio::time::timeout(std::time::Duration::from_secs(3), dd_out_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(dd_ack2["code"], 200);
+    assert_eq!(dd_ack2["headers"]["messageId"], "dd_cb_2");
+
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            if dd_hooks.lock().await.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("dingtalk chat reply posted to sessionWebhook");
+    let hooks_snapshot = dd_hooks.lock().await.clone();
+    assert!(hooks_snapshot[1]["markdown"]["text"]
+        .as_str()
+        .unwrap()
+        .contains("收到你的消息：hello dingtalk"));
+
+    // C) Proactive test push exercises BOTH WeCom `aibot_send_msg` and DingTalk OpenAPI `batchSend`.
+    let (st_test, test_res) = req_json(
+        &router,
+        "POST",
+        "/api/integrations/im/test",
+        Some(&cookie),
+        Some(&csrf),
+        None,
+    )
+    .await;
+    assert_eq!(st_test, StatusCode::OK, "{test_res}");
+    assert_eq!(test_res["delivered"], json!(["wecom", "dingtalk"]));
+
+    let wc_push = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let v = wc_out_rx.recv().await.unwrap();
+            if v["cmd"] == "aibot_send_msg" {
+                break v;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(wc_push["body"]["chatid"], "wc_grp_1");
+    assert_eq!(wc_push["body"]["chat_type"], 2);
+
+    let batch_snapshot = dd_batch.lock().await.clone();
+    assert_eq!(batch_snapshot.len(), 1);
+    assert_eq!(batch_snapshot[0]["robotCode"], "dd_rc_1");
+    assert_eq!(batch_snapshot[0]["userIds"], json!(["lee_dd"]));
+    assert_eq!(batch_snapshot[0]["msgKey"], "sampleMarkdown");
+    let parsed_param: Value =
+        serde_json::from_str(batch_snapshot[0]["msgParam"].as_str().unwrap()).unwrap();
+    assert!(parsed_param["text"].as_str().unwrap().contains("已连通"));
 }
 
 #[tokio::test]

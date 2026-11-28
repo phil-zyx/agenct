@@ -349,7 +349,7 @@ pub fn is_blocked_ip(ip: IpAddr) -> bool {
     }
 }
 
-async fn validate_outbound_host(
+pub(crate) async fn validate_outbound_host(
     host: &str,
     port: u16,
     ip_blocked_msg: &'static str,

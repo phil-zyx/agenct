@@ -51,7 +51,7 @@ export function connectEvents({ onStatus, onStage, onDelta, onTask, onMessage, o
       }
       onSync('message');
     });
-    for (const kind of ['node', 'brain', 'automation', 'resync']) {
+    for (const kind of ['node', 'brain', 'automation', 'im', 'resync']) {
       es.addEventListener(kind, () => onSync(kind));
     }
     es.onerror = () => {
