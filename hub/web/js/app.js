@@ -6,7 +6,7 @@ import { initDrawer } from './drawer.js';
 import { initCommandPalette } from './palette.js';
 import { cycleSoundMode, getSoundMode, isSoundEnabled, playDone, playTap, playToggle, playWarn, soundModeLabel } from './sound.js';
 import { connectEvents } from './sse.js';
-import { initRailGlideTip } from './ui.js';
+import { cycleThemeMode, getThemeMode, initRailGlideTip, isEffectiveDark, themeModeLabel } from './ui.js';
 
 const state = {
   user: null,
@@ -325,6 +325,13 @@ async function boot() {
         showToast(`交互音效：${soundModeLabel(nextMode)}`);
         commandPalette.open();
       },
+      getThemeLabel: () => themeModeLabel(getThemeMode()),
+      onCycleTheme: (ev) => {
+        const nextMode = cycleThemeMode(ev);
+        syncThemeUI();
+        showToast(`外观主题：${themeModeLabel(nextMode)}`);
+        commandPalette.open();
+      },
       onOpenAvatarPicker: () => {
         commandPalette.close(true);
         openAvatarPicker();
@@ -466,11 +473,16 @@ async function boot() {
 
   const soundBtn = document.getElementById('toggle-sound');
   const soundLabel = document.getElementById('sound-label');
+  const themeBtn = document.getElementById('toggle-theme');
+  const themeLabel = document.getElementById('theme-label');
+  const themeMenuIc = document.getElementById('theme-menu-ic');
   const statusPickerBtn = document.getElementById('status-picker-btn');
   const statusTrayWrap = document.getElementById('status-tray-wrap');
   const statusTray = document.getElementById('status-tray');
   const statusTrayTip = document.getElementById('status-tray-tip');
   const statusSoundOrb = document.getElementById('status-sound-orb');
+  const statusThemeOrb = document.getElementById('status-theme-orb');
+  const statusThemeIc = document.getElementById('status-theme-ic');
 
   function syncSoundUI() {
     const mode = getSoundMode();
@@ -484,7 +496,23 @@ async function boot() {
       statusSoundOrb.classList.toggle('is-muted', !on);
     }
   }
+  function syncThemeUI() {
+    const mode = getThemeMode();
+    const label = themeModeLabel(mode);
+    const iconHref = mode === 'system' ? '#ic-theme' : isEffectiveDark(mode) ? '#ic-moon' : '#ic-sun';
+    if (themeLabel) themeLabel.textContent = `外观主题：${label}`;
+    themeMenuIc?.setAttribute('href', iconHref);
+    statusThemeIc?.setAttribute('href', iconHref);
+    if (statusThemeOrb) {
+      statusThemeOrb.dataset.tip = `外观主题：${label}（点击切换）`;
+      if (statusTrayTip?.classList.contains('is-visible') && statusTrayTip.textContent.startsWith('外观主题：')) {
+        statusTrayTip.textContent = statusThemeOrb.dataset.tip;
+      }
+    }
+  }
   syncSoundUI();
+  syncThemeUI();
+  window.matchMedia?.('(prefers-color-scheme: dark)')?.addEventListener?.('change', syncThemeUI);
   syncRailState();
   initRailGlideTip(document.querySelector('.rail'));
 
@@ -521,7 +549,7 @@ async function boot() {
     orb.addEventListener('pointerenter', showTip);
     orb.addEventListener('focus', showTip);
     orb.addEventListener('blur', () => statusTrayTip?.classList.remove('is-visible'));
-    orb.addEventListener('click', () => {
+    orb.addEventListener('click', (ev) => {
       const act = orb.dataset.statusAct;
       if (act === 'poke') {
         avatarUI.poke({ force: true });
@@ -539,6 +567,11 @@ async function boot() {
           statusTrayTip.textContent = orb.dataset.tip || '';
         }
         return;
+      } else if (act === 'theme') {
+        const nextMode = cycleThemeMode(ev);
+        syncThemeUI();
+        showToast(`外观主题已切为：${themeModeLabel(nextMode)}`);
+        return;
       } else if (act === 'settings') {
         setSettingsOpen(true);
       }
@@ -551,6 +584,12 @@ async function boot() {
     const nextMode = cycleSoundMode();
     syncSoundUI();
     showToast(`交互音效：${soundModeLabel(nextMode)}`);
+  });
+  themeBtn?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    const nextMode = cycleThemeMode(ev);
+    syncThemeUI();
+    showToast(`外观主题：${themeModeLabel(nextMode)}`);
   });
 
   document.getElementById('open-settings').onclick = () => {

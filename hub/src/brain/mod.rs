@@ -7,7 +7,7 @@ mod threads;
 mod tools;
 
 pub use compact::compact_user_context;
-pub use roles::{delete_role, list_roles, list_roles_sync, AgentRole};
+pub use roles::{delete_role, list_roles, list_roles_sync, save_role, AgentRole};
 pub use threads::{archive_stale_threads, list_active_threads_sync, list_threads_sync, ThreadView};
 
 use crate::{
@@ -219,6 +219,35 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
+            let (rolling_summary, compacted_msg_id) = read_compaction_state_sync(conn, &uid)?;
+            let (uncompacted_messages, uncompacted_bytes): (i64, i64) = conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(content AS BLOB))), 0)
+                 FROM messages WHERE user_id = ?1 AND status = 'complete' AND id > ?2",
+                params![&uid, compacted_msg_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            let total_messages: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE user_id = ?1 AND status = 'complete'",
+                [&uid],
+                |r| r.get(0),
+            )?;
+            let summary_trimmed = rolling_summary.trim();
+            let context_stats = json!({
+                "soul_bytes": profile.soul_md.len(),
+                "soul_budget_bytes": prompt::SOUL_PROMPT_BUDGET_BYTES,
+                "memory_bytes": profile.memory_md.len(),
+                "memory_budget_bytes": prompt::MEMORY_PROMPT_BUDGET_BYTES,
+                "summary_bytes": summary_trimmed.len(),
+                "summary_budget_bytes": prompt::SUMMARY_PROMPT_BUDGET_BYTES,
+                "has_rolling_summary": !summary_trimmed.is_empty(),
+                "compacted_msg_id": compacted_msg_id,
+                "uncompacted_messages": uncompacted_messages,
+                "uncompacted_bytes": uncompacted_bytes,
+                "compact_trigger_messages": compact::COMPACT_KEEP_RECENT + compact::COMPACT_MIN_BATCH,
+                "compact_keep_recent": compact::COMPACT_KEEP_RECENT,
+                "total_messages": total_messages,
+            });
+
             Ok(json!({
                 "profile": profile,
                 "roles": roles,
@@ -232,6 +261,7 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                 "crons": crons,
                 "audit_logs": audit_logs,
                 "contacts": contacts,
+                "context_stats": context_stats,
             }))
         })
         .await?;

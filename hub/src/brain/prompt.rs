@@ -8,6 +8,9 @@ use crate::{
 use serde_json::{json, Value};
 
 pub(super) const DEFAULT_AGENT_NAME: &str = "Agenct";
+pub(super) const SOUL_PROMPT_BUDGET_BYTES: usize = 1500;
+pub(super) const MEMORY_PROMPT_BUDGET_BYTES: usize = 4800;
+pub(super) const SUMMARY_PROMPT_BUDGET_BYTES: usize = 2000;
 pub(super) const DEFAULT_SOUL_MD: &str = "- 身份：你的 7×24h 个人超级智能体 Agenct。\n- 风格：像靠谱的人类助理一样自然、干练、简短（默认 3～5 句、≤6 行以内，除非用户明确要求详细展开）；结论先行，有具体出处或链接时文末顺手带一句；不要套「待审批：」「结论：」「来源：」这类死板的填表标签，也不堆大标题和大表格。\n- 原则：云端能直接解决的直接解决；涉及本机代码或终端时调度在线节点；跨人承诺或高危操作主动说明边界。";
 pub(super) const DEFAULT_MEMORY_MD: &str =
     "暂无长期记忆。在对话中告诉我你的习惯、规矩或环境事实，我会自动整理记住。";
@@ -189,7 +192,7 @@ pub(super) fn build_system_prompt(
     contacts: &[String],
     gitlab_configured: bool,
 ) -> String {
-    let soul = truncate_bytes(&profile.soul_md, 1500);
+    let soul = truncate_bytes(&profile.soul_md, SOUL_PROMPT_BUDGET_BYTES);
     let memory = truncate_head_tail_bytes(&profile.memory_md, 1800, 3000);
     let summary_section = if rolling_summary.trim().is_empty() {
         "（暂无早期历史摘要）".into()

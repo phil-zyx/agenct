@@ -6792,3 +6792,114 @@ async fn security_headers_attachment_isolation_and_approval_rate_limit() {
         .unwrap();
     assert_eq!(denied_audits, 5);
 }
+
+#[tokio::test]
+async fn visual_role_put_api_and_bootstrap_context_stats() {
+    let hub = Hub::open(test_config("https://git.example.com")).unwrap();
+    let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
+    let router = app(hub.clone());
+
+    // 1. PUT /api/roles/{name} requires CSRF.
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        "/api/roles/reviewer",
+        Some(&cookie),
+        None,
+        Some(json!({
+            "description": "只读审查",
+            "agent": "claude",
+            "effort": "high",
+            "sandbox": "readonly",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+
+    // 2. Valid PUT creates/updates role and persists in /api/roles and /api/bootstrap.
+    let (st, created) = req_json(
+        &router,
+        "PUT",
+        "/api/roles/reviewer",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({
+            "description": "只读代码审查",
+            "agent": "claude",
+            "model": "claude-opus-4-6",
+            "effort": "high",
+            "sandbox": "readonly",
+            "node_id": "",
+            "prompt": "只读检查 diff，不改文件",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{created}");
+    assert_eq!(created["name"], "reviewer");
+    assert_eq!(created["agent"], "claude");
+    assert_eq!(created["effort"], "high");
+    assert_eq!(created["sandbox"], "readonly");
+
+    // 3. Rejects sandbox escalation, invalid model flag, and unknown node_id.
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        "/api/roles/reviewer",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"sandbox": "unsafe-full"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        "/api/roles/reviewer",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"model": "-bad-flag"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    let (st, _) = req_json(
+        &router,
+        "PUT",
+        "/api/roles/reviewer",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"node_id": "nonexistent-node"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+
+    // 4. /api/bootstrap exposes honest context_stats and reflects chat turns.
+    let (st, boot0) = req_json(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let stats0 = &boot0["context_stats"];
+    assert!(stats0["soul_bytes"].as_u64().unwrap() > 0);
+    assert!(stats0["memory_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(stats0["compact_trigger_messages"], 18);
+    assert_eq!(stats0["uncompacted_messages"], 0);
+    assert_eq!(stats0["has_rolling_summary"], false);
+
+    let (st, _) = req_json(
+        &router,
+        "POST",
+        "/api/chat",
+        Some(&cookie),
+        Some(&csrf),
+        Some(json!({"message": "hello context meter"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (st, boot1) = req_json(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
+    assert_eq!(st, StatusCode::OK);
+    let stats1 = &boot1["context_stats"];
+    assert_eq!(stats1["uncompacted_messages"], 2);
+    assert!(stats1["uncompacted_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(boot1["roles"].as_array().unwrap().len(), 1);
+    assert_eq!(boot1["roles"][0]["name"], "reviewer");
+}

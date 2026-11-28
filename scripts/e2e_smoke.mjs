@@ -106,7 +106,23 @@ try {
   await page.waitForSelector('#room:not(.hide)');
   await page.waitForFunction(() => document.getElementById('sse-pill')?.textContent?.includes('实时同步'));
 
-  // 2b. Pasting a clipboard image into the composer uploads it as an attachment chip.
+  // 2a. Empty-state starter cards, caret `/` suggest menu, and manual theme toggle (strict CSP safe).
+  await page.waitForSelector('#chat-starters:not(.hide) .starter-card');
+  await page.focus('#chat-input');
+  await page.fill('#chat-input', '/');
+  await page.waitForSelector('#composer-suggest:not(.hide) .suggest-item');
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('#composer-suggest.hide', { state: 'attached' });
+  await page.fill('#chat-input', '');
+
+  await page.click('#rail-more');
+  await page.click('#toggle-theme');
+  await page.waitForFunction(() => ['dark', 'light'].includes(document.documentElement.dataset.theme || ''));
+  const pickedTheme = await page.evaluate(() => document.documentElement.dataset.theme);
+  assert.equal(await page.evaluate(() => localStorage.getItem('agenct:theme')), pickedTheme);
+  await page.click('body', { position: { x: 200, y: 20 } });
+
+  // 2b. Pasting a clipboard image into the composer uploads it as an attachment tile.
   await page.focus('#chat-input');
   await page.evaluate(() => {
     const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
@@ -135,10 +151,11 @@ try {
   assert.ok(tokenMatch, `expected node token in install command: ${installText}`);
   const nodeToken = tokenMatch[0];
 
-  // 4. Send a /node chat message -> queues task on the node.
+  // 4. Send a /node chat message -> queues task on the node (and hides empty-state starter cards).
   await page.fill('#chat-input', '/node check cloud workspace');
   await page.click('#send-btn');
   await page.waitForFunction(() => document.body.textContent.includes('已将任务派发给在线执行节点'));
+  await page.waitForSelector('#chat-starters.hide', { state: 'attached' });
 
   // 5. Run the real Python node daemon (--once) with --cmd to claim & submit the job.
   execFileSync(
@@ -287,6 +304,28 @@ try {
     { timeout: 5000 },
   );
   await page.click('#roles-card > summary');
+  // 6d-2. Visual Squad Role Editor: create & delete a role via PUT /api/roles/{name}.
+  await page.click('#role-editor-fold > summary');
+  await page.click('#role-editor-form [data-role-preset="reviewer"]');
+  const putRole = page.waitForResponse(
+    (r) => r.url().endsWith('/api/roles/reviewer') && r.request().method() === 'PUT',
+  );
+  await page.click('#role-editor-form button[type="submit"]');
+  assert.equal((await putRole).status(), 200);
+  await page.waitForFunction(
+    () => {
+      const item = document.querySelector('#roles-card [data-role-name="reviewer"]')?.textContent || '';
+      return item.includes('reviewer') && item.includes('只读');
+    },
+    null,
+    { timeout: 5000 },
+  );
+  const delReviewer = page.waitForResponse(
+    (r) => r.url().endsWith('/api/roles/reviewer') && r.request().method() === 'DELETE',
+  );
+  await page.click('#roles-card [data-del-role="reviewer"]');
+  assert.equal((await delReviewer).status(), 200);
+
   const delRole = page.waitForResponse(
     (r) => r.url().endsWith('/api/roles/planner') && r.request().method() === 'DELETE',
   );
@@ -359,9 +398,10 @@ try {
   await page.unroute('**/api/bootstrap', padHandler);
   await page.click('#muse-head-toggle');
 
-  // 7. Verify 2-tab Muse drawer (Work Threads + Soul/Memory), live dynamic avatar picker & Settings view.
+  // 7. Verify 2-tab Muse drawer (Work Threads + Soul/Memory), context meter card, live dynamic avatar picker & Settings view.
   await page.waitForSelector('#drawer-body .panel-card h3');
   await page.click('.muse-seg button[data-tab="soul"]');
+  await page.waitForSelector('#context-meter-card .ctx-meter-track');
   await page.waitForSelector('#chat-tune-memory');
   await page.click('[data-pick-avatar="sakura"]');
   await page.waitForFunction(

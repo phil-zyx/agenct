@@ -7,6 +7,7 @@
   <link rel="icon" type="image/svg+xml" href="brand/agenct-icon.svg">
   <link rel="icon" type="image/png" sizes="32x32" href="brand/agenct-icon-32.png">
   <link rel="apple-touch-icon" href="brand/agenct-icon-180.png">
+  <script src="js/theme-init.js"></script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -33,6 +34,13 @@
       <symbol id="ic-reply" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M11 6h4.5a4.5 4.5 0 1 1 0 9H4"/><path d="M7 12s-3 2.21-3 3s3 3 3 3"/></g></symbol>
       <symbol id="ic-bolt" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linejoin="round" d="M8.628 12.674H8.17c-1.484 0-2.225 0-2.542-.49c-.316-.489-.015-1.17.588-2.533l1.812-4.098c.548-1.239.822-1.859 1.353-2.206S10.586 3 11.935 3h2.09c1.638 0 2.458 0 2.767.535c.309.536-.098 1.25-.91 2.681l-1.073 1.886c-.404.711-.606 1.066-.603 1.358c.003.378.205.726.53.917c.25.147.657.147 1.471.147c1.03 0 1.545 0 1.813.178c.349.232.531.646.467 1.061c-.049.32-.395.703-1.088 1.469l-5.535 6.12c-1.087 1.203-1.63 1.804-1.996 1.613c-.365-.19-.19-.983.16-2.569l.688-3.106c.267-1.208.4-1.812.08-2.214c-.322-.402-.937-.402-2.168-.402Z"/></symbol>
       <symbol id="ic-edit" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linejoin="round"><path d="m16.425 4.605l.99-.99a2.1 2.1 0 0 1 2.97 2.97l-.99.99m-2.97-2.97l-6.66 6.66a3.96 3.96 0 0 0-1.041 1.84L8 16l2.896-.724a3.96 3.96 0 0 0 1.84-1.042l6.659-6.659m-2.97-2.97l2.97 2.97"/><path stroke-linecap="round" d="M19 13.5c0 3.288 0 4.931-.908 6.038a4 4 0 0 1-.554.554C16.43 21 14.788 21 11.5 21H11c-3.771 0-5.657 0-6.828-1.172S3 16.771 3 13v-.5c0-3.287 0-4.931.908-6.038q.25-.304.554-.554C5.57 5 7.212 5 10.5 5"/></g></symbol>
+      <symbol id="ic-sun" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.5v2m0 15v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2.5 12h2m15 0h2M4.93 19.07l1.41-1.41m11.32-11.32l1.41-1.41"/></g></symbol>
+      <symbol id="ic-moon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M20.2 14.4A8.5 8.5 0 0 1 9.6 3.8a8.5 8.5 0 1 0 10.6 10.6Z"/></symbol>
+      <symbol id="ic-theme" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 3v18m0-13.5l4.5 4.5M12 12l5.5 5.5"/></g></symbol>
+      <symbol id="ic-file" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2.5H7a2.5 2.5 0 0 0-2.5 2.5v14A2.5 2.5 0 0 0 7 21.5h10a2.5 2.5 0 0 0 2.5-2.5V8z"/><path d="M14 2.5V8h5.5"/></g></symbol>
+      <symbol id="ic-slash" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="4"/><path d="m14 8l-4 8"/></g></symbol>
+      <symbol id="ic-spark" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/></symbol>
+      <symbol id="ic-shield" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M12 3l7 3v5.5c0 4.5-3 8.1-7 9.5c-4-1.4-7-5-7-9.5V6z"/></symbol>
     </defs>
   </svg>
   <nav class="rail" aria-label="主导航">
@@ -63,6 +71,10 @@
           <button type="button" id="toggle-sound" class="rail-menu-item" role="menuitem">
             <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-sound"/></svg>
             <span id="sound-label">交互音效：柔和</span>
+          </button>
+          <button type="button" id="toggle-theme" class="rail-menu-item" role="menuitem">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use id="theme-menu-ic" href="#ic-theme"/></svg>
+            <span id="theme-label">外观主题：跟随系统</span>
           </button>
           <button type="button" id="open-settings" class="rail-menu-item" role="menuitem">
             <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-user"/></svg>
@@ -160,6 +172,7 @@
           <div id="load-older-wrap" class="load-older-wrap hide">
             <button type="button" id="load-older-btn" class="sm">加载更早消息</button>
           </div>
+          <div id="chat-starters" class="chat-starters hide" aria-label="快速开始"></div>
           <div id="messages" class="stream" aria-label="对话记录"></div>
           <div id="stream-live" class="stream-live hide" aria-live="polite">
             <div id="streaming-msg" class="msg msg-assistant msg-streaming"></div>
@@ -176,10 +189,13 @@
         <div id="stage-bar" class="stage-pill hide">
           <div class="stage-row">
             <span class="stage-lead">
-              <span class="pixel-grid" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span>
+              <span id="work-indicator" class="pixel-grid" data-think-variant="wave" aria-hidden="true"><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span></span>
               <span id="work-stage" class="shimmer-label" role="status"></span>
             </span>
-            <span id="work-elapsed" class="work-elapsed"></span>
+            <span class="stage-right">
+              <span id="work-elapsed" class="work-elapsed"></span>
+              <button type="button" id="work-stop-btn" class="stage-stop-btn hide" aria-label="长按中止当前任务"><span class="stop-sq" aria-hidden="true"></span><span>停止</span></button>
+            </span>
           </div>
           <details id="work-log" class="work-log hide">
             <summary>执行动态</summary>
@@ -187,7 +203,20 @@
           </details>
         </div>
         <div id="pending-atts" class="chat-attachments hide"></div>
+        <div id="composer-suggest" class="composer-suggest hide" role="listbox" aria-label="输入补全建议"></div>
         <div class="composer-pill">
+          <svg id="composer-orbit" class="composer-orbit" aria-hidden="true">
+            <defs>
+              <linearGradient id="composer-comet-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+                <stop offset="0%" stop-color="var(--brand)"/>
+                <stop offset="50%" stop-color="var(--info)"/>
+                <stop offset="100%" stop-color="var(--brand)"/>
+              </linearGradient>
+            </defs>
+            <rect class="orbit-bloom" pathLength="1000"/>
+            <rect class="orbit-glow" pathLength="1000"/>
+            <rect class="orbit-core" pathLength="1000"/>
+          </svg>
           <label class="attach-btn" title="添加附件 (图片/PDF/ZIP/文本)" aria-label="添加附件">
             <input id="file-input" type="file" hidden>
             <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-attach"/></svg>
@@ -251,6 +280,9 @@
             </button>
             <button type="button" class="status-orb" id="status-sound-orb" data-status-act="sound" data-tip="交互音效：开" aria-label="切换交互音效" aria-pressed="true">
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-sound"/></svg>
+            </button>
+            <button type="button" class="status-orb" id="status-theme-orb" data-status-act="theme" data-tip="外观主题：跟随系统" aria-label="切换外观主题">
+              <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use id="status-theme-ic" href="#ic-theme"/></svg>
             </button>
             <button type="button" class="status-orb" data-status-act="settings" data-tip="节点与设置" aria-label="节点与设置">
               <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-tuning"/></svg>

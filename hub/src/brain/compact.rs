@@ -12,8 +12,8 @@ use rusqlite::params;
 use serde::Deserialize;
 use serde_json::json;
 
-const COMPACT_KEEP_RECENT: usize = 8;
-const COMPACT_MIN_BATCH: usize = 10;
+pub(super) const COMPACT_KEEP_RECENT: usize = 8;
+pub(super) const COMPACT_MIN_BATCH: usize = 10;
 const COMPACT_MAX_BATCH: usize = 24;
 
 #[derive(Deserialize)]

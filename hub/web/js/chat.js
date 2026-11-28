@@ -1,7 +1,8 @@
 // Chat stream, typing indicator, attachment uploads, and floating pill composer.
 import { api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 import { playDone, playSend, playTap, playToggle, playWarn } from './sound.js';
-import { initDelegatedCopy, writeClipboard } from './ui.js';
+import { renderStepTrailHtml } from './triage.js';
+import { bindHoldAction, fmtBytes, initDelegatedCopy, writeClipboard } from './ui.js';
 
 function randomId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -11,9 +12,12 @@ function randomId() {
 
 export function initChat({ state, onRefresh, onActivityChange }) {
   const scrollerEl = document.getElementById('scroller');
+  const startersEl = document.getElementById('chat-starters');
   const listEl = document.getElementById('messages');
   const formEl = document.getElementById('chat-form');
   const pillEl = formEl.querySelector('.composer-pill');
+  const orbitEl = document.getElementById('composer-orbit');
+  const suggestEl = document.getElementById('composer-suggest');
   const engineWrap = document.getElementById('composer-engine-wrap');
   const engineBtn = document.getElementById('composer-engine-btn');
   const engineLabel = document.getElementById('composer-engine-label');
@@ -23,8 +27,10 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   const fileEl = document.getElementById('file-input');
   const attsEl = document.getElementById('pending-atts');
   const stageEl = document.getElementById('stage-bar');
+  const workIndicatorEl = document.getElementById('work-indicator');
   const workStageEl = document.getElementById('work-stage');
   const elapsedEl = document.getElementById('work-elapsed');
+  const workStopBtn = document.getElementById('work-stop-btn');
   const workLogEl = document.getElementById('work-log');
   const logTailEl = document.getElementById('work-log-tail');
   const islandShellEl = document.getElementById('island-shell');
@@ -69,7 +75,122 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   let lastTaskSnapshot = null;
   let currentStatusLabel = '';
   let donePulseTimer = null;
+  let activeCancellableTaskId = null;
+  let lastRenderedTail = '';
+  let isComposingInput = false;
+  let suggestOpen = false;
+  let suggestItems = [];
+  let suggestIdx = 0;
+  let suggestRange = null;
   const renderedContents = new Map();
+
+  function syncOrbitGeometry() {
+    if (!pillEl || !orbitEl) return;
+    const w = pillEl.clientWidth;
+    const h = pillEl.clientHeight;
+    if (!w || !h) return;
+    const rawRx = parseFloat(getComputedStyle(pillEl).borderTopLeftRadius) || 26;
+    const rx = Math.max(4, Math.min(rawRx - 0.75, Math.min(w, h) / 2 - 0.75));
+    orbitEl.setAttribute('viewBox', `0 0 ${w} ${h}`);
+    const rw = Math.max(0, w - 1.5);
+    const rh = Math.max(0, h - 1.5);
+    orbitEl.querySelectorAll('rect').forEach((rect) => {
+      rect.setAttribute('x', '0.75');
+      rect.setAttribute('y', '0.75');
+      rect.setAttribute('width', String(rw));
+      rect.setAttribute('height', String(rh));
+      rect.setAttribute('rx', String(rx));
+      rect.setAttribute('ry', String(rx));
+    });
+  }
+
+  if (pillEl && typeof ResizeObserver === 'function') {
+    const ro = new ResizeObserver(() => syncOrbitGeometry());
+    ro.observe(pillEl);
+  }
+
+  if (workStopBtn) {
+    bindHoldAction(
+      workStopBtn,
+      async () => {
+        const tid = activeCancellableTaskId;
+        if (!tid) return;
+        try {
+          await api(`/api/tasks/${encodeURIComponent(tid)}/action`, {
+            method: 'POST',
+            body: { action: 'cancel' },
+          });
+          showToast('任务已中止');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      },
+      { duration: 650, shortHint: '请长按「停止」确认中止任务' },
+    );
+  }
+
+  const STARTER_CARDS = [
+    {
+      icon: '#ic-bolt',
+      title: '巡检本机仓库',
+      sub: '让在线节点查看工作区 git 状态与近期提交',
+      prompt: '帮我检查在线本机节点的工作区仓库状态和最近几次提交。',
+    },
+    {
+      icon: '#ic-shield',
+      title: '配置我的军团角色',
+      sub: '设定只读规划 planner 与可写执行 executor',
+      prompt: '帮我配置两个军团角色：planner（只读规划）和 executor（可写执行）。',
+    },
+    {
+      icon: '#ic-tasks',
+      title: '创建每日定时汇报',
+      sub: '每天固定时间自动汇总进展并推送到 IM',
+      prompt: '帮我创建一个每天 18:30 的定时任务：汇总今天的代码提交与未完待办。',
+    },
+    {
+      icon: '#ic-spark',
+      title: '记住我的工作偏好',
+      sub: '把习惯、环境事实或输出风格写入长期记忆',
+      prompt: '记住：默认用中文简短汇报结论，涉及改动文件时先给计划再动手。',
+    },
+  ];
+
+  function renderStartersOnce() {
+    if (!startersEl || startersEl.dataset.ready) return;
+    startersEl.dataset.ready = '1';
+    startersEl.innerHTML = `
+      <div class="starters-head">
+        <span class="starters-kicker">快速开始</span>
+        <p class="starters-lead">直接输入需求，或从下面选一个常用起点</p>
+      </div>
+      <div class="starters-grid">
+        ${STARTER_CARDS.map(
+          (c, i) => `
+          <button type="button" class="starter-card" data-starter-idx="${i}">
+            <span class="starter-ic"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="${esc(c.icon)}"/></svg></span>
+            <span class="starter-body">
+              <span class="starter-title">${esc(c.title)}</span>
+              <span class="starter-sub">${esc(c.sub)}</span>
+            </span>
+          </button>`,
+        ).join('')}
+      </div>`;
+    startersEl.querySelectorAll('[data-starter-idx]').forEach((btn) => {
+      btn.onclick = () => {
+        const card = STARTER_CARDS[Number(btn.dataset.starterIdx)];
+        if (!card) return;
+        playTap();
+        inputEl.value = card.prompt;
+        closeSuggest();
+        syncComposerState();
+        inputEl.focus();
+        inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+      };
+    });
+  }
+  renderStartersOnce();
 
   function distFromBottom() {
     return Math.max(0, scrollerEl.scrollHeight - scrollerEl.scrollTop - scrollerEl.clientHeight);
@@ -165,12 +286,30 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     visibleWork = brainWork || task;
     const busy = Boolean(visibleWork);
     const stage = typeof visibleWork?.stage === 'string' ? visibleWork.stage.trim() : '';
+    const stageLower = stage.toLowerCase();
+    let variant = 'stars';
+    if (task?.status === 'queued') variant = 'spin';
+    else if (task?.status === 'running') {
+      variant = stageLower.includes('plan') || stageLower.includes('readonly') || stageLower.includes('只读')
+        ? 'stars'
+        : 'wave';
+    } else if (streamingText || stageLower === 'summarizing') {
+      variant = 'pulse';
+    }
+    if (workIndicatorEl) workIndicatorEl.dataset.thinkVariant = variant;
+
     const label = humanizeStage(stage, task?.status);
     const text = busy ? `正在工作 · ${label}` : '';
     if (workStageEl.textContent !== text) workStageEl.textContent = text;
     stageEl.classList.toggle('hide', !busy);
     headEl?.classList.toggle('is-thinking', busy);
     heroEl?.classList.toggle('is-thinking', busy);
+
+    activeCancellableTaskId =
+      task && (task.status === 'running' || task.status === 'queued') && task.taskId
+        ? task.taskId
+        : null;
+    workStopBtn?.classList.toggle('hide', !activeCancellableTaskId);
 
     const taskId = visibleWork?.taskId;
     const rawTail = String(visibleWork?.logTail || '').trim();
@@ -185,7 +324,11 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     const tail = tailLines.join('\n');
     if (taskId !== visibleTaskId || !tail) workLogEl.open = false;
     visibleTaskId = taskId;
-    if (logTailEl.textContent !== tail) logTailEl.textContent = tail;
+    if (tail !== lastRenderedTail) {
+      lastRenderedTail = tail;
+      logTailEl.innerHTML = tail ? renderStepTrailHtml(tailLines) : '';
+    }
+    workLogEl.dataset.steps = String(tailLines.length);
     workLogEl.classList.toggle('hide', !tail);
 
     renderElapsed();
@@ -289,6 +432,30 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
     const active = inputEl.value.trim().length > 0 || pendingAtts.length > 0;
     pillEl?.classList.toggle('has-content', active);
+    syncOrbitGeometry();
+  }
+
+  function attachmentBadgeLabel(att) {
+    const mime = String(att.mime_type || '').toLowerCase();
+    const name = String(att.name || '').toLowerCase();
+    if (mime.startsWith('image/')) return 'IMG';
+    if (mime === 'application/pdf' || name.endsWith('.pdf')) return 'PDF';
+    if (mime.includes('zip') || name.endsWith('.zip')) return 'ZIP';
+    if (mime === 'application/json' || name.endsWith('.json')) return 'JSON';
+    if (mime === 'text/markdown' || name.endsWith('.md')) return 'MD';
+    if (mime === 'text/csv' || name.endsWith('.csv')) return 'CSV';
+    if (mime.startsWith('text/') || name.endsWith('.txt')) return 'TXT';
+    return 'FILE';
+  }
+
+  function revokeAttachmentPreview(att) {
+    if (att?.previewUrl) {
+      try {
+        URL.revokeObjectURL(att.previewUrl);
+      } catch {
+        // ignore
+      }
+    }
   }
 
   function renderPendingAtts() {
@@ -299,15 +466,47 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       return;
     }
     attsEl.classList.remove('hide');
+    const ringCirc = 2 * Math.PI * 15;
     attsEl.innerHTML = pendingAtts
-      .map(
-        (a, i) =>
-          `<span class="chat-attachment-chip">${esc(a.name)} <button type="button" class="text-btn sm" data-rm="${i}">×</button></span>`,
-      )
+      .map((a, i) => {
+        const badge = attachmentBadgeLabel(a);
+        const visualHtml = a.previewUrl
+          ? `<img class="att-thumb" src="${esc(a.previewUrl)}" alt=""><span class="att-badge">${esc(badge)}</span>`
+          : `<span class="att-badge">${esc(badge)}</span>`;
+        const pct = Math.max(0, Math.min(100, Number(a.progress) || 0));
+        const metaText = a.uploading ? '上传中…' : fmtBytes(a.size_bytes);
+        return `
+          <div class="att-tile${a.uploading ? ' is-uploading' : ''}${a.previewUrl ? ' has-thumb' : ''}" data-att-idx="${i}">
+            <span class="att-visual">
+              ${visualHtml}
+              <svg class="att-ring" viewBox="0 0 36 36" aria-hidden="true">
+                <circle class="att-ring-track" cx="18" cy="18" r="15"/>
+                <circle class="att-ring-fill" cx="18" cy="18" r="15" data-att-pct="${pct}"/>
+              </svg>
+            </span>
+            <span class="att-info">
+              <span class="att-name">${esc(a.name)}</span>
+              <span class="att-meta">${esc(metaText)}</span>
+            </span>
+            <button type="button" class="att-rm-btn" data-rm="${i}" aria-label="移除附件">×</button>
+          </div>`;
+      })
       .join('');
+    attsEl.querySelectorAll('.att-ring-fill').forEach((circle) => {
+      const pct = Number(circle.dataset.attPct || 100);
+      circle.style.setProperty('--att-circ', String(ringCirc));
+      circle.style.setProperty('--att-dashoffset', String(ringCirc * (1 - pct / 100)));
+    });
+    attsEl.querySelectorAll('.att-thumb').forEach((img) => {
+      img.addEventListener('error', () => {
+        img.closest('.att-tile')?.classList.add('is-thumb-fallback');
+      });
+    });
     attsEl.querySelectorAll('[data-rm]').forEach((btn) => {
       btn.onclick = () => {
-        pendingAtts.splice(Number(btn.dataset.rm), 1);
+        const idx = Number(btn.dataset.rm);
+        const [removed] = pendingAtts.splice(idx, 1);
+        revokeAttachmentPreview(removed);
         renderPendingAtts();
       };
     });
@@ -319,8 +518,33 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       showToast('附件不能超过 5 MiB');
       return;
     }
+    const localId = randomId();
+    const mime = file.type || 'text/plain';
+    const previewUrl = mime.startsWith('image/') && typeof URL?.createObjectURL === 'function'
+      ? URL.createObjectURL(file)
+      : '';
+    const entry = {
+      localId,
+      id: '',
+      name,
+      mime_type: mime,
+      size_bytes: file.size || 0,
+      previewUrl,
+      uploading: true,
+      progress: 28,
+    };
+    pendingAtts.push(entry);
+    renderPendingAtts();
+
     try {
       const buf = await file.arrayBuffer();
+      const stillQueued = pendingAtts.find((a) => a.localId === localId);
+      if (!stillQueued) {
+        revokeAttachmentPreview(entry);
+        return;
+      }
+      stillQueued.progress = 68;
+      renderPendingAtts();
       let binary = '';
       const bytes = new Uint8Array(buf);
       for (let i = 0; i < bytes.length; i += 8192) {
@@ -330,14 +554,32 @@ export function initChat({ state, onRefresh, onActivityChange }) {
         method: 'POST',
         body: {
           name,
-          mime_type: file.type || 'text/plain',
+          mime_type: mime,
           data_base64: btoa(binary),
         },
       });
-      pendingAtts.push(meta);
+      const target = pendingAtts.find((a) => a.localId === localId);
+      if (!target) {
+        revokeAttachmentPreview(entry);
+        return;
+      }
+      target.id = meta.id;
+      target.name = meta.name || name;
+      target.mime_type = meta.mime_type || mime;
+      target.size_bytes = meta.size_bytes || file.size || 0;
+      target.progress = 100;
+      target.uploading = false;
       renderPendingAtts();
-      showToast(`已上传：${meta.name}`);
+      showToast(`已上传：${target.name}`);
     } catch (err) {
+      const idx = pendingAtts.findIndex((a) => a.localId === localId);
+      if (idx >= 0) {
+        const [removed] = pendingAtts.splice(idx, 1);
+        revokeAttachmentPreview(removed);
+        renderPendingAtts();
+      } else {
+        revokeAttachmentPreview(entry);
+      }
       showToast(`上传失败：${err.message}`);
     }
   }
@@ -364,7 +606,239 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
   });
 
-  inputEl.addEventListener('input', syncComposerState);
+  function closeSuggest() {
+    if (!suggestOpen && suggestEl?.classList.contains('hide')) return;
+    suggestOpen = false;
+    suggestItems = [];
+    suggestRange = null;
+    suggestEl?.classList.add('hide');
+    if (suggestEl) suggestEl.innerHTML = '';
+  }
+
+  function syncSuggestSelection() {
+    if (!suggestEl) return;
+    const opts = Array.from(suggestEl.querySelectorAll('.suggest-item'));
+    if (!opts.length) return;
+    if (suggestIdx < 0 || suggestIdx >= opts.length) suggestIdx = 0;
+    opts.forEach((el, i) => {
+      const on = i === suggestIdx;
+      el.classList.toggle('is-selected', on);
+      el.setAttribute('aria-selected', String(on));
+      if (on) el.scrollIntoView({ block: 'nearest' });
+    });
+  }
+
+  function applySuggest(idx) {
+    const item = suggestItems[idx];
+    if (!item || !suggestRange) return;
+    const val = inputEl.value;
+    const next = val.slice(0, suggestRange.start) + item.insert + val.slice(suggestRange.end);
+    const nextCaret = suggestRange.start + item.insert.length;
+    inputEl.value = next;
+    closeSuggest();
+    syncComposerState();
+    inputEl.focus();
+    inputEl.setSelectionRange(nextCaret, nextCaret);
+    playTap();
+  }
+
+  function buildSuggestCandidates(kind, query) {
+    const q = query.toLowerCase();
+    const groups = [];
+    if (kind === '/') {
+      const cmds = [];
+      const hasElev = (state.tasks || []).some((t) => t.status === 'pending' && t.sandbox === 'elevated');
+      if (hasElev) {
+        cmds.push({
+          title: '/approve',
+          sub: '输入 6 位审批码单次放行挂起任务',
+          badge: '待放行',
+          icon: '#ic-shield',
+          insert: '/approve ',
+          search: 'approve 放行 审批',
+        });
+      }
+      cmds.push({
+        title: '/node',
+        sub: '直接派发任务给在线执行节点',
+        badge: '节点',
+        icon: '#ic-bolt',
+        insert: '/node ',
+        search: 'node 节点 执行',
+      });
+      for (const r of state.roles || []) {
+        cmds.push({
+          title: `/node --role ${r.name}`,
+          sub: r.description || `按 ${r.name} 角色规范派发（${r.agent || '默认'}）`,
+          badge: r.sandbox === 'readonly' ? '只读角色' : '角色',
+          icon: '#ic-spark',
+          insert: `/node --role ${r.name} `,
+          search: `node role ${r.name} ${r.description || ''}`,
+        });
+      }
+      cmds.push(
+        {
+          title: '/role',
+          sub: '通过对话新建或调整军团角色分工',
+          badge: '军团',
+          icon: '#ic-tuning',
+          insert: '/role ',
+          search: 'role 角色 军团',
+        },
+        {
+          title: '/cron',
+          sub: '插入每日定时汇报指令模板',
+          badge: '定时',
+          icon: '#ic-tasks',
+          insert: '每天 18:30 帮我汇总今日进展并汇报：',
+          search: 'cron 定时 汇报',
+        },
+        {
+          title: '/memory',
+          sub: '让管家整理并精简长期记忆',
+          badge: '记忆',
+          icon: '#ic-avatar',
+          insert: '帮我整理并精简长期记忆，剔除已过时条目。',
+          search: 'memory 记忆',
+        },
+      );
+      const matched = q
+        ? cmds.filter((c) => c.title.toLowerCase().includes(q) || c.search.toLowerCase().includes(q))
+        : cmds;
+      if (matched.length) groups.push({ label: '快捷指令', items: matched.slice(0, 7) });
+      return groups;
+    }
+
+    const contacts = (state.contacts || [])
+      .filter((c) => !q || `${c.username} ${c.display_name}`.toLowerCase().includes(q))
+      .slice(0, 5)
+      .map((c) => ({
+        title: `@${c.username}`,
+        sub: `${c.display_name} · 发起团队协作`,
+        badge: '同事',
+        icon: '#ic-contacts',
+        insert: `@${c.username} `,
+      }));
+    if (contacts.length) groups.push({ label: '同事协作', items: contacts });
+
+    const roles = (state.roles || [])
+      .filter((r) => !q || `${r.name} ${r.description || ''}`.toLowerCase().includes(q))
+      .slice(0, 5)
+      .map((r) => ({
+        title: r.name,
+        sub: r.description || `${r.agent || '节点默认'}${r.sandbox === 'readonly' ? ' · 只读' : ''}`,
+        badge: '角色',
+        icon: '#ic-spark',
+        insert: `请用 ${r.name} 角色处理：`,
+      }));
+    if (roles.length) groups.push({ label: '军团角色', items: roles });
+
+    const nodes = (state.nodes || [])
+      .filter((n) => !q || `${n.name} ${n.id}`.toLowerCase().includes(q))
+      .slice(0, 4)
+      .map((n) => ({
+        title: n.name,
+        sub: `${n.online ? '在线' : '离线'} · ${n.effective_default_agent || n.default_agent || 'auto'}`,
+        badge: n.online ? '在线节点' : '离线节点',
+        icon: '#ic-bolt',
+        insert: `在节点 ${n.name} 上：`,
+      }));
+    if (nodes.length) groups.push({ label: '执行节点', items: nodes });
+    return groups;
+  }
+
+  function updateSuggest() {
+    if (!suggestEl || isComposingInput) return;
+    const caret = inputEl.selectionStart ?? inputEl.value.length;
+    if ((inputEl.selectionEnd ?? caret) !== caret) {
+      closeSuggest();
+      return;
+    }
+    const before = inputEl.value.slice(0, caret);
+    let kind = '';
+    let query = '';
+    let start = 0;
+
+    const slashMatch = before.match(/^\/([a-zA-Z0-9_-]*)$/);
+    if (slashMatch) {
+      kind = '/';
+      query = slashMatch[1];
+      start = 0;
+    } else {
+      const atMatch = before.match(/(?:^|[\s(（])@([^\s@]*)$/);
+      if (atMatch) {
+        kind = '@';
+        query = atMatch[1];
+        start = before.length - query.length - 1;
+      }
+    }
+
+    if (!kind) {
+      closeSuggest();
+      return;
+    }
+    const groups = buildSuggestCandidates(kind, query);
+    const flat = [];
+    const htmlParts = [];
+    for (const g of groups) {
+      if (!g.items.length) continue;
+      htmlParts.push(`<div class="suggest-group-title">${esc(g.label)}</div>`);
+      for (const item of g.items) {
+        const idx = flat.length;
+        flat.push(item);
+        htmlParts.push(`
+          <button type="button" class="suggest-item${idx === 0 ? ' is-selected' : ''}" data-suggest-idx="${idx}" role="option" aria-selected="${idx === 0 ? 'true' : 'false'}">
+            <span class="suggest-item-ic"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="${esc(item.icon)}"/></svg></span>
+            <span class="suggest-item-body">
+              <span class="suggest-item-title">${esc(item.title)}</span>
+              ${item.sub ? `<span class="suggest-item-sub">${esc(item.sub)}</span>` : ''}
+            </span>
+            ${item.badge ? `<span class="badge">${esc(item.badge)}</span>` : ''}
+          </button>`);
+      }
+    }
+    if (!flat.length) {
+      closeSuggest();
+      return;
+    }
+    suggestOpen = true;
+    suggestItems = flat;
+    suggestIdx = 0;
+    suggestRange = { start, end: caret };
+    suggestEl.innerHTML = htmlParts.join('');
+    suggestEl.classList.remove('hide');
+  }
+
+  suggestEl?.addEventListener('mousedown', (ev) => {
+    ev.preventDefault();
+  });
+  suggestEl?.addEventListener('click', (ev) => {
+    const btn = ev.target?.closest?.('.suggest-item');
+    if (!btn) return;
+    applySuggest(Number(btn.dataset.suggestIdx));
+  });
+  suggestEl?.addEventListener('pointermove', (ev) => {
+    const btn = ev.target?.closest?.('.suggest-item');
+    if (!btn) return;
+    const idx = Number(btn.dataset.suggestIdx);
+    if (Number.isFinite(idx) && idx !== suggestIdx) {
+      suggestIdx = idx;
+      syncSuggestSelection();
+    }
+  });
+
+  inputEl.addEventListener('compositionstart', () => {
+    isComposingInput = true;
+  });
+  inputEl.addEventListener('compositionend', () => {
+    isComposingInput = false;
+    updateSuggest();
+  });
+  inputEl.addEventListener('input', () => {
+    syncComposerState();
+    updateSuggest();
+  });
+  inputEl.addEventListener('click', updateSuggest);
 
   if (pillEl) {
     pillEl.addEventListener('dragover', (ev) => {
@@ -386,6 +860,31 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   }
 
   inputEl.addEventListener('keydown', (ev) => {
+    if (suggestOpen) {
+      if (ev.key === 'ArrowDown') {
+        ev.preventDefault();
+        suggestIdx = (suggestIdx + 1) % suggestItems.length;
+        syncSuggestSelection();
+        return;
+      }
+      if (ev.key === 'ArrowUp') {
+        ev.preventDefault();
+        suggestIdx = (suggestIdx - 1 + suggestItems.length) % suggestItems.length;
+        syncSuggestSelection();
+        return;
+      }
+      if ((ev.key === 'Tab' || (ev.key === 'Enter' && !ev.shiftKey)) && !ev.isComposing) {
+        ev.preventDefault();
+        applySuggest(suggestIdx);
+        return;
+      }
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeSuggest();
+        return;
+      }
+    }
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) {
       ev.preventDefault();
       formEl.requestSubmit();
@@ -395,6 +894,11 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   formEl.onsubmit = async (ev) => {
     ev.preventDefault();
     if (submitting || activeTurn) return;
+    if (pendingAtts.some((a) => a.uploading)) {
+      showToast('附件仍在上传，请稍候');
+      return;
+    }
+    closeSuggest();
     let text = inputEl.value.trim();
     if (!text && !pendingAtts.length) return;
     if (pendingAtts.length) {
@@ -429,6 +933,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       created_at: Math.floor(Date.now() / 1000),
     };
     inputEl.value = '';
+    pendingAtts.forEach(revokeAttachmentPreview);
     pendingAtts = [];
     renderPendingAtts();
     clearStreaming();
@@ -604,6 +1109,10 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       if (!synced) {
         msgs = [...baseMsgs, optimisticMsg];
       }
+    }
+    if (startersEl) {
+      const showStarters = !activeThread && msgs.length === 0 && !streamingText;
+      startersEl.classList.toggle('hide', !showStarters);
     }
     if (!msgs.length) {
       renderedContents.clear();
@@ -817,7 +1326,11 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     if (typeof delta.text === 'string' && delta.text) {
       const wasEmpty = !streamingText;
       streamingText += delta.text;
-      if (wasEmpty) emitActivity();
+      if (wasEmpty) {
+        startersEl?.classList.add('hide');
+        emitActivity();
+        renderWork();
+      }
       if (!streamRaf) {
         streamRaf = requestAnimationFrame(flushStreamRender);
       }
@@ -956,9 +1469,13 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   });
   document.addEventListener('click', (ev) => {
     if (engineWrap && !engineWrap.contains(ev.target)) closeEngineMenu();
+    if (formEl && !formEl.contains(ev.target)) closeSuggest();
   });
   document.addEventListener('keydown', (ev) => {
-    if (ev.key === 'Escape') closeEngineMenu();
+    if (ev.key === 'Escape') {
+      closeEngineMenu();
+      closeSuggest();
+    }
   });
 
   listEl?.addEventListener('click', async (ev) => {

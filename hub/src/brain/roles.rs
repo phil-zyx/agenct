@@ -167,6 +167,125 @@ pub async fn list_roles(
     Ok(Json(roles))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveRoleInput {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    #[serde(default)]
+    pub node_id: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+pub async fn save_role(
+    State(hub): State<Hub>,
+    AuthUser(user): AuthUser,
+    Path(name): Path<String>,
+    Json(input): Json<SaveRoleInput>,
+) -> Result<Json<AgentRole>> {
+    let norm_name = normalize_role_name(&name).ok_or_else(|| invalid("invalid role name"))?;
+    let next_desc = input
+        .description
+        .as_deref()
+        .map(|s| crate::config::truncate_bytes(s.trim(), 200));
+    let next_agent = match input.agent.as_deref() {
+        Some(raw) if raw.trim().is_empty() => Some(String::new()),
+        Some(raw) => Some(
+            crate::nodes::normalize_agent_name(raw)
+                .ok_or_else(|| invalid("unsupported agent engine"))?
+                .to_owned(),
+        ),
+        None => None,
+    };
+    let next_model = match input.model.as_deref() {
+        Some(raw) => Some(crate::nodes::normalize_model_name(raw)?),
+        None => None,
+    };
+    let next_effort = match input.effort.as_deref() {
+        Some(raw) => Some(crate::nodes::normalize_effort(raw)?),
+        None => None,
+    };
+    let next_sandbox = match input.sandbox.as_deref() {
+        Some(raw) => Some(crate::nodes::normalize_job_sandbox(raw)?),
+        None => None,
+    };
+    let raw_node_id = input.node_id.map(|s| s.trim().to_owned());
+    let next_prompt = input
+        .prompt
+        .as_deref()
+        .map(|s| crate::config::truncate_bytes(s.trim(), 2000));
+
+    let uid = user.id.clone();
+    let name_db = norm_name.clone();
+    let saved = hub
+        .db
+        .write(move |conn| {
+            let next_node_id = match raw_node_id.as_deref() {
+                Some("") => Some(String::new()),
+                Some(needle) => {
+                    let nodes = crate::nodes::list_nodes_sync(conn, &uid)?;
+                    let matched = nodes
+                        .iter()
+                        .find(|n| {
+                            n.id.eq_ignore_ascii_case(needle) || n.name.eq_ignore_ascii_case(needle)
+                        })
+                        .ok_or_else(|| invalid("unknown node_id"))?;
+                    Some(matched.id.clone())
+                }
+                None => None,
+            };
+            let cur = get_role_sync(conn, &uid, &name_db)?;
+            let mut merged = cur.unwrap_or_else(|| AgentRole {
+                name: name_db.clone(),
+                description: String::new(),
+                agent: String::new(),
+                model: String::new(),
+                effort: String::new(),
+                sandbox: String::new(),
+                node_id: String::new(),
+                prompt: String::new(),
+                updated_at: 0,
+            });
+            if let Some(d) = next_desc {
+                merged.description = d;
+            }
+            if let Some(a) = next_agent {
+                merged.agent = a;
+            }
+            if let Some(m) = next_model {
+                merged.model = m;
+            }
+            if let Some(e) = next_effort {
+                merged.effort = e;
+            }
+            if let Some(s) = next_sandbox {
+                merged.sandbox = s;
+            }
+            if let Some(n) = next_node_id {
+                merged.node_id = n;
+            }
+            if let Some(p) = next_prompt {
+                merged.prompt = p;
+            }
+            upsert_role_sync(conn, &uid, &merged)?;
+            Ok(merged)
+        })
+        .await?;
+
+    hub.events
+        .emit(user.id, "brain", json!({"updated": "roles"}));
+    Ok(Json(saved))
+}
+
 pub async fn delete_role(
     State(hub): State<Hub>,
     AuthUser(user): AuthUser,

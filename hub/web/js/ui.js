@@ -1,6 +1,6 @@
 // Shared Bencho-inspired UI helpers: copy-field morph, hold-to-confirm, and liquid glide tooltips.
 import { copyBtnHtml, showToast } from './api.js';
-import { playDone, playTap, playWarn } from './sound.js';
+import { playDone, playTap, playToggle, playWarn } from './sound.js';
 
 export const COPY_BTN_HTML = copyBtnHtml('复制内容');
 
@@ -163,4 +163,96 @@ export function initRailGlideTip(railEl) {
     btn.addEventListener('click', () => tip.classList.remove('is-visible'));
   });
   railEl.addEventListener('pointerleave', () => tip.classList.remove('is-visible'));
+}
+
+const THEME_STORAGE_KEY = 'agenct:theme';
+const THEME_MODES = ['system', 'light', 'dark'];
+const THEME_LABELS = {
+  system: '跟随系统',
+  light: '浅色',
+  dark: '深色',
+};
+
+export function getThemeMode() {
+  try {
+    const raw = localStorage.getItem(THEME_STORAGE_KEY);
+    return raw === 'light' || raw === 'dark' ? raw : 'system';
+  } catch {
+    return 'system';
+  }
+}
+
+export function isEffectiveDark(mode = getThemeMode()) {
+  if (mode === 'dark') return true;
+  if (mode === 'light') return false;
+  return Boolean(window.matchMedia?.('(prefers-color-scheme: dark)')?.matches);
+}
+
+export function themeModeLabel(mode = getThemeMode()) {
+  return THEME_LABELS[mode] || THEME_LABELS.system;
+}
+
+export function applyThemeMode(mode) {
+  const next = THEME_MODES.includes(mode) ? mode : 'system';
+  const root = document.documentElement;
+  if (next === 'system') delete root.dataset.theme;
+  else root.dataset.theme = next;
+  try {
+    if (next === 'system') localStorage.removeItem(THEME_STORAGE_KEY);
+    else localStorage.setItem(THEME_STORAGE_KEY, next);
+  } catch {
+    // ignore storage errors
+  }
+  return next;
+}
+
+function nextThemeMode(cur) {
+  const systemDark = Boolean(window.matchMedia?.('(prefers-color-scheme: dark)')?.matches);
+  if (cur === 'system') return systemDark ? 'light' : 'dark';
+  if (cur === 'dark') return systemDark ? 'system' : 'light';
+  return systemDark ? 'dark' : 'system';
+}
+
+export function cycleThemeMode(origin) {
+  const prev = getThemeMode();
+  const prevDark = isEffectiveDark(prev);
+  const next = nextThemeMode(prev);
+  const nextDark = isEffectiveDark(next);
+  playToggle(nextDark);
+
+  const reduced = Boolean(window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches);
+  const startVT = typeof document.startViewTransition === 'function' ? document.startViewTransition.bind(document) : null;
+  if (prevDark !== nextDark && startVT && !reduced) {
+    let x = window.innerWidth / 2;
+    let y = window.innerHeight / 2;
+    if (origin && typeof origin.clientX === 'number' && typeof origin.clientY === 'number' && (origin.clientX || origin.clientY)) {
+      x = origin.clientX;
+      y = origin.clientY;
+    } else if (origin?.getBoundingClientRect) {
+      const r = origin.getBoundingClientRect();
+      x = r.left + r.width / 2;
+      y = r.top + r.height / 2;
+    }
+    const radius = Math.hypot(Math.max(x, window.innerWidth - x), Math.max(y, window.innerHeight - y));
+    const root = document.documentElement;
+    root.style.setProperty('--vt-x', `${Math.round(x)}px`);
+    root.style.setProperty('--vt-y', `${Math.round(y)}px`);
+    root.style.setProperty('--vt-r', `${Math.ceil(radius)}px`);
+    root.classList.add('is-theme-transitioning');
+    try {
+      const transition = startVT(() => applyThemeMode(next));
+      Promise.resolve(transition?.finished).finally(() => root.classList.remove('is-theme-transitioning'));
+      return next;
+    } catch {
+      root.classList.remove('is-theme-transitioning');
+    }
+  }
+  return applyThemeMode(next);
+}
+
+export function fmtBytes(bytes) {
+  const n = Math.max(0, Number(bytes) || 0);
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }

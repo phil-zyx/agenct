@@ -181,7 +181,10 @@ pub fn app(hub: Hub) -> Router {
         .route("/api/chat", post(brain::chat))
         .route("/api/brain", put(brain::save_profile))
         .route("/api/roles", get(brain::list_roles))
-        .route("/api/roles/{name}", delete(brain::delete_role))
+        .route(
+            "/api/roles/{name}",
+            put(brain::save_role).delete(brain::delete_role),
+        )
         .route(
             "/api/threads/{id}",
             put(brain::update_thread).delete(brain::delete_thread),

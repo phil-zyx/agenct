@@ -66,6 +66,14 @@ export function initCommandPalette({
       run: () => actions.onCycleSound?.(),
     });
     list.push({
+      title: '切换外观主题',
+      sub: `当前：${actions.getThemeLabel?.() || '跟随系统'}`,
+      badge: '主题',
+      icon: '#ic-theme',
+      keywords: 'theme dark light mode 外观 主题 深色 浅色',
+      run: (ev) => actions.onCycleTheme?.(ev),
+    });
+    list.push({
       title: '切换管家形象',
       sub: '打开形象选择器（动态管家 / 樱粉 / 和风 / 猫耳）',
       badge: '形象',
@@ -287,7 +295,7 @@ export function initCommandPalette({
     const runner = actionRunners[idx];
     if (runner) {
       playTap();
-      runner();
+      runner(ev);
     }
   });
 

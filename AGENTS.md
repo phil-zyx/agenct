@@ -44,7 +44,7 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite WAL) ──�
 | `hub/src/integrations/gitlab.rs` | SSRF 加固的 GitLab Webhook、Todo 轮询、提交摘要与受控回复 |
 | `hub/src/integrations/im.rs` | SSRF 加固的企业微信（API 长连接）/ 钉钉（Stream + OpenAPI）双向接入、`/bind` 本人配对及可选群 Webhook 加签通知 |
 | `hub/tests/v2_core.rs` | Rust 集成与回归测试（使用内存 SQLite 与 LLM Stub） |
-| `hub/web/` | 原生 ESM 前端：`index.html`、`style.css`、`js/{app,api,avatar,chat,drawer,palette,sound,sse,triage,ui}.js`、静态头像/品牌资源 |
+| `hub/web/` | 原生 ESM 前端：`index.html`、`style.css`、`js/{app,api,avatar,chat,drawer,palette,sound,sse,theme-init,triage,ui}.js`、静态头像/品牌资源 |
 | `node/agenct-node.py` | 统一执行节点客户端（支持 `claude`/`codex`/`agy`/`opencode`/自定义 `--cmd`） |
 | `node/test_node.py` | 节点单元测试 |
 | `scripts/backup.py` | SQLite 在线快照 + 附件打包备份与恢复 |

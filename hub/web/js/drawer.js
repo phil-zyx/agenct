@@ -2,8 +2,8 @@
 import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 import { renderBuddySvg } from './avatar.js';
 import { playTap, playToggle } from './sound.js';
-import { stripNoise, describeTask, cleanPreviewLine } from './triage.js';
-import { COPY_BTN_HTML, bindHoldAction, initDelegatedCopy } from './ui.js';
+import { stripNoise, describeTask, cleanPreviewLine, renderStepTrailHtml } from './triage.js';
+import { COPY_BTN_HTML, bindHoldAction, fmtBytes, initDelegatedCopy } from './ui.js';
 
 export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread }) {
   const bodyEl = document.getElementById('drawer-body');
@@ -144,7 +144,40 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     };
   }
 
-  function rolesCardHtml(roles, { foldable = false, open = false } = {}) {
+  const ROLE_PRESETS = {
+    planner: {
+      name: 'planner',
+      description: '只读调研与方案规划，不修改代码',
+      agent: 'claude',
+      model: '',
+      effort: 'high',
+      sandbox: 'readonly',
+      node_id: '',
+      prompt: '只读分析架构与实现方案，给出清晰步骤与风险点，不要修改任何文件。',
+    },
+    executor: {
+      name: 'executor',
+      description: '按确认方案改码、补测试并运行验证',
+      agent: 'codex',
+      model: '',
+      effort: 'medium',
+      sandbox: 'workspace-write',
+      node_id: '',
+      prompt: '严格按方案修改代码并运行相关测试，输出修改摘要与验证命令结果。',
+    },
+    reviewer: {
+      name: 'reviewer',
+      description: '独立只读代码审查，聚焦安全与回归风险',
+      agent: 'claude',
+      model: '',
+      effort: 'high',
+      sandbox: 'readonly',
+      node_id: '',
+      prompt: '以资深评审视角逐行核查 diff 中的正确性、边界条件与安全隐患，只读不改文件。',
+    },
+  };
+
+  function rolesCardHtml(roles, nodes, { foldable = false, open = false, openEditor = false } = {}) {
     const SANDBOX_LABEL = { readonly: '只读', 'workspace-write': '可写' };
     const rolesHtml = roles.length
       ? roles
@@ -169,30 +202,104 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             <div class="engine-tags">${tags.join('')}</div>
             ${promptHtml}
             <div class="row">
+              <button type="button" class="sm" data-use-role="${esc(r.name)}">派发</button>
+              <button type="button" class="sm" data-edit-role="${esc(r.name)}">编辑</button>
               <button type="button" class="sm danger" data-del-role="${esc(r.name)}">删除</button>
             </div>
           </div>`;
           })
           .join('')
-      : '<p class="note">尚未配置军团角色。在对话中直接说，例如：<br>「配置 planner 用 agy / claude-opus-5-5-high（只读规划），executor 用 codex / gpt-6.2-sol（可写执行）」</p>';
+      : '<p class="note">尚未配置军团角色，可用下方可视化编辑器一键创建，或在对话中直接说明。</p>';
+
+    const nodeOptionsHtml = [
+      '<option value="">自动匹配在线节点</option>',
+      ...(nodes || []).map((n) => `<option value="${esc(n.id)}">${esc(n.name)} (${esc(n.id)})</option>`),
+    ].join('');
+
+    const effortOptions = [
+      { value: '', label: '跟随' },
+      { value: 'low', label: '低' },
+      { value: 'medium', label: '中' },
+      { value: 'high', label: '高' },
+      { value: 'max', label: '极高' },
+    ];
+
+    const sandboxCards = [
+      { value: 'readonly', title: '只读规划', desc: '禁止写文件与修改工作区' },
+      { value: 'workspace-write', title: '可写执行', desc: '允许工作区内改码与测试' },
+      { value: '', title: '跟随节点', desc: '沿用节点自身默认沙箱' },
+    ];
+
+    const editorHtml = `
+      <details class="node-repos mt-10" id="role-editor-fold" data-drawer-fold="role-editor"${openEditor ? ' open' : ''}>
+        <summary>+ 可视化新建 / 编辑角色</summary>
+        <form id="role-editor-form" class="role-editor-form mt-6">
+          <div class="role-preset-bar">
+            <span class="note">模板：</span>
+            <button type="button" class="sm" data-role-preset="planner">planner</button>
+            <button type="button" class="sm" data-role-preset="executor">executor</button>
+            <button type="button" class="sm" data-role-preset="reviewer">reviewer</button>
+          </div>
+          <label class="field-label">角色标识（1..32 位字母、数字、下划线或连字符）</label>
+          <input type="text" name="name" placeholder="如 planner / executor / reviewer" maxlength="32" required>
+          <label class="field-label">分工说明（可选）</label>
+          <input type="text" name="description" placeholder="一句话分工，如：只读架构审查" maxlength="200">
+          <div class="row engine-row">
+            <select name="agent" class="flex-1" aria-label="执行引擎">${engineSelectOptions('')}</select>
+            <input type="text" name="model" class="flex-1" placeholder="模型名（可选）" maxlength="128" aria-label="模型名">
+          </div>
+          <label class="field-label">推理强度</label>
+          <div class="role-effort-group" role="radiogroup" aria-label="推理强度">
+            ${effortOptions
+              .map(
+                (o, idx) => `
+              <label class="role-pill-opt">
+                <input type="radio" name="effort" value="${esc(o.value)}"${idx === 0 ? ' checked' : ''}>
+                <span>${esc(o.label)}</span>
+              </label>`,
+              )
+              .join('')}
+          </div>
+          <label class="field-label">沙箱级别</label>
+          <div class="role-sandbox-grid" role="radiogroup" aria-label="沙箱级别">
+            ${sandboxCards
+              .map(
+                (s) => `
+              <label class="role-sandbox-card">
+                <input type="radio" name="sandbox" value="${esc(s.value)}"${s.value === '' ? ' checked' : ''}>
+                <span class="role-sandbox-title">${esc(s.title)}</span>
+                <span class="role-sandbox-desc">${esc(s.desc)}</span>
+              </label>`,
+              )
+              .join('')}
+          </div>
+          <label class="field-label">首选执行节点（可选）</label>
+          <select name="node_id">${nodeOptionsHtml}</select>
+          <label class="field-label">角色专属纪律（可选）</label>
+          <textarea name="prompt" rows="2" placeholder="每次该角色执行时自动附加的系统提示…"></textarea>
+          <div class="row">
+            <button type="submit" class="primary sm">保存角色</button>
+            <button type="button" id="role-editor-reset" class="sm">重置</button>
+            <button type="button" id="chat-tune-roles" class="sm">去对话调整</button>
+          </div>
+        </form>
+      </details>`;
 
     const body = `
         ${rolesHtml}
-        <div class="row">
-          <button type="button" id="chat-tune-roles" class="sm primary">去对话调整</button>
-        </div>`;
+        ${editorHtml}`;
 
     if (foldable) {
       return `
       <details class="panel-card drawer-fold" id="roles-card" data-drawer-fold="roles"${open ? ' open' : ''}>
-        <summary><span>我的军团 (${roles.length})</span><span class="drawer-fold-meta">对话配置</span></summary>
+        <summary><span>我的军团 (${roles.length})</span><span class="drawer-fold-meta">可视化 / 对话配置</span></summary>
         ${body}
       </details>`;
     }
 
     return `
       <section class="panel-card" id="roles-card">
-        <h3><span>我的军团 (${roles.length})</span><span class="note">对话配置</span></h3>
+        <h3><span>我的军团 (${roles.length})</span><span class="note">可视化 / 对话配置</span></h3>
         ${body}
       </section>`;
   }
@@ -424,15 +531,14 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         elapsed,
       ].filter(Boolean).join(' · ');
       const logKey = `${task.id}:${task.revision ?? ''}`;
-      const formattedLog = view.logTail
+      const formattedLines = view.logTail
         ? (view.logTail.includes('\n') ? view.logTail.split(/\r?\n/) : view.logTail.split(/\s+\|\s+/))
             .map((s) => s.trim())
             .filter(Boolean)
             .filter((s, idx, arr) => idx === 0 || s !== arr[idx - 1])
-            .join('\n')
-        : '';
-      const log = formattedLog
-        ? `<details class="node-repos" data-triage-log="${esc(logKey)}"${openLogs.has(logKey) ? ' open' : ''}><summary>执行动态</summary><div class="item-sub detail-body">${esc(formattedLog)}</div></details>`
+        : [];
+      const log = formattedLines.length
+        ? `<details class="node-repos" data-triage-log="${esc(logKey)}"${openLogs.has(logKey) ? ' open' : ''}><summary>执行动态 (${formattedLines.length})</summary><div class="item-sub detail-body step-trail-box">${renderStepTrailHtml(formattedLines)}</div></details>`
         : '';
       const links = view.links.map((url) => `<div class="item-sub"><a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(url)}</a></div>`).join('');
       return `${progress ? `<div class="item-sub">${progress}</div>` : ''}${log}${links}`;
@@ -666,6 +772,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     const hasActiveOrFailedCron = crons.some((c) => c.last_status === 'failed' || c.last_status === 'running');
     const cronsOpen = openFolds.has('crons') || hasActiveOrFailedCron;
     const rolesOpen = openFolds.has('roles');
+    const roleEditorOpen = openFolds.has('role-editor');
     const nodesOpen = openFolds.has('nodes') || nodes.length === 0 || Boolean(lastInstallCmd);
 
     const cronsHtml = crons.length
@@ -722,7 +829,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         </details>
       </details>
 
-      ${rolesCardHtml(roles, { foldable: true, open: rolesOpen })}
+      ${rolesCardHtml(roles, nodes, { foldable: true, open: rolesOpen, openEditor: roleEditorOpen })}
 
       ${nodesCardHtml(nodes, { foldable: true, open: nodesOpen })}`;
 
@@ -827,6 +934,94 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     document.getElementById('chat-tune-roles')?.addEventListener('click', () => {
       onPromptChat?.('帮我配置军团角色：');
     });
+    const roleForm = document.getElementById('role-editor-form');
+    const fillRoleEditorForm = (data) => {
+      if (!roleForm || !data) return;
+      roleForm.elements.name.value = data.name || '';
+      roleForm.elements.description.value = data.description || '';
+      roleForm.elements.agent.value = data.agent || '';
+      roleForm.elements.model.value = data.model || '';
+      roleForm.elements.node_id.value = data.node_id || '';
+      roleForm.elements.prompt.value = data.prompt || '';
+      const eff = data.effort || '';
+      const sb = data.sandbox || '';
+      roleForm.querySelectorAll('input[name="effort"]').forEach((r) => {
+        r.checked = r.value === eff;
+      });
+      roleForm.querySelectorAll('input[name="sandbox"]').forEach((r) => {
+        r.checked = r.value === sb;
+      });
+    };
+    bodyEl.querySelectorAll('[data-role-preset]').forEach((btn) => {
+      btn.onclick = () => {
+        const preset = ROLE_PRESETS[btn.dataset.rolePreset];
+        if (!preset) return;
+        playTap();
+        fillRoleEditorForm(preset);
+      };
+    });
+    document.getElementById('role-editor-reset')?.addEventListener('click', () => {
+      playTap();
+      fillRoleEditorForm({
+        name: '',
+        description: '',
+        agent: '',
+        model: '',
+        effort: '',
+        sandbox: '',
+        node_id: '',
+        prompt: '',
+      });
+    });
+    bodyEl.querySelectorAll('[data-use-role]').forEach((b) => {
+      b.onclick = () => {
+        playTap();
+        onPromptChat?.(`/node --role ${b.dataset.useRole} `);
+      };
+    });
+    bodyEl.querySelectorAll('[data-edit-role]').forEach((b) => {
+      b.onclick = () => {
+        const target = (state.roles || []).find((r) => r.name === b.dataset.editRole);
+        if (!target) return;
+        playTap();
+        const rolesCard = document.getElementById('roles-card');
+        const editorFold = document.getElementById('role-editor-fold');
+        if (rolesCard) rolesCard.open = true;
+        if (editorFold) editorFold.open = true;
+        fillRoleEditorForm(target);
+        roleForm?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        roleForm?.elements?.description?.focus();
+      };
+    });
+    if (roleForm) {
+      roleForm.onsubmit = async (ev) => {
+        ev.preventDefault();
+        const fd = new FormData(roleForm);
+        const rawName = String(fd.get('name') || '').trim().toLowerCase();
+        if (!/^[a-z0-9_][a-z0-9_-]{0,31}$/.test(rawName)) {
+          showToast('角色名需为 1..32 位英文/数字/下划线或连字符，且不能以 - 开头');
+          return;
+        }
+        try {
+          await api(`/api/roles/${encodeURIComponent(rawName)}`, {
+            method: 'PUT',
+            body: {
+              description: String(fd.get('description') || '').trim(),
+              agent: String(fd.get('agent') || '').trim(),
+              model: String(fd.get('model') || '').trim(),
+              effort: String(fd.get('effort') || '').trim(),
+              sandbox: String(fd.get('sandbox') || '').trim(),
+              node_id: String(fd.get('node_id') || '').trim(),
+              prompt: String(fd.get('prompt') || '').trim(),
+            },
+          });
+          showToast(`已保存军团角色：${rawName}`);
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    }
     bodyEl.querySelectorAll('[data-del-role]').forEach((b) => {
       b.onclick = async () => {
         try {
@@ -845,6 +1040,79 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     return String(raw || '')
       .replace(/^#\s*(SOUL\.md|MEMORY\.md)[^\n]*\n?/i, '')
       .trim();
+  }
+
+  function contextMeterCardHtml(p) {
+    const s = state.context_stats || {};
+    const soulBytes = Number.isFinite(s.soul_bytes) ? s.soul_bytes : (p.soul_md || '').length;
+    const soulBudget = Number.isFinite(s.soul_budget_bytes) ? s.soul_budget_bytes : 1500;
+    const memBytes = Number.isFinite(s.memory_bytes) ? s.memory_bytes : (p.memory_md || '').length;
+    const memBudget = Number.isFinite(s.memory_budget_bytes) ? s.memory_budget_bytes : 4800;
+    const summaryBytes = Number.isFinite(s.summary_bytes) ? s.summary_bytes : 0;
+    const summaryBudget = Number.isFinite(s.summary_budget_bytes) ? s.summary_budget_bytes : 2000;
+    const hasSummary = Boolean(s.has_rolling_summary);
+    const uncompactedMsgs = Number.isFinite(s.uncompacted_messages)
+      ? s.uncompacted_messages
+      : (state.messages || []).length;
+    const uncompactedBytes = Number.isFinite(s.uncompacted_bytes)
+      ? s.uncompacted_bytes
+      : (state.messages || []).reduce((acc, m) => acc + String(m.content || '').length, 0);
+    const triggerMsgs = Number.isFinite(s.compact_trigger_messages) ? s.compact_trigger_messages : 18;
+    const totalMsgs = Number.isFinite(s.total_messages) ? s.total_messages : (state.messages || []).length;
+
+    const soulEffective = Math.min(soulBytes, soulBudget);
+    const memEffective = Math.min(memBytes, memBudget);
+    const summaryEffective = Math.min(summaryBytes, summaryBudget);
+    const activeTotal = soulEffective + memEffective + summaryEffective + uncompactedBytes;
+    const denom = Math.max(1, activeTotal);
+    const pct = (v) => (v <= 0 ? 0 : Math.max(3, Math.round((v / denom) * 100)));
+    const compactPct = Math.min(100, Math.round((uncompactedMsgs / Math.max(1, triggerMsgs)) * 100));
+
+    const segments = [
+      { key: 'soul', label: 'SOUL 人设', value: fmtBytes(soulBytes), cap: fmtBytes(soulBudget), width: pct(soulEffective) },
+      { key: 'memory', label: 'MEMORY 记忆', value: fmtBytes(memBytes), cap: fmtBytes(memBudget), width: pct(memEffective) },
+      { key: 'summary', label: '滚动摘要', value: hasSummary ? fmtBytes(summaryBytes) : '未触发', cap: fmtBytes(summaryBudget), width: pct(summaryEffective) },
+      { key: 'recent', label: '未压缩对话', value: `${uncompactedMsgs} 条 · ${fmtBytes(uncompactedBytes)}`, cap: `满 ${triggerMsgs} 条触发压缩`, width: pct(uncompactedBytes) },
+    ];
+
+    return `
+      <section class="panel-card context-meter-card" id="context-meter-card">
+        <h3><span>上下文与记忆水位</span><span class="badge">${esc(fmtBytes(activeTotal))}</span></h3>
+        <div class="ctx-meter-track" aria-label="上下文分段占比">
+          ${segments
+            .filter((seg) => seg.width > 0)
+            .map((seg) => `<span class="ctx-seg ctx-seg-${seg.key}" data-seg-pct="${seg.width}" title="${esc(seg.label)}：${esc(seg.value)}"></span>`)
+            .join('')}
+        </div>
+        <div class="ctx-legend">
+          ${segments
+            .map((seg) => `<span class="ctx-legend-item"><i class="ctx-dot ctx-dot-${seg.key}" aria-hidden="true"></i><span>${esc(seg.label)}</span></span>`)
+            .join('')}
+        </div>
+        <div class="ctx-compact-row">
+          <div class="ctx-compact-head">
+            <span>自动压缩水位</span>
+            <span>${uncompactedMsgs} / ${triggerMsgs} 条</span>
+          </div>
+          <div class="ctx-compact-track">
+            <span class="ctx-compact-fill" data-seg-pct="${compactPct}"></span>
+          </div>
+        </div>
+        <details class="node-repos mt-6">
+          <summary>查看分层占用明细（累计 ${totalMsgs} 条对话 · ${(state.threads || []).length} 个活跃线程）</summary>
+          <div class="ctx-breakdown mt-6">
+            ${segments
+              .map(
+                (seg) => `
+              <div class="ctx-breakdown-row">
+                <span class="ctx-breakdown-name"><i class="ctx-dot ctx-dot-${seg.key}" aria-hidden="true"></i>${esc(seg.label)}</span>
+                <span class="ctx-breakdown-val">${esc(seg.value)} <small class="muted">/ ${esc(seg.cap)}</small></span>
+              </div>`,
+              )
+              .join('')}
+          </div>
+        </details>
+      </section>`;
   }
 
   function renderSoulTab() {
@@ -878,6 +1146,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         <h3><span>形象与动态头像</span><span class="note">点选即刻生效</span></h3>
         <div class="avatar-grid">${avatarChoicesHtml}</div>
       </section>
+
+      ${contextMeterCardHtml(p)}
 
       <section class="panel-card">
         <h3><span>行事风格</span><span class="note">${esc(updatedHint)}</span></h3>
@@ -923,6 +1193,10 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             : '<p class="note">暂无记录</p>'
         }
       </section>`;
+
+    bodyEl.querySelectorAll('[data-seg-pct]').forEach((el) => {
+      el.style.width = `${el.dataset.segPct || 0}%`;
+    });
 
     bodyEl.querySelectorAll('[data-pick-avatar]').forEach((btn) => {
       btn.onclick = async () => {
