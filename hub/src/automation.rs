@@ -426,12 +426,7 @@ const CRON_RETRY_MAX_SECS: i64 = 1800;
 
 /// Tools a cron-triggered brain run may call: no self-replicating crons/rules, no memory edits,
 /// no cross-user delegation.
-const CRON_ALLOWED_TOOLS: &[&str] = &[
-    "fetch_gitlab_commits",
-    "dispatch_node",
-    "update_ledger",
-    "manage_thread",
-];
+const CRON_ALLOWED_TOOLS: &[&str] = &["fetch_gitlab_commits", "dispatch_node", "manage_thread"];
 
 const CRON_PROMPT_SUFFIX: &str = "
 
@@ -439,7 +434,7 @@ const CRON_PROMPT_SUFFIX: &str = "
 - 这不是用户的实时发言，用户此刻不在线等待；本轮「用户消息」就是定时任务指令本身。
 - 直接执行并输出简洁的 Markdown 汇报结论，不要反问、不要寒暄。
 - 需要数据时调用工具（如 fetch_gitlab_commits / dispatch_node），只基于工具真实结果汇报；拿不到数据就如实说明。
-- 本模式只允许调用：fetch_gitlab_commits、dispatch_node、update_ledger、manage_thread。";
+- 本模式只允许调用：fetch_gitlab_commits、dispatch_node、manage_thread。";
 
 /// In-process scheduler bookkeeping (single Hub instance by design).
 pub struct SchedulerState {

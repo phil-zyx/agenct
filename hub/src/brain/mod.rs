@@ -1,4 +1,4 @@
-//! Unified single-brain agent loop (SOUL + MEMORY + Ledgers + Tools + Streaming) & bootstrap API.
+//! Unified single-brain agent loop (SOUL + MEMORY + Tools + Streaming) & bootstrap API.
 mod compact;
 mod parser;
 mod prompt;
@@ -42,7 +42,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tools::{execute_tool, ToolOutcome, TOOL_OBSERVATION_MAX_BYTES};
-use uuid::Uuid;
 
 pub const MAX_CALLBACK_DEPTH: i64 = 3;
 const DEFAULT_AVATAR_ID: &str = "agenct";
@@ -79,15 +78,6 @@ impl Default for AgentProfile {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Ledger {
-    pub id: String,
-    pub title: String,
-    pub status: String,
-    pub notes: String,
-    pub updated_at: i64,
-}
-
 pub fn read_profile_sync(conn: &Connection, user_id: &str) -> Result<AgentProfile> {
     Ok(conn
         .query_row(
@@ -108,23 +98,6 @@ pub fn read_profile_sync(conn: &Connection, user_id: &str) -> Result<AgentProfil
         )
         .optional()?
         .unwrap_or_default())
-}
-
-pub fn list_ledgers_sync(conn: &Connection, user_id: &str) -> Result<Vec<Ledger>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, status, notes, updated_at
-         FROM ledgers WHERE user_id = ?1 ORDER BY updated_at DESC LIMIT 50",
-    )?;
-    let rows = stmt.query_map([user_id], |r| {
-        Ok(Ledger {
-            id: r.get(0)?,
-            title: r.get(1)?,
-            status: r.get(2)?,
-            notes: r.get(3)?,
-            updated_at: r.get(4)?,
-        })
-    })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 pub fn read_compaction_state_sync(conn: &Connection, user_id: &str) -> Result<(String, i64)> {
@@ -148,7 +121,6 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
             let profile = read_profile_sync(conn, &uid)?;
             let roles = list_roles_sync(conn, &uid)?;
             let threads = list_threads_sync(conn, &uid)?;
-            let ledgers = list_ledgers_sync(conn, &uid)?;
             let node_list = nodes::list_nodes_sync(conn, &uid)?;
             let permissions = automation::read_permissions_sync(conn, &uid)?;
             let rules = automation::list_rules_sync(conn, &uid)?;
@@ -255,7 +227,6 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                 "has_more_messages": has_more_messages,
                 "tasks": tasks,
                 "nodes": node_list,
-                "ledgers": ledgers,
                 "permissions": permissions,
                 "rules": rules,
                 "crons": crons,
@@ -382,7 +353,7 @@ fn build_snippet(content: &str, context: &str, terms: &[String]) -> String {
     out
 }
 
-/// Searches messages (FTS5 trigram with substring fallback for <3-char terms), ledgers, and memory.
+/// Searches messages (FTS5 trigram with substring fallback for <3-char terms) and memory.
 pub async fn search(
     State(hub): State<Hub>,
     AuthUser(user): AuthUser,
@@ -464,15 +435,6 @@ pub async fn search(
                 .collect::<rusqlite::Result<Vec<_>>>()?;
 
             let lower_terms: Vec<String> = terms.iter().map(|t| t.to_lowercase()).collect();
-            let ledgers: Vec<Ledger> = list_ledgers_sync(conn, &uid)?
-                .into_iter()
-                .filter(|l| {
-                    let hay = format!("{}\n{}", l.title, l.notes).to_lowercase();
-                    lower_terms.iter().all(|t| hay.contains(t))
-                })
-                .take(10)
-                .collect();
-
             let profile = read_profile_sync(conn, &uid)?;
             let memory_matches: Vec<String> = profile
                 .memory_md
@@ -490,7 +452,6 @@ pub async fn search(
             Ok(json!({
                 "query": query_str,
                 "messages": messages,
-                "ledgers": ledgers,
                 "memory_matches": memory_matches,
             }))
         })
@@ -575,102 +536,11 @@ pub async fn save_profile(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct UpsertLedgerInput {
-    #[serde(default)]
-    pub id: Option<String>,
-    pub title: String,
-    #[serde(default = "default_active")]
-    pub status: String,
-    #[serde(default)]
-    pub notes: String,
-}
-
-fn default_active() -> String {
-    "active".into()
-}
-
-pub async fn upsert_ledger(
-    State(hub): State<Hub>,
-    AuthUser(user): AuthUser,
-    Json(input): Json<UpsertLedgerInput>,
-) -> Result<Json<Ledger>> {
-    let title = truncate_bytes(input.title.trim(), 96);
-    if title.is_empty() {
-        return Err(invalid("ledger title required"));
-    }
-    if !matches!(input.status.as_str(), "active" | "muted" | "done") {
-        return Err(invalid("ledger status must be active, muted, or done"));
-    }
-    let ledger = Ledger {
-        id: input
-            .id
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| format!("ldg_{}", &Uuid::new_v4().simple().to_string()[..8])),
-        title,
-        status: input.status,
-        notes: truncate_bytes(input.notes.trim(), 6000),
-        updated_at: now_unix(),
-    };
-    let l_db = ledger.clone();
-    let uid = user.id.clone();
-    hub.db
-        .write(move |conn| {
-            conn.execute(
-                "INSERT INTO ledgers(id, user_id, title, status, notes, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(id) DO UPDATE SET
-                   title=excluded.title, status=excluded.status,
-                   notes=excluded.notes, updated_at=excluded.updated_at
-                 WHERE ledgers.user_id = ?2",
-                params![
-                    l_db.id,
-                    uid,
-                    l_db.title,
-                    l_db.status,
-                    l_db.notes,
-                    l_db.updated_at
-                ],
-            )?;
-            Ok(())
-        })
-        .await?;
-    hub.events.emit(user.id, "brain", json!({"ledger": ledger}));
-    Ok(Json(ledger))
-}
-
-pub async fn delete_ledger(
-    State(hub): State<Hub>,
-    AuthUser(user): AuthUser,
-    Path(id): Path<String>,
-) -> Result<Json<Value>> {
-    let uid = user.id.clone();
-    let lid = id.clone();
-    hub.db
-        .write(move |conn| {
-            if conn.execute(
-                "DELETE FROM ledgers WHERE id = ?1 AND user_id = ?2",
-                params![lid, uid],
-            )? == 0
-            {
-                return Err(denied());
-            }
-            Ok(())
-        })
-        .await?;
-    hub.events
-        .emit(user.id, "brain", json!({"deleted_ledger": id}));
-    Ok(Json(json!({"ok": true, "id": id})))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct UpdateThreadInput {
     #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
-    #[serde(default)]
-    pub ledger_id: Option<String>,
 }
 
 pub async fn update_thread(
@@ -679,10 +549,8 @@ pub async fn update_thread(
     Path(id): Path<String>,
     Json(input): Json<UpdateThreadInput>,
 ) -> Result<Json<Value>> {
-    if input.status.is_none() && input.title.is_none() && input.ledger_id.is_none() {
-        return Err(invalid(
-            "at least one of status, title, or ledger_id is required",
-        ));
+    if input.status.is_none() && input.title.is_none() {
+        return Err(invalid("at least one of status or title is required"));
     }
     let next_status = match input.status.as_deref() {
         Some(raw) => {
@@ -704,53 +572,32 @@ pub async fn update_thread(
         }
         None => None,
     };
-    let next_ledger = input.ledger_id.map(|s| s.trim().to_owned());
 
     let uid = user.id.clone();
     let tid = id.clone();
     let st_ret = next_status.clone();
     let title_ret = next_title.clone();
-    let ledger_ret = next_ledger.clone();
     hub.db
         .write(move |conn| {
-            let cur: Option<(String, String, String)> = conn
+            let cur: Option<(String, String)> = conn
                 .query_row(
-                    "SELECT status, title, ledger_id FROM threads WHERE id = ?1 AND user_id = ?2",
+                    "SELECT status, title FROM threads WHERE id = ?1 AND user_id = ?2",
                     params![tid, uid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
-            let Some((cur_status, cur_title, cur_ledger)) = cur else {
+            let Some((cur_status, cur_title)) = cur else {
                 return Err(denied());
-            };
-            let validated_ledger = match next_ledger.as_deref() {
-                Some("") => String::new(),
-                Some(lid) => {
-                    let exists: bool = conn
-                        .query_row(
-                            "SELECT 1 FROM ledgers WHERE id = ?1 AND user_id = ?2",
-                            params![lid, uid],
-                            |_| Ok(true),
-                        )
-                        .optional()?
-                        .unwrap_or(false);
-                    if !exists {
-                        return Err(invalid("invalid ledger_id"));
-                    }
-                    lid.to_owned()
-                }
-                None => cur_ledger,
             };
             conn.execute(
                 "UPDATE threads
-                 SET status = ?3, title = ?4, ledger_id = ?5, updated_at = ?6
+                 SET status = ?3, title = ?4, updated_at = ?5
                  WHERE id = ?1 AND user_id = ?2",
                 params![
                     tid,
                     uid,
                     next_status.unwrap_or(cur_status),
                     next_title.unwrap_or(cur_title),
-                    validated_ledger,
                     now_unix()
                 ],
             )?;
@@ -764,7 +611,6 @@ pub async fn update_thread(
             "updated_thread": id,
             "status": st_ret,
             "title": title_ret,
-            "ledger_id": ledger_ret,
         }),
     );
     Ok(Json(json!({"ok": true, "id": id})))
@@ -936,7 +782,6 @@ struct TurnSnapshot {
     rolling_summary: String,
     roles: Vec<AgentRole>,
     threads: Vec<ThreadView>,
-    ledgers: Vec<Ledger>,
     nodes: Vec<nodes::NodeView>,
     crons: Vec<automation::CronJob>,
     rules: Vec<automation::DispatchRule>,
@@ -1229,7 +1074,6 @@ fn build_snapshot_sync(
     let (rolling_summary, _) = read_compaction_state_sync(conn, uid)?;
     let roles = list_roles_sync(conn, uid)?;
     let threads = list_active_threads_sync(conn, uid)?;
-    let ledgers = list_ledgers_sync(conn, uid)?;
     let nodes = nodes::list_nodes_sync(conn, uid)?;
     let crons = automation::list_crons_sync(conn, uid)?;
     let rules = automation::list_rules_sync(conn, uid)?;
@@ -1344,7 +1188,6 @@ fn build_snapshot_sync(
         rolling_summary,
         roles,
         threads,
-        ledgers,
         nodes,
         crons,
         rules,
@@ -1666,14 +1509,9 @@ pub async fn run_task_callback(
     let allowed_tools: &[&str] = if !has_followup {
         &[]
     } else if allow_followup_dispatch {
-        &[
-            "update_ledger",
-            "update_memory",
-            "manage_thread",
-            "dispatch_node",
-        ]
+        &["update_memory", "manage_thread", "dispatch_node"]
     } else {
-        &["update_ledger", "update_memory", "manage_thread"]
+        &["update_memory", "manage_thread"]
     };
 
     let truncated_result = truncate_bytes(result_content.trim(), 6000);
@@ -1682,7 +1520,7 @@ pub async fn run_task_callback(
             "{}\n任务「{}」（id=`{}`，执行节点：{}，状态：{}）已返回结果。\n\
              既定后续验收/跟进要求：{}\n\n\
              【节点执行结果】\n{}\n\n\
-             请用自然简洁的中文总结给用户（3～5 句、≤6 行以内）：直接说清结果与关键事实，最后如有具体文件/commit/任务ID/附件或链接顺手带一句（没有就别凑）；禁止套用「待审批：」「结论：」「来源：」这种机械前缀；节点原始报告已保存在右侧抽屉「查看结果」，切勿重复粘贴；如需要可调用允许的工具更新账本、更新记忆、归档线程{}。",
+             请用自然简洁的中文总结给用户（3～5 句、≤6 行以内）：直接说清结果与关键事实，最后如有具体文件/commit/任务ID/附件或链接顺手带一句（没有就别凑）；禁止套用「待审批：」「结论：」「来源：」这种机械前缀；节点原始报告已保存在右侧抽屉「查看结果」，切勿重复粘贴；如需要可调用允许的工具更新长期记忆、归档线程{}。",
             crate::llm::TASK_CALLBACK_MARKER,
             task_title,
             task_id,
@@ -1949,7 +1787,6 @@ async fn agent_loop(
         &snap.rolling_summary,
         &snap.roles,
         &snap.threads,
-        &snap.ledgers,
         &snap.nodes,
         &snap.crons,
         &snap.rules,

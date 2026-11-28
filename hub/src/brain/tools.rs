@@ -1,4 +1,4 @@
-//! Brain tool execution handlers (memory, ledgers, roles, crons, rules, GitLab, nodes, colleagues).
+//! Brain tool execution handlers (memory, roles, crons, rules, GitLab, nodes, colleagues).
 use super::{
     normalize_avatar_id,
     parser::ToolCall,
@@ -8,7 +8,7 @@ use super::{
         archive_thread, create_thread, delete_empty_thread, resolve_or_create_thread,
         update_thread_meta,
     },
-    Ledger, TurnContext,
+    TurnContext,
 };
 use crate::{
     automation, collab,
@@ -16,7 +16,7 @@ use crate::{
     db::record_audit,
     nodes, Hub, Result,
 };
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -133,11 +133,6 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
             ctx.stage("正在更新长期记忆…");
             apply_update_memory(hub, user_id, call).await?;
             Ok(ToolOutcome::done(tool, "已更新人设/长期记忆。"))
-        }
-        "update_ledger" => {
-            ctx.stage("正在更新持续事项…");
-            apply_update_ledger(hub, user_id, call).await?;
-            Ok(ToolOutcome::done(tool, "已更新持续事项。"))
         }
         "manage_thread" => apply_manage_thread(ctx, call).await,
         "manage_cron" => {
@@ -405,15 +400,8 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                 let candidate = raw_tid
                     .filter(|s| !s.is_empty())
                     .or(ctx.active_thread_id.as_deref());
-                match resolve_or_create_thread(
-                    hub,
-                    user_id,
-                    candidate,
-                    Some(topic_title),
-                    &title,
-                    call.ledger_id.as_deref(),
-                )
-                .await?
+                match resolve_or_create_thread(hub, user_id, candidate, Some(topic_title), &title)
+                    .await?
                 {
                     Some(tid) => {
                         if candidate.is_some_and(|c| c.eq_ignore_ascii_case("new")) {
@@ -422,9 +410,7 @@ async fn run_tool(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Result<ToolOutc
                         Some(tid)
                     }
                     None => {
-                        let tid =
-                            create_thread(hub, user_id, topic_title, call.ledger_id.as_deref())
-                                .await?;
+                        let tid = create_thread(hub, user_id, topic_title).await?;
                         created_fresh_thread = Some(tid.clone());
                         Some(tid)
                     }
@@ -629,102 +615,6 @@ async fn apply_update_memory(hub: &Hub, user_id: &str, call: &ToolCall) -> Resul
         .await?;
     hub.events
         .emit(user_id.to_owned(), "brain", json!({"updated": "profile"}));
-    Ok(())
-}
-
-async fn apply_update_ledger(hub: &Hub, user_id: &str, call: &ToolCall) -> Result<()> {
-    let uid = user_id.to_owned();
-    let act = call.action.as_deref().unwrap_or("upsert").trim().to_owned();
-    let lid = call.ledger_id.clone();
-    let title = call.title.clone();
-    let status_in = call.status.clone();
-    let rep = call.notes_replace.clone();
-    let app = call.notes_append.clone();
-    hub.db
-        .write(move |conn| {
-            let now = now_unix();
-            if act == "delete" {
-                if let Some(id) = lid.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    conn.execute("DELETE FROM ledgers WHERE id=?1 AND user_id=?2", params![id, uid])?;
-                } else if let Some(t) = title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    conn.execute("DELETE FROM ledgers WHERE title=?1 AND user_id=?2", params![t, uid])?;
-                }
-                return Ok(());
-            }
-            let next_status = match act.as_str() {
-                "mute" => Some("muted"),
-                "done" => Some("done"),
-                _ => status_in
-                    .as_deref()
-                    .filter(|s| matches!(*s, "active" | "muted" | "done")),
-            };
-            let existing: Option<Ledger> = if let Some(id) =
-                lid.as_deref().map(str::trim).filter(|s| !s.is_empty())
-            {
-                conn.query_row(
-                    "SELECT id, title, status, notes, updated_at FROM ledgers WHERE id=?1 AND user_id=?2",
-                    params![id, uid],
-                    |r| Ok(Ledger { id: r.get(0)?, title: r.get(1)?, status: r.get(2)?, notes: r.get(3)?, updated_at: r.get(4)? }),
-                )
-                .optional()?
-            } else if let Some(t) = title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                conn.query_row(
-                    "SELECT id, title, status, notes, updated_at FROM ledgers WHERE lower(title)=lower(?1) AND user_id=?2 LIMIT 1",
-                    params![t, uid],
-                    |r| Ok(Ledger { id: r.get(0)?, title: r.get(1)?, status: r.get(2)?, notes: r.get(3)?, updated_at: r.get(4)? }),
-                )
-                .optional()?
-            } else {
-                None
-            };
-
-            if let Some(mut cur) = existing {
-                if let Some(t) = title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    cur.title = truncate_bytes(t, 96);
-                }
-                if let Some(st) = next_status {
-                    cur.status = st.to_owned();
-                }
-                if let Some(r) = rep.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    cur.notes = truncate_bytes(r, 6000);
-                } else if let Some(a) = app.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                    let line = if a.starts_with('-') { a.to_owned() } else { format!("- {a}") };
-                    if !cur.notes.contains(&line) {
-                        cur.notes = truncate_bytes(
-                            &if cur.notes.trim().is_empty() {
-                                line
-                            } else {
-                                format!("{}\n{line}", cur.notes.trim_end())
-                            },
-                            6000,
-                        );
-                    }
-                }
-                conn.execute(
-                    "UPDATE ledgers SET title=?3, status=?4, notes=?5, updated_at=?6 WHERE id=?1 AND user_id=?2",
-                    params![cur.id, uid, cur.title, cur.status, cur.notes, now],
-                )?;
-            } else if let Some(t) = title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                let id = format!("ldg_{}", &Uuid::new_v4().simple().to_string()[..8]);
-                let notes = rep
-                    .as_deref()
-                    .or(app.as_deref())
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| truncate_bytes(s, 6000))
-                    .unwrap_or_default();
-                conn.execute(
-                    "INSERT INTO ledgers(id, user_id, title, status, notes, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id, uid, truncate_bytes(t, 96), next_status.unwrap_or("active"), notes, now],
-                )?;
-            }
-            record_audit(conn, &uid, "update_ledger", "ok", title.as_deref().unwrap_or("ledger"), "")?;
-            Ok(())
-        })
-        .await?;
-    hub.events
-        .emit(user_id.to_owned(), "brain", json!({"updated": "ledgers"}));
     Ok(())
 }
 
@@ -1338,7 +1228,7 @@ async fn apply_manage_thread(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Resu
         "create" => {
             let topic =
                 title.unwrap_or_else(|| ctx.message.lines().next().unwrap_or("新话题").trim());
-            let tid = create_thread(hub, user_id, topic, call.ledger_id.as_deref()).await?;
+            let tid = create_thread(hub, user_id, topic).await?;
             ctx.active_thread_id = Some(tid.clone());
             hub.events
                 .emit(user_id.to_owned(), "brain", json!({"updated": "threads"}));
@@ -1355,15 +1245,9 @@ async fn apply_manage_thread(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Resu
                     "（缺少 thread_id。）",
                 ));
             };
-            let Some(found) = resolve_or_create_thread(
-                hub,
-                user_id,
-                Some(tid),
-                title,
-                title.unwrap_or("新话题"),
-                call.ledger_id.as_deref(),
-            )
-            .await?
+            let Some(found) =
+                resolve_or_create_thread(hub, user_id, Some(tid), title, title.unwrap_or("新话题"))
+                    .await?
             else {
                 return Ok(ToolOutcome::failed(
                     tool,
@@ -1387,14 +1271,14 @@ async fn apply_manage_thread(ctx: &mut TurnContext<'_>, call: &ToolCall) -> Resu
                     "（缺少 thread_id。）",
                 ));
             };
-            if title.is_none() && call.ledger_id.is_none() {
+            if title.is_none() {
                 return Ok(ToolOutcome::failed(
                     tool,
-                    "rename 需要提供新的 title 或 ledger_id。",
-                    "（缺少新标题或账本 ID。）",
+                    "rename 需要提供新的 title。",
+                    "（缺少新标题。）",
                 ));
             }
-            if !update_thread_meta(hub, user_id, tid, title, call.ledger_id.as_deref()).await? {
+            if !update_thread_meta(hub, user_id, tid, title).await? {
                 return Ok(ToolOutcome::failed(
                     tool,
                     format!("未找到工作线程 `{tid}`。"),

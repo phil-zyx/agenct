@@ -1,4 +1,4 @@
-// Right Muse Drawer (Tasks/Nodes, Ledgers/Crons/Audit, SOUL/MEMORY) + Settings Pane + Contacts.
+// Right Muse Drawer (Tasks/Nodes, Crons/Audit, SOUL/MEMORY) + Settings Pane + Contacts.
 import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 import { renderBuddySvg } from './avatar.js';
 import { playTap, playToggle } from './sound.js';
@@ -54,7 +54,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     failed: '失败',
     canceled: '已取消',
   };
-  const LEDGER_STATUS_LABEL = { active: '跟进中', muted: '已静默', done: '已完成' };
   const TARGET_LABEL = { cloud: '云端', 'cloud-node': '云端节点', auto: '自动节点' };
   const AUDIT_ACTION_LABEL = {
     node_create: '接入节点',
@@ -386,8 +385,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     const threads = state.threads || [];
     const tasks = state.tasks || [];
     const crons = state.crons || [];
-    const ledgers = state.ledgers || [];
-    const ledgerById = new Map(ledgers.map((l) => [l.id, l]));
     const nodes = state.nodes || [];
     const elevatedNodeIds = new Set(nodes.filter((n) => parseCapabilities(n.capabilities).elevated).map((n) => n.id));
     const anyElevatedNode = elevatedNodeIds.size > 0;
@@ -522,10 +519,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     function renderThreadCard(thr, { attention = false } = {}) {
       const runs = tasksByThread.get(thr.id) || [];
       const latest = runs[0] || null;
-      const ledger = thr.ledger_id ? ledgerById.get(thr.ledger_id) : null;
-      const ledgerHtml = ledger
-        ? `<div class="engine-tags"><span class="engine-tag">${esc(ledger.title)}</span></div>`
-        : '';
       const preview = taskViews.get(latest)?.preview || cleanPreviewLine(thr.summary, 72);
       const previewHtml = preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
       const updatedAt = latest?.updated_at || thr.updated_at;
@@ -538,7 +531,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             ${updatedAt ? `<span class="thread-time">${esc(fmtTime(updatedAt))}</span>` : ''}
           </div>
           ${previewHtml}
-          ${ledgerHtml}
         </div>`;
       }
 
@@ -565,7 +557,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
             <span>${esc(thr.title)}</span>
             <span class="badge ${badgeCls}">${esc(badgeText)}</span>
           </div>
-          ${ledgerHtml}
           ${renderBlockedHtml(latest)}
           ${previewHtml}
           ${renderTaskProgress(latest)}
@@ -574,12 +565,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     }
 
     const isAttentionTask = (t) => !!t && (t.status === 'running' || t.status === 'pending' || t.status === 'failed');
-    const threadsByLedger = new Map();
-    for (const thr of threads) {
-      if (thr.ledger_id) {
-        threadsByLedger.set(thr.ledger_id, (threadsByLedger.get(thr.ledger_id) || 0) + 1);
-      }
-    }
 
     const attentionCards = [];
     const attentionThreadIds = new Set();
@@ -675,32 +660,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         ${threadBodyParts.join('')}
       </section>`;
 
-    const ledgersHtml = ledgers.length
-      ? ledgers
-          .map((l) => {
-            const linkedCount = threadsByLedger.get(l.id) || 0;
-            const linkedMeta = linkedCount
-              ? `<div class="thread-meta">关联 ${linkedCount} 个话题</div>`
-              : '';
-            return `
-        <div class="item">
-          <div class="item-head">
-            <span>${esc(l.title)}</span>
-            <span class="badge ${l.status === 'active' ? 'ok' : ''}">${esc(LEDGER_STATUS_LABEL[l.status] || l.status)}</span>
-          </div>
-          ${linkedMeta}
-          ${compactTextHtml(l.notes, 64, '查看全文')}
-        </div>`;
-          })
-          .join('')
-      : '<p class="note">暂无长期项目，在对话中说明长期跟进事项会自动记录</p>';
-
-    const ledgersSectionHtml = `
-      <section class="panel-card">
-        <h3><span>长期项目 (${ledgers.length})</span><span class="note">持续事项主线</span></h3>
-        ${ledgersHtml}
-      </section>`;
-
     const hasActiveOrFailedCron = crons.some((c) => c.last_status === 'failed' || c.last_status === 'running');
     const cronsOpen = openFolds.has('crons') || hasActiveOrFailedCron;
     const rolesOpen = openFolds.has('roles');
@@ -739,7 +698,6 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     bodyEl.innerHTML = `
       ${attentionHtml}
       ${threadsSectionHtml}
-      ${ledgersSectionHtml}
 
       <details class="panel-card drawer-fold" data-drawer-fold="crons"${cronsOpen ? ' open' : ''}>
         <summary><span>定时任务 (${crons.length})</span><span class="drawer-fold-meta">${hasActiveOrFailedCron ? '需关注' : '自动运行'}</span></summary>

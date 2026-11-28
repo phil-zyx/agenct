@@ -2209,11 +2209,6 @@ async fn message_pagination_thread_filter_and_fts5_search_work() {
                     rusqlite::params![uid, thr, content, 1000 + idx as i64],
                 )?;
             }
-            conn.execute(
-                "INSERT INTO ledgers(id, user_id, title, status, notes, updated_at)
-                 VALUES ('ldg_db', 'u-alice', '数据库容量治理', 'active', '清理旧索引', 1000)",
-                [],
-            )?;
             Ok(())
         })
         .await
@@ -2324,8 +2319,6 @@ async fn message_pagination_thread_filter_and_fts5_search_work() {
         .as_str()
         .unwrap()
         .contains("数据库内存泄漏"));
-    assert_eq!(s_zh["ledgers"].as_array().unwrap().len(), 1);
-    assert_eq!(s_zh["ledgers"][0]["id"], "ldg_db");
 
     let (st, s_hyph) = req_json(
         &router,
@@ -2415,7 +2408,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
         "/api/chat",
         Some(&cookie),
         Some(&csrf),
-        Some(json!({"message": "/node_cb 验收测试结果并更新账本 :: run tests"})),
+        Some(json!({"message": "/node_cb 验收测试结果并更新记忆 :: run tests"})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
@@ -2435,7 +2428,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
         })
         .await
         .unwrap();
-    assert_eq!(on_cb, "验收测试结果并更新账本");
+    assert_eq!(on_cb, "验收测试结果并更新记忆");
     assert_eq!(cb_depth, 0);
 
     let poll = router
@@ -2495,7 +2488,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
     .await
     .expect("async task callback should emit message event");
 
-    let (msgs, ledgers, audit_cnt, saved_result): (Vec<String>, Vec<String>, i64, Option<String>) =
+    let (msgs, memory_md, audit_cnt, saved_result): (Vec<String>, String, i64, Option<String>) =
         hub.db
             .read({
                 let tid = task_id.clone();
@@ -2506,10 +2499,11 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
                     let msgs = ms
                         .query_map([], |r| r.get(0))?
                         .collect::<rusqlite::Result<Vec<String>>>()?;
-                    let mut ls = conn.prepare("SELECT title FROM ledgers WHERE user_id='u-alice'")?;
-                    let ledgers = ls
-                        .query_map([], |r| r.get(0))?
-                        .collect::<rusqlite::Result<Vec<String>>>()?;
+                    let memory_md: String = conn.query_row(
+                        "SELECT memory_md FROM agent_profiles WHERE user_id='u-alice'",
+                        [],
+                        |r| r.get(0),
+                    )?;
                     let audit_cnt: i64 = conn.query_row(
                         "SELECT count(*) FROM audit_logs WHERE user_id='u-alice' AND action='task_callback' AND status='ok'",
                         [],
@@ -2520,7 +2514,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
                         [&tid],
                         |r| r.get(0),
                     )?;
-                    Ok((msgs, ledgers, audit_cnt, saved_result))
+                    Ok((msgs, memory_md, audit_cnt, saved_result))
                 }
             })
             .await
@@ -2532,7 +2526,7 @@ async fn async_task_callback_feeds_node_result_back_to_brain_with_depth_cap() {
     ));
     // Tasks with `on_complete` must not spam chat with a duplicate raw node essay alongside the callback digest.
     assert!(!msgs.iter().any(|m| m.starts_with("**[节点 ")));
-    assert!(ledgers.iter().any(|t| t == "自动跟进事项"));
+    assert!(memory_md.contains("自动跟进事项：节点已返回结果并完成验收"));
     assert_eq!(audit_cnt, 1);
 
     // Evidence attachment links from node output are preserved inside the concise callback message.
@@ -2944,28 +2938,28 @@ async fn auth_user_extractor_enforces_active_and_reuses_guard() {
     // Invalid CSRF fails at guard with 403 before entering the handler.
     let (st, _) = req_json(
         &router,
-        "POST",
-        "/api/ledgers",
+        "PUT",
+        "/api/brain",
         Some(&bob_c),
         Some("wrong-csrf"),
-        Some(json!({"title": "blocked"})),
+        Some(json!({"memory_md": "blocked"})),
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN);
 
     let (st, _) = req_json(
         &router,
-        "POST",
-        "/api/ledgers",
+        "PUT",
+        "/api/brain",
         Some(&bob_c),
         Some(&bob_csrf),
-        Some(json!({"title": "allowed"})),
+        Some(json!({"memory_md": "allowed"})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
 
     // Simulate an account disabled in DB while an existing session row remains:
-    // both GET fallback and POST guard-extension paths in AuthUser must reject with 401.
+    // both GET fallback and mutation guard-extension paths in AuthUser must reject with 401.
     hub.db
         .write(|conn| {
             conn.execute("UPDATE users SET status='disabled' WHERE id='u-bob'", [])?;
@@ -2980,11 +2974,11 @@ async fn auth_user_extractor_enforces_active_and_reuses_guard() {
 
     let (st, body) = req_json(
         &router,
-        "POST",
-        "/api/ledgers",
+        "PUT",
+        "/api/brain",
         Some(&bob_c),
         Some(&bob_csrf),
-        Some(json!({"title": "disabled mutation"})),
+        Some(json!({"memory_md": "disabled mutation"})),
     )
     .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
@@ -4378,7 +4372,7 @@ async fn chat_pinned_thread_id_persists_discussion_and_rejects_foreign_thread() 
 }
 
 #[tokio::test]
-async fn thread_update_rename_ledger_binding_and_stale_archive_hygiene() {
+async fn thread_update_rename_and_stale_archive_hygiene() {
     let hub = Hub::open(test_config("https://git.example.com")).unwrap();
     let (cookie, csrf) = seed_user(&hub, "u-alice", "alice", "Alice", true).await;
     let router = app(hub.clone());
@@ -4394,18 +4388,6 @@ async fn thread_update_rename_ledger_binding_and_stale_archive_hygiene() {
     .await;
     assert_eq!(st, StatusCode::OK);
 
-    let (st, ledger) = req_json(
-        &router,
-        "POST",
-        "/api/ledgers",
-        Some(&cookie),
-        Some(&csrf),
-        Some(json!({"title": "Agenct v2", "status": "active", "notes": "主线"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::OK);
-    let ledger_id = ledger["id"].as_str().unwrap().to_owned();
-
     let (st, chat) = req_json(
         &router,
         "POST",
@@ -4418,19 +4400,19 @@ async fn thread_update_rename_ledger_binding_and_stale_archive_hygiene() {
     assert_eq!(st, StatusCode::OK);
     let thr_id = chat["thread_id"].as_str().unwrap().to_owned();
 
-    // 1. Rename + bind ledger via PUT /api/threads/{id}.
+    // 1. Rename via PUT /api/threads/{id}.
     let (st, _) = req_json(
         &router,
         "PUT",
         &format!("/api/threads/{thr_id}"),
         Some(&cookie),
         Some(&csrf),
-        Some(json!({"title": "移动端输入框修复", "ledger_id": ledger_id})),
+        Some(json!({"title": "移动端输入框修复"})),
     )
     .await;
     assert_eq!(st, StatusCode::OK);
 
-    // 2. Empty update or invalid ledger_id is rejected.
+    // 2. Empty update is rejected.
     let (st, _) = req_json(
         &router,
         "PUT",
@@ -4441,18 +4423,8 @@ async fn thread_update_rename_ledger_binding_and_stale_archive_hygiene() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
-    let (st, _) = req_json(
-        &router,
-        "PUT",
-        &format!("/api/threads/{thr_id}"),
-        Some(&cookie),
-        Some(&csrf),
-        Some(json!({"ledger_id": "ldg_nonexistent"})),
-    )
-    .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
 
-    // 3. Bootstrap reflects updated title, ledger_id, and turn_count.
+    // 3. Bootstrap reflects updated title and turn_count.
     let (st, boot) = req_json(&router, "GET", "/api/bootstrap", Some(&cookie), None, None).await;
     assert_eq!(st, StatusCode::OK);
     let thr_view = boot["threads"]
@@ -4462,7 +4434,6 @@ async fn thread_update_rename_ledger_binding_and_stale_archive_hygiene() {
         .find(|t| t["id"] == thr_id)
         .unwrap();
     assert_eq!(thr_view["title"], "移动端输入框修复");
-    assert_eq!(thr_view["ledger_id"], ledger_id);
     assert_eq!(thr_view["turn_count"], 1);
 
     // 4. Stale (>48h) active threads are archived and >10m empty shells are deleted by archive_stale_threads().

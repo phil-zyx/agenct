@@ -691,14 +691,12 @@ fn stub_turn<F: FnMut(&str)>(
         }
     } else if trimmed.starts_with(TASK_CALLBACK_MARKER) {
         let mut tool_calls = Vec::new();
-        if trimmed.contains("账本") {
+        if trimmed.contains("记忆") {
             tool_calls.push(LlmToolCall {
                 id: "call_stub_cb_1".into(),
-                name: "update_ledger".into(),
+                name: "update_memory".into(),
                 arguments: json!({
-                    "action": "upsert",
-                    "title": "自动跟进事项",
-                    "notes_append": "节点已返回结果并完成验收"
+                    "memory_append": "自动跟进事项：节点已返回结果并完成验收"
                 })
                 .to_string(),
             });
@@ -823,16 +821,6 @@ fn stub_turn<F: FnMut(&str)>(
                 id: "call_stub_1".into(),
                 name: "update_memory".into(),
                 arguments: json!({"memory_append": rest}).to_string(),
-            }],
-        }
-    } else if let Some(rest) = trimmed.strip_prefix("/ledger ") {
-        LlmTurnResponse {
-            content: format!("已更新专项活账本：{rest}"),
-            tool_calls: vec![LlmToolCall {
-                id: "call_stub_1".into(),
-                name: "update_ledger".into(),
-                arguments: json!({"action": "upsert", "title": rest, "notes_append": rest})
-                    .to_string(),
             }],
         }
     } else if let Some(rest) = trimmed.strip_prefix("/cron ") {

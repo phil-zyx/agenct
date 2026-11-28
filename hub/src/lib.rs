@@ -176,8 +176,6 @@ pub fn app(hub: Hub) -> Router {
         .route("/api/brain", put(brain::save_profile))
         .route("/api/roles", get(brain::list_roles))
         .route("/api/roles/{name}", delete(brain::delete_role))
-        .route("/api/ledgers", post(brain::upsert_ledger))
-        .route("/api/ledgers/{id}", delete(brain::delete_ledger))
         .route(
             "/api/threads/{id}",
             put(brain::update_thread).delete(brain::delete_thread),

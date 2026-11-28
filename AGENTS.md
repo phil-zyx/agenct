@@ -31,9 +31,9 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite WAL) ──�
 | `hub/src/lib.rs` | `Hub` 状态容器、统一 `Error`/`Result`、全部 HTTP 路由与中间件装配 |
 | `hub/src/config.rs` | 环境变量解析、Origin 规范化、SSRF/外发 URL 校验、常量时间比较等安全原语 |
 | `hub/src/secrets.rs` | `AGENCT_MASTER_KEY` AES-256-GCM 静态加密（按 `scope` + `user_id` 绑定 AAD）、向后兼容读取与离线密钥轮换 |
-| `hub/src/db.rs` | SQLite Schema（当前 `SCHEMA_VERSION = 15`，含 `messages_fts` trigram 全文索引、军团角色 `agent_roles`、多引擎节点配置与任务回调字段）、迁移、进程级 `.lock` 排他锁、`audit_logs` 只追加触发器 |
+| `hub/src/db.rs` | SQLite Schema（当前 `SCHEMA_VERSION = 16`，含 `messages_fts` trigram 全文索引、军团角色 `agent_roles`、多引擎节点配置与任务回调字段）、迁移、进程级 `.lock` 排他锁、`audit_logs` 只追加触发器 |
 | `hub/src/auth.rs` | 单人本地令牌登录 & 可选 GitLab OAuth 2.0 (PKCE S256)、SQLite Session、Host/Origin/CSRF 守卫中间件与 `AuthUser` 提取器 |
-| `hub/src/brain/` | 单一大脑模块（`mod.rs`、`prompt.rs`、`tools.rs`、`parser.rs`、`roles.rs`、`threads.rs`、`compact.rs`）：`SOUL.md` + `MEMORY.md` + 活账本 `ledgers` + 军团角色 `agent_roles` + 隐式工作线程 `threads` + 滚动摘要压缩 + 原生 Tool Calling（带内联 `<tool_call>` 兜底）+ 异步回调闭环（`on_complete`）、`/api/bootstrap`、`/api/messages` 分页与 `/api/search` FTS5 全文搜索 |
+| `hub/src/brain/` | 单一大脑模块（`mod.rs`、`prompt.rs`、`tools.rs`、`parser.rs`、`roles.rs`、`threads.rs`、`compact.rs`）：`SOUL.md` + `MEMORY.md` + 军团角色 `agent_roles` + 隐式工作线程 `threads` + 滚动摘要压缩 + 原生 Tool Calling（带内联 `<tool_call>` 兜底）+ 异步回调闭环（`on_complete`）、`/api/bootstrap`、`/api/messages` 分页与 `/api/search` FTS5 全文搜索 |
 | `hub/src/llm.rs` | OpenAI 兼容 `/chat/completions` 客户端（支持原生 `tools`、SSE 流式读取、`<think>` 过滤、图片多模态输入）与 `AGENCT_LLM_STUB=1` 确定性测试桩 |
 | `hub/src/models.rs` | 每用户自定义大脑模型与识图（vision）模型配置及连通性测试 |
 | `hub/src/nodes.rs` | 节点注册与多引擎配置、令牌轮换、安装脚本分发、Protocol 2 任务拉取（支持长轮询唤醒、`repos:` 与引擎路由）/租约续期/引擎绑定会话隔离与结果提交 |

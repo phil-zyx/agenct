@@ -17,7 +17,6 @@ const state = {
   has_more_messages: false,
   tasks: [],
   nodes: [],
-  ledgers: [],
   permissions: {},
   rules: [],
   crons: [],

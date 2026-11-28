@@ -16,7 +16,7 @@ Web (原生 ESM + 单连接 SSE) ──▶ Rust Hub (单一 SQLite v1) ──▶
 **只保留一套（零双轨、零历史包袱）：**
 - **认证**：单人模式的本地登录令牌（零配置），或可选的 GitLab OAuth 2.0 团队登录（PKCE S256）；均为 SQLite 会话 + CSRF/Origin/Host 校验；节点使用 `agn_` Bearer Token。
 - **单一运行时**：Hub 直连任意 OpenAI 兼容 `/chat/completions` 接口（支持 DeepSeek、OpenAI、Ollama）。每个用户可在「设置 → 大脑模型」配置自己的大脑模型（可标记支持图片）和可选的识图模型，未配置时使用服务器默认（`AGENCT_LLM_*` / `AGENCT_VISION_*`）。
-- **单一大脑**：`SOUL.md` + `MEMORY.md` + 专项活账本（`ledgers`）+ 定时任务 + 分发规则 + 工具调用（`update_memory` / `update_ledger` / `manage_cron` / `manage_rule` / `manage_role` / `manage_node` / `manage_thread` / `fetch_gitlab_commits` / `dispatch_node` / `delegate_colleague`）。
+- **单一大脑**：`SOUL.md` + `MEMORY.md` + 定时任务 + 分发规则 + 工具调用（`update_memory` / `manage_cron` / `manage_rule` / `manage_role` / `manage_node` / `manage_thread` / `fetch_gitlab_commits` / `dispatch_node` / `delegate_colleague`）。
 - **单一存储**：SQLite（18 张规范表 + FTS5 全文检索，WAL 模式，`spawn_blocking` 读写隔离），附件二进制落盘 + 显式 ACL 授权表，只追加审计表。
 - **单一执行协议**：本地 PC 节点与云端常驻容器节点共用同一份 `node/agenct-node.py` 和排他租约协议 2。
 - **单一实时通道**：`/api/bootstrap` 初始加载 + `/api/events` 真 SSE 推送。

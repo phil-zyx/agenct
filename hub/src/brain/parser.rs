@@ -20,19 +20,11 @@ pub(super) struct ToolCall {
     #[serde(default)]
     pub(super) memory_replace: Option<String>,
     #[serde(default)]
-    pub(super) ledger_id: Option<String>,
-    #[serde(default)]
     pub(super) thread_id: Option<String>,
     #[serde(default)]
     pub(super) thread_title: Option<String>,
     #[serde(default)]
     pub(super) title: Option<String>,
-    #[serde(default)]
-    pub(super) status: Option<String>,
-    #[serde(default)]
-    pub(super) notes_append: Option<String>,
-    #[serde(default)]
-    pub(super) notes_replace: Option<String>,
     #[serde(default)]
     pub(super) cron_id: Option<String>,
     #[serde(default)]
@@ -148,10 +140,7 @@ pub(super) fn default_reply_for_tools(tools: &[ToolCall]) -> String {
     if tools.iter().any(|t| t.tool == "manage_thread") {
         return "好的，已更新工作线程。".into();
     }
-    if tools
-        .iter()
-        .any(|t| matches!(t.tool.as_str(), "update_memory" | "update_ledger"))
-    {
+    if tools.iter().any(|t| t.tool == "update_memory") {
         return "好的，已记录。".into();
     }
     "好的，已处理。".into()

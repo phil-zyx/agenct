@@ -1,5 +1,5 @@
 //! Brain system prompt construction and native OpenAI tool schema definitions.
-use super::{roles::AgentRole, threads::ThreadView, AgentProfile, Ledger};
+use super::{roles::AgentRole, threads::ThreadView, AgentProfile};
 use crate::{
     automation,
     config::{truncate_bytes, truncate_head_tail_bytes},
@@ -48,22 +48,6 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
                     "memory_replace": {"type": "string", "description": "整体替换整理后的长期记忆"}
                 }),
                 &[],
-            ),
-        ),
-        (
-            "update_ledger",
-            fn_schema(
-                "update_ledger",
-                "创建、更新、静默、完成或删除持续推进事项（活账本）",
-                json!({
-                    "action": {"type": "string", "enum": ["upsert", "mute", "done", "delete"]},
-                    "ledger_id": {"type": "string"},
-                    "title": {"type": "string", "description": "事项标题"},
-                    "status": {"type": "string", "enum": ["active", "muted", "done"]},
-                    "notes_append": {"type": "string", "description": "增量进展"},
-                    "notes_replace": {"type": "string", "description": "整体替换说明"}
-                }),
-                &["action"],
             ),
         ),
         (
@@ -145,7 +129,6 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
                 json!({
                     "thread_id": {"type": "string", "description": "沿用同子话题的活跃 thr_xxx；开启新 Topic 传 new；一次性只读查询或定时检查传 none（不建线程）"},
                     "thread_title": {"type": "string", "description": "仅当 thread_id=new 时可选：该 Topic 的简短主题名（如「移动端输入框修复」），省略则用 title"},
-                    "ledger_id": {"type": "string", "description": "可选：关联所属宏观项目账本 ID（ldg_xxx）"},
                     "role": {"type": "string", "description": "可选：按已配置的军团角色名派发（自动套用引擎/模型/推理强度/沙箱/提示词）"},
                     "node_id": {"type": "string", "description": "指定节点 ID 或名称，留空自动匹配"},
                     "agent": {"type": "string", "enum": ["claude", "codex", "agy", "opencode"], "description": "可选：指定或覆盖执行引擎"},
@@ -156,7 +139,7 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
                     "prefer_cloud": {"type": "boolean", "description": "本机代码/git/tmux 设 false；通用云端任务设 true"},
                     "title": {"type": "string", "description": "本次具体执行任务的简短标题"},
                     "instruction": {"type": "string", "description": "补全上下文指代后的自包含执行指令"},
-                    "on_complete": {"type": "string", "description": "可选：节点完成后需要自动回流大脑继续验收/更新账本/衔接后续的跟进目标"}
+                    "on_complete": {"type": "string", "description": "可选：节点完成后需要自动回流大脑继续验收/更新长期记忆/衔接后续的跟进目标"}
                 }),
                 &["title", "instruction"],
             ),
@@ -167,10 +150,9 @@ pub(super) fn tool_definitions(allowed_tools: Option<&[&str]>) -> Vec<Value> {
                 "manage_thread",
                 "在纯讨论、规划或 Topic 切换时主动绑定/新建/重命名/归档工作线程（避免讨论断链或把多个子问题混在同一线程里）",
                 json!({
-                    "action": {"type": "string", "enum": ["bind", "create", "rename", "archive"], "description": "bind 绑定当前对话到已有 thr_xxx；create 开启新 Topic 线程；rename 修正线程标题/绑定账本；archive 归档已完结线程"},
+                    "action": {"type": "string", "enum": ["bind", "create", "rename", "archive"], "description": "bind 绑定当前对话到已有 thr_xxx；create 开启新 Topic 线程；rename 修正线程标题；archive 归档已完结线程"},
                     "thread_id": {"type": "string", "description": "目标 thr_xxx（bind/rename/archive 必填）"},
-                    "title": {"type": "string", "description": "简短精准的 Topic 标题（create/rename 使用，如「移动端输入框修复」）"},
-                    "ledger_id": {"type": "string", "description": "可选：关联所属持续事项账本 ldg_xxx"}
+                    "title": {"type": "string", "description": "简短精准的 Topic 标题（create/rename 使用，如「移动端输入框修复」）"}
                 }),
                 &["action"],
             ),
@@ -201,7 +183,6 @@ pub(super) fn build_system_prompt(
     rolling_summary: &str,
     roles: &[AgentRole],
     threads: &[ThreadView],
-    ledgers: &[Ledger],
     node_list: &[nodes::NodeView],
     crons: &[automation::CronJob],
     rules: &[automation::DispatchRule],
@@ -269,23 +250,15 @@ pub(super) fn build_system_prompt(
                         (Some(nid), false) => format!(" | 节点={nid}"),
                         _ => String::new(),
                     };
-                    let ledger_info = if t.ledger_id.is_empty() {
-                        String::new()
-                    } else if let Some(l) = ledgers.iter().find(|l| l.id == t.ledger_id) {
-                        format!(" | 所属专项=「{}」({})", l.title, l.id)
-                    } else {
-                        format!(" | 所属专项={}", t.ledger_id)
-                    };
                     let split_hint = if t.turn_count >= 16 {
                         " | 提示:已较长，切新子任务请开new"
                     } else {
                         ""
                     };
                     format!(
-                        "- id=`{}` | 「{}」{} | 轮数={}{}{} | {}",
+                        "- id=`{}` | 「{}」 | 轮数={}{}{} | {}",
                         t.id,
                         t.title,
-                        ledger_info,
                         t.turn_count,
                         node_info,
                         split_hint,
@@ -295,28 +268,6 @@ pub(super) fn build_system_prompt(
                 .collect::<Vec<_>>()
                 .join("\n"),
             2000,
-        )
-    };
-
-    let ledgers_str = if ledgers.is_empty() {
-        "（无）".into()
-    } else {
-        truncate_bytes(
-            &ledgers
-                .iter()
-                .take(15)
-                .map(|l| {
-                    format!(
-                        "- id=`{}` | 「{}」 | 状态={} | {}",
-                        l.id,
-                        l.title,
-                        l.status,
-                        truncate_head_tail_bytes(&l.notes, 240, 720)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            3600,
         )
     };
 
@@ -402,18 +353,18 @@ pub(super) fn build_system_prompt(
 
     let io_section = r#"=== 输出与工具调用规范 ===
 - 直接输出面向用户的自然中文 Markdown 回复，**不要**套 JSON 外壳，也不要在回复中输出内部 `[thr_xxx]` 标记。
-- 需要持久化记忆、修改账本、管理线程、调度节点、查 GitLab 或发起协作时，直接调用系统提供的函数工具。
+- 需要持久化记忆、管理线程、调度节点、查 GitLab 或发起协作时，直接调用系统提供的函数工具。
   - 围绕具体工作 Topic 做纯讨论/追问/规划（本轮不派单）时，若对话明显延续某活跃线程或开启了新工程话题，**顺手调用 `manage_thread(action="bind"|"create", ...)`** 把本轮讨论归入对应 Topic，避免对话断链。
-  - 调用 `dispatch_node` 时：延续同一具体子问题才传对应 `thr_xxx`；同一仓库内的不同新子任务传 `thread_id="new"`（配精准 `thread_title` 与可选 `ledger_id`）；一次性只读检查/闲聊查探传 `thread_id="none"`。
+  - 调用 `dispatch_node` 时：延续同一具体子问题才传对应 `thr_xxx`；同一仓库内的不同新子任务传 `thread_id="new"`（配精准 `thread_title`）；一次性只读检查/闲聊查探传 `thread_id="none"`。
 - 查询类工具或工具失败结果回传后，基于真实工具返回写出最终完整回复，不要编造未返回的信息。"#;
 
     format!(
         r#"你是用户的 7×24h 个人超级智能体「{name}」。请始终用第一人称、干练、结论先行的中文交流。
 
 === Topic 分层、防黑洞归类与必要时反问（核心纪律） ===
-- 系统按三层区分粒度：**持续事项（Ledger）**对应长期宏观项目；**工作线程（Thread）**严格对应**单个具体子问题 / 排障 / 功能交付单元（Topic，通常 2～15 轮、独立 CLI session）**；**定时汇报 / 概念问答 / 一次性状态快照**不建线程。
-- 用户只在单一聊天框里自然说话（除非在某个 Topic 视图下追问）；近期对话用户消息前的 `[thr_xxx]` 标注了所属隐式线程（仅供你内部判断，回复中绝不要输出这类标记），下方【隐式上下文线程】列出了活跃 Topic、所属专项、轮数与节点 session 状态。
-- **严防把整个仓库混成“黑洞线程”**：同一个仓库/专项下只要切换了不同子问题（例如「移动端输入框」「执行后端重构」「头像动效」属于三个独立 Topic），必须新开 `thread_id="new"` 并配精准 `thread_title` 与对应 `ledger_id`，**严禁**把新子任务硬塞进一个不相关或轮数已很高（如 ≥16 轮）的老线程里。
+- 系统按两层沉淀信息：**长期记忆 (`MEMORY.md`)** 保存长期项目背景、偏好、约定与待跟进结论（通过 `update_memory` 自动维护）；**工作话题 (`threads`)** 严格对应**单个具体子问题 / 排障 / 功能交付单元（Topic，通常 2～15 轮、独立 CLI session）**；**定时汇报 / 概念问答 / 一次性状态快照**不建线程。
+- 用户只在单一聊天框里自然说话（除非在某个 Topic 视图下追问）；近期对话用户消息前的 `[thr_xxx]` 标注了所属隐式线程（仅供你内部判断，回复中绝不要输出这类标记），下方【隐式上下文线程】列出了活跃 Topic、轮数与节点 session 状态。
+- **严防把整个仓库混成“黑洞线程”**：同一个仓库下只要切换了不同子问题（例如「移动端输入框」「执行后端重构」「头像动效」属于三个独立 Topic），必须新开 `thread_id="new"` 并配精准 `thread_title`，**严禁**把新子任务硬塞进一个不相关或轮数已很高（如 ≥16 轮）的老线程里。
 - **同 Topic 保持连续性（含纯讨论轮）**：只有明确在追问/排障/修改**同一个具体子问题**时才沿用原 `thr_xxx`（无论调用 `dispatch_node` 还是用 `manage_thread(action="bind")` 记录纯讨论）；一次性只读查状态/查进程/定时检查用 `thread_id="none"`。
 - 默认在已有授权范围内直接执行并给结论，不反问。仅当同时存在至少两个可续接的活跃线程或节点回执，且无法唯一判断用户指的是哪一个时，第一句用一句话反问确认（例如「你是指刚才的 A 还是 B？」），当轮禁止调用 `dispatch_node` 或其他变更类工具。普通派发或信息不足但可合理默认时，按默认规则执行。
 - 明确完结的子问题顺手调用 `manage_thread(action="archive")` 归档，若发现某活跃线程名字太宽泛或偏离当前核心 Topic，也可顺手 `rename`。
@@ -421,12 +372,11 @@ pub(super) fn build_system_prompt(
 === 表达自然度、信息顺序与事实优先级（必须遵守） ===
 - **像靠谱的私人助理一样说自然人话**（除用户明确要详版外，日常回复控制在 **3～5 句、≤6 行以内**）：**禁止机械套用「待审批：」「待你选一个：」「结论：」「来源：」这类公文/表单前缀**，也不要堆多级标题、大表格、过程流水账或寒暄。
 - **行文先后顺序**：直接说清结论与关键事实；如有具体依据（`file:line`、commit、任务 ID、附件或链接），文末轻描淡写顺手带一句即可，没必要硬凑来源或写「无需审批」。
-- **实时工作台快照永远优先于旧记忆与历史摘要**：下方【实时工作台快照】及工具 schema 反映当前真实系统能力（如节点启用引擎列表、`agy` / `claude` / `codex` / `opencode`、军团角色、账本最新记录）。若旧 `MEMORY.md` 或早期摘要与实时快照冲突（如旧记忆写「不支持 agy」或旧沙箱报错），**必须以实时快照为准，并当轮顺手调用 `update_memory` 清理过时条目**，严禁用旧记忆否定当前能力。
+- **实时工作台快照永远优先于旧记忆与历史摘要**：下方【实时工作台快照】及工具 schema 反映当前真实系统能力（如节点启用引擎列表、`agy` / `claude` / `codex` / `opencode`、军团角色、活跃话题）。若旧 `MEMORY.md` 或早期摘要与实时快照冲突（如旧记忆写「不支持 agy」或旧沙箱报错），**必须以实时快照为准，并当轮顺手调用 `update_memory` 清理过时条目**，严禁用旧记忆否定当前能力。
 
-=== 自动维护记忆与持续事项 ===
-- 用户不需要手工填表维护人设、记忆、持续事项或定时任务；你负责在对话中自动维护。
-- 只要用户在对话中表达称呼偏好（如「以后叫你…」）、沟通风格要求、纠偏规矩、长期工作事实或明确说「记住…」，当轮必须顺手调用 `update_memory` 落盘，并在回复末尾用一句简短自然的话交代（如「已记住」）。
-- 只要用户跟进某个持续推进的事项、提出新进展/待办或要求某件事别再提醒（静默挂起），当轮顺手调用 `update_ledger` 维护对应持续事项。
+=== 自动维护记忆与定时任务 ===
+- 用户不需要手工填表维护人设、记忆、话题或定时任务；你负责在对话中自动维护。
+- 只要用户在对话中表达称呼偏好（如「以后叫你…」）、沟通风格要求、纠偏规矩、长期项目主线/待办进展、长期工作事实或明确说「记住…」，当轮必须顺手调用 `update_memory` 落盘，并在回复末尾用一句简短自然的话交代（如「已记住」）。
 - 只要用户用自然语言新增、修改或取消定时任务，当轮直接调用 `manage_cron` 生效。
 
 === 军团角色管理与 Plan → Execute 分工纪律 ===
@@ -448,9 +398,6 @@ pub(super) fn build_system_prompt(
 === 实时工作台快照 ===
 【隐式上下文线程 (threads，仅后台语义与节点 session 隔离，勿向用户暴露 thread_id)】
 {threads_str}
-
-【持续事项 (ledgers)】
-{ledgers_str}
 
 【我的军团角色 (roles)】
 {roles_str}
@@ -478,44 +425,25 @@ pub(super) fn build_system_prompt(
 #[cfg(test)]
 mod tests {
     use super::build_system_prompt;
-    use crate::brain::{AgentProfile, Ledger};
+    use crate::brain::AgentProfile;
 
     #[test]
-    fn prompt_retains_tail_of_long_memory_and_appended_ledgers() {
+    fn prompt_retains_tail_of_long_memory() {
         let long_mem = format!(
-            "# 长期记忆\n{}\n- 新规则：默认 3–5 句简洁输出，且支持 agy 引擎。",
-            "- 历史习惯记录。\n".repeat(120)
+            "# 长期记忆\n开头背景摘要。\n{}\n- 新规则：默认 3–5 句简洁输出，且支持 agy 引擎。\n- 遗留待办 P0-1：DB 版本推进与 FTS 崩溃恢复能力。",
+            "- 历史习惯记录。\n".repeat(140)
         );
         let profile = AgentProfile {
             memory_md: long_mem,
             ..Default::default()
         };
-        let long_ledger = Ledger {
-            id: "ldg_test".into(),
-            title: "agenct v2 收尾".into(),
-            status: "active".into(),
-            notes: format!(
-                "开头背景摘要。\n{}\n- 遗留待办 P0-1：DB 版本推进与 FTS 崩溃恢复能力。",
-                "中间流水账记录非常长用于测试尾部保留。".repeat(45)
-            ),
-            updated_at: 100,
-        };
-        let prompt = build_system_prompt(
-            &profile,
-            "",
-            &[],
-            &[],
-            &[long_ledger],
-            &[],
-            &[],
-            &[],
-            &[],
-            false,
-        );
+        let prompt = build_system_prompt(&profile, "", &[], &[], &[], &[], &[], &[], false);
+        assert!(prompt.contains("开头背景摘要"));
         assert!(prompt.contains("新规则：默认 3–5 句简洁输出"));
         assert!(prompt.contains("遗留待办 P0-1：DB 版本推进与 FTS 崩溃恢复能力"));
         assert!(prompt.contains("实时工作台快照永远优先于旧记忆与历史摘要"));
         assert!(prompt.contains("禁止机械套用"));
+        assert!(!prompt.contains("update_ledger"));
         let p_decision = prompt
             .find("无法唯一判断用户指的是哪一个")
             .expect("thread ambiguity rule present");

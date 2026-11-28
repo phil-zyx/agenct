@@ -2,14 +2,14 @@
 use crate::{Error, Result};
 use axum::http::StatusCode;
 use fs2::FileExt;
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS users (
@@ -61,7 +61,6 @@ CREATE TABLE IF NOT EXISTS threads (
     title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','archived')),
     summary TEXT NOT NULL DEFAULT '',
-    ledger_id TEXT NOT NULL DEFAULT '',
     node_id TEXT,
     node_session_id TEXT,
     node_session_agent TEXT NOT NULL DEFAULT '',
@@ -71,16 +70,6 @@ CREATE TABLE IF NOT EXISTS threads (
     updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_threads_user ON threads(user_id, status, updated_at DESC);
-
-CREATE TABLE IF NOT EXISTS ledgers (
-    id TEXT PRIMARY KEY,
-    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    title TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','muted','done')),
-    notes TEXT NOT NULL DEFAULT '',
-    updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_ledgers_user ON ledgers(user_id, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,6 +276,13 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
         )
         .into());
     }
+    let table_exists = |name: &str| -> rusqlite::Result<bool> {
+        tx.query_row(
+            "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )
+    };
     if current_version > 0 {
         if current_version <= 1 {
             tx.execute_batch(
@@ -355,13 +351,6 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
             };
             tx.execute_batch(alter)?;
         }
-        let table_exists = |name: &str| -> rusqlite::Result<bool> {
-            tx.query_row(
-                "SELECT count(*) > 0 FROM sqlite_master WHERE type='table' AND name=?1",
-                [name],
-                |r| r.get(0),
-            )
-        };
         if current_version <= 8 {
             let mut alter = String::new();
             if table_exists("nodes")? {
@@ -412,19 +401,6 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
             }
             tx.execute_batch(&mig)?;
         }
-        if current_version <= 12 && table_exists("threads")? {
-            let has_ledger_id: bool = tx
-                .prepare("PRAGMA table_info(threads)")?
-                .query_map([], |r| r.get::<_, String>(1))?
-                .filter_map(|r| r.ok())
-                .any(|col| col == "ledger_id");
-            if !has_ledger_id {
-                tx.execute(
-                    "ALTER TABLE threads ADD COLUMN ledger_id TEXT NOT NULL DEFAULT ''",
-                    [],
-                )?;
-            }
-        }
         if current_version <= 13 && table_exists("tasks")? {
             let has_blocked_reason: bool = tx
                 .prepare("PRAGMA table_info(tasks)")?
@@ -461,6 +437,95 @@ fn migrate(writer: &mut Connection) -> std::result::Result<(), Box<dyn std::erro
                )",
             [archive_cutoff],
         )?;
+    }
+    if (1..=15).contains(&current_version) {
+        if table_exists("ledgers")? {
+            let mut by_user: std::collections::BTreeMap<String, Vec<String>> =
+                std::collections::BTreeMap::new();
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT user_id, title, status, notes
+                     FROM ledgers
+                     ORDER BY user_id, updated_at DESC",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (uid, raw_title, raw_status, raw_notes) = row?;
+                    let title = raw_title.trim();
+                    let title = if title.is_empty() {
+                        "未命名事项"
+                    } else {
+                        title
+                    };
+                    let status_zh = match raw_status.trim() {
+                        "muted" => "已静默",
+                        "done" => "已完成",
+                        _ => "跟进中",
+                    };
+                    let notes = raw_notes.replace("\r\n", "\n").replace('\n', " ");
+                    let notes = notes.trim();
+                    let bullet = if notes.is_empty() {
+                        format!("- **{title}**（{status_zh}）")
+                    } else {
+                        format!("- **{title}**（{status_zh}）：{notes}")
+                    };
+                    by_user.entry(uid).or_default().push(bullet);
+                }
+            }
+            let now = crate::config::now_unix();
+            for (uid, lines) in by_user {
+                if lines.is_empty() {
+                    continue;
+                }
+                let section = format!("## 历史长期项目\n{}", lines.join("\n"));
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT memory_md FROM agent_profiles WHERE user_id = ?1",
+                        [&uid],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(mem) = existing {
+                    let merged = if mem.trim().is_empty() {
+                        section
+                    } else {
+                        format!("{}\n\n{section}", mem.trim_end())
+                    };
+                    let bounded = crate::config::truncate_bytes(&merged, 12_000);
+                    tx.execute(
+                        "UPDATE agent_profiles SET memory_md = ?2, updated_at = ?3 WHERE user_id = ?1",
+                        rusqlite::params![uid, bounded, now],
+                    )?;
+                } else {
+                    let bounded = crate::config::truncate_bytes(&section, 12_000);
+                    tx.execute(
+                        "INSERT INTO agent_profiles(user_id, name, soul_md, memory_md, avatar_id, updated_at)
+                         VALUES (?1, 'Agenct', '', ?2, 'agenct', ?3)",
+                        rusqlite::params![uid, bounded, now],
+                    )?;
+                }
+            }
+            tx.execute_batch(
+                "DROP INDEX IF EXISTS idx_ledgers_user; DROP TABLE IF EXISTS ledgers;",
+            )?;
+        }
+        if table_exists("threads")? {
+            let has_ledger_id: bool = tx
+                .prepare("PRAGMA table_info(threads)")?
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .any(|col| col == "ledger_id");
+            if has_ledger_id {
+                tx.execute("ALTER TABLE threads DROP COLUMN ledger_id", [])?;
+            }
+        }
     }
     // Older migrations could leave a partial index even after advancing user_version.
     if (1..SCHEMA_VERSION).contains(&current_version) {
@@ -1133,6 +1198,82 @@ mod tests {
             .unwrap(),
         );
         assert_eq!((p_ag.as_str(), e_ag.as_str()), ("agy", "codex"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v15_merges_ledgers_into_memory_and_drops_table() {
+        let dir = std::env::temp_dir().join(format!(
+            "agenct-mig15-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("agenct.sqlite3");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE users (id TEXT PRIMARY KEY, gitlab_id INTEGER UNIQUE, username TEXT NOT NULL UNIQUE, display_name TEXT NOT NULL, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL);
+                 CREATE TABLE agent_profiles (user_id TEXT PRIMARY KEY, name TEXT NOT NULL, soul_md TEXT NOT NULL, memory_md TEXT NOT NULL, avatar_id TEXT NOT NULL DEFAULT 'agenct', rolling_summary TEXT NOT NULL DEFAULT '', compacted_msg_id INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+                 CREATE TABLE threads (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', summary TEXT NOT NULL DEFAULT '', ledger_id TEXT NOT NULL DEFAULT '', node_id TEXT, node_session_id TEXT, node_session_agent TEXT NOT NULL DEFAULT '', node_session_role TEXT NOT NULL DEFAULT '', node_session_model TEXT NOT NULL DEFAULT '', turn_count INTEGER NOT NULL DEFAULT 0, updated_at INTEGER NOT NULL);
+                 CREATE TABLE ledgers (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL);
+                 CREATE INDEX idx_ledgers_user ON ledgers(user_id, updated_at DESC);
+                 INSERT INTO users VALUES ('u1', 1, 'alice', 'Alice', 1, 'active', 100);
+                 INSERT INTO users VALUES ('u2', 2, 'bob', 'Bob', 0, 'active', 100);
+                 INSERT INTO agent_profiles VALUES ('u1', 'Agenct', 'soul', '已有记忆', 'agenct', '', 0, 100);
+                 INSERT INTO threads VALUES ('thr_1', 'u1', 'Deploy', 'active', 'sum', 'ldg_1', 'homelab', 'ses_1', 'codex', '', '', 2, 100);
+                 INSERT INTO ledgers VALUES ('ldg_1', 'u1', 'Tidalis 初版交付', 'active', '已完成核心导出', 200);
+                 INSERT INTO ledgers VALUES ('ldg_2', 'u1', '头像循环动效', 'muted', '待素材到位', 150);
+                 INSERT INTO ledgers VALUES ('ldg_3', 'u2', '测试专项', 'done', '', 120);
+                 PRAGMA user_version = 15;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        drop(db);
+        let conn = Connection::open(&db_path).unwrap();
+        let ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, SCHEMA_VERSION);
+        let ledgers_table: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ledgers'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ledgers_table, 0);
+        let has_ledger_col: bool = conn
+            .prepare("PRAGMA table_info(threads)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .any(|c| c == "ledger_id");
+        assert!(!has_ledger_col);
+
+        let u1_mem: String = conn
+            .query_row(
+                "SELECT memory_md FROM agent_profiles WHERE user_id='u1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(u1_mem.contains("已有记忆"));
+        assert!(u1_mem.contains("## 历史长期项目"));
+        assert!(u1_mem.contains("**Tidalis 初版交付**（跟进中）：已完成核心导出"));
+        assert!(u1_mem.contains("**头像循环动效**（已静默）：待素材到位"));
+
+        let u2_mem: String = conn
+            .query_row(
+                "SELECT memory_md FROM agent_profiles WHERE user_id='u2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(u2_mem.contains("## 历史长期项目"));
+        assert!(u2_mem.contains("**测试专项**（已完成）"));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

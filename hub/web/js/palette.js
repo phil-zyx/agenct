@@ -221,22 +221,6 @@ export function initCommandPalette({
           }),
         });
       }
-      const ledgers = res.ledgers || [];
-      if (ledgers.length) {
-        remoteGroups.push({
-          label: '持续事项',
-          items: ledgers.map((l) => ({
-            title: l.title,
-            sub: (l.notes || '').slice(0, 120),
-            badge: l.status,
-            icon: '#ic-tasks',
-            run: () => {
-              close(true);
-              actions.onToggleTasks?.(true);
-            },
-          })),
-        });
-      }
       const mems = res.memory_matches || [];
       if (mems.length) {
         remoteGroups.push({
