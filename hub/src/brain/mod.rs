@@ -248,6 +248,96 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                 "total_messages": total_messages,
             });
 
+            const CST_OFFSET: i64 = 8 * 3600;
+            const HEATMAP_DAYS: usize = 84;
+            let today_day = (now_unix() + CST_OFFSET).div_euclid(86_400);
+            let start_day = today_day - (HEATMAP_DAYS as i64 - 1);
+            let since_ts = start_day * 86_400 - CST_OFFSET;
+            let mut buckets = vec![[0u32; 3]; HEATMAP_DAYS];
+
+            let mut hm_msg_stmt = conn.prepare(
+                "SELECT (created_at + 28800) / 86400 AS d, COUNT(*)
+                 FROM messages
+                 WHERE user_id = ?1 AND role = 'user' AND status = 'complete' AND created_at >= ?2
+                 GROUP BY d",
+            )?;
+            for row in hm_msg_stmt.query_map(params![&uid, since_ts], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (d, cnt) = row?;
+                if (start_day..=today_day).contains(&d) {
+                    buckets[(d - start_day) as usize][0] = cnt.max(0) as u32;
+                }
+            }
+
+            let mut hm_task_stmt = conn.prepare(
+                "SELECT (updated_at + 28800) / 86400 AS d, COUNT(*)
+                 FROM tasks
+                 WHERE owner_id = ?1 AND status = 'done' AND updated_at >= ?2
+                 GROUP BY d",
+            )?;
+            for row in hm_task_stmt.query_map(params![&uid, since_ts], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (d, cnt) = row?;
+                if (start_day..=today_day).contains(&d) {
+                    buckets[(d - start_day) as usize][1] = cnt.max(0) as u32;
+                }
+            }
+
+            let mut hm_cron_stmt = conn.prepare(
+                "SELECT (created_at + 28800) / 86400 AS d, COUNT(*)
+                 FROM audit_logs
+                 WHERE user_id = ?1 AND action = 'cron_run' AND status = 'ok' AND created_at >= ?2
+                 GROUP BY d",
+            )?;
+            for row in hm_cron_stmt.query_map(params![&uid, since_ts], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })? {
+                let (d, cnt) = row?;
+                if (start_day..=today_day).contains(&d) {
+                    buckets[(d - start_day) as usize][2] = cnt.max(0) as u32;
+                }
+            }
+
+            let mut active_days: u32 = 0;
+            let mut total_chats: u32 = 0;
+            let mut total_tasks: u32 = 0;
+            let mut total_crons: u32 = 0;
+            for b in &buckets {
+                total_chats += b[0];
+                total_tasks += b[1];
+                total_crons += b[2];
+                if b[0] + b[1] + b[2] > 0 {
+                    active_days += 1;
+                }
+            }
+            let today_sum = buckets[HEATMAP_DAYS - 1].iter().sum::<u32>();
+            let mut streak_days: u32 = 0;
+            let mut idx_opt = if today_sum > 0 {
+                Some(HEATMAP_DAYS - 1)
+            } else {
+                HEATMAP_DAYS.checked_sub(2)
+            };
+            while let Some(i) = idx_opt {
+                if buckets[i].iter().sum::<u32>() == 0 {
+                    break;
+                }
+                streak_days += 1;
+                idx_opt = i.checked_sub(1);
+            }
+
+            let activity_heatmap = json!({
+                "start_day": start_day,
+                "today_day": today_day,
+                "days": buckets,
+                "active_days": active_days,
+                "streak_days": streak_days,
+                "total_chats": total_chats,
+                "total_tasks": total_tasks,
+                "total_crons": total_crons,
+            });
+
             Ok(json!({
                 "profile": profile,
                 "roles": roles,
@@ -262,6 +352,7 @@ pub async fn bootstrap(State(hub): State<Hub>, AuthUser(user): AuthUser) -> Resu
                 "audit_logs": audit_logs,
                 "contacts": contacts,
                 "context_stats": context_stats,
+                "activity_heatmap": activity_heatmap,
             }))
         })
         .await?;

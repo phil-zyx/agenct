@@ -2,7 +2,7 @@
 import { api, esc, fmtTime, renderMarkdown, showToast } from './api.js';
 import { playDone, playSend, playTap, playToggle, playWarn } from './sound.js';
 import { renderStepTrailHtml } from './triage.js';
-import { bindHoldAction, fmtBytes, initDelegatedCopy, writeClipboard } from './ui.js';
+import { bindHoldAction, closeContextMenu, fmtBytes, initDelegatedCopy, openContextMenu, writeClipboard } from './ui.js';
 
 function randomId() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID();
@@ -10,14 +10,22 @@ function randomId() {
   return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
 }
 
-export function initChat({ state, onRefresh, onActivityChange }) {
+export function initChat({ state, onRefresh, onActivityChange, onOpenSoulMeter }) {
   const scrollerEl = document.getElementById('scroller');
   const startersEl = document.getElementById('chat-starters');
   const listEl = document.getElementById('messages');
+  const actionDeckEl = document.getElementById('chat-action-deck');
   const formEl = document.getElementById('chat-form');
   const pillEl = formEl.querySelector('.composer-pill');
   const orbitEl = document.getElementById('composer-orbit');
   const suggestEl = document.getElementById('composer-suggest');
+  const statusThreadWrap = document.getElementById('status-thread-wrap');
+  const statusThreadBtn = document.getElementById('status-thread-btn');
+  const threadMenuEl = document.getElementById('composer-thread-menu');
+  const statusSandboxChip = document.getElementById('status-sandbox-chip');
+  const statusCtxBtn = document.getElementById('status-ctx-btn');
+  const statusCtxFill = document.getElementById('status-ctx-fill');
+  const statusCtxLabel = document.getElementById('status-ctx-label');
   const engineWrap = document.getElementById('composer-engine-wrap');
   const engineBtn = document.getElementById('composer-engine-btn');
   const engineLabel = document.getElementById('composer-engine-label');
@@ -42,7 +50,6 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   const streamMsgEl = document.getElementById('streaming-msg');
   const loadOlderWrap = document.getElementById('load-older-wrap');
   const loadOlderBtn = document.getElementById('load-older-btn');
-  const threadFilterBar = document.getElementById('thread-filter-bar');
   const threadFilterTitle = document.getElementById('thread-filter-title');
   const clearThreadFilterBtn = document.getElementById('clear-thread-filter');
 
@@ -83,6 +90,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   let suggestIdx = 0;
   let suggestRange = null;
   const renderedContents = new Map();
+  const renderedMsgs = new Map();
 
   function syncOrbitGeometry() {
     if (!pillEl || !orbitEl) return;
@@ -1034,7 +1042,9 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   }
 
   if (clearThreadFilterBtn) {
-    clearThreadFilterBtn.onclick = () => {
+    clearThreadFilterBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      closeThreadMenu();
       activeThread = null;
       threadMessages = [];
       threadHasMore = false;
@@ -1042,6 +1052,256 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       scrollAfterRender = true;
       render();
     };
+  }
+
+  function closeThreadMenu() {
+    if (!threadMenuEl || !statusThreadBtn) return;
+    threadMenuEl.classList.add('hide');
+    statusThreadBtn.setAttribute('aria-expanded', 'false');
+  }
+
+  function clearThreadIfActive(threadId) {
+    if (!activeThread || activeThread.id !== threadId) return;
+    activeThread = null;
+    threadMessages = [];
+    threadHasMore = false;
+    switchingThread = true;
+    scrollAfterRender = true;
+    render();
+  }
+
+  function renderStatusTab() {
+    const activeThreads = (state.threads || []).filter((t) => t.status !== 'archived');
+    if (threadFilterTitle) {
+      if (activeThread) {
+        threadFilterTitle.textContent = `话题：${activeThread.title}`;
+      } else {
+        threadFilterTitle.textContent = activeThreads.length
+          ? `全部对话 · ${activeThreads.length} 话题`
+          : '全部对话';
+      }
+    }
+    clearThreadFilterBtn?.classList.toggle('hide', !activeThread);
+    statusThreadWrap?.classList.toggle('is-filtered', Boolean(activeThread));
+
+    if (threadMenuEl) {
+      const opts = [
+        `<button type="button" class="engine-menu-opt${!activeThread ? ' on' : ''}" role="menuitemradio" aria-checked="${!activeThread ? 'true' : 'false'}" data-pick-thread=""><span>全部对话（全局流）</span><span class="engine-menu-check">${!activeThread ? '✓' : ''}</span></button>`,
+        ...activeThreads.slice(0, 8).map((t) => {
+          const on = activeThread?.id === t.id;
+          return `<button type="button" class="engine-menu-opt${on ? ' on' : ''}" role="menuitemradio" aria-checked="${on ? 'true' : 'false'}" data-pick-thread="${esc(t.id)}" data-thread-title="${esc(t.title)}"><span>${esc(t.title)}</span><span class="engine-menu-opt-meta"><span class="engine-menu-scope">${t.turn_count || 0}轮</span><span class="engine-menu-check">${on ? '✓' : ''}</span></span></button>`;
+        }),
+      ];
+      threadMenuEl.innerHTML = `<div class="engine-menu-head"><span>切换对话范围</span></div>${opts.join('')}`;
+      threadMenuEl.querySelectorAll('[data-pick-thread]').forEach((btn) => {
+        btn.onclick = (ev) => {
+          ev.stopPropagation();
+          const tid = btn.dataset.pickThread;
+          const title = btn.dataset.threadTitle || tid;
+          closeThreadMenu();
+          playTap();
+          if (!tid) {
+            activeThread = null;
+            threadMessages = [];
+            threadHasMore = false;
+            switchingThread = true;
+            scrollAfterRender = true;
+            render();
+          } else {
+            setThreadFilter(tid, title);
+          }
+        };
+      });
+    }
+
+    if (statusSandboxChip) {
+      const node = primaryNode();
+      if (!node) {
+        statusSandboxChip.classList.add('hide');
+        statusSandboxChip.textContent = '';
+      } else {
+        const caps = parseNodeCaps(node.capabilities);
+        const iso = nodeIsolationSummary(caps) || '工作区沙箱';
+        statusSandboxChip.textContent = iso;
+        statusSandboxChip.classList.toggle('is-warn', iso === '全宿主机权限');
+        statusSandboxChip.classList.remove('hide');
+      }
+    }
+
+    if (statusCtxLabel && statusCtxFill) {
+      const cs = state.context_stats || {};
+      const uncompacted = Number.isFinite(cs.uncompacted_messages)
+        ? cs.uncompacted_messages
+        : (state.messages || []).length;
+      const trigger = Number.isFinite(cs.compact_trigger_messages) ? cs.compact_trigger_messages : 18;
+      const pct = Math.min(100, Math.round((uncompacted / Math.max(1, trigger)) * 100));
+      statusCtxLabel.textContent = `${uncompacted}/${trigger}`;
+      statusCtxFill.style.strokeDashoffset = String(100 - pct);
+    }
+  }
+
+  statusThreadBtn?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (!threadMenuEl) return;
+    const open = threadMenuEl.classList.contains('hide');
+    threadMenuEl.classList.toggle('hide', !open);
+    statusThreadBtn.setAttribute('aria-expanded', String(open));
+    playToggle(open);
+  });
+  statusCtxBtn?.addEventListener('click', () => {
+    playTap();
+    onOpenSoulMeter?.();
+  });
+
+  function renderActionDeck() {
+    if (!actionDeckEl) return;
+    const uid = state.user?.id;
+    if (!uid) {
+      actionDeckEl.classList.add('hide');
+      actionDeckEl.innerHTML = '';
+      return;
+    }
+    const nodes = state.nodes || [];
+    const elevatedNodeIds = new Set(
+      nodes.filter((n) => parseNodeCaps(n.capabilities).elevated === '1').map((n) => n.id),
+    );
+    const anyElevated = elevatedNodeIds.size > 0;
+    const tasks = (state.tasks || []).filter(
+      (t) => t.owner_id === uid && (!activeThread || t.thread_id === activeThread.id),
+    );
+
+    const actionable = [];
+    for (const t of tasks) {
+      const isElevPending = t.requester_id === uid && t.status === 'pending' && t.sandbox === 'elevated';
+      const isBlockedFail = t.requester_id === uid && t.status === 'failed' && Boolean(t.blocked_reason);
+      const isCollab = t.requester_id !== uid && (t.status === 'pending' || t.status === 'running');
+      if (isElevPending || isBlockedFail) {
+        actionable.push({ kind: 'elev', task: t });
+      } else if (isCollab) {
+        actionable.push({ kind: 'collab', task: t });
+      }
+      if (actionable.length >= 3) break;
+    }
+
+    if (!actionable.length) {
+      actionDeckEl.classList.add('hide');
+      actionDeckEl.innerHTML = '';
+      return;
+    }
+
+    actionDeckEl.innerHTML = actionable
+      .map(({ kind, task: t }) => {
+        if (kind === 'elev') {
+          const canElev = t.node_id ? elevatedNodeIds.has(t.node_id) : anyElevated;
+          const badgeText = t.status === 'pending' ? '待单次放行' : '沙箱受阻';
+          const reason = t.blocked_reason || t.instruction || '';
+          const elevLabel = t.status === 'pending' ? '单次放行执行' : '单次放行重试';
+          return `
+            <div class="decision-card is-warn" data-decision-id="${esc(t.id)}">
+              <div class="decision-head">
+                <span class="decision-title"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-shield"/></svg><span>${esc(t.title)}</span></span>
+                <span class="badge warn">${esc(badgeText)}</span>
+              </div>
+              ${reason ? `<div class="decision-sub">${esc(reason.slice(0, 140))}</div>` : ''}
+              <div class="row">
+                ${canElev ? `<button type="button" class="sm warn" data-deck-elevate="${esc(t.id)}">${esc(elevLabel)}</button>` : ''}
+                ${t.status === 'failed' ? `<button type="button" class="sm primary" data-deck-assign="${esc(t.id)}">普通重试</button>` : ''}
+                <button type="button" class="sm danger" data-deck-cancel="${esc(t.id)}">取消</button>
+              </div>
+            </div>`;
+        }
+        return `
+          <div class="decision-card is-info" data-decision-id="${esc(t.id)}">
+            <div class="decision-head">
+              <span class="decision-title"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-contacts"/></svg><span>${esc(t.title)}</span></span>
+              <span class="badge">${t.status === 'running' ? '执行中' : '同事协作'}</span>
+            </div>
+            ${t.instruction ? `<div class="decision-sub">${esc(t.instruction.slice(0, 140))}</div>` : ''}
+            <div class="decision-deliver-row">
+              <input type="text" class="decision-deliver-input" data-deck-deliver-input="${esc(t.id)}" placeholder="输入交付结论或处理结果…">
+              <button type="button" class="sm primary" data-deck-deliver="${esc(t.id)}">交付结果</button>
+            </div>
+            <div class="row">
+              ${t.status === 'pending' ? `<button type="button" class="sm" data-deck-assign="${esc(t.id)}">派给节点</button>` : ''}
+              <button type="button" class="sm danger" data-deck-cancel="${esc(t.id)}">取消</button>
+            </div>
+          </div>`;
+      })
+      .join('');
+    actionDeckEl.classList.remove('hide');
+
+    actionDeckEl.querySelectorAll('[data-deck-elevate]').forEach((b) => {
+      bindHoldAction(
+        b,
+        async () => {
+          try {
+            await api(`/api/tasks/${encodeURIComponent(b.dataset.deckElevate)}/action`, {
+              method: 'POST',
+              body: { action: 'retry_elevated' },
+            });
+            showToast('已批准单次放行');
+            await onRefresh();
+          } catch (err) {
+            showToast(err.message);
+          }
+        },
+        { shortHint: '请长按确认仅本次放行' },
+      );
+    });
+    actionDeckEl.querySelectorAll('[data-deck-cancel]').forEach((b) => {
+      bindHoldAction(
+        b,
+        async () => {
+          try {
+            await api(`/api/tasks/${encodeURIComponent(b.dataset.deckCancel)}/action`, {
+              method: 'POST',
+              body: { action: 'cancel' },
+            });
+            showToast('任务已取消');
+            await onRefresh();
+          } catch (err) {
+            showToast(err.message);
+          }
+        },
+        { shortHint: '请长按「取消」确认中止任务' },
+      );
+    });
+    actionDeckEl.querySelectorAll('[data-deck-assign]').forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api(`/api/tasks/${encodeURIComponent(b.dataset.deckAssign)}/action`, {
+            method: 'POST',
+            body: { action: 'assign_node' },
+          });
+          showToast('已派发给节点');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
+    actionDeckEl.querySelectorAll('[data-deck-deliver]').forEach((b) => {
+      b.onclick = async () => {
+        const tid = b.dataset.deckDeliver;
+        const input = actionDeckEl.querySelector(`[data-deck-deliver-input="${CSS.escape(tid)}"]`);
+        const result = String(input?.value || '').trim();
+        if (!result) {
+          showToast('请先填写交付结果内容', { tone: 'warn' });
+          input?.focus();
+          return;
+        }
+        try {
+          await api(`/api/tasks/${encodeURIComponent(tid)}/action`, {
+            method: 'POST',
+            body: { action: 'deliver', result },
+          });
+          showToast('协作结果已交付');
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+    });
   }
 
   if (loadOlderBtn) {
@@ -1086,10 +1346,8 @@ export function initChat({ state, onRefresh, onActivityChange }) {
       const matched = (state.threads || []).find((t) => t.id === activeThread.id);
       if (matched) activeThread.title = matched.title;
     }
-    if (threadFilterBar && threadFilterTitle) {
-      threadFilterBar.classList.toggle('hide', !activeThread);
-      threadFilterTitle.textContent = activeThread ? `当前话题：${activeThread.title}` : '';
-    }
+    renderStatusTab();
+    renderActionDeck();
     listEl.dataset.filtered = activeThread ? 'true' : 'false';
 
     const showOlder = activeThread ? threadHasMore : hasMoreGlobal;
@@ -1116,6 +1374,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     }
     if (!msgs.length) {
       renderedContents.clear();
+      renderedMsgs.clear();
       listEl.innerHTML = '';
       scrollAfterRender = true;
       switchingThread = false;
@@ -1128,10 +1387,12 @@ export function initChat({ state, onRefresh, onActivityChange }) {
     const animateNew = hasBootRendered && !switchingThread;
     let newAssistantArrived = false;
     renderedContents.clear();
+    renderedMsgs.clear();
     listEl.innerHTML = msgs
       .map((m, idx) => {
         const key = String(idx);
         renderedContents.set(key, String(m.content || ''));
+        renderedMsgs.set(key, m);
         const isNew = animateNew && (!m.id || m.id > lastSeenMsgId);
         if (isNew && !activeThread && m.role === 'assistant' && m.status !== 'failed') {
           newAssistantArrived = true;
@@ -1149,7 +1410,7 @@ export function initChat({ state, onRefresh, onActivityChange }) {
         </div>`
             : '';
         return `
-      <div class="msg msg-${esc(m.role)}${m.status === 'failed' ? ' msg-failed' : ''}${isNew ? ' msg-enter' : ''}">
+      <div class="msg msg-${esc(m.role)}${m.status === 'failed' ? ' msg-failed' : ''}${isNew ? ' msg-enter' : ''}" data-msg-idx="${key}">
         ${actionsHtml}
         <div>${renderMarkdown(m.content)}</div>
         <div class="msg-meta">${esc(fmtTime(m.created_at))}${
@@ -1469,13 +1730,78 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   });
   document.addEventListener('click', (ev) => {
     if (engineWrap && !engineWrap.contains(ev.target)) closeEngineMenu();
+    if (statusThreadWrap && !statusThreadWrap.contains(ev.target)) closeThreadMenu();
     if (formEl && !formEl.contains(ev.target)) closeSuggest();
   });
   document.addEventListener('keydown', (ev) => {
     if (ev.key === 'Escape') {
       closeEngineMenu();
+      closeThreadMenu();
       closeSuggest();
+      closeContextMenu();
     }
+  });
+
+  listEl?.addEventListener('contextmenu', (ev) => {
+    if (window.getSelection()?.toString()?.trim()) return;
+    const msgEl = ev.target?.closest?.('.msg[data-msg-idx]');
+    if (!msgEl) return;
+    const idx = msgEl.dataset.msgIdx || '';
+    const raw = renderedContents.get(idx) || '';
+    const meta = renderedMsgs.get(idx);
+    if (!raw) return;
+    ev.preventDefault();
+    const codeMatch = raw.match(/```[^\n]*\n([\s\S]*?)```/);
+    const items = [
+      {
+        label: '复制全文',
+        icon: '#ic-copy',
+        onSelect: async () => {
+          const ok = await writeClipboard(raw);
+          showToast(ok ? '已复制消息全文' : '复制失败，请手动选择');
+        },
+      },
+      {
+        label: '引用追问',
+        icon: '#ic-reply',
+        onSelect: () => {
+          const snippet = raw
+            .split(/\r?\n/)
+            .map((l) => l.replace(/^#+\s*/, '').trim())
+            .filter(Boolean)
+            .slice(0, 2)
+            .join(' ')
+            .slice(0, 110);
+          if (!snippet) return;
+          const prefix = `> ${snippet}\n\n`;
+          inputEl.value = inputEl.value.trim() ? `${prefix}${inputEl.value}` : prefix;
+          syncComposerState();
+          inputEl.focus();
+          inputEl.setSelectionRange(inputEl.value.length, inputEl.value.length);
+        },
+      },
+    ];
+    if (codeMatch?.[1]) {
+      items.push({
+        label: '复制代码块',
+        icon: '#ic-file',
+        onSelect: async () => {
+          const ok = await writeClipboard(codeMatch[1].trim());
+          showToast(ok ? '已复制代码块' : '复制失败');
+        },
+      });
+    }
+    if (meta?.thread_id && !activeThread) {
+      const thrTitle =
+        (state.threads || []).find((t) => t.id === meta.thread_id)?.title || meta.thread_id;
+      items.push({ separator: true });
+      items.push({
+        label: `只看话题「${thrTitle.slice(0, 14)}」`,
+        icon: '#ic-tasks',
+        onSelect: () => setThreadFilter(meta.thread_id, thrTitle),
+      });
+    }
+    openContextMenu({ x: ev.clientX, y: ev.clientY, items });
   });
 
   listEl?.addEventListener('click', async (ev) => {
@@ -1528,5 +1854,6 @@ export function initChat({ state, onRefresh, onActivityChange }) {
   initDelegatedCopy(listEl);
   syncComposerState();
   renderEnginePill();
-  return { render, setStage, onDelta, onTask, onMessageEvent, syncTasks, insertMention, setThreadFilter, renderEnginePill, flashIslandDone, switchEngine };
+  renderStatusTab();
+  return { render, setStage, onDelta, onTask, onMessageEvent, syncTasks, insertMention, setThreadFilter, clearThreadIfActive, renderEnginePill, flashIslandDone, switchEngine };
 }

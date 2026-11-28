@@ -106,7 +106,8 @@ try {
   await page.waitForSelector('#room:not(.hide)');
   await page.waitForFunction(() => document.getElementById('sse-pill')?.textContent?.includes('实时同步'));
 
-  // 2a. Empty-state starter cards, caret `/` suggest menu, and manual theme toggle (strict CSP safe).
+  // 2a. Empty-state starter cards, hanging status tab, caret `/` suggest menu, and manual theme toggle (strict CSP safe).
+  await page.waitForSelector('#composer-status-tab #status-ctx-label');
   await page.waitForSelector('#chat-starters:not(.hide) .starter-card');
   await page.focus('#chat-input');
   await page.fill('#chat-input', '/');
@@ -398,10 +399,18 @@ try {
   await page.unroute('**/api/bootstrap', padHandler);
   await page.click('#muse-head-toggle');
 
-  // 7. Verify 2-tab Muse drawer (Work Threads + Soul/Memory), context meter card, live dynamic avatar picker & Settings view.
+  // 7. Verify 2-tab Muse drawer (Work Threads + Context Menu + Soul/Memory + Heat Grid), live dynamic avatar picker & Settings view.
   await page.waitForSelector('#drawer-body .panel-card h3');
+  const firstThreadMore = page.locator('#task-pane .thread-card [data-thread-menu]').first();
+  if ((await firstThreadMore.count()) > 0) {
+    await firstThreadMore.click();
+    await page.waitForSelector('#ctx-menu:not(.hide) .ctx-item');
+    await page.keyboard.press('Escape');
+    await page.waitForSelector('#ctx-menu.hide', { state: 'attached' });
+  }
   await page.click('.muse-seg button[data-tab="soul"]');
   await page.waitForSelector('#context-meter-card .ctx-meter-track');
+  await page.waitForFunction(() => document.querySelectorAll('#activity-heat-card .heat-cell').length === 84);
   await page.waitForSelector('#chat-tune-memory');
   await page.click('[data-pick-avatar="sakura"]');
   await page.waitForFunction(
@@ -513,11 +522,17 @@ try {
 
   assert.deepEqual(errors, [], `unexpected browser errors: ${errors.join('; ')}`);
 
-  // 7c. Per-user brain model settings: private URLs are rejected by the Hub (SSRF guard).
+  // 7c. Categorized Settings Tabs + Per-user brain model settings (SSRF guard).
   await page.click('#rail-more');
   await page.click('#open-settings');
   await page.waitForSelector('#perms-form');
   await page.waitForSelector('#models-form');
+  await page.click('#settings-tabs [data-settings-tab="channels"]');
+  await page.waitForSelector('#settings-body [data-settings-panel="channels"]:not(.hide) #im-form');
+  await page.click('#settings-tabs [data-settings-tab="nodes"]');
+  await page.waitForSelector('#settings-body [data-settings-panel="nodes"]:not(.hide) summary:has-text("+ 添加新节点")');
+  await page.click('#settings-tabs [data-settings-tab="model-auth"]');
+  await page.waitForSelector('#settings-body [data-settings-panel="model-auth"]:not(.hide) #models-form');
   assert.ok((await page.textContent('#settings-body')).includes('服务器默认：stub'));
   await page.fill('#models-form input[name="brain_url"]', 'https://10.20.30.40/v1/chat/completions');
   await page.fill('#models-form input[name="brain_model"]', 'evil');

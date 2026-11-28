@@ -41,6 +41,10 @@
       <symbol id="ic-slash" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="4"/><path d="m14 8l-4 8"/></g></symbol>
       <symbol id="ic-spark" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/></symbol>
       <symbol id="ic-shield" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M12 3l7 3v5.5c0 4.5-3 8.1-7 9.5c-4-1.4-7-5-7-9.5V6z"/></symbol>
+      <symbol id="ic-more" viewBox="0 0 24 24"><circle cx="6" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="18" cy="12" r="1.4" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="ic-archive" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="4" rx="1.5"/><path d="M5 8v10a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8m-9 4h4"/></g></symbol>
+      <symbol id="ic-warn" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v5m0 3.2h.01"/></g></symbol>
+      <symbol id="ic-info" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v5m0-8h.01"/></g></symbol>
     </defs>
   </svg>
   <nav class="rail" aria-label="主导航">
@@ -91,6 +95,7 @@
   </nav>
 
   <div id="toast" class="toast-stack" role="status" aria-live="polite"></div>
+  <div id="ctx-menu" class="ctx-menu hide" role="menu" aria-label="快捷操作菜单"></div>
 
   <!-- Login View (GitLab OAuth and/or local owner token) -->
   <section id="login-view" class="login hide">
@@ -148,10 +153,6 @@
           </div>
         </div>
       </div>
-      <div id="thread-filter-bar" class="thread-filter-bar hide" role="status">
-        <span id="thread-filter-title"></span>
-        <button type="button" id="clear-thread-filter" class="text-btn sm">返回全部对话</button>
-      </div>
       <div class="scroller-wrap">
         <div class="chat-fade-top" aria-hidden="true"></div>
         <div id="scroller" class="scroller">
@@ -174,6 +175,7 @@
           </div>
           <div id="chat-starters" class="chat-starters hide" aria-label="快速开始"></div>
           <div id="messages" class="stream" aria-label="对话记录"></div>
+          <div id="chat-action-deck" class="chat-action-deck hide" aria-live="polite"></div>
           <div id="stream-live" class="stream-live hide" aria-live="polite">
             <div id="streaming-msg" class="msg msg-assistant msg-streaming"></div>
           </div>
@@ -186,6 +188,27 @@
       </div>
 
       <form id="chat-form" class="composer">
+        <div id="composer-status-tab" class="composer-status-tab">
+          <div class="status-tab-left">
+            <div class="status-thread-wrap" id="status-thread-wrap">
+              <button type="button" id="status-thread-btn" class="status-tab-chip" aria-haspopup="menu" aria-expanded="false">
+                <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-tasks"/></svg>
+                <span id="thread-filter-title">全部对话</span>
+                <svg class="ic status-chip-caret" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-caret"/></svg>
+              </button>
+              <button type="button" id="clear-thread-filter" class="status-thread-clear hide" title="返回全部对话" aria-label="返回全部对话">×</button>
+              <div id="composer-thread-menu" class="engine-menu thread-switch-menu hide" role="menu" aria-label="切换工作线程"></div>
+            </div>
+            <span id="status-sandbox-chip" class="status-tab-meta hide"></span>
+          </div>
+          <button type="button" id="status-ctx-btn" class="status-ctx-btn" title="查看上下文与记忆水位" aria-label="查看上下文与记忆水位">
+            <svg class="status-ctx-ring" viewBox="0 0 18 18" aria-hidden="true">
+              <circle class="status-ctx-track" cx="9" cy="9" r="6.5"/>
+              <circle id="status-ctx-fill" class="status-ctx-fill" cx="9" cy="9" r="6.5" pathLength="100"/>
+            </svg>
+            <span id="status-ctx-label">0/18</span>
+          </button>
+        </div>
         <div id="stage-bar" class="stage-pill hide">
           <div class="stage-row">
             <span class="stage-lead">
@@ -248,6 +271,11 @@
           </div>
           <button type="button" id="close-settings" class="text-btn">返回聊天</button>
         </header>
+        <div id="settings-tabs" class="settings-tabs" role="tablist" aria-label="设置分类">
+          <button type="button" class="settings-tab on" data-settings-tab="model-auth" role="tab" aria-selected="true">大脑与授权</button>
+          <button type="button" class="settings-tab" data-settings-tab="nodes" role="tab" aria-selected="false">执行节点</button>
+          <button type="button" class="settings-tab" data-settings-tab="channels" role="tab" aria-selected="false">IM 与 GitLab</button>
+        </div>
         <div id="settings-body" class="settings-body"></div>
       </div>
     </section>

@@ -1,5 +1,5 @@
 // Shared Bencho-inspired UI helpers: copy-field morph, hold-to-confirm, and liquid glide tooltips.
-import { copyBtnHtml, showToast } from './api.js';
+import { copyBtnHtml, esc, showToast } from './api.js';
 import { playDone, playTap, playToggle, playWarn } from './sound.js';
 
 export const COPY_BTN_HTML = copyBtnHtml('复制内容');
@@ -255,4 +255,119 @@ export function fmtBytes(bytes) {
   if (n < 1024) return `${Math.round(n)} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+let ctxCleanup = null;
+
+export function closeContextMenu() {
+  const menu = document.getElementById('ctx-menu');
+  if (menu) {
+    menu.classList.add('hide');
+    menu.innerHTML = '';
+  }
+  if (ctxCleanup) {
+    ctxCleanup();
+    ctxCleanup = null;
+  }
+}
+
+export function openContextMenu({ x = null, y = null, anchorEl = null, items = [] } = {}) {
+  const menu = document.getElementById('ctx-menu');
+  if (!menu) return;
+  closeContextMenu();
+  const validItems = (Array.isArray(items) ? items : []).filter((it) => it && (it.separator || it.label));
+  if (!validItems.length) return;
+
+  const runners = [];
+  menu.innerHTML = validItems
+    .map((it) => {
+      if (it.separator) return '<hr class="ctx-sep">';
+      const idx = runners.length;
+      runners.push(it);
+      const icHtml = it.icon
+        ? `<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="${esc(it.icon)}"/></svg>`
+        : '';
+      const kbdHtml = it.shortcut ? `<kbd class="ctx-kbd">${esc(it.shortcut)}</kbd>` : '';
+      return `<button type="button" class="ctx-item${it.danger ? ' danger' : ''}" data-ctx-idx="${idx}" role="menuitem"${it.disabled ? ' disabled' : ''}>${icHtml}<span class="ctx-item-label">${esc(it.label)}</span>${kbdHtml}</button>`;
+    })
+    .join('');
+
+  menu.classList.remove('hide');
+  const rect = menu.getBoundingClientRect();
+  let rawX = x;
+  let rawY = y;
+  if ((rawX === null || rawY === null) && anchorEl?.getBoundingClientRect) {
+    const ar = anchorEl.getBoundingClientRect();
+    rawX = ar.right - rect.width;
+    rawY = ar.bottom + 6;
+  }
+  const left = Math.max(8, Math.min(Number(rawX) || 12, window.innerWidth - rect.width - 8));
+  const top = Math.max(8, Math.min(Number(rawY) || 12, window.innerHeight - rect.height - 8));
+  menu.style.setProperty('--ctx-x', `${Math.round(left)}px`);
+  menu.style.setProperty('--ctx-y', `${Math.round(top)}px`);
+
+  let selectedIdx = -1;
+  const syncFocus = () => {
+    const btns = Array.from(menu.querySelectorAll('.ctx-item:not(:disabled)'));
+    btns.forEach((b, i) => b.classList.toggle('is-active', i === selectedIdx));
+    if (selectedIdx >= 0 && btns[selectedIdx]) btns[selectedIdx].focus();
+  };
+
+  const onClick = (ev) => {
+    const btn = ev.target?.closest?.('.ctx-item');
+    if (!btn || btn.disabled) return;
+    ev.stopPropagation();
+    const item = runners[Number(btn.dataset.ctxIdx)];
+    closeContextMenu();
+    playTap();
+    item?.onSelect?.();
+  };
+  const onPointerDown = (ev) => {
+    if (!menu.contains(ev.target)) closeContextMenu();
+  };
+  const onKeyDown = (ev) => {
+    const btns = Array.from(menu.querySelectorAll('.ctx-item:not(:disabled)'));
+    if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeContextMenu();
+    } else if (ev.key === 'ArrowDown' && btns.length) {
+      ev.preventDefault();
+      selectedIdx = (selectedIdx + 1) % btns.length;
+      syncFocus();
+    } else if (ev.key === 'ArrowUp' && btns.length) {
+      ev.preventDefault();
+      selectedIdx = (selectedIdx - 1 + btns.length) % btns.length;
+      syncFocus();
+    } else if (ev.key === 'Enter' && selectedIdx >= 0 && btns[selectedIdx]) {
+      ev.preventDefault();
+      btns[selectedIdx].click();
+    }
+  };
+  const onDismiss = () => closeContextMenu();
+  let scrollArmed = false;
+  requestAnimationFrame(() => {
+    scrollArmed = true;
+  });
+  const onScroll = (ev) => {
+    if (!scrollArmed) return;
+    if (anchorEl && ev.target && ev.target !== document && ev.target !== window && !ev.target.contains?.(anchorEl)) {
+      return;
+    }
+    closeContextMenu();
+  };
+
+  menu.addEventListener('click', onClick);
+  document.addEventListener('pointerdown', onPointerDown, true);
+  document.addEventListener('keydown', onKeyDown, true);
+  window.addEventListener('resize', onDismiss);
+  window.addEventListener('scroll', onScroll, true);
+
+  ctxCleanup = () => {
+    menu.removeEventListener('click', onClick);
+    document.removeEventListener('pointerdown', onPointerDown, true);
+    document.removeEventListener('keydown', onKeyDown, true);
+    window.removeEventListener('resize', onDismiss);
+    window.removeEventListener('scroll', onScroll, true);
+  };
 }

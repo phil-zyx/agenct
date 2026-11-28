@@ -3,22 +3,46 @@ import { AVATAR_CATALOG, api, esc, fmtTime, renderMarkdown, showToast } from './
 import { renderBuddySvg } from './avatar.js';
 import { playTap, playToggle } from './sound.js';
 import { stripNoise, describeTask, cleanPreviewLine, renderStepTrailHtml } from './triage.js';
-import { COPY_BTN_HTML, bindHoldAction, fmtBytes, initDelegatedCopy } from './ui.js';
+import { COPY_BTN_HTML, bindHoldAction, fmtBytes, initDelegatedCopy, openContextMenu } from './ui.js';
 
-export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread }) {
+export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilterThread, onClearThread }) {
   const bodyEl = document.getElementById('drawer-body');
   const settingsBody = document.getElementById('settings-body');
+  const settingsTabsEl = document.getElementById('settings-tabs');
   const contactsList = document.getElementById('contacts-list');
   const tabBtns = Array.from(document.querySelectorAll('.muse-seg .tab'));
   initDelegatedCopy(bodyEl);
   initDelegatedCopy(settingsBody);
 
   let activeTab = 'tasks';
+  let activeSettingsTab = 'model-auth';
+  let integrationsLoaded = false;
   let lastInstallCmd = '';
   let lastImBindCode = '';
   let integrations = { gitlab: null, im: null, models: null };
   const taskTimers = new Map();
   let elapsedTimer = null;
+
+  function syncSettingsTabs() {
+    settingsTabsEl?.querySelectorAll('[data-settings-tab]').forEach((btn) => {
+      const on = btn.dataset.settingsTab === activeSettingsTab;
+      btn.classList.toggle('on', on);
+      btn.setAttribute('aria-selected', String(on));
+    });
+    settingsBody?.querySelectorAll('[data-settings-panel]').forEach((panel) => {
+      panel.classList.toggle('hide', panel.dataset.settingsPanel !== activeSettingsTab);
+    });
+  }
+
+  settingsTabsEl?.addEventListener('click', (ev) => {
+    const btn = ev.target?.closest?.('[data-settings-tab]');
+    if (!btn) return;
+    const next = btn.dataset.settingsTab;
+    if (!next || next === activeSettingsTab) return;
+    activeSettingsTab = next;
+    playTap();
+    syncSettingsTabs();
+  });
 
   tabBtns.forEach((btn, idx) => {
     btn.onclick = () => {
@@ -43,6 +67,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         api('/api/settings/models'),
       ]);
       integrations = { gitlab, im, models };
+      integrationsLoaded = true;
     } catch {
       // ignore transient errors
     }
@@ -631,13 +656,17 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       const preview = taskViews.get(latest)?.preview || cleanPreviewLine(thr.summary, 72);
       const previewHtml = preview ? `<div class="item-sub">${esc(preview)}</div>` : '';
       const updatedAt = latest?.updated_at || thr.updated_at;
+      const moreBtnHtml = `<button type="button" class="icon-btn thread-more-btn" data-thread-menu="${esc(thr.id)}" aria-label="话题操作"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><use href="#ic-more"/></svg></button>`;
 
       if (!attention) {
         return `
         <div class="item thread-card" role="button" tabindex="0" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">
           <div class="item-head">
-            <span>${esc(thr.title)}</span>
-            ${updatedAt ? `<span class="thread-time">${esc(fmtTime(updatedAt))}</span>` : ''}
+            <span class="thread-title-text">${esc(thr.title)}</span>
+            <span class="thread-head-right">
+              ${updatedAt ? `<span class="thread-time">${esc(fmtTime(updatedAt))}</span>` : ''}
+              ${moreBtnHtml}
+            </span>
           </div>
           ${previewHtml}
         </div>`;
@@ -663,8 +692,11 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       return `
         <div class="item thread-card" role="button" tabindex="0" data-filter-thread="${esc(thr.id)}" data-thread-title="${esc(thr.title)}">
           <div class="item-head">
-            <span>${esc(thr.title)}</span>
-            <span class="badge ${badgeCls}">${esc(badgeText)}</span>
+            <span class="thread-title-text">${esc(thr.title)}</span>
+            <span class="thread-head-right">
+              <span class="badge ${badgeCls}">${esc(badgeText)}</span>
+              ${moreBtnHtml}
+            </span>
           </div>
           ${renderBlockedHtml(latest)}
           ${previewHtml}
@@ -684,7 +716,9 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         attentionCards.push(renderThreadCard(thr, { attention: true }));
       }
     }
-    const idleThreads = threads.filter((thr) => !attentionThreadIds.has(thr.id));
+    const activeThreads = threads.filter((thr) => thr.status !== 'archived');
+    const archivedThreads = threads.filter((thr) => thr.status === 'archived');
+    const idleThreads = activeThreads.filter((thr) => !attentionThreadIds.has(thr.id));
 
     const renderCollabCard = (t) => {
       const stLabel = TASK_STATUS_LABEL[t.status] || t.status;
@@ -757,6 +791,11 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         `<details class="node-repos mt-10"><summary>更早话题 (${moreThreads.length})</summary><div class="mt-6">${moreThreads.map((thr) => renderThreadCard(thr)).join('')}</div></details>`,
       );
     }
+    if (archivedThreads.length) {
+      threadBodyParts.push(
+        `<details class="node-repos mt-10" data-drawer-fold="archived-threads"${openFolds.has('archived-threads') ? ' open' : ''}><summary>已归档话题 (${archivedThreads.length})</summary><div class="mt-6">${archivedThreads.map((thr) => renderThreadCard(thr)).join('')}</div></details>`,
+      );
+    }
     const extraDoneCards = [...doneCollabCards, ...doneLegacyCards];
     if (extraDoneCards.length) {
       threadBodyParts.push(
@@ -765,7 +804,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     }
     const threadsSectionHtml = `
       <section class="panel-card">
-        <h3><span>最近话题 (${threads.length})</span><span class="note">点击继续</span></h3>
+        <h3><span>最近话题 (${activeThreads.length})</span><span class="note">右键或 ⋯ 管理</span></h3>
         ${threadBodyParts.join('')}
       </section>`;
 
@@ -867,19 +906,49 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       );
     });
     bodyEl.querySelectorAll('[data-deliver]').forEach((b) => {
-      b.onclick = async () => {
-        const result = window.prompt('输入交付结果内容：');
-        if (!result?.trim()) return;
-        try {
-          await api(`/api/tasks/${b.dataset.deliver}/action`, {
-            method: 'POST',
-            body: { action: 'deliver', result: result.trim() },
-          });
-          showToast('已交付');
-          await onRefresh();
-        } catch (err) {
-          showToast(err.message);
+      b.onclick = () => {
+        const tid = b.dataset.deliver;
+        const card = b.closest('.item');
+        if (!card) return;
+        let box = card.querySelector('.collab-deliver-box');
+        if (box) {
+          box.querySelector('input')?.focus();
+          return;
         }
+        box = document.createElement('div');
+        box.className = 'decision-deliver-row collab-deliver-box mt-6';
+        box.innerHTML = `<input type="text" class="decision-deliver-input" placeholder="输入交付结论…"><button type="button" class="sm primary">确认交付</button>`;
+        card.appendChild(box);
+        const inp = box.querySelector('input');
+        const okBtn = box.querySelector('button');
+        inp?.focus();
+        const submit = async () => {
+          const result = String(inp?.value || '').trim();
+          if (!result) {
+            showToast('请先填写交付结果', { tone: 'warn' });
+            inp?.focus();
+            return;
+          }
+          try {
+            await api(`/api/tasks/${tid}/action`, {
+              method: 'POST',
+              body: { action: 'deliver', result },
+            });
+            showToast('已交付');
+            await onRefresh();
+          } catch (err) {
+            showToast(err.message);
+          }
+        };
+        okBtn.onclick = submit;
+        inp.onkeydown = (ev) => {
+          if (ev.key === 'Enter' && !ev.isComposing) {
+            ev.preventDefault();
+            submit();
+          } else if (ev.key === 'Escape') {
+            box.remove();
+          }
+        };
       };
     });
     bodyEl.querySelectorAll('[data-cancel]').forEach((b) => {
@@ -897,10 +966,141 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         { shortHint: '请长按「取消」确认中止任务' },
       );
     });
+
+    function startRenameThread(cardEl, thr) {
+      const titleEl = cardEl?.querySelector('.thread-title-text');
+      if (!titleEl) return;
+      const prevTitle = thr.title || '';
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.className = 'thread-rename-input';
+      input.value = prevTitle;
+      input.maxLength = 80;
+      input.setAttribute('aria-label', '重命名话题');
+      titleEl.replaceWith(input);
+      input.focus();
+      input.select();
+
+      let finished = false;
+      const finish = async (commit) => {
+        if (finished) return;
+        finished = true;
+        const nextTitle = input.value.trim();
+        const span = document.createElement('span');
+        span.className = 'thread-title-text';
+        span.textContent = commit && nextTitle ? nextTitle : prevTitle;
+        input.replaceWith(span);
+        if (!commit || !nextTitle || nextTitle === prevTitle) return;
+        try {
+          await api(`/api/threads/${encodeURIComponent(thr.id)}`, {
+            method: 'PUT',
+            body: { title: nextTitle },
+          });
+          showToast(`话题已重命名为「${nextTitle}」`);
+          await onRefresh();
+        } catch (err) {
+          showToast(err.message);
+        }
+      };
+      input.addEventListener('click', (ev) => ev.stopPropagation());
+      input.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' && !ev.isComposing) {
+          ev.preventDefault();
+          finish(true);
+        } else if (ev.key === 'Escape') {
+          ev.preventDefault();
+          ev.stopPropagation();
+          finish(false);
+        }
+      });
+      input.addEventListener('blur', () => finish(true));
+    }
+
+    function openThreadContextMenu(thr, cardEl, pos) {
+      const isArchived = thr.status === 'archived';
+      const nextStatus = isArchived ? 'active' : 'archived';
+      const prevStatus = thr.status || 'active';
+      openContextMenu({
+        ...pos,
+        items: [
+          {
+            label: '筛选该话题对话',
+            icon: '#ic-chat',
+            onSelect: () => onFilterThread?.(thr.id, thr.title),
+          },
+          {
+            label: '重命名话题',
+            icon: '#ic-edit',
+            onSelect: () => startRenameThread(cardEl, thr),
+          },
+          {
+            label: isArchived ? '恢复为活跃话题' : '归档话题',
+            icon: '#ic-archive',
+            onSelect: async () => {
+              try {
+                await api(`/api/threads/${encodeURIComponent(thr.id)}`, {
+                  method: 'PUT',
+                  body: { status: nextStatus },
+                });
+                await onRefresh();
+                showToast(isArchived ? `已恢复「${thr.title}」` : `已归档「${thr.title}」`, {
+                  tone: 'success',
+                  action: {
+                    label: '撤销',
+                    onClick: async () => {
+                      await api(`/api/threads/${encodeURIComponent(thr.id)}`, {
+                        method: 'PUT',
+                        body: { status: prevStatus },
+                      });
+                      await onRefresh();
+                    },
+                  },
+                });
+              } catch (err) {
+                showToast(err.message);
+              }
+            },
+          },
+          { separator: true },
+          {
+            label: '删除话题记录',
+            icon: '#ic-close',
+            danger: true,
+            onSelect: async () => {
+              try {
+                await api(`/api/threads/${encodeURIComponent(thr.id)}`, { method: 'DELETE' });
+                onClearThread?.(thr.id);
+                showToast('话题已删除');
+                await onRefresh();
+              } catch (err) {
+                showToast(err.message);
+              }
+            },
+          },
+        ],
+      });
+    }
+
+    bodyEl.querySelectorAll('[data-thread-menu]').forEach((btn) => {
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        const tid = btn.dataset.threadMenu;
+        const thr = threads.find((t) => t.id === tid);
+        const cardEl = btn.closest('.thread-card');
+        if (thr && cardEl) openThreadContextMenu(thr, cardEl, { anchorEl: btn });
+      };
+    });
+
     bodyEl.querySelectorAll('[data-filter-thread]').forEach((el) => {
       el.onclick = (ev) => {
         if (ev.target.closest('button, a, details, summary, input, select')) return;
         onFilterThread?.(el.dataset.filterThread, el.dataset.threadTitle);
+      };
+      el.oncontextmenu = (ev) => {
+        const thr = threads.find((t) => t.id === el.dataset.filterThread);
+        if (!thr) return;
+        ev.preventDefault();
+        openThreadContextMenu(thr, el, { x: ev.clientX, y: ev.clientY });
       };
       el.onkeydown = (ev) => {
         if ((ev.key === 'Enter' || ev.key === ' ') && ev.target === el) {
@@ -1115,6 +1315,60 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
       </section>`;
   }
 
+  function activityHeatCardHtml() {
+    const hm = state.activity_heatmap || {};
+    const days = Array.isArray(hm.days) && hm.days.length === 84
+      ? hm.days
+      : Array.from({ length: 84 }, () => [0, 0, 0]);
+    const todayDay = Number.isFinite(hm.today_day)
+      ? hm.today_day
+      : Math.floor((Date.now() / 1000 + 8 * 3600) / 86400);
+    const startDay = Number.isFinite(hm.start_day) ? hm.start_day : todayDay - 83;
+    const streak = Number(hm.streak_days || 0);
+    const activeDays = Number(hm.active_days || 0);
+    const totalChats = Number(hm.total_chats || 0);
+    const totalTasks = Number(hm.total_tasks || 0);
+    const totalCrons = Number(hm.total_crons || 0);
+
+    const heatLevel = (sum) => {
+      if (sum <= 0) return 0;
+      if (sum <= 2) return 1;
+      if (sum <= 5) return 2;
+      if (sum <= 10) return 3;
+      return 4;
+    };
+
+    const cellsHtml = days
+      .map((counts, idx) => {
+        const c = Array.isArray(counts) ? counts[0] || 0 : 0;
+        const t = Array.isArray(counts) ? counts[1] || 0 : 0;
+        const cr = Array.isArray(counts) ? counts[2] || 0 : 0;
+        const sum = c + t + cr;
+        const d = new Date((startDay + idx) * 86400 * 1000);
+        const dateLabel = `${d.getUTCMonth() + 1}月${d.getUTCDate()}日`;
+        const tip = sum > 0
+          ? `${dateLabel}：${c} 轮对话 · ${t} 次节点 · ${cr} 次定时`
+          : `${dateLabel}：无记录`;
+        return `<button type="button" class="heat-cell" data-heat-level="${heatLevel(sum)}" data-heat-tip="${esc(tip)}" aria-label="${esc(tip)}" title="${esc(tip)}"></button>`;
+      })
+      .join('');
+
+    return `
+      <section class="panel-card activity-heat-card" id="activity-heat-card">
+        <h3><span>7×24h 协作热力</span><span class="badge ${streak > 0 ? 'ok' : ''}">${streak > 0 ? `连续 ${streak} 天活跃` : `${activeDays} 天有记录`}</span></h3>
+        <div class="heat-kpis">
+          <span class="heat-kpi"><strong>${totalChats}</strong><small>对话轮数</small></span>
+          <span class="heat-kpi"><strong>${totalTasks}</strong><small>节点完成</small></span>
+          <span class="heat-kpi"><strong>${totalCrons}</strong><small>定时巡检</small></span>
+        </div>
+        <div class="heat-grid" role="group" aria-label="近 12 周每日活跃热力">${cellsHtml}</div>
+        <div class="heat-foot">
+          <span id="heat-readout" class="note">悬停方格查看每日明细</span>
+          <span class="heat-legend" aria-hidden="true"><span>少</span><i data-heat-level="0"></i><i data-heat-level="1"></i><i data-heat-level="2"></i><i data-heat-level="3"></i><i data-heat-level="4"></i><span>多</span></span>
+        </div>
+      </section>`;
+  }
+
   function renderSoulTab() {
     const p = state.profile || { name: 'Agenct', soul_md: '', memory_md: '', avatar_id: 'agenct', updated_at: 0 };
     const currentAvatar = p.avatar_id || 'agenct';
@@ -1175,6 +1429,8 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
         </details>
       </section>
 
+      ${activityHeatCardHtml()}
+
       <section class="panel-card">
         <h3>最近动态</h3>
         ${
@@ -1197,6 +1453,16 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     bodyEl.querySelectorAll('[data-seg-pct]').forEach((el) => {
       el.style.width = `${el.dataset.segPct || 0}%`;
     });
+    const heatReadout = document.getElementById('heat-readout');
+    if (heatReadout) {
+      bodyEl.querySelectorAll('.heat-cell').forEach((cell) => {
+        const show = () => {
+          heatReadout.textContent = cell.dataset.heatTip || '';
+        };
+        cell.addEventListener('pointerenter', show);
+        cell.addEventListener('focus', show);
+      });
+    }
 
     bodyEl.querySelectorAll('[data-pick-avatar]').forEach((btn) => {
       btn.onclick = async () => {
@@ -1230,6 +1496,42 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     };
   }
 
+  function renderSettingsSkeleton() {
+    if (!settingsBody) return;
+    settingsBody.innerHTML = `
+      <section class="panel-card skel-card" aria-busy="true">
+        <div class="skel-bar skel-title"></div>
+        <div class="skel-bar skel-line"></div>
+        <div class="skel-bar skel-field"></div>
+        <div class="skel-bar skel-field"></div>
+      </section>
+      <section class="panel-card skel-card" aria-busy="true">
+        <div class="skel-bar skel-title"></div>
+        <div class="skel-bar skel-line"></div>
+        <div class="skel-bar skel-line short"></div>
+      </section>`;
+  }
+
+  async function openSettings(tab) {
+    if (tab) activeSettingsTab = tab;
+    syncSettingsTabs();
+    if (!integrationsLoaded) {
+      renderSettingsSkeleton();
+      await loadIntegrations();
+      renderSettingsPane();
+      return;
+    }
+    renderSettingsPane();
+    loadIntegrations().then(() => {
+      const settingsView = document.getElementById('settings-view');
+      const active = document.activeElement;
+      const editing = active && settingsView?.contains(active) && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName);
+      if (!editing && settingsView && !settingsView.classList.contains('hide')) {
+        renderSettingsPane();
+      }
+    });
+  }
+
   function renderSettingsPane() {
     const perms = state.permissions || {};
     const gl = integrations.gitlab || {};
@@ -1246,6 +1548,7 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           <input type="password" name="${slot}_key" placeholder="${ep ? '留空保持不变' : 'sk-...'}" autocomplete="off">`;
 
     settingsBody.innerHTML = `
+      <div class="settings-panel${activeSettingsTab === 'model-auth' ? '' : ' hide'}" data-settings-panel="model-auth">
       ${
         models.secrets_encrypted === false
           ? '<div class="sandbox-block-note mb-10">安全提示：服务器尚未配置 AGENCT_MASTER_KEY，用户自定义 API Key、GitLab PAT 与 IM Webhook 当前以明文存储在 SQLite 中。生产部署建议设置 AGENCT_MASTER_KEY 并运行 agenct-hub reencrypt-secrets。</div>'
@@ -1280,9 +1583,13 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
           <div class="row"><button type="submit" class="primary sm">保存授权</button></div>
         </form>
       </section>
+      </div>
 
+      <div class="settings-panel${activeSettingsTab === 'nodes' ? '' : ' hide'}" data-settings-panel="nodes">
       ${nodesCardHtml(nodes)}
+      </div>
 
+      <div class="settings-panel${activeSettingsTab === 'channels' ? '' : ' hide'}" data-settings-panel="channels">
       <section class="panel-card">
         <h3>GitLab 接入</h3>
         <form id="gl-form">
@@ -1393,8 +1700,10 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
               </div>
             </form>`;
         })()}
-      </section>`;
+      </section>
+      </div>`;
 
+    syncSettingsTabs();
     bindNodeHandlers(settingsBody);
     settingsBody.querySelectorAll('label.toggle input[type="checkbox"]').forEach((cb) => {
       cb.addEventListener('change', () => playToggle(cb.checked));
@@ -1593,5 +1902,5 @@ export function initDrawer({ state, onRefresh, onMention, onPromptChat, onFilter
     renderDrawer();
   }
 
-  return { render: renderAll, loadIntegrations, renderSettingsPane, openTab };
+  return { render: renderAll, loadIntegrations, renderSettingsPane, openSettings, openTab };
 }

@@ -214,27 +214,100 @@ export function fmtTime(unix) {
   return new Date(unix * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
-export function showToast(msg) {
+function inferToastTone(text) {
+  if (/失败|出错|无效|拒绝|无法|不能|不正确|已停用|受阻|错误/.test(text)) return 'error';
+  if (/请长按|稍候|注意|提示|警告|已中止|已取消|重连/.test(text)) return 'warn';
+  if (/已|成功|完成|连通|保存|恢复|重置|切换|上传|更新|创建|删除|归档|批准|放行|打招呼|交付/.test(text)) {
+    return 'success';
+  }
+  return 'info';
+}
+
+const TOAST_ICON = {
+  success: '#ic-check',
+  warn: '#ic-warn',
+  error: '#ic-warn',
+  info: '#ic-info',
+};
+
+export function showToast(msg, opts = {}) {
   const stack = document.getElementById('toast');
   const text = String(msg ?? '').trim();
   if (!stack || !text) return;
   const now = performance.now();
-  if (showToast._lastMsg === text && now - (showToast._lastAt || 0) < 900) return;
+  if (!opts.action && showToast._lastMsg === text && now - (showToast._lastAt || 0) < 900) return;
   showToast._lastMsg = text;
   showToast._lastAt = now;
 
+  if (!stack._hoverBound) {
+    stack._hoverBound = true;
+    stack._paused = false;
+    stack.addEventListener('pointerenter', () => {
+      stack._paused = true;
+      stack.classList.add('is-paused');
+      const t = performance.now();
+      for (const el of Array.from(stack.children)) {
+        if (el._gone || el._timer == null) continue;
+        clearTimeout(el._timer);
+        el._timer = null;
+        el._remaining = Math.max(900, (el._deadline || t) - t);
+      }
+    });
+    stack.addEventListener('pointerleave', () => {
+      stack._paused = false;
+      stack.classList.remove('is-paused');
+      const t = performance.now();
+      for (const el of Array.from(stack.children)) {
+        if (el._gone || el._timer != null) continue;
+        const ms = el._remaining || 1800;
+        el._deadline = t + ms;
+        el._timer = setTimeout(() => el._dismiss?.(), ms);
+      }
+    });
+  }
+
+  const tone = opts.tone || inferToastTone(text);
+  const duration = Math.max(1500, Number(opts.duration) || (opts.action ? 5200 : 3600));
+  const iconHref = TOAST_ICON[tone] || TOAST_ICON.info;
+
   const item = document.createElement('div');
   item.className = 'toast-item';
-  item.textContent = text;
+  item.dataset.tone = tone;
+  item.innerHTML = `
+    <span class="toast-ic" aria-hidden="true"><svg class="ic" viewBox="0 0 24 24"><use href="${iconHref}"/></svg></span>
+    <span class="toast-body">
+      <span class="toast-title">${esc(text)}</span>
+      ${opts.description ? `<span class="toast-desc">${esc(opts.description)}</span>` : ''}
+    </span>
+    ${opts.action?.label ? `<button type="button" class="toast-act-btn">${esc(opts.action.label)}</button>` : ''}
+    <button type="button" class="toast-close" aria-label="关闭通知">×</button>
+    <span class="toast-bar" aria-hidden="true"></span>`;
+
+  const barEl = item.querySelector('.toast-bar');
+  if (barEl) barEl.style.setProperty('--toast-ms', `${duration}ms`);
 
   const dismiss = () => {
     if (item._gone) return;
     item._gone = true;
-    clearTimeout(item._t);
+    clearTimeout(item._timer);
+    item._timer = null;
     item.classList.add('is-leaving');
     setTimeout(() => item.remove(), 220);
   };
+  item._dismiss = dismiss;
 
+  const actBtn = item.querySelector('.toast-act-btn');
+  if (actBtn && typeof opts.action?.onClick === 'function') {
+    actBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      opts.action.onClick();
+      dismiss();
+    });
+  }
+  item.querySelector('.toast-close')?.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    dismiss();
+  });
   item.addEventListener('click', dismiss);
   stack.appendChild(item);
 
@@ -243,7 +316,12 @@ export function showToast(msg) {
     const oldest = live.shift();
     if (oldest) oldest.remove();
   }
-  item._t = setTimeout(dismiss, 3400);
+
+  item._remaining = duration;
+  if (!stack._paused) {
+    item._deadline = performance.now() + duration;
+    item._timer = setTimeout(dismiss, duration);
+  }
 }
 
 export const AVATAR_CATALOG = [

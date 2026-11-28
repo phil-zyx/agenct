@@ -146,7 +146,7 @@ function setSettingsOpen(open) {
   if (open) {
     setTasksOpen(false, true);
     setContactsOpen(false, true);
-    drawerUI.loadIntegrations().then(() => drawerUI.renderSettingsPane());
+    drawerUI.openSettings?.();
   }
   syncRailState();
 }
@@ -260,6 +260,14 @@ async function boot() {
     state,
     onRefresh: refresh,
     onActivityChange: (act) => avatarUI.setActivity(act),
+    onOpenSoulMeter: () => {
+      setSettingsOpen(false);
+      setTasksOpen(true);
+      drawerUI.openTab('soul');
+      setTimeout(() => {
+        document.getElementById('context-meter-card')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      }, 60);
+    },
   });
   drawerUI = initDrawer({
     state,
@@ -282,6 +290,9 @@ async function boot() {
       setSettingsOpen(false);
       if (window.innerWidth <= 900) setTasksOpen(false);
       chatUI.setThreadFilter(threadId, title);
+    },
+    onClearThread(threadId) {
+      chatUI.clearThreadIfActive?.(threadId);
     },
   });
 
@@ -626,6 +637,20 @@ async function boot() {
       if (task?.status === 'done') {
         chatUI.flashIslandDone?.();
         playDone();
+        if (task.title) {
+          showToast(`任务已完成：${task.title}`, {
+            tone: 'success',
+            action: task.thread_id
+              ? {
+                  label: '查看话题',
+                  onClick: () => {
+                    setSettingsOpen(false);
+                    chatUI.setThreadFilter(task.thread_id, task.title);
+                  },
+                }
+              : undefined,
+          });
+        }
       } else if (task?.status === 'failed') playWarn();
     },
     onMessage(msg) {

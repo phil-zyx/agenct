@@ -6902,4 +6902,10 @@ async fn visual_role_put_api_and_bootstrap_context_stats() {
     assert!(stats1["uncompacted_bytes"].as_u64().unwrap() > 0);
     assert_eq!(boot1["roles"].as_array().unwrap().len(), 1);
     assert_eq!(boot1["roles"][0]["name"], "reviewer");
+
+    let heatmap = &boot1["activity_heatmap"];
+    assert_eq!(heatmap["days"].as_array().unwrap().len(), 84);
+    assert!(heatmap["total_chats"].as_u64().unwrap() >= 1);
+    assert!(heatmap["active_days"].as_u64().unwrap() >= 1);
+    assert!(heatmap["streak_days"].as_u64().unwrap() >= 1);
 }

@@ -32,10 +32,12 @@ const BUDDY_SVG = `
 
     <g class="buddy-face face-idle">
       <g class="buddy-blink">
-        <ellipse class="buddy-eye" cx="39.5" cy="44.5" rx="3" ry="3.8" />
-        <ellipse class="buddy-eye" cx="56.5" cy="44.5" rx="3" ry="3.8" />
-        <circle class="buddy-eye-glint" cx="40.6" cy="43.1" r="1.1" />
-        <circle class="buddy-eye-glint" cx="57.6" cy="43.1" r="1.1" />
+        <g class="buddy-pupils">
+          <ellipse class="buddy-eye" cx="39.5" cy="44.5" rx="3" ry="3.8" />
+          <ellipse class="buddy-eye" cx="56.5" cy="44.5" rx="3" ry="3.8" />
+          <circle class="buddy-eye-glint" cx="40.6" cy="43.1" r="1.1" />
+          <circle class="buddy-eye-glint" cx="57.6" cy="43.1" r="1.1" />
+        </g>
       </g>
       <path class="buddy-mouth" d="M44 52.5Q48 56 52 52.5" />
     </g>
@@ -47,19 +49,23 @@ const BUDDY_SVG = `
     </g>
 
     <g class="buddy-face face-thinking">
-      <ellipse class="buddy-eye" cx="39" cy="43" rx="2.9" ry="3.6" />
-      <ellipse class="buddy-eye" cx="56" cy="43" rx="2.9" ry="3.6" />
-      <circle class="buddy-eye-glint" cx="40.3" cy="41.6" r="1.1" />
-      <circle class="buddy-eye-glint" cx="57.3" cy="41.6" r="1.1" />
+      <g class="buddy-pupils">
+        <ellipse class="buddy-eye" cx="39" cy="43" rx="2.9" ry="3.6" />
+        <ellipse class="buddy-eye" cx="56" cy="43" rx="2.9" ry="3.6" />
+        <circle class="buddy-eye-glint" cx="40.3" cy="41.6" r="1.1" />
+        <circle class="buddy-eye-glint" cx="57.3" cy="41.6" r="1.1" />
+      </g>
       <path class="buddy-brow" d="M35.5 38Q39 36.2 42.5 37.8" />
       <path class="buddy-mouth" d="M44.5 53Q48 51.5 51.5 53" />
     </g>
 
     <g class="buddy-face face-queued">
-      <ellipse class="buddy-eye" cx="40.5" cy="43.8" rx="3.1" ry="3.7" />
-      <ellipse class="buddy-eye" cx="57.5" cy="43.8" rx="3.1" ry="3.7" />
-      <circle class="buddy-eye-glint" cx="41.8" cy="42.4" r="1.15" />
-      <circle class="buddy-eye-glint" cx="58.8" cy="42.4" r="1.15" />
+      <g class="buddy-pupils">
+        <ellipse class="buddy-eye" cx="40.5" cy="43.8" rx="3.1" ry="3.7" />
+        <ellipse class="buddy-eye" cx="57.5" cy="43.8" rx="3.1" ry="3.7" />
+        <circle class="buddy-eye-glint" cx="41.8" cy="42.4" r="1.15" />
+        <circle class="buddy-eye-glint" cx="58.8" cy="42.4" r="1.15" />
+      </g>
       <path class="buddy-mouth" d="M45 53Q48 54.8 51 53" />
     </g>
 
@@ -234,8 +240,20 @@ export function createAvatarController({
 
   let avatarId = 'agenct';
   let resting = false;
+  let currentState = 'idle';
   let idleTimer = null;
   let pokeTimer = null;
+  let eyeRaf = 0;
+  let pointerPos = null;
+  let lastPointerAt = 0;
+  let wanderStep = 0;
+  const WANDER_OFFSETS = [
+    [-1.5, -0.4],
+    [1.6, -0.3],
+    [0, 0],
+    [-1.0, 0.7],
+    [1.2, 0.5],
+  ];
   let activity = {
     sseConnected: true,
     brainStage: '',
@@ -243,6 +261,43 @@ export function createAvatarController({
     taskStatus: '',
     taskStage: '',
   };
+
+  function setEyes(x, y, wandering = false) {
+    for (const host of [headToggleEl, heroWrapEl]) {
+      if (!host) continue;
+      host.style.setProperty('--eye-x', `${x.toFixed(2)}px`);
+      host.style.setProperty('--eye-y', `${y.toFixed(2)}px`);
+      host.classList.toggle('is-wandering', wandering);
+    }
+  }
+
+  function canTrackEyes(state = currentState) {
+    return (
+      avatarId === BUDDY_AVATAR_ID &&
+      (state === 'idle' || state === 'thinking' || state === 'queued') &&
+      !window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches
+    );
+  }
+
+  function flushEyeTracking() {
+    eyeRaf = 0;
+    if (!pointerPos || !canTrackEyes()) return;
+    for (const host of [headToggleEl, heroWrapEl]) {
+      if (!host) continue;
+      const stage = host.querySelector('.avatar-stage') || host;
+      const rc = stage.getBoundingClientRect();
+      if (!rc.width || !rc.height) continue;
+      const cx = rc.left + rc.width / 2;
+      const cy = rc.top + rc.height / 2;
+      const dx = pointerPos.x - cx;
+      const dy = pointerPos.y - cy;
+      const dist = Math.hypot(dx, dy) || 1;
+      const scale = Math.tanh(dist / 180);
+      host.classList.remove('is-wandering');
+      host.style.setProperty('--eye-x', `${((dx / dist) * 2.2 * scale).toFixed(2)}px`);
+      host.style.setProperty('--eye-y', `${((dy / dist) * 1.5 * scale).toFixed(2)}px`);
+    }
+  }
 
   function isActive() {
     return (
@@ -273,11 +328,13 @@ export function createAvatarController({
 
   function applyState() {
     const next = deriveAgentState({ ...activity, resting });
+    currentState = next;
     const meta = STATUS_META[next] || STATUS_META.idle;
     for (const el of [headToggleEl, heroWrapEl, chatPaneEl]) {
       if (!el) continue;
       if (el.dataset.agentState !== next) el.dataset.agentState = next;
     }
+    if (!canTrackEyes(next)) setEyes(0, 0, false);
     if (headStateTextEl) {
       const custom = typeof activity.statusLabel === 'string' ? activity.statusLabel.trim() : '';
       const subText = next === 'idle' || next === 'resting' || next === 'offline'
@@ -350,6 +407,25 @@ export function createAvatarController({
   if (heroWrapEl) {
     heroWrapEl.addEventListener('click', () => poke());
   }
+
+  document.addEventListener(
+    'pointermove',
+    (ev) => {
+      if (!canTrackEyes()) return;
+      pointerPos = { x: ev.clientX, y: ev.clientY };
+      lastPointerAt = performance.now();
+      if (!eyeRaf) eyeRaf = requestAnimationFrame(flushEyeTracking);
+    },
+    { passive: true },
+  );
+
+  setInterval(() => {
+    if (document.hidden || !canTrackEyes() || currentState !== 'idle') return;
+    if (performance.now() - lastPointerAt < 3500) return;
+    const [wx, wy] = WANDER_OFFSETS[wanderStep % WANDER_OFFSETS.length];
+    wanderStep++;
+    setEyes(wx, wy, true);
+  }, 2800);
 
   scheduleRestTimer();
   applyState();
