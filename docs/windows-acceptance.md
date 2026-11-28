@@ -2,7 +2,7 @@
 
 本清单用于**原生 Windows 10/11**（非 WSL2）真机环境下，逐项验证 `node/agenct-node.py` 的跨平台执行后端探测/降级、参数与环境变量行为、静默超时队列保护，以及日志与 Windows Terminal 实时滚动能力。
 
-> **说明**：所有命令默认在仓库根目录（例如 `C:\Users\<you>\projects\agenct`）的原生 PowerShell 7（`pwsh`）中执行；若仅使用单测或 `--cmd` 冒烟，无需安装全部 AI CLI。
+> **说明**：所有命令默认在仓库根目录（例如 `C:\Users\<you>\projects\agenct`）的原生 PowerShell（优先 `pwsh`，未安装时使用自带 `powershell.exe`）中执行；若仅使用单测或 `--cmd` 冒烟，无需安装全部 AI CLI。
 
 ---
 
@@ -15,14 +15,14 @@
   - **预期结果**：输出 `Windows 10` 或 `Windows 11`（不出现 `Linux` / `microsoft`）。
   - **判定标准**：`platform.system()` 为 `Windows`。
 
-- [ ] **0.2 检查 `pwsh`（PowerShell 7+）与 Windows Terminal（`wt.exe`）**
+- [ ] **0.2 检查 PowerShell（`pwsh` / `powershell.exe`）与 Windows Terminal（`wt.exe`）**
   ```powershell
-  Get-Command pwsh -ErrorAction SilentlyContinue | Select-Object Source
+  Get-Command pwsh, powershell.exe -ErrorAction SilentlyContinue | Select-Object Name, Source
   Get-Command wt.exe -ErrorAction SilentlyContinue | Select-Object Source
   wt.exe --version
   ```
-  - **预期结果**：`pwsh` 可解析，`wt.exe --version` 返回版本号且 `$LASTEXITCODE` 为 `0`。
-  - **判定标准**：`wt-tail` 后端拉起标签页时固定调用 `pwsh -NoExit -Command "Get-Content -Wait ..."`；若本机缺少 `pwsh`，需先安装 PowerShell 7 再验收场景 2 与场景 6。
+  - **预期结果**：至少解析出 `pwsh` 或 `powershell.exe` 之一，`wt.exe --version` 返回版本号且 `$LASTEXITCODE` 为 `0`。
+  - **判定标准**：`wt-tail` 后端拉起标签页时优先调用 `pwsh`，缺失时自动回退系统自带 `powershell.exe -NoExit -Command "Get-Content -Wait ..."`。
 
 - [ ] **0.3 运行节点全量单元测试基线**
   ```powershell
@@ -77,7 +77,7 @@
   dir "$env:USERPROFILE\.agenct\runs"
   ```
   - **预期结果**：
-    1. 返回 `rc= 0 backend= wt-tail`，`attach_cmd` 为白名单命令 `['...wt.exe', '-w', '0', 'new-tab', '--title', 'agenct:win-wt-1', 'pwsh', '-NoExit', '-Command', 'Get-Content -Wait ...']`。
+    1. 返回 `rc= 0 backend= wt-tail`，`attach_cmd` 为白名单命令 `['...wt.exe', '-w', '0', 'new-tab', '--title', 'agenct:win-wt-1', '<pwsh|powershell.exe>', '-NoExit', '-Command', 'Get-Content -Wait ...']`（有 `pwsh` 时为 `pwsh`，否则为 `powershell.exe`）。
     2. Windows Terminal 当前窗口自动新建标题为 `agenct:win-wt-1` 的标签页，逐行实时滚动显示 `tick-1` 至 `tick-5`（只读查看，不影响子进程管道回收）。
     3. `%USERPROFILE%\.agenct\runs\` 下存在 `agenct-win-wt-1-<6hex>.log` 且内容包含完整 5 行输出。
   - **判定标准**：标签页正常打开并实时滚动、无报错弹窗、日志落盘于 `%USERPROFILE%\.agenct\runs\` 而非 `/tmp`，且任务结束后日志文件保留。
@@ -193,7 +193,8 @@
   New-Item -ItemType Directory -Force -Path $runs | Out-Null
   $log = Join-Path $runs "manual-wt-check.log"
   "" | Set-Content -Path $log -Encoding UTF8
-  wt.exe -w 0 new-tab --title "agenct:manual-check" pwsh -NoExit -Command "Get-Content -Wait '$log'"
+  $psShell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell.exe" }
+  wt.exe -w 0 new-tab --title "agenct:manual-check" $psShell -NoExit -Command "Get-Content -Wait '$log'"
   1..5 | ForEach-Object {
     "[$(Get-Date -Format HH:mm:ss)] 中文输出行 $_" | Add-Content -Path $log -Encoding UTF8
     Start-Sleep -Milliseconds 600

@@ -1195,9 +1195,21 @@ class TestUnifiedNode(unittest.TestCase):
         self.assertEqual(linux_dir, os.path.join(tempfile.gettempdir(), "agenct-runs"))
 
     def test_wt_tail_whitelisted_argv_and_runtime_degradation(self) -> None:
-        wt_argv = node.build_wt_tail_argv("wt.exe", "tsk_42", r"C:\Users\alice\.agenct\runs\tsk_42.log")
         self.assertEqual(
-            wt_argv,
+            node.resolve_wt_shell(which=lambda c: r"C:\Program Files\PowerShell\7\pwsh.exe" if c == "pwsh" else None),
+            "pwsh",
+        )
+        self.assertEqual(
+            node.resolve_wt_shell(which=lambda c: r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" if c == "powershell.exe" else None),
+            "powershell.exe",
+        )
+        self.assertEqual(node.resolve_wt_shell(which=lambda _c: None), "powershell.exe")
+
+        wt_argv_pwsh = node.build_wt_tail_argv(
+            "wt.exe", "tsk_42", r"C:\Users\alice\.agenct\runs\tsk_42.log", shell_bin="pwsh",
+        )
+        self.assertEqual(
+            wt_argv_pwsh,
             [
                 "wt.exe", "-w", "0", "new-tab",
                 "--title", "agenct:tsk_42",
@@ -1205,6 +1217,21 @@ class TestUnifiedNode(unittest.TestCase):
                 r"Get-Content -Wait C:\Users\alice\.agenct\runs\tsk_42.log",
             ],
         )
+        wt_argv_ps = node.build_wt_tail_argv(
+            "wt.exe", "tsk_42", r"C:\Users\alice\.agenct\runs\tsk_42.log", shell_bin="powershell.exe",
+        )
+        self.assertEqual(wt_argv_ps[6], "powershell.exe")
+        with self.assertRaises(ValueError):
+            node.build_wt_tail_argv("wt.exe", "tsk_42", "x.log", shell_bin="cmd.exe")
+
+        b_wt_fallback = node.resolve_exec_backend(
+            "wt-tail",
+            system="Windows",
+            which=lambda c: r"C:\Users\dev\AppData\Local\Microsoft\WindowsApps\wt.exe" if c == "wt.exe" else None,
+            runner=lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, b"1.20.0\n", b""),
+        )
+        self.assertIsInstance(b_wt_fallback, node.WtTailBackend)
+        self.assertEqual(b_wt_fallback.shell_bin, "powershell.exe")
 
         # Simulated wt-tail execution with mocked wt.exe launch
         with tempfile.TemporaryDirectory() as tmp:
@@ -1970,9 +1997,32 @@ class TestUnifiedNode(unittest.TestCase):
             self.assertEqual([i["name"] for i in items], ["ok.txt"])
             self.assertEqual(base64.b64decode(items[0]["data_base64"]), b"SAFE_DATA")
 
-        # 3. http_json refuses HTTP 3xx redirects rather than forwarding Bearer tokens.
-        class RedirectHandler(BaseHTTPRequestHandler):
+        # 3. http_json bypasses proxy for private/NO_PROXY globs & CIDRs, and refuses 3xx redirects.
+        self.assertTrue(node._should_bypass_proxy("http://10.0.0.11:5176/node/v1/work", {}))
+        self.assertTrue(node._should_bypass_proxy("http://192.168.1.50:8080/health", {}))
+        self.assertTrue(
+            node._should_bypass_proxy(
+                "https://hub.internal:8443/work",
+                {"NO_PROXY": "192.168.*,10.*,*.internal"},
+            )
+        )
+        self.assertFalse(
+            node._should_bypass_proxy(
+                "https://hub.example.com/work",
+                {"NO_PROXY": "192.168.*,10.*,127.*,localhost"},
+            )
+        )
+
+        class RedirectOrOkHandler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if self.path.startswith("/ok"):
+                    body = b'{"status":"ok"}'
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 self.send_response(302)
                 self.send_header("Location", "http://127.0.0.1:9/steal")
                 self.end_headers()
@@ -1980,10 +2030,20 @@ class TestUnifiedNode(unittest.TestCase):
             def log_message(self, *_args):
                 pass
 
-        srv = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+        srv = HTTPServer(("127.0.0.1", 0), RedirectOrOkHandler)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
         try:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "HTTP_PROXY": "http://127.0.0.1:9",
+                    "HTTPS_PROXY": "http://127.0.0.1:9",
+                    "NO_PROXY": "192.168.*,10.*,127.*,localhost",
+                },
+            ):
+                ok_data = node.http_json(f"http://127.0.0.1:{srv.server_port}/ok", "agn_tok")
+                self.assertEqual(ok_data, {"status": "ok"})
             with self.assertRaises(urllib.error.HTTPError) as ctx:
                 node.http_json(f"http://127.0.0.1:{srv.server_port}/node/v1/work", "agn_tok")
             self.assertEqual(ctx.exception.code, 302)

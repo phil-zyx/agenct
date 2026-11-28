@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fnmatch
 import hashlib
 import importlib
+import ipaddress
 import json
 import locale
 import ntpath
@@ -34,6 +36,7 @@ import threading
 import time
 from typing import Callable
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -678,6 +681,77 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
 
 _HTTP_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+_DIRECT_HTTP_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
+)
+
+
+def _host_matches_no_proxy(host: str, port: int | None, no_proxy_raw: str) -> bool:
+    if not host or not no_proxy_raw:
+        return False
+    try:
+        ip_obj = ipaddress.ip_address(host)
+    except ValueError:
+        ip_obj = None
+
+    for raw_entry in no_proxy_raw.split(","):
+        entry = raw_entry.strip().lower()
+        if not entry:
+            continue
+        if entry == "*":
+            return True
+        target = entry
+        entry_port: int | None = None
+        if entry.startswith("["):
+            end = entry.find("]")
+            if end != -1:
+                inner = entry[1:end]
+                rest = entry[end + 1:]
+                if rest.startswith(":") and rest[1:].isdigit():
+                    entry_port = int(rest[1:])
+                target = inner
+        elif "/" not in entry and entry.count(":") == 1:
+            h_part, p_part = entry.rsplit(":", 1)
+            if p_part.isdigit():
+                target = h_part
+                entry_port = int(p_part)
+        if entry_port is not None and port is not None and entry_port != port:
+            continue
+        if ip_obj is not None and "/" in target:
+            try:
+                if ip_obj in ipaddress.ip_network(target, strict=False):
+                    return True
+            except ValueError:
+                pass
+        if target.startswith("."):
+            if host == target[1:] or host.endswith(target):
+                return True
+        elif "*" in target or "?" in target:
+            if fnmatch.fnmatchcase(host, target):
+                return True
+        elif host == target or host.endswith("." + target):
+            return True
+    return False
+
+
+def _should_bypass_proxy(url: str, env: dict[str, str] | None = None) -> bool:
+    """Bypass HTTP(S) proxy for private/loopback Hub URLs and NO_PROXY glob/CIDR rules."""
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_unspecified:
+            return True
+    except ValueError:
+        pass
+    eff_env = os.environ if env is None else env
+    no_proxy_val = ",".join(v for v in (eff_env.get("no_proxy"), eff_env.get("NO_PROXY")) if v)
+    return _host_matches_no_proxy(host, parsed.port, no_proxy_val)
 
 _SCRUBBED_CHILD_ENV_KEYS = (
     "AGENCT_NODE_TOKEN",
@@ -744,7 +818,8 @@ def http_json(
     if extra_headers:
         headers.update(extra_headers)
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with _HTTP_OPENER.open(req, timeout=timeout) as resp:
+    opener = _DIRECT_HTTP_OPENER if _should_bypass_proxy(url) else _HTTP_OPENER
+    with opener.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -1121,10 +1196,30 @@ def _sanitize_task_label(task_id: str) -> str:
     return (cleaned or "task")[:40]
 
 
-def build_wt_tail_argv(wt_bin: str, task_id: str, log_path: str) -> list[str]:
+_WT_ALLOWED_SHELLS = ("pwsh", "powershell.exe")
+
+
+def resolve_wt_shell(*, which: Callable[[str], str | None] | None = None) -> str:
+    """Prefer PowerShell 7 (`pwsh`) when available, otherwise fall back to Windows `powershell.exe`."""
+    which_fn = which or shutil.which
+    if which_fn("pwsh") or which_fn("pwsh.exe"):
+        return "pwsh"
+    return "powershell.exe"
+
+
+def build_wt_tail_argv(
+    wt_bin: str,
+    task_id: str,
+    log_path: str,
+    *,
+    shell_bin: str | None = None,
+) -> list[str]:
     """Build strictly whitelisted Windows Terminal tail command argv."""
     if not wt_bin or "\n" in log_path or "\r" in log_path or "\x00" in log_path:
         raise ValueError("Invalid wt-tail arguments")
+    eff_shell = resolve_wt_shell() if shell_bin is None else shell_bin.strip()
+    if eff_shell not in _WT_ALLOWED_SHELLS:
+        raise ValueError(f"Unsupported wt-tail shell: {eff_shell}")
     safe_task = _sanitize_task_label(task_id)
     if any(ch in log_path for ch in (" ", "\t", "'", '"', ";", "|", "&", "$", "`", "(", ")")):
         escaped = log_path.replace("'", "''")
@@ -1138,7 +1233,7 @@ def build_wt_tail_argv(wt_bin: str, task_id: str, log_path: str) -> list[str]:
         "new-tab",
         "--title",
         f"agenct:{safe_task}",
-        "pwsh",
+        eff_shell,
         "-NoExit",
         "-Command",
         ps_cmd,
@@ -2055,9 +2150,16 @@ class WtTailBackend(ExecBackend):
 
     name = "wt-tail"
 
-    def __init__(self, *, wt_bin: str = "wt.exe", runs_dir: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        wt_bin: str = "wt.exe",
+        runs_dir: str | None = None,
+        shell_bin: str | None = None,
+    ) -> None:
         self.wt_bin = wt_bin
         self.runs_dir = runs_dir
+        self.shell_bin = shell_bin
         self._lock = threading.Lock()
         self._active: dict[str, ExecHandle] = {}
 
@@ -2077,7 +2179,7 @@ class WtTailBackend(ExecBackend):
         log_path = os.path.join(runs_dir, f"agenct-{safe_task}-{uuid.uuid4().hex[:6]}.log")
         open(log_path, "ab").close()
 
-        wt_argv = build_wt_tail_argv(self.wt_bin, safe_task, log_path)
+        wt_argv = build_wt_tail_argv(self.wt_bin, safe_task, log_path, shell_bin=self.shell_bin)
         try:
             subprocess.Popen(
                 wt_argv,
@@ -2186,7 +2288,7 @@ def resolve_exec_backend(
             )
         wt_bin = probe_wt_exe(system=system, which=which, runner=runner)
         if wt_bin:
-            return WtTailBackend(wt_bin=wt_bin, runs_dir=runs_dir)
+            return WtTailBackend(wt_bin=wt_bin, runs_dir=runs_dir, shell_bin=resolve_wt_shell(which=which))
         return PipeBackend()
 
     if req == "tmux":
@@ -2210,7 +2312,7 @@ def resolve_exec_backend(
     if req == "wt-tail":
         wt_bin = probe_wt_exe(system=system, which=which, runner=runner)
         if wt_bin:
-            return WtTailBackend(wt_bin=wt_bin, runs_dir=runs_dir)
+            return WtTailBackend(wt_bin=wt_bin, runs_dir=runs_dir, shell_bin=resolve_wt_shell(which=which))
         return PipeBackend()
 
     return PipeBackend()
